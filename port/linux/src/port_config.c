@@ -14,7 +14,9 @@ it exists, so that the player's edits and comments stay.
 #include "port_config.h"
 #include "tomlc17.h"
 
+#if !defined(HALO_ANDROID) && !defined(HALO_WII)
 #include <SDL3/SDL.h>
+#endif
 #include <ctype.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -547,6 +549,9 @@ static void config_path(char *path, size_t size)
 	const char *root = getenv("HALO_DATA_ROOT");
 
 	snprintf(path, size, "%s/config.toml", root && *root ? root : ".");
+#elif defined(HALO_WII)
+	/* the data folder on the SD card or USB drive (port/wii/src/wii_platform.c) */
+	snprintf(path, size, "%s/config.toml", platform_data_root());
 #else
 	/* the executable's folder, with its separator */
 	const char *base = SDL_GetBasePath();
@@ -558,7 +563,7 @@ static void config_path(char *path, size_t size)
 /* the whole file, NUL terminated, or NULL; free() it */
 static char *config_read_file(const char *path, size_t *size)
 {
-#ifdef HALO_ANDROID
+#if defined(HALO_ANDROID) || defined(HALO_WII)
 	FILE *file = fopen(path, "rb");
 	char *text = NULL;
 	long length;
@@ -601,7 +606,7 @@ static char *config_read_file(const char *path, size_t *size)
 
 static int config_write_file(const char *path, const char *text)
 {
-#ifdef HALO_ANDROID
+#if defined(HALO_ANDROID) || defined(HALO_WII)
 	FILE *file = fopen(path, "wb");
 	int written;
 

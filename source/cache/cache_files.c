@@ -710,10 +710,17 @@ long tag_loaded(
 	return result;
 }
 
+/* port: the tag cache's address, the Wii's elsewhere (physical_memory_map.c) */
+#ifdef HALO_PORT_TAG_CACHE_BASE_ADDRESS
+#define CACHE_FILES_TAG_CACHE_ADDRESS HALO_PORT_TAG_CACHE_BASE_ADDRESS
+#else
+#define CACHE_FILES_TAG_CACHE_ADDRESS 0x803A6000
+#endif
+
 void cache_files_enable_writes(
 	void)
 {
-	XPhysicalProtect((void *)0x803A6000, 0x01600000, PAGE_READWRITE);
+	XPhysicalProtect((void *)CACHE_FILES_TAG_CACHE_ADDRESS, 0x01600000, PAGE_READWRITE);
 
 	return;
 }
@@ -721,7 +728,7 @@ void cache_files_enable_writes(
 void cache_files_disable_writes(
 	void)
 {
-	XPhysicalProtect((void *)0x803A6000, 0x01600000, PAGE_READONLY);
+	XPhysicalProtect((void *)CACHE_FILES_TAG_CACHE_ADDRESS, 0x01600000, PAGE_READONLY);
 	XPhysicalProtect(
 		cache_file_globals.tag_header->vertex_buffers,
 		cache_file_globals.tag_header->vertex_buffer_count * 12,

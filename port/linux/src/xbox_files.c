@@ -64,6 +64,20 @@ const char *platform_data_root(void)
 		{
 			snprintf(root, sizeof(root), "%s", environment);
 		}
+#ifdef HALO_WII
+		/* the Homebrew Channel's folder for the game, on the SD card or a USB
+		drive (port/wii/README.md) */
+		else if (has_maps("sd:/apps/halo") || !has_maps("usb:/apps/halo"))
+		{
+			snprintf(root, sizeof(root), "sd:/apps/halo");
+			if (!has_maps(root))
+				platform_log("no maps/ folder in sd:/apps/halo or usb:/apps/halo");
+		}
+		else
+		{
+			snprintf(root, sizeof(root), "usb:/apps/halo");
+		}
+#else
 		else if (has_maps("."))
 		{
 			snprintf(root, sizeof(root), ".");
@@ -121,6 +135,7 @@ const char *platform_data_root(void)
 			if (!has_maps(root))
 				platform_log("no maps/ folder found; set paths.data in config.toml to the folder that holds maps/");
 		}
+#endif
 		trim_separators(root);
 		platform_log("data root: %s (the game's log: debug.txt there)", root);
 	}
@@ -160,6 +175,13 @@ const char *platform_save_root(void)
 
 		if (*environment)
 			snprintf(root, sizeof(root), "%s", environment);
+#ifdef HALO_WII
+		/* beside the maps, on the same card or drive */
+		else
+			snprintf(root, sizeof(root), "%s/saves", platform_data_root());
+		(void)data_home;
+		(void)home;
+#else
 #ifdef _WIN32
 		/* the Windows build (port/windows) keeps saves in the roaming
 		application data folder */
@@ -172,6 +194,7 @@ const char *platform_save_root(void)
 			snprintf(root, sizeof(root), "%s/.local/share/halo-linux", home);
 		else
 			snprintf(root, sizeof(root), "%s", platform_data_root());
+#endif
 		trim_separators(root);
 		make_directories(root);
 		platform_log("save root: %s", root);

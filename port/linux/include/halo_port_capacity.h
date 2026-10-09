@@ -10,10 +10,58 @@ distributed netcode names objects and players by their datum index, the
 same on every machine (port/linux/game/network_objects.c tracks
 MAXIMUM_TRACKED_OBJECTS = HALO_PORT_MAXIMUM_OBJECTS_PER_MAP objects, and a
 client's own objects take the upper half of the object array).
+
+The Wii (HALO_WII) has 88 MB in all, so it keeps the Xbox's own sizes, and
+its own places for the game state (port/wii/README.md, "Memory"). It cannot
+join the other builds' distributed games as a result.
 */
 
 #ifndef __HALO_PORT_CAPACITY_H
 #define __HALO_PORT_CAPACITY_H
+
+#ifdef HALO_WII
+
+/* the game state, at the top of MEM1 (claimed there by
+port/wii/src/wii_memory.c): the Xbox's CPU part with room for the port's
+own additions, and its GPU part */
+#define HALO_PORT_GAME_STATE_BASE_ADDRESS 0x813C0000 /* (0x80061000) */
+#define HALO_PORT_GAME_STATE_CPU_SIZE 0x400000 /* (0x305000) */
+#define HALO_PORT_GAME_STATE_GPU_SIZE 0x40000 /* (0x40000) */
+#define HALO_PORT_GAME_STATE_SIZE (HALO_PORT_GAME_STATE_CPU_SIZE+HALO_PORT_GAME_STATE_GPU_SIZE)
+/* the tag cache, at the bottom of the MEM2 window (port/linux/src/platform.h):
+converted maps are linked to it (tools/wii_convert_maps.py) */
+#define HALO_PORT_TAG_CACHE_BASE_ADDRESS 0x90100000 /* (0x803A6000) */
+/* the texture cache, smaller than the Xbox's to leave the MEM2 window room
+for the tag cache, the sound cache and Direct3D's resources */
+#define HALO_PORT_TEXTURE_CACHE_PAGE_COUNT 0x400 /* (0x580) */
+#define HALO_PORT_TEXTURE_CACHE_SIZE (HALO_PORT_TEXTURE_CACHE_PAGE_COUNT*0x4000) /* (0x1600000) */
+#define HALO_PORT_SOUND_CACHE_SIZE 0x400000 /* (0x400000) */
+
+#define HALO_PORT_MAXIMUM_ACTORS 256
+#define HALO_PORT_MAXIMUM_PROPS 768
+#define HALO_PORT_MAXIMUM_SWARMS 32
+#define HALO_PORT_MAXIMUM_SWARM_COMPONENTS 256
+#define HALO_PORT_MAXIMUM_OBJECTS_PER_MAP 2048
+#define HALO_PORT_OBJECT_MEMORY_POOL_SIZE 0x100000
+#define HALO_PORT_MAXIMUM_CLUSTER_REFERENCES 2048
+#define HALO_PORT_MAXIMUM_RENDERED_OBJECTS 256
+#define HALO_PORT_MAXIMUM_CACHED_OBJECT_RENDER_STATES 256
+#define HALO_PORT_MAXIMUM_AREA_OF_EFFECT_OBJECTS 64
+#define HALO_PORT_MAXIMUM_OBJECT_LISTS_PER_MAP 48
+#define HALO_PORT_MAXIMUM_LISTED_OBJECTS_PER_MAP 128
+#define HALO_PORT_MAXIMUM_WIDGETS 64
+#define HALO_PORT_MAXIMUM_LIGHT_VOLUMES 256
+#define HALO_PORT_MAXIMUM_EFFECTS 256
+#define HALO_PORT_MAXIMUM_EFFECT_LOCATIONS 512
+#define HALO_PORT_MAXIMUM_PARTICLES 1024
+#define HALO_PORT_MAXIMUM_PARTICLE_SYSTEMS 64
+#define HALO_PORT_MAXIMUM_SYSTEM_PARTICLES 512
+#define HALO_PORT_MAXIMUM_CONTRAILS 256
+#define HALO_PORT_MAXIMUM_CONTRAIL_POINTS 1024
+#define HALO_PORT_MAXIMUM_LIGHTS_PER_MAP 896
+#define HALO_PORT_MAXIMUM_GAME_LOOPING_SOUNDS 1024
+
+#else /* the desktop and Android builds */
 
 /* ---------- game state
 
@@ -114,5 +162,7 @@ without its widget */
 #define HALO_PORT_MAXIMUM_CONTRAIL_POINTS 8192 /* (1024) */
 #define HALO_PORT_MAXIMUM_LIGHTS_PER_MAP 4096 /* (896) */
 #define HALO_PORT_MAXIMUM_GAME_LOOPING_SOUNDS 4096 /* (1024) */
+
+#endif /* HALO_WII */
 
 #endif /* __HALO_PORT_CAPACITY_H */

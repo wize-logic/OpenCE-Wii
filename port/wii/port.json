@@ -1,0 +1,29 @@
+{
+  "comment": "Wii build inputs; the game sources are the Linux build's (port/linux/port.json). The Wii keeps only the shared platform files listed here; port/wii/src provides the rest, and while it is incomplete tools/wii_link.py stubs what is still missing. See port/wii/README.md.",
+  "shared_platform_sources": [
+    "bink_null.c",
+    "d3d8_resources.c",
+    "halo_linker_common.c",
+    "msvc_crt.c",
+    "msvc_wide.c",
+    "port_config.c",
+    "posix_files.c",
+    "xbdm.c",
+    "xbox_files.c",
+    "xbox_kernel.c",
+    "xbox_texture_formats.c",
+    "xbox_xapi.c",
+    "xiso.c"
+  ],
+  "platform_sources": "port/wii/src",
+  "libraries": [
+    "fat",
+    "wiikeyboard",
+    "wiiuse",
+    "bte",
+    "aesnd",
+    "asnd",
+    "ogc",
+    "m"
+  ]
+}

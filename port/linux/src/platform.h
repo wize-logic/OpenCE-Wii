@@ -118,6 +118,15 @@ physical/virtual arithmetic the game and Direct3D rely on keeps working. */
 /* 128 MB, a development kit's: Android's guest image is linked just above
 the window (port/android/include/halo_android_abi.h) */
 #define PLATFORM_CONTIGUOUS_SIZE 0x08000000UL
+#elif defined(HALO_WII)
+/* The Wii's cached memory is also at virtual 0x80000000 + P, so the
+arithmetic holds as it does on the Xbox. Its window is not at the base but
+claimed in MEM2 at a fixed address, with the tag cache at its bottom (the
+game state has a second, at the top of MEM1: halo_port_capacity.h). The
+texture and sound caches and Direct3D's resources share the rest
+(port/wii/src/wii_memory.c). */
+#define PLATFORM_CONTIGUOUS_WINDOW 0x90100000UL
+#define PLATFORM_CONTIGUOUS_SIZE 0x02E00000UL
 #else
 /* 512 MB on the desktop builds, whose caches outgrow the Xbox's (Custom
 Edition maps' textures and geometry: halo_port_capacity.h). Its pages are

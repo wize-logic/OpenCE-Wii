@@ -14,7 +14,9 @@ threads, asynchronous procedure calls, time, memory and debug output.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef HALO_WII /* (newlib has no mmap; nothing here needs it there) */
 #include <sys/mman.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -22,6 +24,7 @@ threads, asynchronous procedure calls, time, memory and debug output.
 
 /* ---------- logging */
 
+#ifndef HALO_WII /* the Wii's goes to its log sink (port/wii/src/wii_platform.c) */
 void platform_log(const char *format, ...)
 {
 	va_list arguments;
@@ -32,6 +35,7 @@ void platform_log(const char *format, ...)
 	va_end(arguments);
 	fputc('\n', stderr);
 }
+#endif
 
 void platform_unimplemented(const char *name)
 {
