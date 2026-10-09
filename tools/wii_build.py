@@ -63,6 +63,9 @@ def wii_abi_flags(devkitpro: Path) -> List[str]:
         "-fdata-sections",
         OPTIMISATION,
         "-g",
+        # every type in the debug information, those only sizeof names (the tag schema's)
+        # too: the map converter reads the tags' layouts from it (tools/wii_tag_layout.py)
+        "-fno-eliminate-unused-debug-types",
         "-DGEKKO",
         "-DHW_RVL",
         "-D__wii__",

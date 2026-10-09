@@ -127,7 +127,7 @@ otherwise) */
 /* a definition: its name, its structure and its fields, which end with
 TAG_SCHEMA_END */
 #define TAG_SCHEMA_DEFINITION(name, type, fields) \
-	{ #name, sizeof(type), (fields) }
+	{ #name, sizeof(type), (fields), #type }
 
 #define TAG_SCHEMA_BLOCK(type, field, definition, maximum) \
 	{ _tag_schema_block, sizeof(struct tag_block), 1, 0, \
@@ -252,6 +252,10 @@ struct tag_schema_definition
 	char const *name;
 	long size;
 	struct tag_schema_field const *fields;
+	/* the C type it is written with, as its source spells it (the Wii's map
+	converter reads the type's layout from the build's debug information:
+	tools/wii_convert_maps.py) */
+	char const *type_name;
 };
 
 struct tag_schema_group
