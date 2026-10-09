@@ -2,8 +2,8 @@
 XGPU.H
 
 Internals shared by the OpenGL implementation of the Xbox Direct3D API:
-the NV2A shader translators (nv2a_vsh.c, nv2a_psh.c), texture decoding
-(xbox_textures.c), guest memory write tracking (memory_watch.c) and the
+the NV2A shader translators (nv2a_vsh.c, nv2a_psh.c), the texture cache
+(xbox_textures.c, over xbox_texture_formats.h's decoding), guest memory write tracking (memory_watch.c) and the
 device itself (d3d8_gl.c).
 */
 
@@ -12,6 +12,7 @@ device itself (d3d8_gl.c).
 
 #include "platform.h"
 #include "gl.h"
+#include "xbox_texture_formats.h"
 
 #ifdef HALO_ANDROID
 /* OpenGL ES features that are optional (d3d8_gl.c gl_initialize) */
@@ -177,25 +178,6 @@ lights and the ambient light) */
 #define XGPU_MODEL_LIGHT_COUNT 12
 
 /* ---------- textures */
-
-struct xgpu_texture_description
-{
-	DWORD format;       /* D3DFMT_* */
-	unsigned long width, height, depth, levels;
-	BOOL cube_map;
-	BOOL linear;        /* not swizzled; addressed with texel coordinates */
-	BOOL compressed;
-	unsigned long pitch; /* linear textures */
-	BOOL hires;         /* a high-res HUD texture drawn in the texture's place (hud_hires.h) */
-	BOOL hires_coverage; /* ... whose green is its coverage (a meter's) */
-	BOOL hires_point_threshold; /* ... whose red holds discrete segment data */
-};
-
-void xgpu_texture_describe(DWORD format_word, DWORD size_word, struct xgpu_texture_description *description);
-/* bytes of one face, mip levels included (cube faces are padded) */
-unsigned long xgpu_texture_face_size(const struct xgpu_texture_description *description);
-unsigned long xgpu_texture_level_offset(const struct xgpu_texture_description *description, unsigned long level);
-unsigned long xgpu_texture_level_pitch(const struct xgpu_texture_description *description, unsigned long level);
 
 /* the GL texture for an Xbox texture header, uploading or refreshing it
 from guest memory as needed; *target receives GL_TEXTURE_2D etc. */
