@@ -12,11 +12,11 @@ the tag schema tools/wii_tag_layout.py reads from build/wii/halo.elf:
 - the data blocks whose contents are plain bytes (left), UTF-16 text (16-bit swaps) and so on,
   as DATA_CONTENTS says, field by field;
 - each structure bsp's header and tags, where it loads;
-- the vertex and index buffers' Direct3D headers.
+- the vertex and index buffers' Direct3D headers, and their vertices and indices;
+- the scripts' syntax nodes, the animations' frames and the recorded animations' event streams;
+- the bitmaps' pixels, in GX's formats (tools/wii_gx_textures.py).
 
-Still to do, and reported for each map (the converted map is not playable until they are): the
-vertex and index data, the animation frame data, the scripts' syntax nodes, the recorded
-animations' event streams, and the bitmaps' pixels (to GX formats).
+What the walk does not reach is reported for each map.
 
 The output is uncompressed, which the Wii reads where it is (the Xbox inflated its maps to a cache
 partition; source/cache/cache_files_windows.c, HALO_WII), its header big-endian with the Wii's
@@ -35,6 +35,7 @@ from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from wii_tag_layout import Definition, Executable, Schema, fourcc  # noqa: E402
+import wii_gx_textures  # noqa: E402
 
 XBOX_TAG_CACHE_ADDRESS = 0x803A6000
 TAG_CACHE_SIZE = 0x1600000
@@ -44,6 +45,11 @@ CACHE_FILE_VERSION_XBOX = 5
 CACHE_FILE_VERSION_WII = 0x57490005
 SCENARIO_GROUP_TAG = 0x73636E72  # 'scnr'
 STRUCTURE_BSP_GROUP_TAG = 0x73627370  # 'sbsp'
+BITMAP_GROUP_TAG = 0x6269746D  # 'bitm'
+BITMAP_TYPE_2D = 0
+BITMAP_GROUP_TYPE_INTERFACE = 4
+# struct bitmap_data's flags (source/bitmaps/bitmaps.c)
+BITMAP_POWER_OF_TWO_BIT, BITMAP_COMPRESSED_BIT, BITMAP_LINEAR_BIT, BITMAP_V16U16_BIT = 0, 1, 4, 5
 SCENARIO_STRUCTURE_BSPS_OFFSET = 0x5A4
 BUFFER_SIZE = 12
 
@@ -181,6 +187,9 @@ class Converter:
         self.instance_plan = self._plan_of_type("struct tag_validate_instance")
         self.bsp_header_plan = self._plan_of_type("struct tag_validate_structure_bsp_header")
         self.data_array_plan = self._plan_of_type("struct data_array")
+        self.bitmap_group = self.executable.member_offsets("struct bitmap_group")
+        self.bitmap_data = self.executable.member_offsets("struct bitmap_data")
+        self.bitmap_data_size = self.executable.size_of(self.executable.types["struct bitmap_data"])
         # the scripts' value sizes (source/hs/hs.c), as the executable holds them
         sizes = self.executable.symbols["hs_type_sizes"]
         count = self.executable.symbol_sizes["hs_type_sizes"] // 2
@@ -211,6 +220,7 @@ class Converter:
         self.vertex_jobs: Dict[int, Tuple[int, int]] = {}
         self.triangle_jobs: Dict[int, Tuple[int, int]] = {}
         self.buffer_regions: List[Region] = []
+        self.bitmaps: Dict[str, int] = {}
 
         # the header (source/cache/cache_files_windows.c's struct cache_file_header, the one
         # that names every field the game reads): its values big-endian, its version the Wii's;
@@ -245,6 +255,8 @@ class Converter:
                 self.notes.append(f"tag {index} ({fourcc(group_tag)}) is outside the tags")
                 continue
             self.walk(group.definition, tags, base_address, 1, swap=True)
+            if group_tag == BITMAP_GROUP_TAG:
+                self.bitmap_pixels(tags, base_address)
         if missing_groups:
             self.notes.append("tags of groups the game reads nothing of (left as they are): " +
                               ", ".join(f"{group} x{count}" for group, count in sorted(missing_groups.items())))
@@ -268,6 +280,8 @@ class Converter:
                 self.report_coverage(bsp)
         self.buffer_data(tags)
         self.report_coverage(tags)
+        self.notes.append("bitmaps in GX's formats: " + ", ".join(
+            f"{kind} {count}" for kind, count in sorted(self.bitmaps.items())))
         for what, count in sorted(self.deferred.items()):
             self.notes.append(f"not converted yet: {what} ({count} bytes)")
         return bytes(self.output), self.notes
@@ -479,6 +493,62 @@ class Converter:
             return
         if position > end or (event not in EVENTS and event not in EVENTS_V1):
             self.notes.append(f"a recorded animation's stream (version {version}) does not end as its events say")
+
+    def bitmap_pixels(self, region: Region, group: int):
+        """a bitmap group's bitmaps' pixels, in the map past the tags, in GX's formats where they
+        fit (tools/wii_gx_textures.py), each texture's levels as rasterizer_swizzle.c counts them.
+
+        The texture cache reads a bitmap's pixels at its offset plus the group's pixel data's file
+        offset (xbox_texture_cache.c), but the Xbox's maps keep in that field where the pixels
+        were in the bitmap's tag file: a bitmap's own offset is already in the map. It is made 0
+        here. An interface bitmap is linear whatever its flags (bitmap_group.c)."""
+        pixel_data = region.offset(group + self.bitmap_group["pixel_data"]) + self.tag_data["file_offset"]
+        struct.pack_into(">i", self.output, pixel_data, 0)
+        group_type = struct.unpack_from("<h", self.source, region.offset(group + self.bitmap_group["type"]))[0]
+        count, address = struct.unpack_from("<iI", self.source, region.offset(group + self.bitmap_group["bitmaps"]))
+        if count <= 0 or not region.contains(address, count * self.bitmap_data_size):
+            return
+        fields = self.bitmap_data
+        for index in range(count):
+            element = region.offset(address + index * self.bitmap_data_size)
+
+            def value(name, code="<h"):
+                return struct.unpack_from(code, self.source, element + fields[name])[0]
+
+            width, height, depth = value("width"), value("height"), value("depth")
+            bitmap_type, bitmap_format, flags = value("type"), value("format"), value("flags", "<H")
+            mipmap_count, pixels_offset = value("mipmap_count"), value("pixels_offset", "<i")
+            if group_type == BITMAP_GROUP_TYPE_INTERFACE:
+                flags |= 1 << BITMAP_LINEAR_BIT
+            kind = wii_gx_textures.BITMAP_FORMATS.get(bitmap_format)
+            outcome = kind or f"format {bitmap_format}"
+            linear = flags >> BITMAP_LINEAR_BIT & 1
+            compressed = flags >> BITMAP_COMPRESSED_BIT & 1
+            if (kind is None or bitmap_type != BITMAP_TYPE_2D or flags >> BITMAP_V16U16_BIT & 1 or width <= 0 or
+                    height <= 0 or (linear and kind.startswith("dxt"))):
+                outcome = "left: " + (outcome if kind is None else "type or shape")
+            else:
+                levels = 1
+                if flags >> BITMAP_POWER_OF_TWO_BIT & 1 and not linear:
+                    largest = max(width // 4, height // 4, depth) if compressed else max(width, height, depth)
+                    levels = min(mipmap_count, max(largest, 1).bit_length() - 1) + 1
+                row = width * wii_gx_textures.XBOX_BYTES[kind]
+                pitch = (row + 63) & ~63 if linear else 0
+                size = sum(wii_gx_textures.xbox_level_bytes(kind, width, height, level, pitch) for level in range(levels))
+                if linear and pitch != row:
+                    # (rows the game does not draw: texture_cache_bitmap_valid)
+                    outcome = "left: linear rows of no pitch"
+                elif pixels_offset < 0 or pixels_offset + size > len(self.source):
+                    self.notes.append(f"a bitmap's pixels are outside the map ({pixels_offset:x})")
+                    continue
+                else:
+                    converted = wii_gx_textures.convert(self.source[pixels_offset:pixels_offset + size], kind, width,
+                                                        height, levels, pitch)
+                    if converted is None:
+                        outcome = "left: too small or large"
+                    else:
+                        self.output[pixels_offset:pixels_offset + size] = converted
+            self.bitmaps[outcome] = self.bitmaps.get(outcome, 0) + 1
 
     def swap_words(self, offset: int, size: int, width: int):
         code = {2: "H", 4: "I"}[width]

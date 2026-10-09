@@ -25,12 +25,28 @@ void *__real_malloc(size_t size);
 void *__real_calloc(size_t count, size_t size);
 void *__real_realloc(void *pointer, size_t size);
 void __real_free(void *pointer);
+void *__real_memalign(size_t alignment, size_t size);
+void *__real_aligned_alloc(size_t alignment, size_t size);
 size_t malloc_usable_size(void *pointer);
 
 void *__wrap_malloc(size_t size);
 void *__wrap_calloc(size_t count, size_t size);
 void *__wrap_realloc(void *pointer, size_t size);
 void __wrap_free(void *pointer);
+void *__wrap_memalign(size_t alignment, size_t size);
+
+struct _reent;
+void *__real__malloc_r(struct _reent *reent, size_t size);
+void *__real__calloc_r(struct _reent *reent, size_t count, size_t size);
+void *__real__realloc_r(struct _reent *reent, void *pointer, size_t size);
+void __real__free_r(struct _reent *reent, void *pointer);
+void *__real__memalign_r(struct _reent *reent, size_t alignment, size_t size);
+void *__wrap__malloc_r(struct _reent *reent, size_t size);
+void *__wrap__calloc_r(struct _reent *reent, size_t count, size_t size);
+void *__wrap__realloc_r(struct _reent *reent, void *pointer, size_t size);
+void __wrap__free_r(struct _reent *reent, void *pointer);
+void *__wrap__memalign_r(struct _reent *reent, size_t alignment, size_t size);
+void *__wrap_aligned_alloc(size_t alignment, size_t size);
 
 static uintptr_t overflow_base, overflow_end;
 
@@ -111,6 +127,24 @@ void *__wrap_calloc(size_t count, size_t size)
 	return pointer;
 }
 
+void *__wrap_memalign(size_t alignment, size_t size)
+{
+	void *pointer = __real_memalign(alignment, size);
+
+	if (!pointer && size && alignment <= OVERFLOW_HEADER)
+		pointer = overflow_alloc(size);
+	return pointer;
+}
+
+void *__wrap_aligned_alloc(size_t alignment, size_t size)
+{
+	void *pointer = __real_aligned_alloc(alignment, size);
+
+	if (!pointer && size && alignment <= OVERFLOW_HEADER)
+		pointer = overflow_alloc(size);
+	return pointer;
+}
+
 void __wrap_free(void *pointer)
 {
 	if (!pointer)
@@ -150,4 +184,104 @@ void *__wrap_realloc(void *pointer, size_t size)
 	memcpy(moved, pointer, old_size < size ? old_size : size);
 	__wrap_free(pointer);
 	return moved;
+}
+
+/* ---------- newlib's reentrant entry points */
+
+void __malloc_lock(struct _reent *reent);
+void __malloc_unlock(struct _reent *reent);
+
+/* (the thread holding the malloc lock is in newlib's calloc, realloc or
+memalign) */
+static int inside_newlib;
+
+void *__wrap__malloc_r(struct _reent *reent, size_t size)
+{
+	void *pointer;
+
+	__malloc_lock(reent);
+	pointer = __real__malloc_r(reent, size);
+	if (!pointer && size && !inside_newlib)
+		pointer = overflow_alloc(size);
+	__malloc_unlock(reent);
+	return pointer;
+}
+
+void *__wrap__calloc_r(struct _reent *reent, size_t count, size_t size)
+{
+	void *pointer;
+
+	__malloc_lock(reent);
+	inside_newlib++;
+	pointer = __real__calloc_r(reent, count, size);
+	inside_newlib--;
+	__malloc_unlock(reent);
+
+	if (!pointer && count && size && size <= SIZE_MAX / count)
+	{
+		pointer = overflow_alloc(count * size);
+		if (pointer)
+			memset(pointer, 0, count * size);
+	}
+	return pointer;
+}
+
+void __wrap__free_r(struct _reent *reent, void *pointer)
+{
+	if (!pointer)
+		return;
+	if (from_overflow(pointer))
+		wl_mem_free((unsigned char *)pointer - OVERFLOW_HEADER);
+	else
+		__real__free_r(reent, pointer);
+}
+
+void *__wrap__realloc_r(struct _reent *reent, void *pointer, size_t size)
+{
+	size_t old_size;
+	void *moved;
+
+	if (!pointer)
+		return __wrap__malloc_r(reent, size);
+	if (!size)
+	{
+		__wrap__free_r(reent, pointer);
+		return NULL;
+	}
+	if (!from_overflow(pointer))
+	{
+		__malloc_lock(reent);
+		inside_newlib++;
+		moved = __real__realloc_r(reent, pointer, size);
+		inside_newlib--;
+		__malloc_unlock(reent);
+		if (moved)
+			return moved;
+		old_size = malloc_usable_size(pointer);
+	}
+	else
+	{
+		old_size = *(size_t *)((unsigned char *)pointer - OVERFLOW_HEADER);
+	}
+	moved = __wrap__malloc_r(reent, size);
+	if (!moved)
+		return NULL;
+	memcpy(moved, pointer, old_size < size ? old_size : size);
+	__wrap__free_r(reent, pointer);
+	return moved;
+}
+
+void *__wrap__memalign_r(struct _reent *reent, size_t alignment, size_t size)
+{
+	void *pointer;
+
+	__malloc_lock(reent);
+	inside_newlib++;
+	pointer = __real__memalign_r(reent, alignment, size);
+	inside_newlib--;
+	__malloc_unlock(reent);
+
+	if (!pointer && size && alignment <= OVERFLOW_HEADER)
+		pointer = overflow_alloc(size);
+	return pointer;
 }

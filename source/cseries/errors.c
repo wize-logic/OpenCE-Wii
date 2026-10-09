@@ -176,6 +176,23 @@ static void write_to_debug_file(
 	}
 	fprintf(file, "%s%s", prefix, string);
 	fflush(file);
+#ifdef HALO_WII
+	/* port: and the console's log (OSREPORT, and the SD card's log file), as
+	debug.txt is on the card */
+	{
+		extern void platform_log(char const *format, ...);
+		char line[512];
+		size_t length;
+
+		csstrncpy(line, string, sizeof(line) - 1);
+		line[sizeof(line) - 1] = 0;
+		length = csstrlen(line);
+		while (length && (line[length - 1] == '\n' || line[length - 1] == '\r'))
+			line[--length] = 0;
+		if (length)
+			platform_log("debug.txt: %s", line);
+	}
+#endif
 }
 
 void write_to_error_file(

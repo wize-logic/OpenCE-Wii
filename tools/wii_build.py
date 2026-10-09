@@ -276,7 +276,8 @@ def generate_wii_build(n: Writer, sln: Any) -> None:
     linker = tools / "powerpc-eabi-gcc"
     ldflags = " ".join(["-mrvl", "-mcpu=750", "-meabi", "-mhard-float", "-g", "-Wl,--gc-sections", "-Wl,--wrap=main", "-Wl,--wrap=exit", "-Wl,--wrap=abort",
                         # (the game's heap: port/wii/src/wii_malloc.c)
-                        *(f"-Wl,--wrap={name}" for name in ("malloc", "calloc", "realloc", "free")),
+                        *(f"-Wl,--wrap={name}" for name in ("malloc", "calloc", "realloc", "free", "memalign", "aligned_alloc",
+                                                       "_malloc_r", "_calloc_r", "_realloc_r", "_free_r", "_memalign_r")),
                         f"-Wl,-Map,{build_dir / 'halo.map'}", f"-L{devkitpro / 'libogc' / 'lib' / 'wii'}"])
     libs = " ".join([*(str(library) for library in wiilibs_outputs),
                      *(f"-l{library}" for library in config.get("libraries", []))])

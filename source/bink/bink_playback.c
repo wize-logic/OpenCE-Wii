@@ -517,6 +517,11 @@ void bink_playback_start(
 		return;
 	if (cache_files_precache_in_progress())
 		return;
+#ifdef HALO_WII
+	/* port: the port has no movie decoder (port/linux/src/bink_null.c), and
+	the Wii's texture cache has no 4 or 16 MB to lend one: no movie starts */
+	return;
+#endif
 
 	match_dassert(
 		"c:\\halo\\SOURCE\\bink\\bink_playback.c",

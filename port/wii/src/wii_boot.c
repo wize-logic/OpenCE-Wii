@@ -90,6 +90,7 @@ int __wrap_main(void)
 
 	wl_platform_system_init();
 	wl_platform_log_init(NULL);
+	wl_platform_crash_report_install();
 	wii_console_start();
 	wii_report("Halo: Combat Evolved for the Wii (bring-up build)\n");
 	if (!claimed)
