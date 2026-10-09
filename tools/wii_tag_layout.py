@@ -92,9 +92,11 @@ class Executable:
         self.segments = [(segment["p_vaddr"], segment["p_filesz"], segment.data())
                          for segment in self.elf.iter_segments() if segment["p_type"] == "PT_LOAD"]
         self.symbols: Dict[str, int] = {}
+        self.symbol_sizes: Dict[str, int] = {}
         for symbol in self.elf.get_section_by_name(".symtab").iter_symbols():
             if symbol.name:
                 self.symbols.setdefault(symbol.name, symbol["st_value"])
+                self.symbol_sizes.setdefault(symbol.name, symbol["st_size"])
         self.dwarf = self.elf.get_dwarf_info()
         self.types: Dict[str, object] = {}
         # the game names different structures alike in different files (MSVC's file-scope

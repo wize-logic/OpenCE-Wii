@@ -18,8 +18,9 @@ Still to do, and reported for each map (the converted map is not playable until 
 vertex and index data, the animation frame data, the scripts' syntax nodes, the recorded
 animations' event streams, and the bitmaps' pixels (to GX formats).
 
-The output is uncompressed, its header big-endian with the Wii's version
-(CACHE_FILE_VERSION_WII).
+The output is uncompressed, which the Wii reads where it is (the Xbox inflated its maps to a cache
+partition; source/cache/cache_files_windows.c, HALO_WII), its header big-endian with the Wii's
+version (CACHE_FILE_VERSION_WII, port/linux/game/cache_file_formats.h).
 
 usage: tools/wii_convert_maps.py [--elf build/wii/halo.elf] [--output DIR] map.map...
 """
@@ -47,13 +48,14 @@ SCENARIO_STRUCTURE_BSPS_OFFSET = 0x5A4
 BUFFER_SIZE = 12
 
 # What each data block holds, by the definition and field that name it: "bytes" (left as they
-# are), "utf16" (16-bit swaps), or "deferred" (not converted yet: reported).
+# are), "utf16" (16-bit swaps), "hs_syntax" (the scripts' syntax nodes: hs_syntax below), or
+# "deferred" (not converted yet: reported).
 DATA_CONTENTS: Dict[Tuple[str, str], str] = {
     ("font", "pixels"): "bytes",
     ("hs_source_file", "source"): "bytes",
     ("hud_message_text", "text_data"): "utf16",
     ("scenario", "hs_string_constants"): "bytes",
-    ("scenario", "hs_syntax_data"): "deferred",
+    ("scenario", "hs_syntax_data"): "hs_syntax",
     ("sound_permutation", "mouth_data"): "bytes",
     ("sound_permutation", "subtitle_data"): "bytes",
     ("string_list_entry", "string"): "bytes",
@@ -61,11 +63,46 @@ DATA_CONTENTS: Dict[Tuple[str, str], str] = {
     # (cluster and sound cluster data are kept in the tags but read by nothing)
     ("structure_bsp", "cluster_data"): "bytes",
     ("structure_bsp", "sound_cluster_data"): "bytes",
-    ("animation", "data"): "deferred",
-    ("animation", "default_data"): "deferred",
-    ("animation", "frame_info"): "deferred",
-    ("recorded_animation", "event_stream"): "deferred",
+    ("animation", "data"): "animation",
+    ("animation", "default_data"): "animation",
+    ("animation", "frame_info"): "animation",
+    ("recorded_animation", "event_stream"): "recorded_animation",
+    ("structure_material", "compressed_vertex_data"): "bsp_vertices",
+    ("structure_material", "uncompressed_vertex_data"): "bsp_vertices",
 }
+
+
+# The vertex types the maps' geometry is in (source/rasterizer/rasterizer_geometry.h), each a
+# vertex's values in order as the game's vertex declarations read them
+# (rasterizer_xbox_vertex_shaders_initialize.c): f a float, p a packed normal (11:11:10 bits in a
+# 32-bit word, which a 32-bit swap keeps), h a short, b a byte.
+VERTEX_FORMATS: Dict[int, str] = {
+    0: "fff" "fff" "fff" "fff" "ff",          # environment, uncompressed: 56 bytes
+    1: "fff" "ppp" "ff",                       # environment, compressed: 32
+    2: "fff" "ff",                             # lightmap, uncompressed: 20
+    3: "p" "hh",                               # lightmap, compressed: 8
+    4: "fff" "fff" "fff" "fff" "ff" "hh" "ff",  # model, uncompressed: 68
+    5: "fff" "ppp" "hh" "bb" "h",              # model, compressed: 32
+}
+VERTEX_STRUCT_CODES = {"f": "I", "p": "I", "h": "H", "b": "B"}
+TRIANGLE_BUFFER_STRIP = 1
+
+# A recorded animation's stream (source/cutscene): its unit control's fields by version
+# (recorded_animation_initialize.c), each (width, count): width 1 is bytes, which keep their order
+UNIT_CONTROL_FIELDS = [
+    [(1, 1), (1, 1), (2, 1), (2, 1), (2, 1), (4, 2), (4, 3), (4, 3), (4, 3)],
+    [(4, 1)],
+    [(2, 1)],
+    [(2, 1)],
+]
+# each event's data, by type: the version 1 streams' after their 4-byte header
+# (recorded_animation_playback_v1.c), the current ones' after their header byte and time delta
+# (recorded_animation_playback.c)
+EVENTS_V1 = {0: [], 1: [], 2: [(1, 2)], 3: [(1, 2)], 4: [(2, 1)], 5: [(2, 1)], 6: [(4, 2)], 7: [], 8: [],
+             **{event: [(4, 3)] for event in range(9, 16)}, **{event: [(4, 2)] for event in range(16, 23)}}
+EVENTS = {0: [], 1: [], 2: [(1, 1)], 3: [(1, 1)], 4: [(2, 1)], 5: [(2, 1)], 6: [(4, 2)],
+          **{event: [(1, 2)] for event in range(7, 15)}, **{event: [(2, 2)] for event in range(15, 23)}}
+RECORDED_ANIMATION_END = 1
 
 
 class Region:
@@ -120,12 +157,34 @@ class Converter:
         if problems:
             raise SystemExit("the tag layouts have problems (tools/wii_tag_layout.py):\n  " + "\n  ".join(problems))
         self.plans = {id(definition): Plan(definition) for definition in self.schema.definitions.values()}
+        self.vertex_structs = {vertex_type: (struct.Struct("<" + "".join(VERTEX_STRUCT_CODES[c] for c in format)),
+                                             struct.Struct(">" + "".join(VERTEX_STRUCT_CODES[c] for c in format)))
+                               for vertex_type, format in VERTEX_FORMATS.items()}
+        # each definition's vertex and triangle buffers (struct vertex_buffer, struct
+        # triangle_buffer): where in an element, and which
+        self.buffer_fields = {}
+        for definition in self.schema.definitions.values():
+            names = {leaf.name.split(".", 1)[1] if "." in leaf.name else leaf.name: leaf.offset
+                     for leaf in definition.leaves}
+            found = []
+            for name, offset in names.items():
+                if name.endswith(".hardware_format"):
+                    prefix = name[:-len(".hardware_format")]
+                    if f"{prefix}.type" in names and f"{prefix}.count" in names:
+                        kind = "vertex" if f"{prefix}.offset" in names else "triangle"
+                        found.append((kind, names[f"{prefix}.type"]))
+            if found:
+                self.buffer_fields[id(definition)] = found
         self.delta = tag_cache_address - XBOX_TAG_CACHE_ADDRESS
         self.tag_data = self.executable.member_offsets("struct tag_data")
         self.header_plan = self._plan_of_type("struct tag_validate_header")
         self.instance_plan = self._plan_of_type("struct tag_validate_instance")
         self.bsp_header_plan = self._plan_of_type("struct tag_validate_structure_bsp_header")
-        self.bsp_reference_plan = None
+        self.data_array_plan = self._plan_of_type("struct data_array")
+        # the scripts' value sizes (source/hs/hs.c), as the executable holds them
+        sizes = self.executable.symbols["hs_type_sizes"]
+        count = self.executable.symbol_sizes["hs_type_sizes"] // 2
+        self.hs_type_sizes = list(struct.unpack(f">{count}h", self.executable.read(sizes, 2 * count)))
         print(f"layouts: {len(self.schema.groups)} groups, {len(self.schema.definitions)} definitions "
               f"({time.monotonic() - started:.0f} s)")
 
@@ -149,10 +208,17 @@ class Converter:
         self.output = bytearray(image)
         self.notes: List[str] = []
         self.deferred: Dict[str, int] = {}
+        self.vertex_jobs: Dict[int, Tuple[int, int]] = {}
+        self.triangle_jobs: Dict[int, Tuple[int, int]] = {}
+        self.buffer_regions: List[Region] = []
 
-        # the header: its words big-endian, its version the Wii's
-        self.output[0:24] = struct.pack(">6I", signature, CACHE_FILE_VERSION_WII, file_length, 0,
-                                        tag_data_offset, tag_data_size)
+        # the header (source/cache/cache_files_windows.c's struct cache_file_header, the one
+        # that names every field the game reads): its values big-endian, its version the Wii's;
+        # the name, the build and the reserved bytes as they are
+        struct.pack_into(">III", self.output, 0, signature, CACHE_FILE_VERSION_WII, file_length)
+        struct.pack_into(">II", self.output, 0x10, tag_data_offset, tag_data_size)
+        scenario_type, pad, checksum = struct.unpack_from("<hhI", image, 0x60)
+        struct.pack_into(">hhI", self.output, 0x60, scenario_type, pad, checksum)
         footer = struct.unpack_from("<I", image, HEADER_SIZE - 4)[0]
         self.output[HEADER_SIZE - 4:HEADER_SIZE] = struct.pack(">I", footer)
 
@@ -180,7 +246,7 @@ class Converter:
                 continue
             self.walk(group.definition, tags, base_address, 1, swap=True)
         if missing_groups:
-            self.notes.append("tags of groups the schema has no definition for (left as they are): " +
+            self.notes.append("tags of groups the game reads nothing of (left as they are): " +
                               ", ".join(f"{group} x{count}" for group, count in sorted(missing_groups.items())))
 
         # the structure bsps, each where it loads
@@ -198,7 +264,9 @@ class Converter:
                     self.walk(bsp_group.definition, bsp, root, 1, swap=True)
                 else:
                     self.notes.append(f"structure bsp {index}'s root is outside it")
+                self.buffer_data(bsp)
                 self.report_coverage(bsp)
+        self.buffer_data(tags)
         self.report_coverage(tags)
         for what, count in sorted(self.deferred.items()):
             self.notes.append(f"not converted yet: {what} ({count} bytes)")
@@ -226,6 +294,13 @@ class Converter:
             base = address + element * definition.size
             if swap:
                 self.apply(plan, region, base)
+            for kind, offset in self.buffer_fields.get(id(definition), ()):
+                at = region.offset(base + offset)
+                buffer_type, count = struct.unpack_from("<hxxi", self.source, at)
+                hardware = struct.unpack_from("<I", self.source, at + (16 if kind == "vertex" else 12))[0]
+                if count > 0 and hardware:
+                    jobs = self.vertex_jobs if kind == "vertex" else self.triangle_jobs
+                    jobs[hardware] = (buffer_type, count)
             for field in definition.fields:
                 if field.type == "block" and field.definition is not None:
                     for item in range(field.count):
@@ -241,9 +316,9 @@ class Converter:
                     # (its scalars are its parent's, swapped already: its blocks and data only)
                     self.walk(field.definition, region, base + field.offset, field.count, swap=False)
                 elif field.type == "data":
-                    self.data(definition, field, region, base + field.offset)
+                    self.data(definition, field, region, base + field.offset, base)
 
-    def data(self, definition: Definition, field, region: Region, address: int):
+    def data(self, definition: Definition, field, region: Region, address: int, element: int):
         at = region.offset(address)
         size = struct.unpack_from("<i", self.source, at + self.tag_data["size"])[0]
         data_address = struct.unpack_from("<I", self.source, at + self.tag_data["address"])[0]
@@ -261,10 +336,171 @@ class Converter:
             offset = region.offset(data_address)
             words = struct.unpack_from(f"<{size // 2}H", self.source, offset)
             struct.pack_into(f">{size // 2}H", self.output, offset, *words)
+        elif contents == "hs_syntax":
+            self.hs_syntax(region, data_address, size)
+        elif contents == "recorded_animation":
+            self.recorded_animation(definition, region, element, data_address, size)
+        elif contents == "animation":
+            self.animation(definition, field, region, element, data_address, size)
+        elif contents == "bsp_vertices":
+            self.bsp_vertices(definition, field, region, element, data_address, size)
         elif contents == "deferred":
             what = f"{definition.name}.{field.name}"
             self.deferred[what] = self.deferred.get(what, 0) + size
         region.covered[start:start + size] = b"\x01" * size
+
+    def hs_syntax(self, region: Region, address: int, size: int):
+        """the scripts' syntax nodes: a data array's header, then its nodes. A node's value is a
+        32-bit cell holding a boolean, short, long or real by the node's type, which the game reads
+        both as the whole cell and as its narrow member (port/linux/include/halo_cells.h): it is
+        written as the 32-bit number the Xbox's cell held, a constant's widened from its type's
+        size (hs_type_sizes), a call's or global's (an expression or global index) as it is"""
+        header = self.apply(self.data_array_plan, region, address)
+        offset = region.offset(address) + self.data_array_plan.little.size
+        end = region.offset(address) + size
+        node = struct.Struct("<hhhhiiI")
+        node_big = struct.Struct(">hhhhiiI")
+        while offset + node.size <= end:
+            datum, index, node_type, flags, next_node, source, data = node.unpack_from(self.source, offset)
+            primitive, global_value = flags & 1, flags & 4
+            if primitive and not global_value and 0 <= node_type < len(self.hs_type_sizes):
+                width = self.hs_type_sizes[node_type]
+                if width == 1:
+                    data = data & 0xFF
+                elif width == 2:
+                    data = (data & 0xFFFF) - 0x10000 if data & 0x8000 else data & 0xFFFF
+                    data &= 0xFFFFFFFF
+            node_big.pack_into(self.output, offset, datum, index, node_type, flags, next_node, source, data)
+            offset += node.size
+
+    def animation(self, definition: Definition, field, region: Region, element: int, address: int, size: int):
+        """an animation's frames (source/models/model_animations.c): its frame info all floats; its
+        default data and uncompressed frames, node by node, a rotation four shorts, a translation
+        three floats, a scale a float (frames for the nodes the flags say move, the default for
+        the others); and its compressed data, a header of section offsets and the sections,
+        swapped by their elements' widths (32-bit node headers, 16-bit frame indices, rotations of
+        three 16-bit words, translations and scales of floats)"""
+        leaves = {leaf.name.split(".", 1)[1]: leaf.offset for leaf in definition.leaves}
+
+        def value(name, code="<h"):
+            return struct.unpack_from(code, self.source, region.offset(element + leaves[name]))[0]
+
+        offset = region.offset(address)
+        if field.name == "frame_info":
+            self.swap_words(offset, size, 4)
+            return
+        node_count, frame_count, frame_size = value("node_count"), value("frame_count"), value("frame_size")
+        flags = value("flags", "<H")
+        moving = {kind: (value(f"nodes_with_{kind}_flags[0]", "<I") | value(f"nodes_with_{kind}_flags[1]", "<I") << 32)
+                  for kind in ("rotation", "translation", "scale")}
+        widths = {"rotation": (2, 4), "translation": (4, 3), "scale": (4, 1)}
+
+        def nodes(position: int, animated: bool) -> int:
+            for node in range(node_count):
+                for kind in ("rotation", "translation", "scale"):
+                    if bool(moving[kind] >> node & 1) == animated:
+                        width, count = widths[kind]
+                        self.swap_words(position, width * count, width)
+                        position += width * count
+            return position
+
+        if field.name == "default_data":
+            end = nodes(offset, False)
+            if end - offset != size:
+                self.notes.append(f"an animation's default data is {size} bytes, not {end - offset}")
+            return
+        compressed_offset = value("compressed_data_offset", "<i")
+        compressed = flags & 1
+        uncompressed = frame_count * frame_size if (not compressed or compressed_offset) else 0
+        position = offset
+        for frame in range(frame_count if uncompressed else 0):
+            end = nodes(position, True)
+            if end - position != frame_size:
+                self.notes.append(f"an animation's frame is {frame_size} bytes, not {end - position}")
+                break
+            position = end
+        if compressed:
+            block = offset + compressed_offset
+            header = struct.unpack_from("<11i", self.source, block)
+            struct.pack_into(">11i", self.output, block, *header)
+            sections = [(0x2C, 4)] + list(zip(header, (2, 2, 2, 4, 2, 4, 4, 4, 2, 4, 4)))
+            sections.sort()
+            for (start, width), (next_start, _) in zip(sections, sections[1:] + [(size - compressed_offset, 0)]):
+                if 0 <= start < next_start <= size - compressed_offset:
+                    self.swap_words(block + start, (next_start - start) // width * width, width)
+
+    def recorded_animation(self, definition: Definition, region: Region, element: int, address: int, size: int):
+        """a recorded animation's event stream: its unit control (the fields of each version up to
+        its own), the current format's animation state (three yaw and pitch shorts), then its
+        events up to the end event. A current event's header is a byte of two bitfields, time delta
+        (2 bits) then type (6), which MSVC packs from the low bit and a big-endian compiler from
+        the high one: it is rewritten so; a time delta of a word follows it, unaligned"""
+        leaves = {leaf.name.split(".", 1)[1]: leaf.offset for leaf in definition.leaves}
+        version = self.source[region.offset(element + leaves["version"])]
+        control_version = self.source[region.offset(element + leaves["unit_control_data_version"])]
+        start = region.offset(address)
+        end = start + size
+        position = start
+
+        def swap(fields):
+            nonlocal position
+            for width, count in fields:
+                if width > 1:
+                    self.swap_words(position, width * count, width)
+                position += width * count
+
+        for fields in UNIT_CONTROL_FIELDS[:min(max(control_version, 1), len(UNIT_CONTROL_FIELDS))]:
+            swap(fields)
+        if version == 4:
+            swap([(2, 6)])
+            while position < end:
+                header = self.source[position]
+                time_delta, event = header & 3, header >> 2
+                self.output[position] = (time_delta << 6) | event
+                position += 1
+                if time_delta == 2:
+                    position += 1
+                elif time_delta == 3:
+                    self.swap_words(position, 2, 2)
+                    position += 2
+                if event == RECORDED_ANIMATION_END or event not in EVENTS:
+                    break
+                swap(EVENTS[event])
+        elif 1 <= version <= 3:
+            while position + 4 <= end:
+                event = struct.unpack_from("<h", self.source, position)[0]
+                self.swap_words(position, 4, 2)
+                position += 4
+                if event == RECORDED_ANIMATION_END or event not in EVENTS_V1:
+                    break
+                swap(EVENTS_V1[event])
+        else:
+            self.notes.append(f"a recorded animation of version {version}, which the game does not play")
+            return
+        if position > end or (event not in EVENTS and event not in EVENTS_V1):
+            self.notes.append(f"a recorded animation's stream (version {version}) does not end as its events say")
+
+    def swap_words(self, offset: int, size: int, width: int):
+        code = {2: "H", 4: "I"}[width]
+        count = size // width
+        struct.pack_into(f">{count}{code}", self.output, offset, *struct.unpack_from(f"<{count}{code}", self.source, offset))
+
+    def bsp_vertices(self, definition: Definition, field, region: Region, element: int, address: int, size: int):
+        """a structure bsp material's vertices, as the tools keep them beside its buffers: its
+        rendered vertices, then its lightmap's, each in the (un)compressed environment format"""
+        leaves = {leaf.name.split(".", 1)[1]: leaf.offset for leaf in definition.leaves}
+        compressed = field.name.startswith("compressed")
+        count = struct.unpack_from("<i", self.source, region.offset(element + leaves["vertices.count"]))[0]
+        lightmap = struct.unpack_from("<i", self.source, region.offset(element + leaves["lightmap_vertices.count"]))[0]
+        rendered_type, lightmap_type = (1, 3) if compressed else (0, 2)
+        offset = region.offset(address)
+        for vertex_type, vertices in ((rendered_type, count), (lightmap_type, lightmap)):
+            little, big = self.vertex_structs[vertex_type]
+            for vertex in range(vertices):
+                big.pack_into(self.output, offset, *little.unpack_from(self.source, offset))
+                offset += little.size
+        if offset != region.offset(address) + size:
+            self.notes.append(f"{definition.name}.{field.name}: {size} bytes, not its {count} and {lightmap} vertices")
 
     def buffers(self, region: Region, vertex_buffers: int, vertex_count: int, index_buffers: int, index_count: int):
         """the Direct3D headers of the vertex and index buffers: Common, Data (moved), Lock"""
@@ -279,8 +515,47 @@ class Converter:
             struct.pack_into(f">{count * 3}I", self.output, offset, *words)
             start = address - region.address
             region.covered[start:start + count * BUFFER_SIZE] = b"\x01" * (count * BUFFER_SIZE)
-        if vertex_count > 0 or index_count > 0:
-            self.deferred["vertex and index data"] = self.deferred.get("vertex and index data", 0)
+
+    def buffer_data(self, region: Region):
+        """the vertices and indices of the buffers whose Direct3D headers are in region, by the
+        type and count the tags that draw them give: vertices by their type's format, indices as
+        16-bit words (a strip of count triangles has count + 2)"""
+        for jobs, kind in ((self.vertex_jobs, "vertex"), (self.triangle_jobs, "triangle")):
+            done = []
+            for hardware, (buffer_type, count) in list(jobs.items()):
+                if not region.contains(hardware, BUFFER_SIZE):
+                    continue
+                del jobs[hardware]
+                data = struct.unpack_from("<I", self.source, region.offset(hardware) + 4)[0]
+                if kind == "vertex":
+                    if buffer_type not in self.vertex_structs:
+                        self.notes.append(f"a vertex buffer of type {buffer_type}, which has no format here")
+                        continue
+                    little, big = self.vertex_structs[buffer_type]
+                    size = count * little.size
+                else:
+                    indices = count + 2 if buffer_type == TRIANGLE_BUFFER_STRIP else count * 3
+                    size = indices * 2
+                if not region.contains(data, size):
+                    self.notes.append(f"a {kind} buffer's data is outside {region.name}")
+                    continue
+                offset = region.offset(data)
+                if kind == "vertex":
+                    for vertex in range(count):
+                        big.pack_into(self.output, offset + vertex * little.size,
+                                      *little.unpack_from(self.source, offset + vertex * little.size))
+                else:
+                    words = struct.unpack_from(f"<{indices}H", self.source, offset)
+                    struct.pack_into(f">{indices}H", self.output, offset, *words)
+                start = data - region.address
+                region.covered[start:start + size] = b"\x01" * size
+                done.append((data, size))
+            # (each buffer's data ends where the next's begins, or before: a check of the counts)
+            done.sort()
+            for (first, size), (second, _) in zip(done, done[1:]):
+                if first + size > second:
+                    self.notes.append(f"{kind} buffers overlap at {first:08x}: their counts are not what they seem")
+                    break
 
     def mark_string(self, region: Region, address: int):
         if not region.contains(address):

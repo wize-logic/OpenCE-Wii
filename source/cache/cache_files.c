@@ -893,6 +893,20 @@ boolean cache_file_header_verify(
 	/* port: a cache of another version (an MCC map, say) that is to be
 	loaded is refused with its version named, not stopped on: the game goes
 	back to its menus */
+#ifdef HALO_WII
+	/* port: the Wii runs the Xbox's caches converted for it
+	(tools/wii_convert_maps.py) */
+	if (header->version != CACHE_FILE_VERSION_WII)
+	{
+		if (fatal)
+		{
+			error(_error_silent, "'%.96s' is a cache of version %ld, which the Wii cannot run: convert the Xbox's maps with tools/wii_convert_maps.py",
+				scenario_name, (long)header->version);
+		}
+
+		return FALSE;
+	}
+#else
 	if (header->version != 5)
 	{
 		if (fatal)
@@ -903,6 +917,7 @@ boolean cache_file_header_verify(
 
 		return FALSE;
 	}
+#endif
 
 	/* port: the map holds at least its header, and its tag data lies in it
 	and fits the tag cache, which it is read into whole (a size rounded up

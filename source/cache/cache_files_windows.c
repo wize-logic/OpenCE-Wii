@@ -657,6 +657,33 @@ boolean cache_files_precache_map_begin(
 
 				return FALSE;
 			}
+#ifdef HALO_WII
+			/* port: the Wii's maps are read in place (converted and stored
+			uncompressed: tools/wii_convert_maps.py), so "precaching" one
+			opens it into the cache file slot, done at once */
+			map_file = cached_map_file_get(map_file_index);
+			if (map_file->file != INVALID_HANDLE_VALUE)
+				CloseHandle(map_file->file);
+			cache_file_get_map_path(cache_map_name, path);
+			map_file->file = CreateFileA(path, GENERIC_READ, 0, NULL, OPEN_EXISTING,
+				FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, NULL);
+			memset(&map_file->header, 0, sizeof(struct cache_file_header));
+			if (map_file->file == INVALID_HANDLE_VALUE)
+			{
+				error(_error_silent, "couldn't open map '%s'", path);
+				if (copy_map)
+					display_error_damaged_media();
+				return FALSE;
+			}
+			(void)buffer_size;
+			(void)buffer;
+			cache_file_globals.copy_in_progress = TRUE;
+			cache_file_globals.copying_to_map_file_index = map_file_index;
+			strncpy(cache_file_globals.copying_to_map_file_name, cache_map_name,
+				sizeof(cache_file_globals.copying_to_map_file_name) - 1);
+			cache_file_globals.copying_to_map_file_name[sizeof(cache_file_globals.copying_to_map_file_name) - 1] = 0;
+			return TRUE;
+#endif
 			buffer = texture_cache_steal_memory(buffer_size);
 			map_file = cached_map_file_get(map_file_index);
 
@@ -728,9 +755,11 @@ void cache_files_precache_map_end(
 		"c:\\halo\\SOURCE\\cache\\cache_files_windows.c",
 		1031,
 		cache_file_globals.copy_in_progress);
+#ifndef HALO_WII /* (nothing was copied: cache_files_precache_map_begin) */
 	cache_copy_end();
 	texture_cache_return_memory();
 	cached_map_file_set_modification_date(cache_file_globals.copying_to_map_file_index);
+#endif
 	cached_map_file_read_header(cache_file_globals.copying_to_map_file_index);
 	cache_file_globals.copy_in_progress = FALSE;
 	cache_file_globals.copying_to_map_file_index = NONE;
@@ -745,7 +774,9 @@ void cache_files_precache_map_queue_end(
 		"c:\\halo\\SOURCE\\cache\\cache_files_windows.c",
 		1022,
 		cache_file_globals.copy_in_progress);
+#ifndef HALO_WII /* (nothing to copy) */
 	cache_copy_queue_end();
+#endif
 
 	return;
 }
@@ -923,6 +954,12 @@ short cache_files_precache_map_status(
 		"c:\\halo\\SOURCE\\cache\\cache_files_windows.c",
 		984,
 		cache_file_globals.copy_in_progress);
+#ifdef HALO_WII
+	/* (opened in place: done) */
+	if (progress)
+		*progress = 1.0f;
+	return _cached_map_file_success;
+#endif
 	switch (cache_copy_get_status(progress))
 	{
 		case _cache_copy_bad_file_failure:
@@ -1032,6 +1069,16 @@ static void cache_files_open_cache_files(
 	boolean valid;
 	short map_file_index;
 
+#ifdef HALO_WII
+	/* port: the Wii reads its maps where they are, uncompressed on the SD card
+	or USB drive (cache_files_precache_map_begin): no cache partition */
+	for (map_file_index = 0; map_file_index < NUMBER_OF_CACHED_MAP_FILES; map_file_index++)
+	{
+		cached_map_file_invalidate(map_file_index);
+		memset(&cached_map_file_get(map_file_index)->header, 0, sizeof(struct cache_file_header));
+	}
+	return;
+#endif
 	cached_map_files_delete(NUMBER_OF_CACHED_MAP_FILES);
 	for (map_file_index = 0;
 		map_file_index < NUMBER_OF_CACHED_MAP_FILES;

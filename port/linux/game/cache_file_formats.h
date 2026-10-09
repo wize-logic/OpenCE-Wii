@@ -35,6 +35,10 @@ against the file or buffer it refers to before it is used.
 
 #define CACHE_FILE_VERSION_XBOX 5
 #define CACHE_FILE_VERSION_CUSTOM_EDITION 609
+/* the Wii's: an Xbox cache converted to big-endian with its tags moved to the
+Wii's tag cache (tools/wii_convert_maps.py), the Xbox's version with 'WI'
+above it */
+#define CACHE_FILE_VERSION_WII 0x57490005
 
 /* Halo PC and Custom Edition keep tag data at a fixed address, as the Xbox
 does at 0x803A6000: 0x40440000, above a 0x440000-byte game state at
