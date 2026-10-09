@@ -3,6 +3,7 @@
   "shared_platform_sources": [
     "bink_null.c",
     "d3d8_resources.c",
+    "d3d8_state.c",
     "halo_linker_common.c",
     "msvc_crt.c",
     "msvc_wide.c",

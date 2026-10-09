@@ -25,7 +25,10 @@ def main() -> int:
     runner = args.wiilibs / "tools" / "dolphin_run.py"
     if not runner.is_file():
         sys.exit(f"wii_dolphin.py: no {runner}; pass --wiilibs")
-    if not any(not argument.startswith("-") and argument.endswith((".dol", ".elf")) for argument in rest):
+    # (the program is the one argument ending in .dol or .elf that is no option's value)
+    values = {rest[index + 1] for index, argument in enumerate(rest[:-1]) if argument.startswith("--")
+              and "=" not in argument}
+    if not any(argument.endswith((".dol", ".elf")) and argument not in values for argument in rest):
         rest.append("build/wii/halo.dol")
     (args.sd / "apps" / "halo").mkdir(parents=True, exist_ok=True)
     return subprocess.run([sys.executable, str(runner), "--name", "halo-wii-dolphin", "--sd", str(args.sd),

@@ -106,6 +106,11 @@ out of an Xbox disc image into destination (sdl_platform.c), and quits if
 the player declines; nonzero once destination has one */
 BOOL platform_offer_game_data(const char *destination);
 const char *platform_save_root(void);
+#ifdef HALO_WII
+/* the game's folder on the SD card or a USB drive, found without reading the
+settings (port/wii/src/wii_posix.c) */
+const char *wii_game_folder(void);
+#endif
 
 /* ---------- contiguous ("physical") memory
 

@@ -550,8 +550,9 @@ static void config_path(char *path, size_t size)
 
 	snprintf(path, size, "%s/config.toml", root && *root ? root : ".");
 #elif defined(HALO_WII)
-	/* the data folder on the SD card or USB drive (port/wii/src/wii_platform.c) */
-	snprintf(path, size, "%s/config.toml", platform_data_root());
+	/* the game's folder on the SD card or USB drive (not platform_data_root,
+	which reads the settings this is loading) */
+	snprintf(path, size, "%s/config.toml", wii_game_folder());
 #else
 	/* the executable's folder, with its separator */
 	const char *base = SDL_GetBasePath();

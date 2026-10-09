@@ -67,15 +67,11 @@ const char *platform_data_root(void)
 #ifdef HALO_WII
 		/* the Homebrew Channel's folder for the game, on the SD card or a USB
 		drive (port/wii/README.md) */
-		else if (has_maps("sd:/apps/halo") || !has_maps("usb:/apps/halo"))
-		{
-			snprintf(root, sizeof(root), "sd:/apps/halo");
-			if (!has_maps(root))
-				platform_log("no maps/ folder in sd:/apps/halo or usb:/apps/halo");
-		}
 		else
 		{
-			snprintf(root, sizeof(root), "usb:/apps/halo");
+			snprintf(root, sizeof(root), "%s", wii_game_folder());
+			if (!has_maps(root))
+				platform_log("no maps/ folder in sd:/apps/halo or usb:/apps/halo");
 		}
 #else
 		else if (has_maps("."))
