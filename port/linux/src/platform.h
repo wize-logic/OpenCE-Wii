@@ -131,7 +131,7 @@ game state has a second, at the top of MEM1: halo_port_capacity.h). The
 texture and sound caches and Direct3D's resources share the rest
 (port/wii/src/wii_memory.c). */
 #define PLATFORM_CONTIGUOUS_WINDOW 0x90100000UL
-#define PLATFORM_CONTIGUOUS_SIZE 0x02E00000UL
+#define PLATFORM_CONTIGUOUS_SIZE 0x02C00000UL
 #else
 /* 512 MB on the desktop builds, whose caches outgrow the Xbox's (Custom
 Edition maps' textures and geometry: halo_port_capacity.h). Its pages are

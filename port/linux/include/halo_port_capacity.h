@@ -31,9 +31,11 @@ own additions, and its GPU part */
 /* the tag cache, at the bottom of the MEM2 window (port/linux/src/platform.h):
 converted maps are linked to it (tools/wii_convert_maps.py) */
 #define HALO_PORT_TAG_CACHE_BASE_ADDRESS 0x90100000 /* (0x803A6000) */
-/* the texture cache, smaller than the Xbox's to leave the MEM2 window room
-for the tag cache, the sound cache and Direct3D's resources */
-#define HALO_PORT_TEXTURE_CACHE_PAGE_COUNT 0x400 /* (0x580) */
+/* the texture cache, smaller than the Xbox's to leave MEM2 room for the tag
+cache, the sound cache, Direct3D's resources and the game's malloc, which
+the Xbox had its 64 MB to share for (7.5 MB at the menus: port/wii/README.md,
+"Memory") */
+#define HALO_PORT_TEXTURE_CACHE_PAGE_COUNT 0x300 /* (0x580) */
 #define HALO_PORT_TEXTURE_CACHE_SIZE (HALO_PORT_TEXTURE_CACHE_PAGE_COUNT*0x4000) /* (0x1600000) */
 #define HALO_PORT_SOUND_CACHE_SIZE 0x400000 /* (0x400000) */
 

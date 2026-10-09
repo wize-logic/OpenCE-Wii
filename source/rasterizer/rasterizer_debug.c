@@ -74,7 +74,12 @@ symbols in this file:
 
 enum
 {
+#ifdef HALO_WII
+	/* port: the Wii's memory holds fewer (halo_port_capacity.h) */
+	MAXIMUM_DEBUG_PRIMITIVES = 1024,
+#else
 	MAXIMUM_DEBUG_PRIMITIVES = 8192,
+#endif
 	MAXIMUM_VERTICES_PER_DEBUG_PRIMITIVE = 3
 };
 

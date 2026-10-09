@@ -4,6 +4,7 @@
     "bink_null.c",
     "d3d8_resources.c",
     "d3d8_state.c",
+    "dsound_sdl.c",
     "halo_linker_common.c",
     "msvc_crt.c",
     "msvc_wide.c",
@@ -14,7 +15,8 @@
     "xbox_kernel.c",
     "xbox_texture_formats.c",
     "xbox_xapi.c",
-    "xiso.c"
+    "xiso.c",
+    "xnet.c"
   ],
   "platform_sources": "port/wii/src",
   "libraries": [

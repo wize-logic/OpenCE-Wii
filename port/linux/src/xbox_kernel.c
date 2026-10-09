@@ -16,6 +16,10 @@ threads, asynchronous procedure calls, time, memory and debug output.
 #include <string.h>
 #ifndef HALO_WII /* (newlib has no mmap; nothing here needs it there) */
 #include <sys/mman.h>
+#else
+void wl_platform_tls_thread_exit(void);
+/* (port/wii/src/wii_posix.c) */
+int wii_thread_priority(pthread_t thread, int win32_priority);
 #endif
 #include <time.h>
 #include <unistd.h>
@@ -504,6 +508,11 @@ static void *thread_main(void *context)
 	pthread_mutex_unlock(&handle->lock);
 
 	exit_code = thread->start(thread->parameter);
+#ifdef HALO_WII
+	/* its thread-local variables, which a later thread at its address would
+	otherwise be given (WiiLibs' wl/platform/wii/tls_wii.c) */
+	wl_platform_tls_thread_exit();
+#endif
 
 	pthread_mutex_lock(&handle->lock);
 	thread->exit_code = exit_code;
@@ -552,8 +561,14 @@ HANDLE WINAPI CreateThread(LPSECURITY_ATTRIBUTES attributes, DWORD stack_size,
 
 	pthread_attr_init(&thread_attributes);
 	pthread_attr_setdetachstate(&thread_attributes, PTHREAD_CREATE_DETACHED);
+#ifdef HALO_WII
+	/* the Xbox's own sizes, at least 128 KB (the Wii's heap is no bigger
+	than the Xbox's) */
+	pthread_attr_setstacksize(&thread_attributes, stack_size > 0x20000 ? stack_size : 0x20000);
+#else
 	/* Xbox stacks are small; give the host a comfortable minimum */
 	pthread_attr_setstacksize(&thread_attributes, stack_size > 0x100000 ? stack_size : 0x100000);
+#endif
 	if (pthread_create(&thread->thread, &thread_attributes, thread_main, thread) != 0)
 	{
 		pthread_attr_destroy(&thread_attributes);
@@ -563,6 +578,11 @@ HANDLE WINAPI CreateThread(LPSECURITY_ATTRIBUTES attributes, DWORD stack_size,
 		return NULL;
 	}
 	pthread_attr_destroy(&thread_attributes);
+#ifdef HALO_WII
+	/* the main thread's priority, not libogc's lowest (wii_thread_priority) */
+	if (!wii_thread_priority(thread->thread, THREAD_PRIORITY_NORMAL))
+		platform_log("CreateThread: cannot set a thread's priority");
+#endif
 	if (thread_id)
 		*thread_id = (DWORD)halo_linux_InterlockedIncrement(&next_thread_id);
 	return handle;
@@ -587,10 +607,22 @@ DWORD WINAPI ResumeThread(HANDLE object)
 
 BOOL WINAPI SetThreadPriority(HANDLE object, int priority)
 {
+#ifdef HALO_WII
+	/* the Wii's scheduler is strict: the priorities are kept
+	(wii_thread_priority) */
+	struct platform_handle *handle = platform_handle_get(object, _platform_handle_thread);
+
+	if (object == GetCurrentThread())
+		return wii_thread_priority(pthread_self(), priority);
+	if (!handle)
+		return FALSE;
+	return wii_thread_priority(((struct platform_thread *)handle->data)->thread, priority);
+#else
 	/* Linux does not let unprivileged processes raise thread priority;
 	the Xbox scheduling hints are not needed for correctness */
 	(void)priority;
 	return object == GetCurrentThread() || platform_handle_get(object, _platform_handle_thread) != NULL;
+#endif
 }
 
 BOOL WINAPI GetExitCodeThread(HANDLE object, LPDWORD exit_code)

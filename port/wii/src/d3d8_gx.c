@@ -27,9 +27,11 @@ game's progress through its frames can be followed in the log.
 
 #include <ogc/video.h>
 
+#include "wl/platform/mem.h"
 #include "wl/platform/platform.h"
 
-void d3d8_surface_initialize(D3DSurface *surface, D3DFORMAT format, unsigned long width, unsigned long height);
+void wii_heap_usage(unsigned long *used, unsigned long *free_bytes);
+
 void d3d8_state_defaults(void);
 
 /* ---------- constants */
@@ -188,6 +190,23 @@ void WINAPI D3DDevice_BlockUntilVerticalBlank(void)
 
 /* ---------- the device */
 
+/* a surface's header as d3d8_resources.c's d3d8_surface_initialize writes
+one, but with no memory (Data 0) */
+static void surface_describe(D3DSurface *surface, D3DFORMAT format, unsigned long width, unsigned long height,
+	unsigned long bytes_per_texel)
+{
+	unsigned long pitch = (width * bytes_per_texel + D3DTEXTURE_PITCH_ALIGNMENT - 1) &
+		~(unsigned long)(D3DTEXTURE_PITCH_ALIGNMENT - 1);
+
+	memset(surface, 0, sizeof(*surface));
+	/* owned by the device: without D3DCOMMON_D3DCREATED, Release never frees it */
+	surface->Common = D3DCOMMON_TYPE_SURFACE | 1;
+	surface->Data = 0;
+	surface->Format = ((DWORD)format << D3DFORMAT_FORMAT_SHIFT) | (2 << D3DFORMAT_DIMENSION_SHIFT) | D3DFORMAT_DMACHANNEL_A;
+	surface->Size = ((pitch / D3DTEXTURE_PITCH_ALIGNMENT - 1) << D3DSIZE_PITCH_SHIFT) |
+		((height - 1) << D3DSIZE_HEIGHT_SHIFT) | (width - 1);
+}
+
 static D3DDevice *device_pointer(void)
 {
 	return (D3DDevice *)&device;
@@ -219,9 +238,11 @@ HRESULT WINAPI Direct3D_CreateDevice(UINT adapter, D3DDEVTYPE device_type, void 
 		memset(&device, 0, sizeof(device));
 		if (presentation_parameters)
 			device.presentation = *presentation_parameters;
-		/* the Xbox's 640 by 480, which the Wii's EFB is too */
-		d3d8_surface_initialize(&device.back_buffer, D3DFMT_LIN_A8R8G8B8, SCREEN_WIDTH, SCREEN_HEIGHT);
-		d3d8_surface_initialize(&device.depth_buffer, D3DFMT_LIN_D24S8, SCREEN_WIDTH, SCREEN_HEIGHT);
+		/* the Xbox's 640 by 480, which the Wii's EFB is too: the device's
+		own targets are the EFB's colour and depth, and have no memory in the
+		contiguous window (which has 2.4 MB fewer to spare than the Xbox's) */
+		surface_describe(&device.back_buffer, D3DFMT_LIN_A8R8G8B8, SCREEN_WIDTH, SCREEN_HEIGHT, 4);
+		surface_describe(&device.depth_buffer, D3DFMT_LIN_D24S8, SCREEN_WIDTH, SCREEN_HEIGHT, 4);
 		device.render_target = &device.back_buffer;
 		device.depth_stencil = &device.depth_buffer;
 		for (index = 0; index < D3DTS_MAX; index++)
@@ -631,6 +652,15 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			device.frames, device.statistics.draws, device.statistics.immediate_draws, device.statistics.vertices,
 			device.statistics.clears, STATISTICS_FRAMES);
 		memset(&device.statistics, 0, sizeof(device.statistics));
+		if (device.frames % (STATISTICS_FRAMES * 4) == 0)
+		{
+			/* the heaps: MEM1's (newlib's), and WiiLibs' in MEM2 */
+			unsigned long used, free_bytes;
+
+			wii_heap_usage(&used, &free_bytes);
+			platform_log("memory: MEM1 heap %lu KB used, %lu KB free", used / 1024, free_bytes / 1024);
+			wl_mem_log_usage();
+		}
 	}
 }
 

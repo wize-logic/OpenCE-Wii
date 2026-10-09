@@ -25,7 +25,12 @@ enum
 	MAXIMUM_AI_DEBUG_LINEOFSIGHT_POINTS = 16384,
 	MAXIMUM_AI_DEBUG_LINEOFSIGHT_PAIRS = 8192,
 	NUMBER_OF_AI_DEBUG_ACTOR_RECORDS = 512,
+#ifdef HALO_WII
+	/* port: (the Wii's memory, as AI_DEBUG_ACTOR's) */
+	MAXIMUM_AI_DEBUG_PATH_STORAGE = 2,
+#else
 	MAXIMUM_AI_DEBUG_PATH_STORAGE = 32,
+#endif
 };
 
 enum
@@ -611,6 +616,17 @@ void ai_debug_speak(
 
 extern struct ai_debug_state ai_debug;
 extern struct actor_debug_info *actor_debug_array;
+/* port: an actor's debug record. The Wii's memory has no room for one for
+each actor (MAXIMUM_NUMBER_OF_ACTORS of them, 6.6 MB, which a development
+kit's 128 MB had): every actor shares one there, which only the AI debug
+displays read */
+#ifdef HALO_WII
+#define AI_DEBUG_ACTOR_RECORDS 1
+#define AI_DEBUG_ACTOR(index) ((void)(index), &actor_debug_array[0])
+#else
+#define AI_DEBUG_ACTOR_RECORDS MAXIMUM_NUMBER_OF_ACTORS
+#define AI_DEBUG_ACTOR(index) (&actor_debug_array[(index)])
+#endif
 extern struct path_debug_storage *actor_path_debug_array;
 
 

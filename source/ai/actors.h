@@ -261,7 +261,12 @@ by actor index): every actor of the native builds' larger pool
 (halo_port_capacity.h), else one past the Xbox's 256 is written past its
 end */
 #define MAXIMUM_NUMBER_OF_ACTORS HALO_PORT_MAXIMUM_ACTORS
+#ifdef HALO_WII
+/* port: the AI debug display's paths, fewer in the Wii's memory (ai_debug.h) */
+#define MAXIMUM_NUMBER_OF_ACTOR_PATHS 2
+#else
 #define MAXIMUM_NUMBER_OF_ACTOR_PATHS 32
+#endif
 
 #define MAXIMUM_UNIT_INDICES_PER_SWARM 16
 #define MAXIMUM_COMPONENT_INDICES_PER_SWARM 16

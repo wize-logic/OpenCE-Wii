@@ -35,11 +35,19 @@ turns the reverb off; audio.enabled = false skips opening a device
 */
 
 #include "platform.h"
+#ifndef HALO_WII
 #include "sdl_platform.h"
+#endif
 #include "port_config.h"
 #include "voice_audio.h"
 
+#ifdef HALO_WII
+/* the Wii plays through WiiLibs' audio output (wl/platform: AESND) */
+#include "wl/platform/platform.h"
+#define PLATFORM_AUDIO_DEVICE_NAME_SIZE 128
+#else
 #include <SDL3/SDL.h>
+#endif
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,7 +55,12 @@ turns the reverb off; audio.enabled = false skips opening a device
 #include <time.h>
 #include <unistd.h>
 
+#ifdef HALO_WII
+/* (a third less mixing for the Wii's processor; its DSP plays it at 48 kHz) */
+#define OUTPUT_RATE 32000
+#else
 #define OUTPUT_RATE 48000
+#endif
 #define OUTPUT_CHANNELS 2
 #define MAXIMUM_STREAM_PACKETS 64
 #define MIX_CHUNK_FRAMES 1024
@@ -1292,6 +1305,74 @@ static void mix(float *output, unsigned long frames)
 
 /* ---------- output */
 
+#ifdef HALO_WII
+static BOOL audio_started = FALSE;
+
+/* WiiLibs' audio thread asks for frames: mixed, and made 16-bit */
+static void audio_fill(void *user, int16_t *stereo, uint32_t frames)
+{
+	float buffer[MIX_CHUNK_FRAMES * OUTPUT_CHANNELS];
+
+	(void)user;
+	while (frames)
+	{
+		uint32_t chunk = frames > MIX_CHUNK_FRAMES ? MIX_CHUNK_FRAMES : frames;
+		uint32_t index;
+
+		mix(buffer, chunk);
+		for (index = 0; index < chunk * OUTPUT_CHANNELS; index++)
+		{
+			float sample = buffer[index] * 32767.0f;
+
+			stereo[index] = (int16_t)(sample > 32767.0f ? 32767 : sample < -32768.0f ? -32768 : (int)sample);
+		}
+		stereo += chunk * OUTPUT_CHANNELS;
+		frames -= chunk;
+	}
+}
+
+/* without output, drain voices in real time */
+static void *silent_clock_thread(void *parameter)
+{
+	float buffer[320 * OUTPUT_CHANNELS];
+	struct timespec period = { 0, 10000000L };
+
+	(void)parameter;
+	for (;;)
+	{
+		mix(buffer, 320);
+		nanosleep(&period, NULL);
+	}
+	return NULL;
+}
+
+static void audio_start(void)
+{
+	if (audio_started)
+		return;
+	audio_started = TRUE;
+	master_volume = (float)config_real("audio.volume");
+	reverb_enabled = config_boolean("audio.reverb");
+	resampler_initialize();
+	resampler_phases_initialize();
+	reverb_initialize();
+	if (config_boolean("audio.enabled") && wl_platform_audio_start(OUTPUT_RATE, 256, audio_fill, NULL) == WL_OK)
+		return;
+	platform_log("cannot start the audio output; sound is silent");
+	{
+		pthread_t thread;
+
+		pthread_create(&thread, NULL, silent_clock_thread, NULL);
+		pthread_detach(thread);
+	}
+}
+
+/* (the Wii has one output) */
+void dsound_sdl_output_device_check(void)
+{
+}
+#else
+
 static SDL_AudioStream *audio_stream;
 static BOOL audio_started = FALSE;
 /* the device it plays on (audio.output_device), and when it was looked at */
@@ -1433,6 +1514,8 @@ void dsound_sdl_output_device_check(void)
 		pthread_detach(thread);
 	}
 }
+
+#endif
 
 /* ---------- completion */
 

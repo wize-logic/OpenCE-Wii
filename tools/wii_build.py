@@ -42,6 +42,9 @@ WIILIBS_LIBRARIES = ("wl/platform/libwl_platform.a", "wl/audio/libwl_audio.a", "
 #  - frame pointers (the stack walker follows the frame chain),
 #  - no fused multiply-adds (PowerPC has fmadd): every port simulates the
 #    same game from the same inputs (port/include/halo_math.h),
+#  - thread-local variables through libgcc's emulation (__emutls_get_address,
+#    over pthread keys): the PowerPC ABI addresses them from r2, which the
+#    EABI gives the small data area and libogc no thread's storage,
 #  - libogc's Wii (HW_RVL) declarations.
 # -malign-double is not needed: the PowerPC EABI already aligns doubles and
 # 64-bit integers to 8 bytes, as MSVC does.
@@ -59,6 +62,7 @@ def wii_abi_flags(devkitpro: Path) -> List[str]:
         "-msvr4-struct-return",
         "-fno-omit-frame-pointer",
         "-ffp-contract=off",
+        "-femulated-tls",
         "-ffunction-sections",
         "-fdata-sections",
         OPTIMISATION,
@@ -270,7 +274,9 @@ def generate_wii_build(n: Writer, sln: Any) -> None:
     # constructor, as clang puts those in .init_array, which devkitPPC's
     # start-up code never runs. There must be none in clang's units.
     linker = tools / "powerpc-eabi-gcc"
-    ldflags = " ".join(["-mrvl", "-mcpu=750", "-meabi", "-mhard-float", "-g", "-Wl,--gc-sections", "-Wl,--wrap=main",
+    ldflags = " ".join(["-mrvl", "-mcpu=750", "-meabi", "-mhard-float", "-g", "-Wl,--gc-sections", "-Wl,--wrap=main", "-Wl,--wrap=exit", "-Wl,--wrap=abort",
+                        # (the game's heap: port/wii/src/wii_malloc.c)
+                        *(f"-Wl,--wrap={name}" for name in ("malloc", "calloc", "realloc", "free")),
                         f"-Wl,-Map,{build_dir / 'halo.map'}", f"-L{devkitpro / 'libogc' / 'lib' / 'wii'}"])
     libs = " ".join([*(str(library) for library in wiilibs_outputs),
                      *(f"-l{library}" for library in config.get("libraries", []))])
@@ -291,10 +297,12 @@ def generate_wii_build(n: Writer, sln: Any) -> None:
     n.rule(name="wii_dol", command=f"{devkitpro / 'tools' / 'bin' / 'elf2dol'} $in $out",
            description="WII DOL $out")
     n.build(outputs=dol, rule="wii_dol", inputs=elf)
-    # (clang's constructors would be silently dropped: see the link's comment)
+    # (clang's constructors would be silently dropped: see the link's comment;
+    # and native thread-local data would be addressed from r2, which is not a
+    # thread's: see wii_abi_flags)
     n.rule(name="wii_no_constructors",
-           command=f"! {tools / 'powerpc-eabi-readelf'} -S $in | grep -q init_array && touch $out",
-           description="WII CHECK no .init_array in $in")
+           command=f"! {tools / 'powerpc-eabi-readelf'} -S $in | grep -qE 'init_array|[.]tdata|[.]tbss' && touch $out",
+           description="WII CHECK no .init_array or native thread-local data in $in")
     n.build(outputs=build_dir / "no_constructors.stamp", rule="wii_no_constructors", inputs=elf)
     n.build(outputs="wii", rule="phony", inputs=[dol, build_dir / "no_constructors.stamp"])
     n.newline()
