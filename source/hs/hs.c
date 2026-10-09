@@ -3278,7 +3278,7 @@ union hs_real_value
 
 union hs_short_result
 {
-	short short_value;
+	HALO_CELL_MEMBER(short, short_value); /* port: big-endian cells (halo_cells.h) */
 	long value;
 };
 
@@ -3286,15 +3286,17 @@ union hs_evaluation_argument
 {
 	long long_value;
 	real real_value;
-	short short_value;
-	unsigned short unsigned_short_value;
-	boolean boolean_value;
+	/* port: big-endian cells (halo_cells.h) */
+	HALO_CELL_MEMBER(short, short_value);
+	HALO_CELL_MEMBER(unsigned short, unsigned_short_value);
+	HALO_CELL_MEMBER(boolean, boolean_value);
 	char const *string_value;
 };
 
+/* port: a narrow argument at its cell's low-order end (halo_cells.h) */
 struct hs_arguments_boolean
 {
-	boolean value;
+	HALO_CELL_MEMBER(boolean, value);
 };
 
 struct hs_arguments_long
@@ -3304,20 +3306,19 @@ struct hs_arguments_long
 
 struct hs_arguments_word
 {
-	word value;
+	HALO_CELL_MEMBER(word, value);
 };
 
 struct hs_arguments_short_long
 {
-	short value0;
-	word pad0;
+	HALO_CELL_PADDED(short value0, word pad0);
 	long value1;
 };
 
 struct hs_arguments_long_word
 {
 	long value0;
-	word value1;
+	HALO_CELL_MEMBER(word, value1);
 };
 
 struct hs_arguments_string
@@ -3346,9 +3347,8 @@ struct hs_arguments_long_long_string
 
 struct hs_arguments_short_word
 {
-	short value0;
-	word pad0;
-	word value1;
+	HALO_CELL_PADDED(short value0, word pad0);
+	HALO_CELL_MEMBER(word, value1);
 };
 
 struct hs_arguments_long_long_long
@@ -3404,7 +3404,7 @@ struct hs_arguments_long_long_string_word
 	long value0;
 	long value1;
 	char const *value2;
-	word value3;
+	HALO_CELL_MEMBER(word, value3);
 };
 
 struct hs_arguments_long_long_long_boolean
@@ -3412,7 +3412,7 @@ struct hs_arguments_long_long_long_boolean
 	long value0;
 	long value1;
 	char const *value2;
-	boolean value3;
+	HALO_CELL_MEMBER(boolean, value3);
 };
 
 struct hs_arguments_long_long_long_boolean_word
@@ -3420,9 +3420,8 @@ struct hs_arguments_long_long_long_boolean_word
 	long value0;
 	long value1;
 	char const *value2;
-	boolean value3;
-	byte pad3[3];
-	word value4;
+	HALO_CELL_PADDED(boolean value3, byte pad3[3]);
+	HALO_CELL_MEMBER(word, value4);
 };
 
 struct hs_arguments_real
@@ -3453,21 +3452,16 @@ struct hs_arguments_real_real_real_real
 
 struct hs_arguments_word_word_word_real
 {
-	word value0;
-	word pad0;
-	word value1;
-	word pad1;
-	word value2;
-	word pad2;
+	HALO_CELL_PADDED(word value0, word pad0);
+	HALO_CELL_PADDED(word value1, word pad1);
+	HALO_CELL_PADDED(word value2, word pad2);
 	real value3;
 };
 
 struct hs_arguments_word_word_long_real
 {
-	word value0;
-	word pad0;
-	word value1;
-	word pad1;
+	HALO_CELL_PADDED(word value0, word pad0);
+	HALO_CELL_PADDED(word value1, word pad1);
 	long value2;
 	real value3;
 };
@@ -3478,8 +3472,7 @@ struct hs_arguments_real_real_real_real_boolean_real
 	real value1;
 	real value2;
 	real value3;
-	boolean value4;
-	byte pad4[3];
+	HALO_CELL_PADDED(boolean value4, byte pad4[3]);
 	real value5;
 };
 
@@ -3487,7 +3480,7 @@ struct hs_arguments_long_real_word
 {
 	long value0;
 	real value1;
-	word value2;
+	HALO_CELL_MEMBER(word, value2);
 };
 
 struct hs_arguments_long_real_real
@@ -3502,15 +3495,13 @@ struct hs_arguments_real_real_real_word
 	real value0;
 	real value1;
 	real value2;
-	word value3;
+	HALO_CELL_MEMBER(word, value3);
 };
 
 struct hs_arguments_short_word_real_real_real
 {
-	short value0;
-	word pad0;
-	word value1;
-	word pad1;
+	HALO_CELL_PADDED(short value0, word pad0);
+	HALO_CELL_PADDED(word value1, word pad1);
 	real value2;
 	real value3;
 	real value4;
@@ -3518,33 +3509,28 @@ struct hs_arguments_short_word_real_real_real
 
 struct hs_arguments_word_word_word
 {
-	word value0;
-	word pad0;
-	word value1;
-	word pad1;
-	word value2;
+	HALO_CELL_PADDED(word value0, word pad0);
+	HALO_CELL_PADDED(word value1, word pad1);
+	HALO_CELL_MEMBER(word, value2);
 };
 
 struct hs_arguments_word_word_long
 {
-	word value0;
-	word pad0;
-	word value1;
-	word pad1;
+	HALO_CELL_PADDED(word value0, word pad0);
+	HALO_CELL_PADDED(word value1, word pad1);
 	long value2;
 };
 
 struct hs_arguments_long_word_boolean
 {
 	long value0;
-	word value1;
-	word pad1;
-	boolean value2;
+	HALO_CELL_PADDED(word value1, word pad1);
+	HALO_CELL_MEMBER(boolean, value2);
 };
 
 union hs_boolean_result
 {
-	boolean boolean;
+	HALO_CELL_MEMBER(boolean, boolean); /* port: big-endian cells (halo_cells.h) */
 	long value;
 };
 

@@ -1994,7 +1994,9 @@ void hs_evaluate_equality(
 	arguments = hs_arguments_evaluate(thread_index, 2, parameter_types, initialize);
 	if (arguments)
 	{
-		boolean equal = csmemcmp(arguments, arguments+1, hs_type_sizes[type])==0;
+		/* port: a value's bytes where its cell keeps them (halo_cells.h) */
+		boolean equal = csmemcmp((char *)arguments + HALO_CELL_OFFSET(hs_type_sizes[type]),
+			(char *)(arguments+1) + HALO_CELL_OFFSET(hs_type_sizes[type]), hs_type_sizes[type])==0;
 
 		if (function_index==_hs_function_not_equal)
 			equal = !equal;

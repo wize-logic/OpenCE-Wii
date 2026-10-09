@@ -23,6 +23,7 @@ enum
 /* ---------- headers */
 
 #include "tag_files/tag_groups.h"
+#include "halo_cells.h" /* port: big-endian cells */
 
 /* ---------- macros */
 
@@ -80,9 +81,9 @@ struct hs_syntax_node
 	union
 	{
 		long data;
-		boolean boolean_value;
+		HALO_CELL_MEMBER(boolean, boolean_value);
 		real real_value;
-		short short_value;
+		HALO_CELL_MEMBER(short, short_value);
 	};
 };
 

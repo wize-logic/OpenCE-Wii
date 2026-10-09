@@ -548,6 +548,24 @@ def join(left: str, right: str) -> str:
     return f"{left} {right}"
 
 
+# The 64-bit integers' halves: a big-endian processor (the Wii) keeps the high half first, so the
+# halves that overlay QuadPart swap places there (the PDB is the little-endian Xbox's)
+BIG_ENDIAN_HALVES = {
+    "        unsigned long LowPart;\n        long HighPart;\n":
+        "#ifdef __BIG_ENDIAN__\n        long HighPart;\n        unsigned long LowPart;\n#else\n"
+        "        unsigned long LowPart;\n        long HighPart;\n#endif\n",
+    "        unsigned long LowPart;\n        unsigned long HighPart;\n":
+        "#ifdef __BIG_ENDIAN__\n        unsigned long HighPart;\n        unsigned long LowPart;\n#else\n"
+        "        unsigned long LowPart;\n        unsigned long HighPart;\n#endif\n",
+}
+
+
+def big_endian_halves(header: str) -> str:
+    for little, either in BIG_ENDIAN_HALVES.items():
+        header = header.replace(little, either)
+    return header
+
+
 def literal(value: int) -> str:
     return f"{value:#x}" if value > 0xFFFF else str(value)
 
@@ -567,7 +585,7 @@ def main() -> int:
     if missing:
         sys.exit("not in the PDB: " + " ".join(missing))
     writer.fix_layouts()
-    args.output.write_text(writer.write(), encoding="utf-8")
+    args.output.write_text(big_endian_halves(writer.write()), encoding="utf-8")
     for warning in writer.warnings:
         print("note:", warning, file=sys.stderr)
     print(f"{args.output}: {len(writer.enums)} enumerations, {len(writer.definitions)} structures and unions, "
