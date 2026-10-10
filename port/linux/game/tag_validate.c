@@ -393,7 +393,9 @@ static boolean claims_cover(
 {
 	unsigned long bytes;
 
-	free(claims_block);
+	/* (the game's free halts on a null pointer: its debug memory's) */
+	if (claims_block)
+		free(claims_block);
 	claims_block = NULL;
 	tag_validate_claims = NULL;
 	claims_first = first - first % CLAIM_BITS;
@@ -418,7 +420,9 @@ static boolean claims_cover(
 static void claims_release(
 	void)
 {
-	free(claims_block);
+	/* (the game's free halts on a null pointer: its debug memory's) */
+	if (claims_block)
+		free(claims_block);
 	claims_block = NULL;
 	tag_validate_claims = NULL;
 	claims_word_count = 0;
