@@ -136,6 +136,18 @@ allocates begins with it), which the priority check below confirms. */
 
 #include <tuxedo/thread.h>
 
+/* devkitPPC's sched_yield is a stub (ENOSYS): SwitchToThread, which the
+game's waits on its worker threads spin on (the texture cache's for a read,
+xbox_texture_cache.c), gave those threads nothing, and a wait at the menu
+took most of a minute. It is libogc's yield (to the threads of the same
+priority: the game's run at the main thread's), through the link's wrap
+(tools/wii_build.py). */
+int __wrap_sched_yield(void)
+{
+	KThreadYield();
+	return 0;
+}
+
 int wii_thread_priority(pthread_t thread, int win32_priority)
 {
 	KThread *kernel_thread = (KThread *)thread;
