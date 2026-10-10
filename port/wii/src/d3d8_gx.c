@@ -28,6 +28,7 @@ renderer does.
 #include "platform.h"
 
 #include <math.h>
+#include <tuxedo/ppc/intrinsics.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
@@ -128,6 +129,8 @@ struct frame_timing
 	/* the draws' time by path: GX's transform (its matrices, then its
 	vertices), the processor's, immediate mode */
 	uint64_t hardware_setup, hardware_vertices, processor, immediate;
+	/* the processor's vertices' steps, in timebase ticks (60.75 a microsecond) */
+	unsigned long long fetch_ticks, program_ticks, store_ticks, emit_ticks;
 };
 
 struct draw_statistics
@@ -734,6 +737,11 @@ space (draw_run, the clears, the render targets' copies) take */
 static BOOL transform_hardware;
 /* (the draw's vertices carry a position matrix index: draw_keys) */
 static BOOL emit_matrix_index;
+/* the attributes a processor's draw sends (emit_attributes_set): bit 0 and 1
+the colours, 2 to 5 the texture coordinates, 6 the fog; all of them unless
+a draw says fewer */
+#define EMIT_ALL 0x7F
+static unsigned emit_attributes = EMIT_ALL;
 
 static void transform_software(void)
 {
@@ -741,6 +749,7 @@ static void transform_software(void)
 		return;
 	transform_hardware = FALSE;
 	emit_matrix_index = FALSE;
+	emit_attributes = EMIT_ALL;
 	GX_SetCurrentMtx(GX_PNMTX0);
 	GX_ClearVtxDesc();
 	GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
@@ -1673,6 +1682,10 @@ static void tev_setup(unsigned stages)
 {
 	static int debug = -1;
 	struct gx_psh_textures textures;
+
+	/* (all of the vertices' values, until a translation says less) */
+	tev_texcoords = 0x1F;
+	tev_channels = 3;
 	struct pixel_shader_entry *entry = NULL;
 	DWORD stage;
 	unsigned index;
@@ -1808,9 +1821,10 @@ static void tev_setup(unsigned stages)
 Each draw's vertices are the program's: fetched from the streams (or the
 immediate registers), run, then sent to GX as they come out. */
 
-static float normalized(long value, float maximum)
+/* (by the reciprocal, which the callers' constant maxima fold) */
+static inline float normalized(long value, float maximum)
 {
-	float result = (float)value / maximum;
+	float result = (float)value * (1.0f / maximum);
 
 	return result < -1.0f ? -1.0f : result;
 }
@@ -1997,7 +2011,8 @@ static float fog_coordinate(float fog)
 		factor = 0.0f;
 	if (factor > 1.0f)
 		factor = 1.0f;
-	return (factor * 255.0f + 0.5f) / 256.0f;
+	/* (a power of two: the same as the division) */
+	return (factor * 255.0f + 0.5f) * (1.0f / 256.0f);
 }
 
 /* a cube map's direction (s, t, r) on its sphere map: the mirror ball's
@@ -2097,11 +2112,41 @@ static inline void vertex_emit(const struct gx_vertex *vertex)
 	if (emit_matrix_index)
 		GX_MatrixIndex1x8(vertex->matrix);
 	GX_Position3f32(vertex->position[0], vertex->position[1], vertex->position[2]);
-	GX_Color4u8(vertex->color0[0], vertex->color0[1], vertex->color0[2], vertex->color0[3]);
-	GX_Color4u8(vertex->color1[0], vertex->color1[1], vertex->color1[2], vertex->color1[3]);
+	if (emit_attributes == EMIT_ALL)
+	{
+		GX_Color4u8(vertex->color0[0], vertex->color0[1], vertex->color0[2], vertex->color0[3]);
+		GX_Color4u8(vertex->color1[0], vertex->color1[1], vertex->color1[2], vertex->color1[3]);
+		for (stage = 0; stage < 4; stage++)
+			GX_TexCoord2f32(vertex->texcoord[stage][0], vertex->texcoord[stage][1]);
+		GX_TexCoord1f32(vertex->fog);
+		return;
+	}
+	if (emit_attributes & 1)
+		GX_Color4u8(vertex->color0[0], vertex->color0[1], vertex->color0[2], vertex->color0[3]);
+	if (emit_attributes & 2)
+		GX_Color4u8(vertex->color1[0], vertex->color1[1], vertex->color1[2], vertex->color1[3]);
 	for (stage = 0; stage < 4; stage++)
-		GX_TexCoord2f32(vertex->texcoord[stage][0], vertex->texcoord[stage][1]);
-	GX_TexCoord1f32(vertex->fog);
+		if (emit_attributes & (4U << stage))
+			GX_TexCoord2f32(vertex->texcoord[stage][0], vertex->texcoord[stage][1]);
+	if (emit_attributes & 0x40)
+		GX_TexCoord1f32(vertex->fog);
+}
+
+/* a processor's draw sends only what its stages read (after
+transform_software, which takes every attribute back) */
+static void emit_attributes_set(void)
+{
+	static const u8 attributes[7] = { GX_VA_CLR0, GX_VA_CLR1, GX_VA_TEX0, GX_VA_TEX1, GX_VA_TEX2, GX_VA_TEX3,
+		GX_VA_TEX4 };
+	unsigned wanted = (tev_channels & 3) | (tev_texcoords & 0x1F) << 2, index;
+
+	if (wanted == EMIT_ALL)
+		return;
+	for (index = 0; index < 7; index++)
+		if (!(wanted & (1U << index)))
+			GX_SetVtxDesc(attributes[index], GX_NONE);
+	emit_attributes = wanted;
+	transform_hardware = TRUE;
 }
 
 static void vertex_send(const struct nv2a_cpu_output *out, const struct draw_projection *projection)
@@ -2135,7 +2180,7 @@ static u8 gx_primitive(D3DPRIMITIVETYPE type);
 static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct draw_projection *projection,
 	void (*fetch)(void *, UINT, float (*)[4]), void *context, struct nv2a_cpu_program *program, float point_size)
 {
-	float inputs[NV2A_CPU_INPUT_COUNT][4];
+	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
 	struct nv2a_cpu_output out;
 	float minimum[2] = { 1.0e9f, 1.0e9f }, maximum[2] = { -1.0e9f, -1.0e9f };
 	char textures[160];
@@ -2241,7 +2286,7 @@ static struct frame_timing last_timing;
 static struct draw_projection projection_fit(struct nv2a_cpu_program *program, UINT count, vertex_fetch_proc fetch,
 	void *context, float point_size)
 {
-	float inputs[NV2A_CPU_INPUT_COUNT][4];
+	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
 	struct nv2a_cpu_output out;
 	struct draw_projection projection = { FALSE, 0.0f, 0.0f };
 	UINT vertex;
@@ -2436,7 +2481,7 @@ static BOOL position_matrix_compute(const struct vertex_shader_object *shader, s
 	float ws[4];
 	const float *scale = device.vertex_constants[VERTEX_CONSTANT_BIAS - 38];
 	const float *offset = device.vertex_constants[VERTEX_CONSTANT_BIAS - 37];
-	float inputs[NV2A_CPU_INPUT_COUNT][4];
+	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
 	struct nv2a_cpu_output base, column;
 	int component;
 
@@ -2522,7 +2567,7 @@ in position_matrix_rows and position_projection, and in draw_uniform */
 static BOOL position_keys(const struct vertex_shader_object *shader, struct nv2a_cpu_program *program, void *fetch,
 	int reg, float point_size)
 {
-	float inputs[NV2A_CPU_INPUT_COUNT][4];
+	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
 	unsigned key;
 	int index;
 
@@ -2595,7 +2640,7 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 {
 	int position_register = -1;
 	uint64_t started = wl_platform_time_us();
-	float inputs[NV2A_CPU_INPUT_COUNT][4];
+	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
 	struct nv2a_cpu_output out;
 	struct draw_projection projection = { FALSE, 0.0f, 0.0f };
 	float point_size;
@@ -2655,6 +2700,8 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 				position_matrix_load();
 				emit_matrix_index = draw_keys.count > 1;
 			}
+			if (shader)
+				emit_attributes_set();
 
 			GX_Begin(gx_primitive(primitive_type), DEVICE_VERTEX_FORMAT, (u16)count);
 			for (vertex = 0; vertex < count; vertex++)
@@ -2663,16 +2710,28 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 
 				if (vertex_memo_stamps[slot] != vertex_memo_draw)
 				{
+					u32 t0 = PPCMftb(), t1, t2;
+
 					fetch(context, vertex, inputs);
+					t1 = PPCMftb();
 					nv2a_cpu_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
 						point_size, &out);
+					t2 = PPCMftb();
 					vertex_store(&out, &projection, position_register >= 0 ? inputs[position_register] : NULL,
 						&vertex_memo[slot]);
 					vertex_memo[slot].matrix = (u8)(GX_PNMTX1 + 3 * vertex_keys[vertex]);
 					vertex_memo_stamps[slot] = vertex_memo_draw;
 					device.statistics.vertices_run++;
+					timing.fetch_ticks += t1 - t0;
+					timing.program_ticks += t2 - t1;
+					timing.store_ticks += PPCMftb() - t2;
 				}
-				vertex_emit(&vertex_memo[slot]);
+				{
+					u32 t3 = PPCMftb();
+
+					vertex_emit(&vertex_memo[slot]);
+					timing.emit_ticks += PPCMftb() - t3;
+				}
 			}
 			GX_End();
 		}
@@ -2687,6 +2746,8 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 			position_matrix_load();
 			emit_matrix_index = draw_keys.count > 1;
 		}
+		if (shader)
+			emit_attributes_set();
 
 		GX_Begin(gx_primitive(primitive_type), DEVICE_VERTEX_FORMAT, (u16)count);
 		for (vertex = 0; vertex < count; vertex++)
@@ -3076,7 +3137,8 @@ static void stream_fetch(void *context, UINT vertex, float (*inputs)[4])
 	UINT index = fetch->indices ? fetch->indices[vertex] + device.base_vertex_index : fetch->first + vertex;
 	unsigned long element;
 
-	memset(inputs, 0, NV2A_CPU_INPUT_COUNT * sizeof(*inputs));
+	/* (each element sets its register's four components; the registers no
+	element names stay as the caller cleared them, once a draw) */
 	for (element = 0; element < fetch->shader->element_count; element++)
 	{
 		const struct vertex_element *source = &fetch->shader->elements[element];
@@ -3141,7 +3203,7 @@ static const struct nv2a_cpu_dependencies *draw_dependencies(struct vertex_shade
 {
 	const struct nv2a_cpu_dependencies *general = &shader->dependencies;
 	unsigned long clip = general->clip[0] | general->clip[1] | general->clip[3], candidates = 0;
-	float inputs[NV2A_CPU_INPUT_COUNT][4];
+	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
 	unsigned index;
 	int reg;
 
@@ -3300,7 +3362,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 {
 	struct vertex_shader_object *shader = (struct vertex_shader_object *)fetch->shader;
 	const struct nv2a_cpu_dependencies *dependencies;
-	float inputs[NV2A_CPU_INPUT_COUNT][4];
+	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
 	struct nv2a_cpu_output base, column;
 	const struct vertex_element *position_element;
 	/* each stage's source: -1 the position, else the GX texture attribute */
@@ -3926,10 +3988,15 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			if (timing.window_start)
 			{
 				platform_log("Direct3D: a frame's draws: GX's transform %lu ms (matrices %lu, vertices %lu), the "
-					"processor's %lu, immediate %lu", (unsigned long)((timing.hardware_setup + timing.hardware_vertices) /
+					"processor's %lu (an indexed draw's vertices: fetch %lu, program %lu, store %lu, emit %lu), "
+					"immediate %lu", (unsigned long)((timing.hardware_setup + timing.hardware_vertices) /
 					1000 / STATISTICS_FRAMES), (unsigned long)(timing.hardware_setup / 1000 / STATISTICS_FRAMES),
 					(unsigned long)(timing.hardware_vertices / 1000 / STATISTICS_FRAMES),
 					(unsigned long)(timing.processor / 1000 / STATISTICS_FRAMES),
+					(unsigned long)(timing.fetch_ticks / 60750 / STATISTICS_FRAMES),
+					(unsigned long)(timing.program_ticks / 60750 / STATISTICS_FRAMES),
+					(unsigned long)(timing.store_ticks / 60750 / STATISTICS_FRAMES),
+					(unsigned long)(timing.emit_ticks / 60750 / STATISTICS_FRAMES),
 					(unsigned long)(timing.immediate / 1000 / STATISTICS_FRAMES));
 				platform_log("Direct3D: a frame takes %lu ms: draws %lu (vertex programs and GX), textures %lu, "
 					"pixel shaders %lu, the end of the frame %lu (waiting for GX), the rest (the game) %lu",
