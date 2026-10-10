@@ -556,10 +556,10 @@ static const struct config_setting config_settings[] =
 		"Pixel shaders show their first texture." },
 	{ "debug.gpu_debug_flat", _config_boolean, "false", "HALO_GPU_DEBUG_FLAT", _environment_set_is_true, _platform_all,
 		"Pixel shaders show their vertex colour." },
-	{ "debug.gpu_cull", _config_boolean, "true", "HALO_GPU_CULL", _environment_set_is_true, _platform_all,
+	{ "debug.gpu_cull", _config_boolean, "true", "HALO_GPU_CULL", _environment_value, _platform_all,
 		"Triangles facing away are culled as the game asks; false draws them all\n"
 		"(to tell a culling fault from missing geometry)." },
-	{ "debug.gpu_transform", _config_boolean, "true", "HALO_GPU_TRANSFORM", _environment_set_is_true, _platform_all,
+	{ "debug.gpu_transform", _config_boolean, "true", "HALO_GPU_TRANSFORM", _environment_value, _platform_all,
 		"The Wii: draws whose vertex programs GX's own transform can compute go to it;\n"
 		"false runs every program on the processor." },
 	{ "debug.screenshot_directory", _config_string, "\"\"", "HALO_SCREENSHOT_DIR", _environment_value, _platform_all,
