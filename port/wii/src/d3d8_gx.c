@@ -185,6 +185,8 @@ static struct
 	struct draw_statistics statistics;
 	unsigned long frames;
 } device;
+/* (changed with any of device.vertex_constants: constants_hash) */
+static unsigned long constants_generation = 1;
 
 /* ---------- the vertical blank
 
@@ -289,6 +291,7 @@ static void viewport_update_constants(void)
 	{
 		memcpy(device.vertex_constants[VERTEX_CONSTANT_BIAS - 38], device.viewport_scale, sizeof(device.viewport_scale));
 		memcpy(device.vertex_constants[VERTEX_CONSTANT_BIAS - 37], device.viewport_offset, sizeof(device.viewport_offset));
+		constants_generation++;
 	}
 }
 
@@ -715,6 +718,7 @@ void WINAPI D3DDevice_SetVertexShaderConstant(INT reg, CONST void *constant_data
 	if (first + (long)constant_count > VERTEX_CONSTANT_COUNT)
 		constant_count = (DWORD)(VERTEX_CONSTANT_COUNT - first);
 	memcpy(device.vertex_constants[first], constant_data, constant_count * 4 * sizeof(float));
+	constants_generation++;
 }
 
 /* ---------- the frame on GX
@@ -2184,6 +2188,19 @@ static inline void color_bytes(const float value[4], u8 out[4])
 	out[3] = color_byte(value[3]);
 }
 
+/* a clip-space position as GX's perspective projection takes it, (x w, y w,
+-w) in pixels (position_matrix's rows make the same of a vertex's own) */
+static inline void clip_position(const float clip[4], float out[3])
+{
+	const float *scale = device.vertex_constants[VERTEX_CONSTANT_BIAS - 38];
+	const float *offset = device.vertex_constants[VERTEX_CONSTANT_BIAS - 37];
+	float w = clip[3];
+
+	out[0] = clip[0] * scale[0] + (offset[0] + 0.5f) * w;
+	out[1] = clip[1] * scale[1] + (offset[1] + 0.5f) * w;
+	out[2] = -w;
+}
+
 static void vertex_store(const struct nv2a_cpu_output *out, const struct draw_projection *projection,
 	const float *raw_position, struct gx_vertex *vertex)
 {
@@ -2199,15 +2216,7 @@ static void vertex_store(const struct nv2a_cpu_output *out, const struct draw_pr
 		vertex->position[2] = raw_position[2];
 	}
 	else if (projection->perspective)
-	{
-		const float *scale = device.vertex_constants[VERTEX_CONSTANT_BIAS - 38];
-		const float *offset = device.vertex_constants[VERTEX_CONSTANT_BIAS - 37];
-		float w = out->clip[3];
-
-		vertex->position[0] = out->clip[0] * scale[0] + (offset[0] + 0.5f) * w;
-		vertex->position[1] = out->clip[1] * scale[1] + (offset[1] + 0.5f) * w;
-		vertex->position[2] = -w;
-	}
+		clip_position(out->clip, vertex->position);
 	else
 	{
 		/* the program's screen position (pixel centres on integers, as
@@ -2491,16 +2500,43 @@ static struct
 /* ... or, where those inputs take a few values (a model of several nodes, each
 vertex bound to one), each value's vertices: a position matrix each, which
 GX picks per vertex by its matrix index (GX_PNMTX1 on: GX_PNMTX0 is the
-identity of the draws in screen space) */
+identity of the draws in screen space).
+
+A model's vertex (model_vertex_compressed: two node indices, bytes, in v5,
+and the first node's weight, a normalized short, in v6) whose weight is 1
+or 0 hangs off one node, whatever its other index: the game's programs give
+it what that node alone gives (port/wii/tests/nv2a_native_check.c checks
+each), so such vertices are keyed by their node, and those that blend by
+their two nodes and weight (node_keys). Those of a value with too few
+vertices for a matrix of its own, past the nine, are the processor's
+(KEY_PROCESSOR): the program computes their position, sent as draw_run
+sends any through GX_PNMTX0 and the same projection, in the same draw. */
 #define MATRIX_KEYS 9
+#define KEY_PROCESSOR 0xFF
+#define NODE_INDICES 5
+#define NODE_WEIGHT 6
+/* (the indices a node needs for a matrix: a matrix costs the program's
+position four times, which so many vertices' positions on GX repay) */
+#define NODE_KEY_LEAST 6
 static struct
 {
 	unsigned count;
+	/* the draw's vertices keyed KEY_PROCESSOR */
+	UINT processor;
 	/* a vertex of each value, of the draw's */
 	UINT representative[MATRIX_KEYS];
 	Mtx rows[MATRIX_KEYS];
 } draw_keys;
 static unsigned char vertex_keys[65536];
+/* (the KEY_PROCESSOR vertices the processor ran, in the statistics' window) */
+static unsigned long processor_positions;
+
+/* whether the draw's vertices carry a matrix index (else every vertex is the
+one matrix's) */
+static inline BOOL draw_keyed(void)
+{
+	return draw_keys.count > 1 || draw_keys.processor;
+}
 
 struct stream_fetch;
 static const struct nv2a_cpu_dependencies *draw_dependencies(struct vertex_shader_object *shader,
@@ -2563,25 +2599,42 @@ static struct
 {
 	unsigned long long key;
 	Mtx rows;
+	/* (its fitted is FALSE where the depth was not wanted: a model's other
+	nodes, position_keys) */
 	struct draw_projection projection;
 } position_cache[POSITION_CACHE_ENTRIES];
 
-static unsigned long long constants_key(const struct vertex_shader_object *shader, const struct nv2a_cpu_program *program)
+/* each draw's number (draw_streams, D3DDevice_End), by which what is the
+same for the whole draw is found once (draw_dependencies) */
+static unsigned long draw_serial;
+
+/* the constants a draw's program reads (and the viewport's), hashed: the
+start of the matrices' keys (constants_key, hardware_key). The hash of a
+program and declaration is kept while no constant is set
+(constants_generation), for its next draw: a model's other passes and
+parts, and each matrix of its nodes. */
+#define CONSTANTS_HASHES 8
+
+static unsigned long long constants_hash(const struct vertex_shader_object *shader,
+	const struct nv2a_cpu_program *program)
 {
+	static struct
+	{
+		unsigned long generation;
+		const void *shader, *program;
+		unsigned long long hash;
+	} hashes[CONSTANTS_HASHES];
+	static unsigned next;
 	const struct nv2a_cpu_dependencies *dependencies = &shader->dependencies;
 	unsigned long long hash = 14695981039346656037ULL ^ (unsigned long)program;
 	unsigned long row, word;
+	unsigned which;
 
+	for (which = 0; which < CONSTANTS_HASHES; which++)
+		if (hashes[which].generation == constants_generation && hashes[which].shader == shader &&
+			hashes[which].program == program)
+			return hashes[which].hash;
 	hash = (hash ^ (unsigned long)shader) * 1099511628211ULL;
-	hash = (hash ^ draw_uniform.mask) * 1099511628211ULL;
-	for (row = 0; row < NV2A_CPU_INPUT_COUNT; row++)
-		if (draw_uniform.mask & (1UL << row))
-		{
-			const unsigned long *words = (const unsigned long *)draw_uniform.values[row];
-
-			for (word = 0; word < 4; word++)
-				hash = (hash ^ words[word]) * 1099511628211ULL;
-		}
 	for (row = 0; row < NV2A_CPU_CONSTANT_COUNT; row++)
 		if (dependencies->relative || (dependencies->constants[row / 32] & (1UL << (row % 32))) ||
 			row == VERTEX_CONSTANT_BIAS - 38 || row == VERTEX_CONSTANT_BIAS - 37)
@@ -2592,25 +2645,49 @@ static unsigned long long constants_key(const struct vertex_shader_object *shade
 			for (word = 0; word < 4; word++)
 				hash = (hash ^ words[word]) * 1099511628211ULL;
 		}
+	which = next++ % CONSTANTS_HASHES;
+	hashes[which].generation = constants_generation;
+	hashes[which].shader = shader;
+	hashes[which].program = program;
+	hashes[which].hash = hash;
+	return hash;
+}
+
+static unsigned long long constants_key(const struct vertex_shader_object *shader, const struct nv2a_cpu_program *program)
+{
+	unsigned long long hash = constants_hash(shader, program);
+	unsigned long row, word;
+
+	hash = (hash ^ draw_uniform.mask) * 1099511628211ULL;
+	for (row = 0; row < NV2A_CPU_INPUT_COUNT; row++)
+		if (draw_uniform.mask & (1UL << row))
+		{
+			const unsigned long *words = (const unsigned long *)draw_uniform.values[row];
+
+			for (word = 0; word < 4; word++)
+				hash = (hash ^ words[word]) * 1099511628211ULL;
+		}
 	return hash ? hash : 1;
 }
 
 static BOOL position_matrix_compute(const struct vertex_shader_object *shader, struct nv2a_cpu_program *program,
-	int reg, float point_size);
+	int reg, float point_size, BOOL fit);
 
+/* the position matrix (position_matrix_rows) for the constants and
+draw_uniform, and where fit, its depth (position_projection) */
 static BOOL position_matrix(const struct vertex_shader_object *shader, struct nv2a_cpu_program *program, int reg,
-	float point_size)
+	float point_size, BOOL fit)
 {
 	unsigned long long key = constants_key(shader, program);
 	unsigned slot = (unsigned)(key % POSITION_CACHE_ENTRIES);
 
-	if (position_cache[slot].key == key)
+	if (position_cache[slot].key == key && (position_cache[slot].projection.fitted || !fit))
 	{
 		memcpy(position_matrix_rows, position_cache[slot].rows, sizeof(position_matrix_rows));
 		position_projection = position_cache[slot].projection;
 		return TRUE;
 	}
-	if (!position_matrix_compute(shader, program, reg, point_size))
+	if (!position_matrix_compute(shader, program, reg, point_size, fit))
 		return FALSE;
 	position_cache[slot].key = key;
 	memcpy(position_cache[slot].rows, position_matrix_rows, sizeof(position_matrix_rows));
@@ -2619,7 +2696,7 @@ static BOOL position_matrix(const struct vertex_shader_object *shader, struct nv
 }
 
 static BOOL position_matrix_compute(const struct vertex_shader_object *shader, struct nv2a_cpu_program *program,
-	int reg, float point_size)
+	int reg, float point_size, BOOL fit)
 {
 	float ws[4];
 	const float *scale = device.vertex_constants[VERTEX_CONSTANT_BIAS - 38];
@@ -2628,8 +2705,10 @@ static BOOL position_matrix_compute(const struct vertex_shader_object *shader, s
 	struct nv2a_cpu_output base, column;
 	int component;
 
+	/* (the program for its position alone: the same, bit for bit) */
 	matrix_inputs(shader, inputs);
-	nv2a_cpu_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size, &base);
+	nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
+		&base, NV2A_CPU_LIVE_POSITION);
 	for (component = 0; component < 4; component++)
 	{
 		float x = base.clip[0], y = base.clip[1], w = base.clip[3];
@@ -2637,8 +2716,8 @@ static BOOL position_matrix_compute(const struct vertex_shader_object *shader, s
 		if (component < 3)
 		{
 			inputs[reg][component] = 1.0f;
-			nv2a_cpu_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
-				&column);
+			nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
+				point_size, &column, NV2A_CPU_LIVE_POSITION);
 			inputs[reg][component] = 0.0f;
 			x = column.clip[0] - base.clip[0];
 			y = column.clip[1] - base.clip[1];
@@ -2662,6 +2741,8 @@ static BOOL position_matrix_compute(const struct vertex_shader_object *shader, s
 		}
 		position_projection.perspective = TRUE;
 		position_projection.fitted = FALSE;
+		if (!fit)
+			return TRUE;
 		if (!(length > 1.0e-12f))
 			return FALSE;
 		for (point = 0; point < 2; point++)
@@ -2670,8 +2751,8 @@ static BOOL position_matrix_compute(const struct vertex_shader_object *shader, s
 
 			for (component = 0; component < 3; component++)
 				inputs[reg][component] = t * gradient[component];
-			nv2a_cpu_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
-				&column);
+			nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
+				point_size, &column, NV2A_CPU_LIVE_POSITION);
 			d[point] = column.position[2] / 16777215.0f;
 			v[point] = column.clip[3];
 		}
@@ -2689,7 +2770,7 @@ static BOOL position_matrix_compute(const struct vertex_shader_object *shader, s
 /* (after transform_software, which takes GX back to the identity) */
 static void position_matrix_load(void)
 {
-	if (draw_keys.count > 1)
+	if (draw_keyed())
 	{
 		unsigned key;
 
@@ -2706,7 +2787,8 @@ static void position_matrix_load(void)
 }
 
 /* each of the draw's values a position matrix (draw_keys), its first's left
-in position_matrix_rows and position_projection, and in draw_uniform */
+in position_matrix_rows, position_projection (the only depth fitted: the
+draw's) and draw_uniform */
 static BOOL position_keys(const struct vertex_shader_object *shader, struct nv2a_cpu_program *program, void *fetch,
 	int reg, float point_size)
 {
@@ -2720,7 +2802,7 @@ static BOOL position_keys(const struct vertex_shader_object *shader, struct nv2a
 		for (index = 0; index < NV2A_CPU_INPUT_COUNT; index++)
 			if (draw_uniform.mask & (1UL << index))
 				memcpy(draw_uniform.values[index], inputs[index], sizeof(inputs[index]));
-		if (!position_matrix(shader, program, reg, point_size))
+		if (!position_matrix(shader, program, reg, point_size, key == 0))
 			return FALSE;
 		memcpy(draw_keys.rows[key], position_matrix_rows, sizeof(position_matrix_rows));
 	}
@@ -2788,6 +2870,10 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 	struct draw_projection projection = { FALSE, 0.0f, 0.0f };
 	float point_size;
 	UINT vertex;
+	/* (whether the vertices carry a matrix index, KEY_PROCESSOR's the
+	identity; the outputs of a vertex whose position GX computes) */
+	BOOL keyed = FALSE;
+	unsigned live_gx;
 
 	memcpy(&point_size, &D3D__RenderState[D3DRS_POINTSIZE], sizeof(point_size));
 	if (gpu_transform < 0)
@@ -2796,10 +2882,13 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 	{
 		position_register = position_register_of(shader,
 			draw_dependencies((struct vertex_shader_object *)shader, program, (struct stream_fetch *)context, count));
-		if (position_register >= 0 && (draw_keys.count > 1 ?
+		if (position_register >= 0 && (draw_keyed() ?
 			position_keys(shader, program, context, position_register, point_size) :
-			position_matrix(shader, program, position_register, point_size)))
+			position_matrix(shader, program, position_register, point_size, TRUE)))
+		{
 			projection = position_projection;
+			keyed = draw_keyed();
+		}
 		else
 			position_register = -1;
 	}
@@ -2841,11 +2930,12 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 			if (position_register >= 0)
 			{
 				position_matrix_load();
-				emit_matrix_index = draw_keys.count > 1;
+				emit_matrix_index = keyed;
 			}
 			if (shader)
 				emit_attributes_set();
 			store_plan_set();
+			live_gx = position_register >= 0 ? store_plan.live & ~NV2A_CPU_LIVE_POSITION : store_plan.live;
 
 			GX_Begin(gx_primitive(primitive_type), DEVICE_VERTEX_FORMAT, (u16)count);
 			for (vertex = 0; vertex < count; vertex++)
@@ -2855,16 +2945,19 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 				if (vertex_memo_stamps[slot] != vertex_memo_draw)
 				{
 					u32 t0 = PPCMftb(), t1, t2;
+					BOOL processor = keyed && vertex_keys[vertex] == KEY_PROCESSOR;
 
 					fetch(context, vertex, inputs);
 					t1 = PPCMftb();
 					nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants,
-						(const float (*)[4])inputs, point_size, &out, store_plan.live);
+						(const float (*)[4])inputs, point_size, &out, processor ? store_plan.live : live_gx);
 					t2 = PPCMftb();
-					vertex_store(&out, &projection, position_register >= 0 ? inputs[position_register] : NULL,
+					vertex_store(&out, &projection, position_register >= 0 && !processor ? inputs[position_register] : NULL,
 						&vertex_memo[slot]);
-					vertex_memo[slot].matrix = (u8)(GX_PNMTX1 + 3 * vertex_keys[vertex]);
+					vertex_memo[slot].matrix = (u8)(processor ? GX_PNMTX0 : GX_PNMTX1 + 3 * vertex_keys[vertex]);
 					vertex_memo_stamps[slot] = vertex_memo_draw;
+					if (processor)
+						processor_positions++;
 					device.statistics.vertices_run++;
 					timing.fetch_ticks += t1 - t0;
 					timing.program_ticks += t2 - t1;
@@ -2888,23 +2981,28 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 		if (position_register >= 0)
 		{
 			position_matrix_load();
-			emit_matrix_index = draw_keys.count > 1;
+			emit_matrix_index = keyed;
 		}
 		if (shader)
 			emit_attributes_set();
 		store_plan_set();
+		live_gx = position_register >= 0 ? store_plan.live & ~NV2A_CPU_LIVE_POSITION : store_plan.live;
 
 		GX_Begin(gx_primitive(primitive_type), DEVICE_VERTEX_FORMAT, (u16)count);
 		for (vertex = 0; vertex < count; vertex++)
 		{
 			struct gx_vertex sent;
+			BOOL processor = keyed && vertex_keys[vertex] == KEY_PROCESSOR;
 
-			sent.matrix = (u8)(GX_PNMTX1 + 3 * vertex_keys[vertex]);
+			sent.matrix = (u8)(processor ? GX_PNMTX0 : GX_PNMTX1 + 3 * vertex_keys[vertex]);
 			fetch(context, vertex, inputs);
 			nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
-				point_size, &out, store_plan.live);
-			vertex_store(&out, &projection, position_register >= 0 ? inputs[position_register] : NULL, &sent);
+				point_size, &out, processor ? store_plan.live : live_gx);
+			vertex_store(&out, &projection, position_register >= 0 && !processor ? inputs[position_register] : NULL,
+				&sent);
 			vertex_emit(&sent);
+			if (processor)
+				processor_positions++;
 		}
 		device.statistics.vertices_run += count;
 		GX_End();
@@ -3432,7 +3530,8 @@ each input component alone) and the projection's fit. What GX can take:
   skinned ones (a product of a weight and a matrix) and the lit ones stay on
   the processor (draw_run). */
 
-static unsigned long hardware_draws, hardware_vertices, hardware_colors_run, hardware_keyed_draws;
+static unsigned long hardware_draws, hardware_vertices, hardware_colors_run, hardware_keyed_draws,
+	hardware_blended_draws;
 
 static int single_register(unsigned long mask)
 {
@@ -3456,25 +3555,150 @@ static const struct vertex_element *element_of(const struct vertex_shader_object
 	return NULL;
 }
 
+/* a model's vertex's value (node_keys): its node, 0 to 255, where it hangs
+off one (its weight 1 on the first, or 0: on the second), else 256 and its
+blend's place among the draw's (two nodes and a weight, which make one
+matrix), or -1 past BLEND_VALUES of them */
+#define BLEND_VALUES 64
+
+struct node_values
+{
+	unsigned long blends[BLEND_VALUES];
+	unsigned blend_count, last;
+};
+
+static int vertex_value(struct node_values *values, const unsigned char *nodes, const unsigned char *weights,
+	BOOL add)
+{
+	short weight = short_at(weights);
+	unsigned long blend;
+	unsigned which;
+
+	if (weight == 32767)
+		return nodes[0];
+	if (weight == 0)
+		return nodes[1];
+	blend = (unsigned long)nodes[0] << 24 | (unsigned long)nodes[1] << 16 | (unsigned short)weight;
+	/* (a strip's neighbours are often the last's blend) */
+	if (values->last < values->blend_count && values->blends[values->last] == blend)
+		return 256 + (int)values->last;
+	for (which = 0; which < values->blend_count; which++)
+		if (values->blends[which] == blend)
+			break;
+	if (which == values->blend_count)
+	{
+		if (!add || values->blend_count == BLEND_VALUES)
+			return -1;
+		values->blends[values->blend_count++] = blend;
+	}
+	values->last = which;
+	return 256 + (int)which;
+}
+
+/* a model's vertices keyed by their values (draw_keys' comment): those of the
+most vertices take the matrices, every one where they all fit, else each
+that has NODE_KEY_LEAST of the draw's indices; the other vertices are
+KEY_PROCESSOR. FALSE where no value takes one. */
+static BOOL node_keys(const struct vertex_shader_object *shader, const struct stream_fetch *fetch, UINT count)
+{
+	const struct vertex_element *node_element = element_of(shader, NODE_INDICES);
+	const struct vertex_element *weight_element = element_of(shader, NODE_WEIGHT);
+	unsigned node_stream = node_element->stream & (MAXIMUM_STREAMS - 1);
+	unsigned weight_stream = weight_element->stream & (MAXIMUM_STREAMS - 1);
+	const unsigned char *nodes = fetch->streams[node_stream] + node_element->offset;
+	const unsigned char *weights = fetch->streams[weight_stream] + weight_element->offset;
+	UINT node_stride = device.streams[node_stream].stride, weight_stride = device.streams[weight_stream].stride;
+	UINT indices_of[256 + BLEND_VALUES], untracked = 0, vertex, least;
+	unsigned char key_of[256 + BLEND_VALUES];
+	unsigned short seen[256 + BLEND_VALUES];
+	unsigned seen_count = 0, which;
+	struct node_values values;
+
+	if (count > sizeof(vertex_keys))
+		return FALSE;
+	memset(indices_of, 0, sizeof(indices_of));
+	values.blend_count = values.last = 0;
+	for (vertex = 0; vertex < count; vertex++)
+	{
+		unsigned long whole = fetch->indices ? (unsigned long)fetch->indices[vertex] + device.base_vertex_index :
+			fetch->first + vertex;
+		int value = vertex_value(&values, nodes + whole * node_stride, weights + whole * weight_stride, TRUE);
+
+		if (value < 0)
+			untracked++;
+		else if (!indices_of[value]++)
+			seen[seen_count++] = (unsigned short)value;
+	}
+	least = !untracked && seen_count <= MATRIX_KEYS ? 1 : NODE_KEY_LEAST;
+	memset(key_of, KEY_PROCESSOR, sizeof(key_of));
+	draw_keys.count = 0;
+	while (draw_keys.count < MATRIX_KEYS)
+	{
+		unsigned best = 0;
+		BOOL found = FALSE;
+
+		for (which = 0; which < seen_count; which++)
+		{
+			unsigned value = seen[which];
+
+			if (key_of[value] == KEY_PROCESSOR && indices_of[value] >= least &&
+				(!found || indices_of[value] > indices_of[best]))
+			{
+				best = value;
+				found = TRUE;
+			}
+		}
+		if (!found)
+			break;
+		draw_keys.representative[draw_keys.count] = count;
+		key_of[best] = (unsigned char)draw_keys.count++;
+	}
+	if (!draw_keys.count)
+		return FALSE;
+	draw_keys.processor = 0;
+	for (vertex = 0; vertex < count; vertex++)
+	{
+		unsigned long whole = fetch->indices ? (unsigned long)fetch->indices[vertex] + device.base_vertex_index :
+			fetch->first + vertex;
+		int value = vertex_value(&values, nodes + whole * node_stride, weights + whole * weight_stride, FALSE);
+		unsigned char key = value < 0 ? KEY_PROCESSOR : key_of[value];
+
+		vertex_keys[vertex] = key;
+		if (key == KEY_PROCESSOR)
+			draw_keys.processor++;
+		else if (draw_keys.representative[key] == count)
+			draw_keys.representative[key] = vertex;
+	}
+	return TRUE;
+}
+
 /* what a draw's program depends on: its analysis, or, where its clip-space
 position is not affine but the inputs it is not affine in (other than a
 position of three floats) hold the same values in every vertex the draw
 names (a skinned model's part bound to one node: its node indices and
 weights), its analysis with those as constants, whose values draw_uniform
-keeps for the matrices */
+keeps for the matrices; where they hold a few values, draw_keys keeps them
+(once a draw: draw_hardware's, then draw_run's if it is the processor's) */
 static const struct nv2a_cpu_dependencies *draw_dependencies(struct vertex_shader_object *shader,
 	struct nv2a_cpu_program *program, struct stream_fetch *fetch, UINT count)
 {
+	static unsigned long serial;
+	static const struct nv2a_cpu_dependencies *found;
 	const struct nv2a_cpu_dependencies *general = &shader->dependencies;
 	unsigned long clip = general->clip[0] | general->clip[1] | general->clip[3], candidates = 0;
 	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
 	unsigned index;
 	int reg;
 
+	if (fetch && serial == draw_serial && found)
+		return found;
 	draw_uniform.mask = 0;
 	draw_keys.count = 0;
+	draw_keys.processor = 0;
+	found = NULL;
+	serial = draw_serial;
 	if (!fetch || !count || !general->clip_captured || !(clip & NV2A_CPU_NOT_AFFINE))
-		return general;
+		return found = general;
 	for (reg = 0; reg < NV2A_CPU_INPUT_COUNT; reg++)
 	{
 		const struct vertex_element *element;
@@ -3483,12 +3707,23 @@ static const struct nv2a_cpu_dependencies *draw_dependencies(struct vertex_shade
 			continue;
 		element = element_of(shader, reg);
 		if (!element || !fetch->streams[element->stream & (MAXIMUM_STREAMS - 1)] || !element->bytes)
-			return general;
+			return found = general;
 		if (element->type != D3DVSDT_FLOAT3)
 			candidates |= 1UL << reg;
 	}
 	if (!candidates)
-		return general;
+		return found = general;
+	if (candidates == (1UL << NODE_INDICES | 1UL << NODE_WEIGHT) && program->native &&
+		element_of(shader, NODE_INDICES)->type == D3DVSDT_PBYTE2 &&
+		element_of(shader, NODE_WEIGHT)->type == D3DVSDT_NORMSHORT1)
+	{
+		if (!node_keys(shader, fetch, count))
+		{
+			draw_keys.count = 0;
+			return found = general;
+		}
+	}
+	else
 	{
 		/* the candidates' bytes in each vertex, grouped by value */
 		const unsigned char *streams[NV2A_CPU_INPUT_COUNT];
@@ -3528,7 +3763,7 @@ static const struct nv2a_cpu_dependencies *draw_dependencies(struct vertex_shade
 				if (draw_keys.count == MATRIX_KEYS || count > sizeof(vertex_keys))
 				{
 					draw_keys.count = 0;
-					return general;
+					return found = general;
 				}
 				wholes[key] = whole;
 				draw_keys.representative[key] = vertex;
@@ -3538,18 +3773,18 @@ static const struct nv2a_cpu_dependencies *draw_dependencies(struct vertex_shade
 		}
 		(void)regs;
 	}
-	stream_fetch(fetch, 0, inputs);
+	stream_fetch(fetch, draw_keys.representative[0], inputs);
 	for (reg = 0; reg < NV2A_CPU_INPUT_COUNT; reg++)
 		if (candidates & (1UL << reg))
 			memcpy(draw_uniform.values[reg], inputs[reg], sizeof(inputs[reg]));
 	draw_uniform.mask = candidates;
 	for (index = 0; index < shader->specialized_count; index++)
 		if (shader->specialized[index].uniform == candidates)
-			return &shader->specialized[index].dependencies;
+			return found = &shader->specialized[index].dependencies;
 	index = shader->specialized_count < 2 ? shader->specialized_count++ : 1;
 	shader->specialized[index].uniform = candidates;
 	nv2a_cpu_analyze_uniform(program, candidates, &shader->specialized[index].dependencies);
-	return &shader->specialized[index].dependencies;
+	return found = &shader->specialized[index].dependencies;
 }
 
 /* the matrices of recent draws, by what made them: the program, its
@@ -3579,26 +3814,20 @@ static unsigned long long hash_words(unsigned long long hash, const void *data, 
 
 static unsigned long long hardware_key(const struct vertex_shader_object *shader, const struct nv2a_cpu_program *program)
 {
-	const struct nv2a_cpu_dependencies *dependencies = &shader->dependencies;
-	unsigned long long hash = 14695981039346656037ULL;
-	unsigned long state[6], row;
+	/* (the program, its declaration and the constants: constants_hash) */
+	unsigned long long hash = constants_hash(shader, program);
+	unsigned long state[4], row;
 
-	state[0] = (unsigned long)program;
-	state[1] = (unsigned long)shader;
-	state[2] = tev_texcoords | sphere_stages << 8;
-	state[3] = D3D__RenderState[D3DRS_FOGTABLEMODE];
-	state[4] = D3D__RenderState[D3DRS_FOGSTART];
-	state[5] = D3D__RenderState[D3DRS_FOGEND];
+	state[0] = tev_texcoords | sphere_stages << 8;
+	state[1] = D3D__RenderState[D3DRS_FOGTABLEMODE];
+	state[2] = D3D__RenderState[D3DRS_FOGSTART];
+	state[3] = D3D__RenderState[D3DRS_FOGEND];
 	hash = hash_words(hash, state, sizeof(state));
 	hash = hash_words(hash, texcoord_scale, sizeof(texcoord_scale));
 	hash = hash_words(hash, &draw_uniform.mask, sizeof(draw_uniform.mask));
 	for (row = 0; row < NV2A_CPU_INPUT_COUNT; row++)
 		if (draw_uniform.mask & (1UL << row))
 			hash = hash_words(hash, draw_uniform.values[row], sizeof(draw_uniform.values[row]));
-	for (row = 0; row < NV2A_CPU_CONSTANT_COUNT; row++)
-		if (dependencies->relative || (dependencies->constants[row / 32] & (1UL << (row % 32))) ||
-			row == VERTEX_CONSTANT_BIAS - 38 || row == VERTEX_CONSTANT_BIAS - 37)
-			hash = hash_words(hash ^ row, device.vertex_constants[row], sizeof(device.vertex_constants[row]));
 	/* (0 is an empty entry's) */
 	return hash ? hash : 1;
 }
@@ -3635,7 +3864,11 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	unsigned long clip_mask, least = 0xFFFFFFFFUL, most = 0, vertex, color_mask[2];
 	float stage_rows[5][2][4], point_size;
 	struct draw_projection projection;
-	BOOL fogged = FALSE, cpu_colors = FALSE;
+	/* (position_read: a stage reads a coordinate GX makes from the position,
+	which a vertex the processor transforms does not give it) */
+	BOOL fogged = FALSE, cpu_colors = FALSE, position_read = FALSE, keyed;
+	const unsigned char *position_stream;
+	UINT position_stride;
 	unsigned long long key;
 	struct hardware_matrices *cached;
 	uint64_t started = wl_platform_time_us(), emitting;
@@ -3674,8 +3907,13 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		}
 		if (mask & NV2A_CPU_NOT_AFFINE)
 			return hardware_rejected(program, "a texture coordinate read is not affine");
-		if (!(mask & 0xFFFF) || reg == position_register)
+		if (!(mask & 0xFFFF))
 			continue;
+		if (reg == position_register)
+		{
+			position_read = TRUE;
+			continue;
+		}
 		element = reg >= 0 ? element_of(shader, reg) : NULL;
 		if (!element || (element->type != D3DVSDT_FLOAT2 && element->type != D3DVSDT_NORMSHORT2) ||
 			!fetch->streams[element->stream & (MAXIMUM_STREAMS - 1)])
@@ -3712,7 +3950,8 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	/* (with several values of the inputs, what is read besides the position
 	and the colours, which the processor gives, may not depend on them: one
 	texture matrix serves every vertex) */
-	if (draw_keys.count > 1)
+	keyed = draw_keyed();
+	if (keyed)
 	{
 		const struct nv2a_cpu_dependencies *general = &shader->dependencies;
 
@@ -3734,6 +3973,8 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 			}
 		}
 	}
+	if (draw_keys.processor && (position_read || fogged))
+		return hardware_rejected(program, "a texture coordinate or the fog from the position, with blended vertices");
 	/* the vertices' range: GX's indices are 16 bits */
 	for (vertex = 0; vertex < count; vertex++)
 	{
@@ -3854,7 +4095,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	memset(stage_rows[4][1], 0, sizeof(stage_rows[4][1]));
 
 	/* (the position's matrix and depth as draw_run makes them, to the bit) */
-	if (!position_matrix(shader, program, position_register, point_size))
+	if (!position_matrix(shader, program, position_register, point_size, TRUE))
 		return hardware_rejected(program, "no depth to fit (every w the same)");
 	projection = position_projection;
 	{
@@ -3870,20 +4111,27 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 
 	/* GX's state for the game's vertices (each value's matrix: the first's
 	is the cache's) */
-	if (draw_keys.count > 1 && !position_keys(shader, program, fetch, position_register, point_size))
+	if (keyed && !position_keys(shader, program, fetch, position_register, point_size))
 		return hardware_rejected(program, "no depth to fit for a model's node");
+	position_stream = fetch->streams[position_element->stream & (MAXIMUM_STREAMS - 1)] + position_element->offset;
+	position_stride = device.streams[position_element->stream & (MAXIMUM_STREAMS - 1)].stride;
+	if (position_stride > 255)
+		return FALSE;
 	GX_ClearVtxDesc();
 	position_matrix_load();
-	GX_SetVtxDesc(GX_VA_POS, GX_INDEX16);
 	GX_SetVtxAttrFmt(HARDWARE_VERTEX_FORMAT, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	if (draw_keys.processor)
 	{
-		const unsigned char *stream = fetch->streams[position_element->stream & (MAXIMUM_STREAMS - 1)];
-		UINT stride = device.streams[position_element->stream & (MAXIMUM_STREAMS - 1)].stride;
-
-		if (stride > 255)
-			return FALSE;
-		GX_SetArray(GX_VA_POS, (void *)(stream + position_element->offset), (u8)stride);
-		DCFlushRange((void *)(stream + least * stride), (most - least + 1) * stride);
+		/* (each vertex's position sent: the processor's, or the vertex's own
+		through its node's matrix) */
+		GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+	}
+	else
+	{
+		GX_SetVtxDesc(GX_VA_POS, GX_INDEX16);
+		GX_SetArray(GX_VA_POS, (void *)position_stream, (u8)position_stride);
+		DCFlushRange((void *)(position_stream - position_element->offset + least * position_stride),
+			(most - least + 1) * position_stride);
 	}
 	for (component = 0; component < texture_count; component++)
 	{
@@ -3921,6 +4169,21 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		GX_SetVtxAttrFmt(HARDWARE_VERTEX_FORMAT, GX_VA_CLR1, GX_CLR_RGBA, GX_RGBA8, 0);
 		GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
 		GX_SetChanCtrl(GX_COLOR1A1, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+	}
+	else
+	{
+		/* the colours: constant */
+		GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_REG, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+		GX_SetChanCtrl(GX_COLOR1A1, GX_DISABLE, GX_SRC_REG, GX_SRC_REG, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+		GX_SetChanMatColor(GX_COLOR0A0, (GXColor){ color_byte(base.d0[0]), color_byte(base.d0[1]),
+			color_byte(base.d0[2]), color_byte(base.d0[3]) });
+		GX_SetChanMatColor(GX_COLOR1A1, (GXColor){ color_byte(base.d1[0]), color_byte(base.d1[1]),
+			color_byte(base.d1[2]), color_byte(base.d1[3]) });
+	}
+	if (cpu_colors || draw_keys.processor)
+	{
+		/* (what the processor computes of a vertex, once however many of
+		the indices name it) */
 		if (!vertex_memo)
 		{
 			vertex_memo = malloc(VERTEX_MEMO_SIZE * sizeof(*vertex_memo));
@@ -3935,16 +4198,6 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		}
 		vertex_memo_draw++;
 	}
-	else
-	{
-		/* the colours: constant */
-		GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_REG, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
-		GX_SetChanCtrl(GX_COLOR1A1, GX_DISABLE, GX_SRC_REG, GX_SRC_REG, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
-		GX_SetChanMatColor(GX_COLOR0A0, (GXColor){ color_byte(base.d0[0]), color_byte(base.d0[1]),
-			color_byte(base.d0[2]), color_byte(base.d0[3]) });
-		GX_SetChanMatColor(GX_COLOR1A1, (GXColor){ color_byte(base.d1[0]), color_byte(base.d1[1]),
-			color_byte(base.d1[2]), color_byte(base.d1[3]) });
-	}
 
 	emitting = wl_platform_time_us();
 	GX_Begin(gx_primitive(primitive_type), HARDWARE_VERTEX_FORMAT, (u16)count);
@@ -3952,35 +4205,66 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	{
 		unsigned long whole = indices ? (unsigned long)indices[vertex] + device.base_vertex_index : first + vertex;
 		u16 index = (u16)whole;
+		BOOL processor = keyed && vertex_keys[vertex] == KEY_PROCESSOR;
+		struct gx_vertex local, *computed = &local;
 
-		if (draw_keys.count > 1)
-			GX_MatrixIndex1x8((u8)(GX_PNMTX1 + 3 * vertex_keys[vertex]));
-		GX_Position1x16(index);
-		if (cpu_colors)
+		if (keyed)
+			GX_MatrixIndex1x8((u8)(processor ? GX_PNMTX0 : GX_PNMTX1 + 3 * vertex_keys[vertex]));
+		if (processor || cpu_colors)
 		{
-			struct gx_vertex local, *colors = &local;
+			/* what the processor computes of the vertex: its position (in
+			draw_run's (x w, y w, -w), through the identity) where it is the
+			processor's, its colours where they are */
 			unsigned long slot = whole - least;
 
 			if (vertex_memo && slot < VERTEX_MEMO_SIZE)
-				colors = &vertex_memo[slot];
-			if (colors == &local || vertex_memo_stamps[slot] != vertex_memo_draw)
+				computed = &vertex_memo[slot];
+			if (computed == &local || vertex_memo_stamps[slot] != vertex_memo_draw)
 			{
 				struct nv2a_cpu_output out;
 
 				stream_fetch(fetch, vertex, inputs);
-				nv2a_cpu_run_colors(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
-					&out);
-				for (component = 0; component < 4; component++)
+				if (processor)
 				{
-					colors->color0[component] = color_byte(out.d0[component]);
-					colors->color1[component] = color_byte(out.d1[component]);
+					nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants,
+						(const float (*)[4])inputs, point_size, &out,
+						NV2A_CPU_LIVE_POSITION | (cpu_colors ? NV2A_CPU_LIVE_D0 | NV2A_CPU_LIVE_D1 : 0));
+					clip_position(out.clip, computed->position);
+					processor_positions++;
 				}
-				if (colors != &local)
+				else
+					nv2a_cpu_run_colors(program, (const float (*)[4])device.vertex_constants,
+						(const float (*)[4])inputs, &out);
+				if (cpu_colors)
+				{
+					for (component = 0; component < 4; component++)
+					{
+						computed->color0[component] = color_byte(out.d0[component]);
+						computed->color1[component] = color_byte(out.d1[component]);
+					}
+					hardware_colors_run++;
+				}
+				if (computed != &local)
 					vertex_memo_stamps[slot] = vertex_memo_draw;
-				hardware_colors_run++;
 			}
-			GX_Color4u8(colors->color0[0], colors->color0[1], colors->color0[2], colors->color0[3]);
-			GX_Color4u8(colors->color1[0], colors->color1[1], colors->color1[2], colors->color1[3]);
+		}
+		if (processor)
+			GX_Position3f32(computed->position[0], computed->position[1], computed->position[2]);
+		else if (draw_keys.processor)
+		{
+			float position[3];
+
+			word_copy(&position[0], position_stream + whole * position_stride);
+			word_copy(&position[1], position_stream + whole * position_stride + 4);
+			word_copy(&position[2], position_stream + whole * position_stride + 8);
+			GX_Position3f32(position[0], position[1], position[2]);
+		}
+		else
+			GX_Position1x16(index);
+		if (cpu_colors)
+		{
+			GX_Color4u8(computed->color0[0], computed->color0[1], computed->color0[2], computed->color0[3]);
+			GX_Color4u8(computed->color1[0], computed->color1[1], computed->color1[2], computed->color1[3]);
 		}
 		for (component = 0; component < texture_count; component++)
 			GX_TexCoord1x16(index);
@@ -3988,8 +4272,10 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	GX_End();
 	hardware_draws++;
 	hardware_vertices += count;
-	if (draw_keys.count > 1)
+	if (keyed)
 		hardware_keyed_draws++;
+	if (draw_keys.processor)
+		hardware_blended_draws++;
 	timing.hardware_setup += emitting - started;
 	timing.hardware_vertices += wl_platform_time_us() - emitting;
 	return TRUE;
@@ -4003,6 +4289,7 @@ static void draw_streams(D3DPRIMITIVETYPE primitive_type, UINT count, const WORD
 
 	if (!program || !count || count > MAXIMUM_GX_VERTICES || !draw_prepare())
 		return;
+	draw_serial++;
 	fetch.shader = device.vertex_shader;
 	fetch.indices = indices;
 	fetch.first = first;
@@ -4079,6 +4366,7 @@ void WINAPI D3DDevice_End(void)
 	if (device.immediate && device.immediate_vertices)
 	{
 		device.statistics.immediate_draws++;
+		draw_serial++;
 		device.statistics.vertices += device.immediate_vertices;
 		program = program_current();
 		if (program && device.immediate_buffer && draw_prepare())
@@ -4237,10 +4525,12 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			device.draws_elsewhere, device.statistics.textures_bound, device.statistics.textures_failed,
 			device.statistics.stages_without_mode, STATISTICS_FRAMES);
 		program_statistics_log();
-		platform_log("Direct3D: in hardware: %lu draws (%lu of their matrices kept, %lu of several nodes), %lu vertices "
-			"(%lu with the processor's colours)", hardware_draws, hardware_cache_hits, hardware_keyed_draws,
-			hardware_vertices, hardware_colors_run);
+		platform_log("Direct3D: in hardware: %lu draws (%lu of their matrices kept, %lu of several nodes, %lu with "
+			"blended vertices), %lu vertices (%lu with the processor's colours); positions the processor's in "
+			"models' draws: %lu", hardware_draws, hardware_cache_hits, hardware_keyed_draws, hardware_blended_draws,
+			hardware_vertices, hardware_colors_run, processor_positions);
 		hardware_draws = hardware_vertices = hardware_colors_run = hardware_cache_hits = hardware_keyed_draws = 0;
+		hardware_blended_draws = processor_positions = 0;
 		platform_log("Direct3D: textures not drawn: %lu without data, %lu of a shape, %lu of a format, "
 			"%lu without memory, %lu not decoded; %lu converted bitmaps found", texture_failures[_failure_no_data],
 			texture_failures[_failure_shape],

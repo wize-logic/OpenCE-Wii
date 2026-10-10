@@ -7,9 +7,12 @@ each of the game's programs is run as its function and on the interpreter
 (port/wii/src/nv2a_cpu.c) over random constants and inputs, and the two
 must give the same outputs, bit for bit; so must its function for the
 outputs a draw reads (nv2a_cpu_run_live), in those outputs, for random sets
-of them. Then the functions' own arithmetic: nv2a_sqrtf's refinement, from
-estimates as coarse as frsqrte's, against sqrtf, and nv2a_floor_index
-against floorf.
+of them. A model's vertex on one node (weight 1 on its first index, or 0
+on its second) must give every output that the node with weight 1 alone
+does, whatever the other index (port/wii/src/d3d8_gx.c keys such vertices
+by their node). Then the functions' own arithmetic: nv2a_sqrtf's
+refinement, from estimates as coarse as frsqrte's, against sqrtf, and
+nv2a_floor_index against floorf.
 
 usage: nv2a_native_check microcode.inc
 */
@@ -20,6 +23,11 @@ usage: nv2a_native_check microcode.inc
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+/* a model's vertex (model_vertex_compressed's declaration): its two node
+indices, bytes, and the first node's weight, a normalized short */
+#define NODE_INDICES 5
+#define NODE_WEIGHT 6
 
 static float random_float(void)
 {
@@ -128,7 +136,7 @@ int main(int argc, char **argv)
 	static DWORD words[65536];
 	static float constants[NV2A_CPU_CONSTANT_COUNT][4], inputs[NV2A_CPU_INPUT_COUNT][4];
 	static struct nv2a_cpu_program program;
-	unsigned long count = 0, position, checked = 0, differ = 0, native = 0;
+	unsigned long count = 0, position, checked = 0, differ = 0, native = 0, one_node_checked = 0;
 	char line[512];
 	int in_comment = 0;
 	FILE *in;
@@ -247,9 +255,43 @@ int main(int argc, char **argv)
 					break;
 				}
 			}
+			/* a model's vertex on one node (d3d8_gx.c's node_keys):
+			node indices (a, b) with a weight of 1, or (b, a) with 0, give
+			every output that (a, a) with 1 does */
+			{
+				struct nv2a_cpu_output one_node, other;
+				int a = rand() % 256, b = rand() % 256, order;
+
+				inputs[NODE_INDICES][0] = a / 255.0f;
+				inputs[NODE_INDICES][1] = a / 255.0f;
+				inputs[NODE_INDICES][2] = 0.0f;
+				inputs[NODE_INDICES][3] = 1.0f;
+				inputs[NODE_WEIGHT][0] = 1.0f;
+				inputs[NODE_WEIGHT][1] = inputs[NODE_WEIGHT][2] = 0.0f;
+				inputs[NODE_WEIGHT][3] = 1.0f;
+				nv2a_cpu_run(&program, (const float (*)[4])constants, (const float (*)[4])inputs, 1.0f, &one_node);
+				for (order = 0; order < 2; order++)
+				{
+					inputs[NODE_INDICES][order] = b / 255.0f;
+					inputs[NODE_WEIGHT][0] = order ? 1.0f : 0.0f;
+					nv2a_cpu_run(&program, (const float (*)[4])constants, (const float (*)[4])inputs, 1.0f, &other);
+					inputs[NODE_INDICES][order] = a / 255.0f;
+					one_node_checked++;
+					if (memcmp(&one_node, &other, sizeof(other)))
+					{
+						printf("program %08lx: a vertex on node %d (indices %d and %d, weight %d) differs\n",
+							nv2a_cpu_hash(instructions, instruction_count), a, order ? a : b, order ? b : a, order);
+						differ++;
+						break;
+					}
+				}
+				if (order < 2)
+					break;
+			}
 		}
 	}
-	printf("%lu programs with functions, %lu runs compared, %lu differ\n", native, checked, differ);
+	printf("%lu programs with functions, %lu runs compared, %lu vertices on one node, %lu differ\n", native, checked,
+		one_node_checked, differ);
 	differ += arithmetic_check();
 	return differ != 0;
 }
