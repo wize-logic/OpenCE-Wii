@@ -3491,6 +3491,9 @@ each input component alone) and the projection's fit. What GX can take:
 
 static unsigned long hardware_draws, hardware_vertices, hardware_colors_run, hardware_keyed_draws,
 	hardware_blended_draws;
+/* draws whose sphere maps' coordinates the processor computes, and the
+vertices it ran for them */
+static unsigned long hardware_sphere_draws, hardware_spheres_run;
 
 static int single_register(unsigned long mask)
 {
@@ -3820,6 +3823,9 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	/* each stage's source: -1 the position, else the GX texture attribute */
 	int stage_source[4], texture_registers[4], texture_count = 0, position_register, stage, component;
 	BOOL stage_unread[4];
+	/* the sphere-mapped stages whose direction the vertices give: their
+	coordinates the processor's, sent with each vertex */
+	unsigned cpu_spheres = 0, live;
 	unsigned long clip_mask, least = 0xFFFFFFFFUL, most = 0, vertex, color_mask[2];
 	float stage_rows[5][2][4], point_size;
 	struct draw_projection projection;
@@ -3858,10 +3864,16 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 			continue;
 		if (sphere_stages & (1U << stage))
 		{
-			/* (a direction the vertices give is the processor's; one the
-			same for every vertex is one point of the sphere map) */
+			/* (a direction the vertices give is the processor's, its sphere
+			map's coordinates sent with the vertex as the processor's draws
+			send them; one the same for every vertex is one point of the
+			sphere map) */
 			if ((dependencies->t[stage][0] | dependencies->t[stage][1] | dependencies->t[stage][2]) & 0xFFFF)
-				return hardware_rejected(program, "a cube map's direction (a sphere map's coordinates)");
+			{
+				if (!program->native)
+					return hardware_rejected(program, "a cube map's direction, on the interpreter");
+				cpu_spheres |= 1U << stage;
+			}
 			continue;
 		}
 		if (mask & NV2A_CPU_NOT_AFFINE)
@@ -3915,7 +3927,8 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		const struct nv2a_cpu_dependencies *general = &shader->dependencies;
 
 		for (stage = 0; stage < 4; stage++)
-			if (!stage_unread[stage] && ((general->t[stage][0] | general->t[stage][1]) & draw_uniform.mask))
+			if (!stage_unread[stage] && !(cpu_spheres & (1U << stage)) &&
+				((general->t[stage][0] | general->t[stage][1]) & draw_uniform.mask))
 				return hardware_rejected(program, "a texture coordinate from a model's nodes");
 		if (fogged && (general->fog & draw_uniform.mask))
 			return hardware_rejected(program, "the fog from a model's nodes");
@@ -4108,6 +4121,16 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		GX_SetArray(GX_VA_TEX0 + component, (void *)(stream + element->offset), (u8)stride);
 		DCFlushRange((void *)(stream + least * stride), (most - least + 1) * stride);
 	}
+	/* (the processor's sphere map coordinates: the attributes after those
+	read by index) */
+	for (stage = 0, component = texture_count; stage < 4; stage++)
+	{
+		if (!(cpu_spheres & (1U << stage)))
+			continue;
+		GX_SetVtxDesc(GX_VA_TEX0 + component, GX_DIRECT);
+		GX_SetVtxAttrFmt(HARDWARE_VERTEX_FORMAT, GX_VA_TEX0 + component, GX_TEX_ST, GX_F32, 0);
+		component++;
+	}
 	GX_InvVtxCache();
 	for (stage = 0; stage < 5; stage++)
 	{
@@ -4119,6 +4142,16 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		GX_SetTexCoordGen(GX_TEXCOORD0 + stage, GX_TG_MTX2x4,
 			stage < 4 && stage_source[stage] >= 0 ? GX_TG_TEX0 + stage_source[stage] : GX_TG_POS, GX_TEXMTX0 + 3 * stage);
 	}
+	/* (as transform_software sends the processor's coordinates) */
+	for (stage = 0, component = texture_count; stage < 4; stage++)
+	{
+		if (!(cpu_spheres & (1U << stage)))
+			continue;
+		GX_SetTexCoordGen(GX_TEXCOORD0 + stage, GX_TG_MTX2x4, GX_TG_TEX0 + component, GX_IDENTITY);
+		component++;
+	}
+	if (cpu_spheres)
+		hardware_sphere_draws++;
 	if (cpu_colors)
 	{
 		/* the colours: the processor's, sent with each vertex */
@@ -4139,7 +4172,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		GX_SetChanMatColor(GX_COLOR1A1, (GXColor){ color_byte(base.d1[0]), color_byte(base.d1[1]),
 			color_byte(base.d1[2]), color_byte(base.d1[3]) });
 	}
-	if (cpu_colors || draw_keys.processor)
+	if (cpu_colors || cpu_spheres || draw_keys.processor)
 	{
 		/* (what the processor computes of a vertex, once however many of
 		the indices name it) */
@@ -4169,11 +4202,12 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 
 		if (keyed)
 			GX_MatrixIndex1x8((u8)(processor ? GX_PNMTX0 : GX_PNMTX1 + 3 * vertex_keys[vertex]));
-		if (processor || cpu_colors)
+		if (processor || cpu_colors || cpu_spheres)
 		{
 			/* what the processor computes of the vertex: its position (in
 			draw_run's (x w, y w, -w), through the identity) where it is the
-			processor's, its colours where they are */
+			processor's, its colours and sphere maps' coordinates where they
+			are */
 			unsigned long slot = whole - least;
 
 			if (vertex_memo && slot < VERTEX_MEMO_SIZE)
@@ -4183,13 +4217,22 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 				struct nv2a_cpu_output out;
 
 				stream_fetch(fetch, vertex, inputs);
-				if (processor)
+				if (processor || cpu_spheres)
 				{
+					live = (processor ? NV2A_CPU_LIVE_POSITION : 0) |
+						(cpu_colors ? NV2A_CPU_LIVE_D0 | NV2A_CPU_LIVE_D1 : 0) | cpu_spheres * NV2A_CPU_LIVE_T0;
 					nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants,
-						(const float (*)[4])inputs, point_size, &out,
-						NV2A_CPU_LIVE_POSITION | (cpu_colors ? NV2A_CPU_LIVE_D0 | NV2A_CPU_LIVE_D1 : 0));
-					clip_position(out.clip, computed->position);
-					processor_positions++;
+						(const float (*)[4])inputs, point_size, &out, live);
+					if (processor)
+					{
+						clip_position(out.clip, computed->position);
+						processor_positions++;
+					}
+					for (stage = 0; stage < 4; stage++)
+						if (cpu_spheres & (1U << stage))
+							sphere_coordinates(out.t[stage], computed->texcoord[stage]);
+					if (cpu_spheres)
+						hardware_spheres_run++;
 				}
 				else
 					nv2a_cpu_run_colors(program, (const float (*)[4])device.vertex_constants,
@@ -4222,11 +4265,15 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 			GX_Position1x16(index);
 		if (cpu_colors)
 		{
-			GX_Color4u8(computed->color0[0], computed->color0[1], computed->color0[2], computed->color0[3]);
-			GX_Color4u8(computed->color1[0], computed->color1[1], computed->color1[2], computed->color1[3]);
+			/* (a colour's four bytes as one word: the same bytes in the FIFO) */
+			GX_Color1u32(color_word(computed->color0));
+			GX_Color1u32(color_word(computed->color1));
 		}
 		for (component = 0; component < texture_count; component++)
 			GX_TexCoord1x16(index);
+		for (stage = 0; stage < 4; stage++)
+			if (cpu_spheres & (1U << stage))
+				GX_TexCoord2f32(computed->texcoord[stage][0], computed->texcoord[stage][1]);
 	}
 	GX_End();
 	hardware_draws++;
@@ -4490,6 +4537,9 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			hardware_vertices, hardware_colors_run, processor_positions);
 		hardware_draws = hardware_vertices = hardware_colors_run = hardware_cache_hits = hardware_keyed_draws = 0;
 		hardware_blended_draws = processor_positions = 0;
+		platform_log("Direct3D: in hardware with the processor's sphere map coordinates: %lu draws, %lu vertices run",
+			hardware_sphere_draws, hardware_spheres_run);
+		hardware_sphere_draws = hardware_spheres_run = 0;
 		platform_log("Direct3D: textures not drawn: %lu without data, %lu of a shape, %lu of a format, "
 			"%lu without memory, %lu not decoded; %lu converted bitmaps found", texture_failures[_failure_no_data],
 			texture_failures[_failure_shape],
