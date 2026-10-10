@@ -753,7 +753,7 @@ void transport_client_start(
 	transport_client_stop();
 	transport_push_key(key, key_id);
 	XNetXnAddrToInAddr(xnaddr, key_id, &in_addr);
-	address->address.long_words[0] = SWAP4(in_addr.s_addr);
+	address->address.long_words[0] = ntohl(in_addr.s_addr); /* port: was SWAP4, right only on little-endian */
 	address->address_length = IPV4_ADDRESS_LENGTH;
 	address->port = port;
 	address->address_type = 0;

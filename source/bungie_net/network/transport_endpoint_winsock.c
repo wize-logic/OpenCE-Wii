@@ -1043,11 +1043,9 @@ short get_endpoint_address(
 			{
 				network_address = socket_address.sin_addr.s_addr;
 				network_port = socket_address.sin_port;
-				address->address.long_words[0] =
-					(((network_address & 0xFF0000) | (network_address >> 16)) >> 8) |
-					(((network_address & 0xFF00) | (network_address << 16)) << 8);
+				address->address.long_words[0] = ntohl(network_address); /* port: was a swap, right only on little-endian */
 				address->address_length = IPV4_ADDRESS_LENGTH;
-				address->port = (word)((network_port << 8) | (network_port >> 8));
+				address->port = (word)ntohs((word)network_port); /* port: was a swap */
 			}
 			else
 			{
@@ -1060,11 +1058,9 @@ short get_endpoint_address(
 		{
 			network_address = socket_address.sin_addr.s_addr;
 			network_port = socket_address.sin_port;
-			address->address.long_words[0] =
-				(((network_address & 0xFF0000) | (network_address >> 16)) >> 8) |
-				(((network_address & 0xFF00) | (network_address << 16)) << 8);
+			address->address.long_words[0] = ntohl(network_address); /* port: was a swap, right only on little-endian */
 			address->address_length = IPV4_ADDRESS_LENGTH;
-			address->port = (word)((network_port << 8) | (network_port >> 8));
+			address->port = (word)ntohs((word)network_port); /* port: was a swap */
 		}
 		else
 		{
@@ -1166,8 +1162,8 @@ short bind_endpoint(
 	{
 		struct sockaddr_in socket_address;
 
-		socket_address.sin_addr.s_addr = SWAP4(address->address.long_words[0]);
-		socket_address.sin_port = (word)SWAP2(address->port);
+		socket_address.sin_addr.s_addr = htonl(address->address.long_words[0]); /* port: was SWAP4, right only on little-endian */
+		socket_address.sin_port = (word)htons(address->port); /* port: was SWAP2 */
 		socket_address.sin_family = AF_INET;
 
 		if (bind(ep->socket, (struct sockaddr *)&socket_address, sizeof(socket_address)) != 0)
@@ -1219,8 +1215,8 @@ short connect_endpoint(
 			ep->socket = create_socket(AF_INET, socket_type, IPPROTO_IP);
 		}
 
-		socket_address.sin_addr.s_addr = SWAP4(address->address.long_words[0]);
-		socket_address.sin_port = (word)SWAP2(address->port);
+		socket_address.sin_addr.s_addr = htonl(address->address.long_words[0]); /* port: was SWAP4, right only on little-endian */
+		socket_address.sin_port = (word)htons(address->port); /* port: was SWAP2 */
 		socket_address.sin_family = AF_INET;
 		blocking = endpoint_blocking(ep);
 		set_endpoint_blocking(ep, FALSE);
@@ -1605,9 +1601,9 @@ long read_from_endpoint(
 	}
 	else if (result >= 0)
 	{
-		src_addr->address.long_words[0] = SWAP4(socket_address.sin_addr.s_addr);
+		src_addr->address.long_words[0] = ntohl(socket_address.sin_addr.s_addr); /* port: was SWAP4, right only on little-endian */
 		src_addr->address_length = IPV4_ADDRESS_LENGTH;
-		src_addr->port = (word)SWAP2(socket_address.sin_port);
+		src_addr->port = (word)ntohs(socket_address.sin_port); /* port: was SWAP2 */
 	}
 
 	return result;
@@ -1628,8 +1624,8 @@ long write_to_endpoint(
 		ep && buffer && (length > 0) && dest_addr);
 	match_assert(TRANSPORT_ENDPOINT_WINSOCK_FILE, 0x3BE, transport_initialized);
 
-	socket_address.sin_addr.s_addr = SWAP4(dest_addr->address.long_words[0]);
-	socket_address.sin_port = (word)SWAP2(dest_addr->port);
+	socket_address.sin_addr.s_addr = htonl(dest_addr->address.long_words[0]); /* port: was SWAP4, right only on little-endian */
+	socket_address.sin_port = (word)htons(dest_addr->port); /* port: was SWAP2 */
 	socket_address.sin_family = AF_INET;
 
 	if (ep->socket == INVALID_SOCKET)
