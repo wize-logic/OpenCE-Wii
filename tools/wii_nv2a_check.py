@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Checks the vertex programs compiled ahead of time against the interpreter, on the host
-(port/wii/tests/nv2a_native_check.c, port/wii/tools/nv2a_codegen.c).
+(port/wii/tests/nv2a_native_check.c, port/wii/tools/nv2a_codegen.c), then the models' lighting
+on GX's lights against the programs on the interpreter (port/wii/tests/gx_lighting_check.c,
+port/wii/src/gx_lighting.c: display.gx_lighting).
 
 usage: tools/wii_nv2a_check.py
 """
@@ -24,7 +26,12 @@ def main() -> int:
     subprocess.run([str(work / "nv2a_codegen"), str(MICROCODE), str(work / "nv2a_programs.c")], check=True)
     subprocess.run([*compile_flags, "-o", str(work / "nv2a_native_check"), str(wii / "tests" / "nv2a_native_check.c"),
                     str(wii / "src" / "nv2a_cpu.c"), str(work / "nv2a_programs.c"), "-lm"], check=True)
-    return subprocess.run([str(work / "nv2a_native_check"), str(MICROCODE)]).returncode
+    native = subprocess.run([str(work / "nv2a_native_check"), str(MICROCODE)]).returncode
+    subprocess.run([*compile_flags, "-DNV2A_CPU_NO_NATIVES", "-o", str(work / "gx_lighting_check"),
+                    str(wii / "tests" / "gx_lighting_check.c"), str(wii / "src" / "gx_lighting.c"),
+                    str(wii / "src" / "nv2a_cpu.c"), "-lm"], check=True)
+    lighting = subprocess.run([str(work / "gx_lighting_check"), str(MICROCODE)]).returncode
+    return native or lighting
 
 
 if __name__ == "__main__":

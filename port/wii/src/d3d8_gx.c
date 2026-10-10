@@ -44,6 +44,7 @@ int: libogc's is renamed while its headers are read) */
 
 #include "gx_psh.h"
 #include "gx_psh_cache.h"
+#include "gx_lighting.h"
 #include "port_config.h"
 #include "nv2a_cpu_native.h"
 #include "wii_memory.h"
@@ -77,6 +78,8 @@ void d3d8_state_defaults(void);
 #define DEVICE_VERTEX_FORMAT GX_VTXFMT7
 /* (the game's own vertices, indexed: draw_hardware) */
 #define HARDWARE_VERTEX_FORMAT GX_VTXFMT6
+/* (the view's sphere maps' grids: sphere_bake) */
+#define SPHERE_BAKE_VERTEX_FORMAT GX_VTXFMT5
 /* bytes of decoded textures kept (in the game's heap) */
 #define TEXTURE_CACHE_BYTES (1536UL * 1024UL)
 #define TEXTURE_CACHE_ENTRIES 128
@@ -2278,6 +2281,8 @@ struct gx_vertex
 	u8 color0[4], color1[4];
 	float texcoord[4][2];
 	float fog;
+	/* (a lit draw's: the processor's skinned normal, in the world) */
+	float normal[3];
 };
 
 /* what a processor's draw computes of each vertex: what vertex_emit sends
@@ -3845,9 +3850,17 @@ static BOOL node_keys(const struct vertex_shader_object *shader, const struct st
 	unsigned short seen[256 + BLEND_VALUES];
 	unsigned seen_count = 0, which;
 	struct node_values values;
+	/* (each vertex's value, from the first pass to the second; in the heap) */
+	static short *values_of;
 
 	if (count > sizeof(vertex_keys))
 		return FALSE;
+	if (!values_of)
+	{
+		values_of = malloc(sizeof(vertex_keys) * sizeof(*values_of));
+		if (!values_of)
+			return FALSE;
+	}
 	memset(indices_of, 0, sizeof(indices_of));
 	values.blend_count = values.last = 0;
 	for (vertex = 0; vertex < count; vertex++)
@@ -3856,6 +3869,7 @@ static BOOL node_keys(const struct vertex_shader_object *shader, const struct st
 			fetch->first + vertex;
 		int value = vertex_value(&values, nodes + whole * node_stride, weights + whole * weight_stride, TRUE);
 
+		values_of[vertex] = (short)value;
 		if (value < 0)
 			untracked++;
 		else if (!indices_of[value]++)
@@ -3890,9 +3904,9 @@ static BOOL node_keys(const struct vertex_shader_object *shader, const struct st
 	draw_keys.processor = 0;
 	for (vertex = 0; vertex < count; vertex++)
 	{
-		unsigned long whole = fetch->indices ? (unsigned long)fetch->indices[vertex] + device.base_vertex_index :
-			fetch->first + vertex;
-		int value = vertex_value(&values, nodes + whole * node_stride, weights + whole * weight_stride, FALSE);
+		/* (as the first pass found it: a blend it could not add is untracked
+		in both) */
+		int value = values_of[vertex];
 		unsigned char key = value < 0 ? KEY_PROCESSOR : key_of[value];
 
 		vertex_keys[vertex] = key;
@@ -4064,6 +4078,458 @@ static unsigned long long hardware_key(const struct vertex_shader_object *shader
 	return hash ? hash : 1;
 }
 
+/* ---------- the models' lighting on GX's lights
+
+A lit model's colours (its normal's lighting) and its reflection's sphere
+map coordinates are the processor's, vertex by vertex, on the path above:
+the lighting, the skinning of the normal, the reflection and the sphere
+map's square roots are most of the program. With display.gx_lighting, the
+programs gx_lighting.c has a recipe for (the models' lit permutations) are
+lit by GX's lights, and their reflection read through GX's texture
+coordinates from the normal (gx_lighting.c says how, and how close it is):
+- the position matrices make E (gx_lighting_space: the device's (x w, y w,
+  -w) is K E, K then in the projection), and their normal matrices E's
+  turn, as GX lights in the space its position matrices make;
+- the normal is sent with each vertex, three floats from the map's 11:11:10
+  word (as the programs read it), or the processor's skinned one for a
+  vertex whose position is the processor's (it goes through GX_PNMTX0,
+  then K's inverse, the normal through the world's turn to E);
+- COLOR0 is D0's colour, COLOR1A1 D1 (the Fresnel colour); D0's alpha is 0,
+  or the planar fog's, the processor's (a world position's, by each node's
+  matrix), sent as the vertex's colour;
+- texture coordinate 3 (the reflection's cube map) is made of the normal by
+  a matrix for each node (texture matrix rows LIT_SPHERE_ROW on, given with
+  each vertex as its position matrix is), into a sphere map of the view:
+  drawn from the world's in the EFB's rows below the back buffer
+  (sphere_bake), for each cube map and direction of a draw from the eye
+  (rounded to LIT_SPHERE_STEP), once a frame. */
+
+/* (config.toml's display.gx_lighting; -1 not read yet) */
+static int gx_lighting_on = -1;
+/* the view frames' rounding (tests/gx_lighting_check.c's REFLECTION_STEP) */
+#define LIT_SPHERE_STEP (15.0f * 3.14159265f / 180.0f)
+/* the texture matrices of the normal's sphere map coordinates: a node's
+(two rows each, past the stages' TEXMTX0 to TEXMTX4), and those of the
+processor's vertices (texture coordinate 3's own) */
+#define LIT_SPHERE_ROW 45
+#define LIT_SPHERE_PROCESSOR_ROW (GX_TEXMTX0 + 3 * 3)
+/* the view's sphere maps: kept for the frame, and the most made in one */
+#define SPHERE_BAKES 16
+#define SPHERE_BAKES_A_FRAME 48
+/* the first row of the EFB below the back buffer, where they are drawn */
+#define SPHERE_BAKE_ROW SCREEN_HEIGHT
+
+static struct
+{
+	const struct gx_lighting_recipe *recipe;
+	/* what GX makes: the colours, the reflection */
+	BOOL colors, reflection;
+	/* D0's alpha the processor's (the fog) */
+	BOOL alpha;
+	struct gx_lighting_space space;
+	struct gx_lighting lighting;
+	/* each key's rows in E, and in the world (for the fog) */
+	Mtx rows[MATRIX_KEYS];
+	float world[MATRIX_KEYS][3][4];
+	/* the view's frame, E's turn to it */
+	float frame[3][3], turn[3][3];
+	GXTexObj sphere;
+	/* the normal's element */
+	const unsigned char *normals;
+	UINT normal_stride;
+	BOOL normal_packed;
+} lit;
+
+/* in the statistics' window: draws lit, their vertices, the draws refused
+(no space, lights beyond GX's), sphere maps drawn */
+static unsigned long lit_draws, lit_vertices, lit_refused, sphere_bakes_made;
+
+static struct
+{
+	const void *texels;
+	float frame[3][3], scale;
+	unsigned long frame_number;
+	void *buffer;
+} sphere_bakes[SPHERE_BAKES];
+static unsigned sphere_bakes_next;
+static unsigned long sphere_bakes_frame, sphere_bakes_in_frame;
+
+/* the view's sphere map of the world's (bound to texture map 3 by the
+draw: textures_bind) for the frame, drawn now if not yet this frame. GX's
+state the draw set (draw_prepare's) is set again after. */
+static BOOL sphere_bake(const struct texture_entry *world, const float frame[3][3], float scale, GXTexObj *out)
+{
+	enum { GRID = 24, SIZE = GX_LIGHTING_SPHERE_SIZE };
+	unsigned which, row, column;
+	Mtx44 matrix;
+	static float coordinates[GRID + 1][GRID + 1][2];
+	void *buffer = NULL;
+
+	if (sphere_bakes_frame != device.frames)
+	{
+		sphere_bakes_frame = device.frames;
+		sphere_bakes_in_frame = 0;
+	}
+	for (which = 0; which < SPHERE_BAKES; which++)
+		if (sphere_bakes[which].buffer && sphere_bakes[which].frame_number == device.frames &&
+			sphere_bakes[which].texels == world->texels && sphere_bakes[which].scale == scale &&
+			!memcmp(sphere_bakes[which].frame, frame, sizeof(sphere_bakes[which].frame)))
+		{
+			buffer = sphere_bakes[which].buffer;
+			break;
+		}
+	if (!buffer)
+	{
+		if (sphere_bakes_in_frame >= SPHERE_BAKES_A_FRAME)
+			return FALSE;
+		which = sphere_bakes_next++ % SPHERE_BAKES;
+		if (!sphere_bakes[which].buffer)
+		{
+			sphere_bakes[which].buffer = aligned_alloc(32, SIZE * SIZE * 4);
+			if (!sphere_bakes[which].buffer)
+				return FALSE;
+		}
+		buffer = sphere_bakes[which].buffer;
+		sphere_bakes[which].texels = world->texels;
+		memcpy(sphere_bakes[which].frame, frame, sizeof(sphere_bakes[which].frame));
+		sphere_bakes[which].scale = scale;
+		sphere_bakes[which].frame_number = device.frames;
+		sphere_bakes_in_frame++;
+		sphere_bakes_made++;
+
+		/* each grid point's place on the world's sphere map */
+		for (row = 0; row <= GRID; row++)
+			for (column = 0; column <= GRID; column++)
+				gx_lighting_sphere_texel(frame, scale, (float)column / GRID, (float)row / GRID, coordinates[row][column]);
+		/* the grid over the rows below the back buffer, the world's sphere map
+		(texture map 3) on it */
+		GX_SetViewport(0.0f, (f32)SPHERE_BAKE_ROW, SIZE, SIZE, 0.0f, 1.0f);
+		GX_SetScissor(0, SPHERE_BAKE_ROW, SIZE, SIZE);
+		memset(matrix, 0, sizeof(matrix));
+		matrix[0][0] = 2.0f;
+		matrix[0][3] = -1.0f;
+		matrix[1][1] = -2.0f;
+		matrix[1][3] = 1.0f;
+		/* (depth -1/2, inside GX's clip-space -1 to 0) */
+		matrix[2][3] = -0.5f;
+		matrix[3][3] = 1.0f;
+		GX_LoadProjectionMtx(matrix, GX_ORTHOGRAPHIC);
+		projection_valid = FALSE;
+		GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+		GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
+		GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+		GX_SetColorUpdate(GX_TRUE);
+		GX_SetAlphaUpdate(GX_TRUE);
+		GX_SetCullMode(GX_CULL_NONE);
+		indirect_apply(NULL);
+		GX_SetNumTevStages(1);
+		GX_SetTevSwapModeTable(GX_TEV_SWAP0, GX_CH_RED, GX_CH_GREEN, GX_CH_BLUE, GX_CH_ALPHA);
+		GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP3, GX_COLORNULL);
+		GX_SetTevSwapMode(GX_TEVSTAGE0, GX_TEV_SWAP0, GX_TEV_SWAP0);
+		GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+		/* (x and y over 0 to 1: the projection's) */
+		GX_ClearVtxDesc();
+		GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+		GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+		GX_SetVtxAttrFmt(SPHERE_BAKE_VERTEX_FORMAT, GX_VA_POS, GX_POS_XY, GX_F32, 0);
+		GX_SetVtxAttrFmt(SPHERE_BAKE_VERTEX_FORMAT, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+		GX_SetCurrentMtx(GX_PNMTX0);
+		GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
+		transform_hardware = TRUE;
+		for (row = 0; row < GRID; row++)
+		{
+			GX_Begin(GX_TRIANGLESTRIP, SPHERE_BAKE_VERTEX_FORMAT, 2 * (GRID + 1));
+			for (column = 0; column <= GRID; column++)
+			{
+				GX_Position2f32((f32)column / GRID, (f32)row / GRID);
+				GX_TexCoord2f32(coordinates[row][column][0], coordinates[row][column][1]);
+				GX_Position2f32((f32)column / GRID, (f32)(row + 1) / GRID);
+				GX_TexCoord2f32(coordinates[row + 1][column][0], coordinates[row + 1][column][1]);
+			}
+			GX_End();
+		}
+		efb_copy_filter(FALSE);
+		DCInvalidateRange(buffer, SIZE * SIZE * 4);
+		GX_SetTexCopySrc(0, SPHERE_BAKE_ROW, SIZE, SIZE);
+		GX_SetTexCopyDst(SIZE, SIZE, GX_TF_RGBA8, GX_FALSE);
+		GX_CopyTex(buffer, GX_FALSE);
+		GX_PixModeSync();
+		efb_copy_filter(TRUE);
+		GX_InvalidateTexAll();
+		/* the draw's own state again */
+		GX_SetViewport(0.0f, 0.0f, SCREEN_WIDTH, SCREEN_HEIGHT, 0.0f, 1.0f);
+		GX_SetScissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+		states_apply();
+		gx_psh_apply(pixel_shader_program);
+		indirect_apply(pixel_shader_program);
+	}
+	GX_InitTexObj(out, buffer, SIZE, SIZE, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObjFilterMode(out, GX_LINEAR, GX_LINEAR);
+	return TRUE;
+}
+
+/* the world's rows of E's (the inverse of the world's to E, a turn and a
+scale: its transpose over sigma squared) */
+static void lit_world_rows(const Mtx rows, float out[3][4])
+{
+	const struct gx_lighting_space *space = &lit.space;
+	float scale = 1.0f / (space->sigma * space->sigma);
+	int row, column, k;
+
+	for (row = 0; row < 3; row++)
+		for (column = 0; column < 4; column++)
+		{
+			float value = 0.0f;
+
+			for (k = 0; k < 3; k++)
+				value += space->world_to_eye[k][row] *
+					(rows[k][column] - (column == 3 ? space->world_to_eye[k][3] : 0.0f));
+			out[row][column] = value * scale;
+		}
+}
+
+/* the normal of a vertex of the draw's buffer, as the program reads it */
+static inline void lit_normal(UINT whole, float out[3])
+{
+	const unsigned char *source = lit.normals + whole * lit.normal_stride;
+
+	if (lit.normal_packed)
+	{
+		u32 word;
+
+		memcpy(&word, source, sizeof(word));
+		out[0] = packed_elevens[word & 0x7FF];
+		out[1] = packed_elevens[(word >> 11) & 0x7FF];
+		out[2] = packed_tens[word >> 22];
+	}
+	else
+	{
+		word_copy(&out[0], source);
+		word_copy(&out[1], source + 4);
+		word_copy(&out[2], source + 8);
+	}
+}
+
+/* GX's lights and channels for the draw (lit.lighting) */
+static void lit_lights_load(const float d1_constant[4])
+{
+	const struct gx_lighting *lighting = &lit.lighting;
+	unsigned index;
+	u8 masks[2] = { 0, 0 };
+
+	for (index = 0; index < lighting->light_count; index++)
+	{
+		const struct gx_lighting_light *light = &lighting->lights[index];
+		GXLightObj object;
+
+		GX_InitLightPos(&object, light->position[0], light->position[1], light->position[2]);
+		GX_InitLightDir(&object, light->direction[0], light->direction[1], light->direction[2]);
+		GX_InitLightColor(&object, (GXColor){ light->color[0], light->color[1], light->color[2], light->color[3] });
+		GX_InitLightAttn(&object, light->a[0], light->a[1], light->a[2], light->k[0], light->k[1], light->k[2]);
+		GX_LoadLightObj(&object, (u8)(GX_LIGHT0 << index));
+	}
+	for (index = 0; index < 2; index++)
+	{
+		unsigned light;
+
+		for (light = 0; light < lighting->light_count; light++)
+			if (lighting->masks[index] & (1u << light))
+				masks[index] |= (u8)(GX_LIGHT0 << light);
+	}
+	GX_SetChanCtrl(GX_COLOR0, GX_ENABLE, GX_SRC_REG, GX_SRC_REG, masks[0], GX_DF_CLAMP, GX_AF_SPOT);
+	GX_SetChanAmbColor(GX_COLOR0A0, (GXColor){ lighting->ambient[0][0], lighting->ambient[0][1],
+		lighting->ambient[0][2], 255 });
+	/* (D0's alpha: 0, or the vertex's) */
+	GX_SetChanMatColor(GX_COLOR0A0, (GXColor){ 255, 255, 255, 0 });
+	GX_SetChanCtrl(GX_ALPHA0, GX_DISABLE, GX_SRC_REG, lit.alpha ? GX_SRC_VTX : GX_SRC_REG, GX_LIGHTNULL, GX_DF_NONE,
+		GX_AF_NONE);
+	if (lighting->fresnel)
+	{
+		GX_SetChanCtrl(GX_COLOR1A1, GX_ENABLE, GX_SRC_REG, GX_SRC_REG, masks[1], GX_DF_SIGNED, GX_AF_SPOT);
+		GX_SetChanAmbColor(GX_COLOR1A1, (GXColor){ lighting->ambient[1][0], lighting->ambient[1][1],
+			lighting->ambient[1][2], lighting->ambient[1][3] });
+		GX_SetChanMatColor(GX_COLOR1A1, (GXColor){ 255, 255, 255, 255 });
+	}
+	else
+	{
+		GX_SetChanCtrl(GX_COLOR1A1, GX_DISABLE, GX_SRC_REG, GX_SRC_REG, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+		GX_SetChanMatColor(GX_COLOR1A1, (GXColor){ color_byte(d1_constant[0]), color_byte(d1_constant[1]),
+			color_byte(d1_constant[2]), color_byte(d1_constant[3]) });
+	}
+}
+
+/* the texture matrix of the sphere map's coordinates of a normal through
+rows (E's): the frame's x and y of it, made unit by the rows' scale, as 0
+to 1 */
+static void lit_sphere_matrix(const float rows[3][4], u32 id)
+{
+	Mtx matrix;
+	float scale = 0.0f, length;
+	int row, column, k;
+
+	for (row = 0; row < 3; row++)
+		scale += sqrtf(rows[row][0] * rows[row][0] + rows[row][1] * rows[row][1] + rows[row][2] * rows[row][2]);
+	length = scale > 1.0e-12f ? 3.0f / scale : 0.0f;
+	memset(matrix, 0, sizeof(matrix));
+	for (row = 0; row < 2; row++)
+	{
+		for (column = 0; column < 3; column++)
+		{
+			float value = 0.0f;
+
+			for (k = 0; k < 3; k++)
+				value += lit.turn[row][k] * rows[k][column];
+			matrix[row][column] = 0.5f * length * value;
+		}
+		matrix[row][3] = 0.5f;
+	}
+	GX_LoadTexMtxImm(matrix, id, GX_MTX2x4);
+}
+
+/* whether the draw is lit on GX (lit), found before its matrices: its
+program has a recipe and the setting is on, and what GX would make of it
+the processor otherwise computes for each vertex */
+static BOOL lit_choose(const struct nv2a_cpu_program *program, const struct vertex_shader_object *shader,
+	const struct stream_fetch *fetch, BOOL cpu_colors, unsigned cpu_spheres)
+{
+	const struct vertex_element *normal;
+
+	lit.recipe = NULL;
+	lit.colors = lit.reflection = lit.alpha = FALSE;
+	if (gx_lighting_on < 0)
+		gx_lighting_on = config_boolean("display.gx_lighting") ? 1 : 0;
+	if (!gx_lighting_on || !(cpu_colors || (cpu_spheres & 8)))
+		return FALSE;
+	lit.recipe = gx_lighting_recipe_find(program->hash);
+	if (!lit.recipe)
+		return FALSE;
+	normal = element_of(shader, 1);
+	if (!normal || (normal->type != D3DVSDT_NORMPACKED3 && normal->type != D3DVSDT_FLOAT3) ||
+		!fetch->streams[normal->stream & (MAXIMUM_STREAMS - 1)])
+		return FALSE;
+	lit.normals = fetch->streams[normal->stream & (MAXIMUM_STREAMS - 1)] + normal->offset;
+	lit.normal_stride = device.streams[normal->stream & (MAXIMUM_STREAMS - 1)].stride;
+	lit.normal_packed = normal->type == D3DVSDT_NORMPACKED3;
+	lit.colors = cpu_colors;
+	/* (the reflection: the world's sphere map, of a pixel shader GX holds,
+	drawn into the back buffer, below which its view's is drawn) */
+	lit.reflection = (cpu_spheres & 8) && gx_lighting_recipe_reflects(lit.recipe) && bound_entries[3] &&
+		bound_entries[3]->sphere && pixel_shader_usable && device.render_target == &device.back_buffer;
+	return lit.colors || lit.reflection;
+}
+
+/* the draw's lights, matrices in E and view's sphere map, once its keys'
+matrices are made (FALSE: the processor's after all) */
+static BOOL lit_prepare(const struct vertex_shader_object *shader, struct stream_fetch *fetch, int position_register,
+	BOOL keyed, UINT first_vertex)
+{
+	const float (*constants)[4] = (const float (*)[4])device.vertex_constants + VERTEX_CONSTANT_BIAS;
+	const struct vertex_element *position_element = element_of(shader, position_register);
+	const unsigned char *positions;
+	float point[3], center[3];
+	unsigned key, keys = keyed ? draw_keys.count : 1;
+	UINT whole;
+	int row;
+
+	if (!gx_lighting_space_make(constants, &lit.space))
+		return FALSE;
+	for (key = 0; key < keys; key++)
+		gx_lighting_space_rows(&lit.space, (const float (*)[4])(keyed ? draw_keys.rows[key] : position_matrix_rows),
+			lit.rows[key]);
+	/* (the draw's center: a vertex of its first key) */
+	whole = keyed ? draw_keys.representative[0] : first_vertex;
+	whole = fetch->indices ? (UINT)fetch->indices[whole] + device.base_vertex_index : fetch->first + whole;
+	positions = fetch->streams[position_element->stream & (MAXIMUM_STREAMS - 1)] + position_element->offset;
+	word_copy(&point[0], positions + whole * device.streams[position_element->stream & (MAXIMUM_STREAMS - 1)].stride);
+	word_copy(&point[1], positions + whole * device.streams[position_element->stream & (MAXIMUM_STREAMS - 1)].stride + 4);
+	word_copy(&point[2], positions + whole * device.streams[position_element->stream & (MAXIMUM_STREAMS - 1)].stride + 8);
+	for (row = 0; row < 3; row++)
+		center[row] = lit.rows[0][row][0] * point[0] + lit.rows[0][row][1] * point[1] + lit.rows[0][row][2] * point[2] +
+			lit.rows[0][row][3];
+	if (!gx_lighting_make(lit.recipe, constants, &lit.space, center, &lit.lighting))
+		return FALSE;
+	lit.alpha = lit.colors && lit.lighting.alpha != _gx_lighting_alpha_zero;
+	if (lit.alpha)
+		for (key = 0; key < keys; key++)
+			lit_world_rows(lit.rows[key], lit.world[key]);
+	if (lit.reflection)
+	{
+		float toward[3];
+
+		for (row = 0; row < 3; row++)
+			toward[row] = lit.space.eye[row] - center[row];
+		gx_lighting_view_frame(&lit.space, toward, LIT_SPHERE_STEP, lit.frame, lit.turn);
+		if (!sphere_bake(bound_entries[3], (const float (*)[3])lit.frame, lit.lighting.reflection_scale, &lit.sphere))
+			lit.reflection = FALSE;
+	}
+	return lit.colors || lit.reflection;
+}
+
+/* GX's state for a lit draw: E's matrices (the normal's too) and
+projection, the normal, the lights and the sphere map's coordinates
+(after position_matrix_load and the texture coordinates' generation) */
+static void lit_state(BOOL keyed, const struct draw_projection *projection, const float d1_constant[4])
+{
+	float matrix[4][4];
+	unsigned key, keys = keyed ? draw_keys.count : 1;
+
+	gx_lighting_space_projection(&lit.space, SCREEN_WIDTH, SCREEN_HEIGHT, projection->a, projection->b, matrix);
+	GX_LoadProjectionMtx(matrix, GX_PERSPECTIVE);
+	projection_valid = FALSE;
+	for (key = 0; key < keys; key++)
+	{
+		GX_LoadPosMtxImm(lit.rows[key], (u32)(GX_PNMTX1 + 3 * key));
+		GX_LoadNrmMtxImm(lit.rows[key], (u32)(GX_PNMTX1 + 3 * key));
+	}
+	if (draw_keys.processor)
+	{
+		/* (the processor's (x w, y w, -w) through K's inverse; its normal, the
+		world's, through the world's turn to E) */
+		Mtx inverse, turn;
+		int row;
+
+		memset(inverse, 0, sizeof(inverse));
+		inverse[0][0] = 1.0f / lit.space.k00;
+		inverse[0][2] = -lit.space.k02 / lit.space.k00;
+		inverse[1][1] = 1.0f / lit.space.k11;
+		inverse[1][2] = -lit.space.k12 / lit.space.k11;
+		inverse[2][2] = 1.0f;
+		GX_LoadPosMtxImm(inverse, GX_PNMTX0);
+		for (row = 0; row < 3; row++)
+			memcpy(turn[row], lit.space.world_to_eye[row], sizeof(turn[row]));
+		GX_LoadNrmMtxImm(turn, GX_PNMTX0);
+	}
+	GX_SetVtxDesc(GX_VA_NRM, GX_DIRECT);
+	GX_SetVtxAttrFmt(HARDWARE_VERTEX_FORMAT, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
+	if (lit.colors)
+	{
+		lit_lights_load(d1_constant);
+		if (lit.alpha)
+		{
+			GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+			GX_SetVtxAttrFmt(HARDWARE_VERTEX_FORMAT, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+		}
+	}
+	if (lit.reflection)
+	{
+		for (key = 0; key < keys; key++)
+			lit_sphere_matrix((const float (*)[4])lit.rows[key], LIT_SPHERE_ROW + 2 * key);
+		if (draw_keys.processor)
+		{
+			float rows[3][4];
+			int row;
+
+			for (row = 0; row < 3; row++)
+				memcpy(rows[row], lit.space.world_to_eye[row], sizeof(rows[row]));
+			lit_sphere_matrix((const float (*)[4])rows, LIT_SPHERE_PROCESSOR_ROW);
+		}
+		if (keyed)
+			GX_SetVtxDesc(GX_VA_TEX3MTXIDX, GX_DIRECT);
+		GX_SetTexCoordGen(GX_TEXCOORD3, GX_TG_MTX2x4, GX_TG_NRM, LIT_SPHERE_ROW);
+		GX_LoadTexObj(&lit.sphere, GX_TEXMAP3);
+	}
+}
+
 /* why a program's draws stay on the processor: once a program, for the log */
 static BOOL hardware_rejected(const struct nv2a_cpu_program *program, const char *reason)
 {
@@ -4101,7 +4567,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	struct draw_projection projection;
 	/* (position_read: a stage reads a coordinate GX makes from the position,
 	which a vertex the processor transforms does not give it) */
-	BOOL fogged = FALSE, cpu_colors = FALSE, position_read = FALSE, keyed;
+	BOOL fogged = FALSE, cpu_colors = FALSE, position_read = FALSE, keyed, lit_on;
 	const unsigned char *position_stream;
 	UINT position_stride;
 	unsigned long long key;
@@ -4219,6 +4685,9 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	}
 	if (draw_keys.processor && (position_read || fogged))
 		return hardware_rejected(program, "a texture coordinate or the fog from the position, with blended vertices");
+	/* (the colours and reflection GX's lights and normals can make:
+	display.gx_lighting) */
+	lit_on = lit_choose(program, shader, fetch, cpu_colors, cpu_spheres);
 	/* the vertices' range: GX's indices are 16 bits */
 	for (vertex = 0; vertex < count; vertex++)
 	{
@@ -4357,6 +4826,18 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	is the cache's) */
 	if (keyed && !position_keys(shader, program, fetch, position_register, point_size))
 		return hardware_rejected(program, "no depth to fit for a model's node");
+	if (lit_on && !lit_prepare(shader, fetch, position_register, keyed, 0))
+	{
+		lit_on = FALSE;
+		lit_refused++;
+	}
+	if (lit_on)
+	{
+		if (lit.colors)
+			cpu_colors = FALSE;
+		if (lit.reflection)
+			cpu_spheres &= ~8U;
+	}
 	position_stream = fetch->streams[position_element->stream & (MAXIMUM_STREAMS - 1)] + position_element->offset;
 	position_stride = device.streams[position_element->stream & (MAXIMUM_STREAMS - 1)].stride;
 	if (position_stride > 255)
@@ -4424,7 +4905,13 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	}
 	if (cpu_spheres)
 		hardware_sphere_draws++;
-	if (cpu_colors)
+	if (lit_on)
+		lit_state(keyed, &projection, base.d1);
+	if (lit_on && lit.colors)
+	{
+		/* (the colours: GX's lights, lit_state) */
+	}
+	else if (cpu_colors)
 	{
 		/* the colours: the processor's, sent with each vertex */
 		GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
@@ -4474,6 +4961,8 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 
 		if (keyed)
 			GX_MatrixIndex1x8((u8)(processor ? GX_PNMTX0 : GX_PNMTX1 + 3 * vertex_keys[vertex]));
+		if (lit_on && lit.reflection && keyed)
+			GX_MatrixIndex1x8((u8)(processor ? LIT_SPHERE_PROCESSOR_ROW : LIT_SPHERE_ROW + 2 * vertex_keys[vertex]));
 		if (processor || cpu_colors || cpu_spheres)
 		{
 			/* what the processor computes of the vertex: its position (in
@@ -4505,6 +4994,25 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 							sphere_coordinates(out.t[stage], computed->texcoord[stage]);
 					if (cpu_spheres)
 						hardware_spheres_run++;
+					if (lit_on && processor)
+					{
+						/* (a lit draw's blended vertex: its normal and world position
+						by its own blend of the nodes, as the program skins them) */
+						const float (*constants)[4] = (const float (*)[4])device.vertex_constants + VERTEX_CONSTANT_BIAS;
+						float blend[3][4], world[3];
+						int row;
+
+						gx_lighting_skin(constants, inputs[NODE_INDICES], inputs[NODE_WEIGHT], blend);
+						for (row = 0; row < 3; row++)
+						{
+							computed->normal[row] = blend[row][0] * inputs[1][0] + blend[row][1] * inputs[1][1] +
+								blend[row][2] * inputs[1][2];
+							world[row] = blend[row][0] * inputs[0][0] + blend[row][1] * inputs[0][1] +
+								blend[row][2] * inputs[0][2] + blend[row][3];
+						}
+						if (lit.alpha)
+							computed->color0[3] = color_byte(gx_lighting_planar_fog(&lit.lighting, world));
+					}
 				}
 				else
 					nv2a_cpu_run_colors(program, (const float (*)[4])device.vertex_constants,
@@ -4535,6 +5043,41 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		}
 		else
 			GX_Position1x16(index);
+		if (lit_on)
+		{
+			/* the normal (the map's, or the processor's skinned one), and D0's
+			alpha where it is the fog's */
+			if (processor)
+				GX_Normal3f32(computed->normal[0], computed->normal[1], computed->normal[2]);
+			else
+			{
+				float normal[3];
+
+				lit_normal(whole, normal);
+				GX_Normal3f32(normal[0], normal[1], normal[2]);
+			}
+			if (lit.alpha)
+			{
+				u8 alpha;
+
+				if (processor)
+					alpha = computed->color0[3];
+				else
+				{
+					const float (*rows)[4] = (const float (*)[4])lit.world[keyed ? vertex_keys[vertex] : 0];
+					float model[3], world[3];
+					int row;
+
+					word_copy(&model[0], position_stream + whole * position_stride);
+					word_copy(&model[1], position_stream + whole * position_stride + 4);
+					word_copy(&model[2], position_stream + whole * position_stride + 8);
+					for (row = 0; row < 3; row++)
+						world[row] = rows[row][0] * model[0] + rows[row][1] * model[1] + rows[row][2] * model[2] + rows[row][3];
+					alpha = color_byte(gx_lighting_planar_fog(&lit.lighting, world));
+				}
+				GX_Color4u8(255, 255, 255, alpha);
+			}
+		}
 		if (cpu_colors)
 		{
 			/* (a colour's four bytes as one word: the same bytes in the FIFO) */
@@ -4548,6 +5091,19 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 				GX_TexCoord2f32(computed->texcoord[stage][0], computed->texcoord[stage][1]);
 	}
 	GX_End();
+	if (lit_on)
+	{
+		lit_draws++;
+		lit_vertices += count;
+		if (draw_keys.processor)
+		{
+			/* (GX_PNMTX0 the identity again, as the processor's draws take it) */
+			Mtx identity;
+
+			guMtxIdentity(identity);
+			GX_LoadPosMtxImm(identity, GX_PNMTX0);
+		}
+	}
 	hardware_draws++;
 	hardware_vertices += count;
 	if (keyed)
@@ -4812,6 +5368,9 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		platform_log("Direct3D: in hardware with the processor's sphere map coordinates: %lu draws, %lu vertices run",
 			hardware_sphere_draws, hardware_spheres_run);
 		hardware_sphere_draws = hardware_spheres_run = 0;
+		platform_log("Direct3D: lit by GX (display.gx_lighting): %lu draws, %lu vertices, %lu refused; %lu view sphere "
+			"maps drawn", lit_draws, lit_vertices, lit_refused, sphere_bakes_made);
+		lit_draws = lit_vertices = lit_refused = sphere_bakes_made = 0;
 		platform_log("Direct3D: textures not drawn: %lu without data, %lu of a shape, %lu of a format, "
 			"%lu without memory, %lu not decoded; %lu converted bitmaps found", texture_failures[_failure_no_data],
 			texture_failures[_failure_shape],
@@ -4831,6 +5390,8 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 				shaders.patched - shaders_last.patched, shaders.tests - shaders_last.tests,
 				shaders.tests_differ - shaders_last.tests_differ, shaders.generic - shaders_last.generic,
 				shaders.audited - shaders_last.audited, shaders.audits_differ - shaders_last.audits_differ);
+			platform_log("Direct3D: pixel shader structures pushed out of the cache: %lu, translated again: %lu",
+				shaders.evicted - shaders_last.evicted, shaders.again - shaders_last.again);
 			shaders_last = shaders;
 		}
 		efb.parks = efb.resolves = efb.skipped = 0;

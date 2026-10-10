@@ -1,4 +1,6 @@
 /* host stand-in for port/linux/src/platform.h: what gx_psh.c names (tests/gx_psh_check.c) */
+#ifndef HOST_PLATFORM_H
+#define HOST_PLATFORM_H
 #include <stdint.h>
 typedef uint32_t DWORD;
 typedef int BOOL;
@@ -10,3 +12,4 @@ enum {
  D3DRS_PSCOMPAREMODE = 42, D3DRS_PSFINALCOMBINERCONSTANT0 = 43, D3DRS_PSFINALCOMBINERCONSTANT1 = 44,
  D3DRS_PSRGBOUTPUTS0 = 45, D3DRS_PSCOMBINERCOUNT = 53, D3DRS_PS_MAX = 57, D3DRS_PSTEXTUREMODES = 116,
 };
+#endif

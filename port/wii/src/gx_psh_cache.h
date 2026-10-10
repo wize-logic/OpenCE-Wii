@@ -26,6 +26,9 @@ struct gx_psh_cache_counts
 	/* changed programs translated again to check them, and those that came
 	out otherwise (then translated for each set of constants) */
 	unsigned long audited, audits_differ;
+	/* structures pushed out of the cache by others, and structures
+	translated that had been (by their hash, of the last 256 pushed out) */
+	unsigned long evicted, again;
 };
 
 /* the program for the pixel shader render states and the textures (as
