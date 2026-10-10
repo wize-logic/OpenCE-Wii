@@ -10,10 +10,13 @@ This port is in bring-up. In Dolphin, the game boots from the SD card and loads 
   Autumn in about 11 seconds, plays its opening (the cryo bay, the look-training prompts), and
   survives a cinematic's skip, which reverts to the saved game. Ten minutes of it ran without a
   fault.
-- **Other levels**: a30, b30 and c10 load and play with the scripted player (a tour:
+- **Every campaign level** loads and plays with the scripted player, in Dolphin, without a
+  fault: a10, a30, a50, b30, b40, c10, c20, c40, d20 and d40 (a tour:
   `debug.network_test = "solo:levels\\a30\\a30,levels\\b30\\b30"` with
-  `debug.network_test_tour` seconds of game time in each). The outdoor levels run at about one
-  frame a second in Dolphin: their skinned characters' vertices are the CPU's.
+  `debug.network_test_tour` seconds of game time in each; give the menu
+  `debug.network_test_start = 15` seconds first, as its profile enumeration still reads ui.map's
+  tags for a few seconds). The outdoor levels run at about one frame a second in Dolphin: their
+  skinned characters' vertices are the CPU's.
 - **Loading**: the menu is up within a second of the game's start.
 - **Every map converts**: the 24 Xbox maps (campaign and multiplayer) go through
   `tools/wii_convert_maps.py` with nothing left unconverted.
