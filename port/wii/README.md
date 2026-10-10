@@ -148,9 +148,8 @@ inflated it to, and the Wii reads it where it is.
   - the compressed animations' floats, read a byte at a time (the 750 can trap on a misaligned
     float load)
   - values written at one width and read at another: a profile count passed as a `word *` to a
-    function that writes a word, a chicago shader's `extra_flags` (the tag's long), the pregame
-    start request (a long on the wire, filled as a long), the server's read of the start
-    request's short, and the textures the game writes itself (the device decodes them from a copy
+    function that writes a word, a chicago shader's `extra_flags` (the tag's long), the server's
+    read of the pregame start request (a short on the wire, decoded into a long's first two bytes), and the textures the game writes itself (the device decodes them from a copy
     in the Xbox's byte order)
 - **Floating point.** `_controlfp`/`_statusfp` map the MSVC control word onto the FPSCR
   (`port/linux/src/msvc_crt.c`).
@@ -407,9 +406,9 @@ Dolphin runs the game, but these need the console:
    - a profile count (`playlist_profiles_enumerate_available_to_local_player_index`) written as a
      word into a long, so the multiplayer game-type list read the other half;
    - a chicago shader's `extra_flags`, two words in the game's structure over the tag's long;
-   - the pregame start request: the client filled a short that the packet encodes as a long, and
-     the server's decoded short sat in the long's high half (the low 16 bits on the wire are
-     unchanged, so the network version stays);
+   - the pregame start request: the packet carries one short, which the server decodes into the
+     first two bytes of a long and read as the long's low half, its other half on big-endian
+     (nothing sent changes);
    - textures the game writes itself, decoded as if in the Xbox's byte order (`d3d8_gx.c`);
    - not big-endian: a shadow's bounding radius left unset in the mirror's window, which the
      object shadow pass then read (a NaN halted c40).
