@@ -271,6 +271,22 @@ static char const *data_00316820[] =
 
 /* ---------- private code */
 
+/* port: whether the tag index is one of the loaded map's tags, its salt and
+all (no assertion): what a sound or a string list kept from the menu's map
+across a map load, which its tag lookups would halt on, is checked with */
+boolean cache_tag_index_current(
+	long tag_index)
+{
+	short absolute_index = (short)tag_index;
+
+	if (tag_index == NONE || !cache_file_globals.tags_loaded || !global_tag_instances ||
+		absolute_index < 0 || absolute_index >= global_tag_count)
+	{
+		return FALSE;
+	}
+	return !(tag_index & 0xFFFF0000) || global_tag_instances[absolute_index].tag_index == tag_index;
+}
+
 static struct cache_file_tag_instance *cache_get_tag_instance(
 	long tag_index)
 {

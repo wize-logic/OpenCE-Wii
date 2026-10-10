@@ -260,7 +260,9 @@ wchar_t *unicode_string_list_get_string(long tag_index, short string_index)
 {
 	wchar_t *result = L"<missing string>";
 
-	if (tag_index != NONE)
+	/* port: a list of a map no longer loaded (the menu's, which its profile
+	enumeration reads on another thread while a level loads) has no strings */
+	if (tag_index != NONE && cache_tag_index_current(tag_index))
 	{
 		struct string_list *list = unicode_string_list_definition_get(tag_index);
 

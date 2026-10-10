@@ -3460,9 +3460,19 @@ static void update_channels(
 		if (channel->sound_index != NONE)
 		{
 			struct sound_datum *sound = sound_get(channel->sound_index);
-			struct sound_definition *definition =
-				sound_definition_get(sound->definition_index);
-			real fade = sound_calculate_fade(channel->sound_index);
+			struct sound_definition *definition;
+			real fade;
+
+			/* port: a sound the menu's map started as it was disposed of (a
+			button's) whose definition the next map does not have: stopped */
+			if (!cache_tag_index_current(sound->definition_index))
+			{
+				sound_stop(channel->sound_index);
+				channel->sound_index = NONE;
+				continue;
+			}
+			definition = sound_definition_get(sound->definition_index);
+			fade = sound_calculate_fade(channel->sound_index);
 
 			if (fade == 0.f && sound->fade_interpolation_end == 0.f)
 			{

@@ -130,6 +130,8 @@ void *tag_block_get_element_with_size(struct tag_block const *block, long index,
 long tag_loaded(long group_tag, const char *name);
 
 void *tag_get(long group_tag, long tag_index);
+/* port: whether the index is one of the loaded map's tags (cache_files.c) */
+boolean cache_tag_index_current(long tag_index);
 
 /* ---------- globals */
 
