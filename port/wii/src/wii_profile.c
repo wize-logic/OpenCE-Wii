@@ -82,6 +82,7 @@ struct profile_watch
 	unsigned long generation; /* maps seen: 1 is the first (the main menu's) */
 	int loading;
 	int reset_pending; /* a load seen, and the map's clock not yet */
+	int ready; /* the game has been initialized (game_globals exists) */
 	long last_time;
 };
 
@@ -155,9 +156,18 @@ static int profile_poll(struct profile_watch *watch, long *time_out)
 {
 	float progress;
 	long time = -1;
-	int loading = game_map_loading_in_progress(&progress) != 0;
+	int loading = 0;
 	int playing = 0;
 
+	*time_out = -1;
+	/* (game_initialize makes the game's globals just before the clock: until the clock is up, they are not there) */
+	if (!watch->ready)
+	{
+		if (!game_time_initialized())
+			return 0;
+		watch->ready = 1;
+	}
+	loading = game_map_loading_in_progress(&progress) != 0;
 	if (loading && !watch->loading)
 	{
 		watch->generation++;
