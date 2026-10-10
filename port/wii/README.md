@@ -283,9 +283,13 @@ and pixel shaders.
   - Draws whose w doesn't vary, such as the interface's, are drawn in screen space.
 - **Pixel shaders.** The register combiners are translated to TEV stages (`src/gx_psh.c`).
   - The stages are a WiiLibs TEV program (`wl/platform/tev.h`): its builder, register pool and
-    merging of what a stage's inputs need of its order. WiiLibs' validator checks each program
-    as it is translated (all but its refusal of a bias with `DIVIDE_2`, which GX computes), and
-    `wl_tev_apply_unchecked` sets it, with the swap tables it reads through.
+    merging of what a stage's inputs need of its order and konst selections. WiiLibs' validator
+    checks each program as it is translated, and `wl_tev_apply_unchecked` sets it, with the swap
+    tables it reads through.
+  - After translation, dead halves are removed, a half alone in its stage moves into another
+    stage's free half where nothing between depends on it, and each stage's order is reduced to
+    what it reads (`stages_compact`): about half the stages of the random set, three of the menu
+    planet's twelve, and fewer texture coordinates and colours asked of the vertices.
   - Combiner registers are renamed as they are written, and dead values are dropped.
   - Inputs a stage can't reach (a second texture or rasterized colour, a second constant, a
     doubly inverted product) are first computed into a free register, or into the operation's
