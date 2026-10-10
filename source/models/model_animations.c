@@ -2286,6 +2286,38 @@ static void animation_get_keyframe_rotation(
 	return;
 }
 
+
+/* port: a compressed animation's translations and scales follow its 16-bit
+sections without padding, at addresses 2 bytes off a long's: on the Xbox's
+processor that costs nothing, but the PowerPC 750's floating-point loads
+from such an address can raise an alignment exception. They are copied a
+byte at a time into aligned values first (volatile, so that the bytes are
+not loaded back into one floating-point load) */
+static real compressed_animation_real(
+	void const *address)
+{
+	volatile unsigned char const *bytes = (volatile unsigned char const *)address;
+	union
+	{
+		unsigned char bytes[sizeof(real)];
+		real value;
+	} copy;
+	short index;
+
+	for (index = 0; index < (short)sizeof(real); index++)
+		copy.bytes[index] = bytes[index];
+	return copy.value;
+}
+
+static void compressed_animation_point(
+	real_point3d const *address,
+	real_point3d *point)
+{
+	point->x = compressed_animation_real(&address->x);
+	point->y = compressed_animation_real(&address->y);
+	point->z = compressed_animation_real(&address->z);
+}
+
 static void animation_get_keyframe_translation(
 	struct animation const *animation,
 	real real_frame_index,
@@ -2339,7 +2371,7 @@ static void animation_get_keyframe_translation(
 
 	if (keyframe_count==0)
 	{
-		*translation = default_translations[node_index];
+		compressed_animation_point(&default_translations[node_index], translation);
 	}
 	else
 	{
@@ -2364,7 +2396,7 @@ static void animation_get_keyframe_translation(
 		frame) holds the last one */
 		if (frame_index>keyframe_frame_indices[keyframe_count-1])
 		{
-			*translation = keyframe_translations[keyframe_count-1];
+			compressed_animation_point(&keyframe_translations[keyframe_count-1], translation);
 			return;
 		}
 
@@ -2399,7 +2431,7 @@ static void animation_get_keyframe_translation(
 
 		if (real_frame_index==(real)this_keyframe_frame_index)
 		{
-			*translation = *this_keyframe;
+			compressed_animation_point(this_keyframe, translation);
 		}
 		else
 		{
@@ -2414,7 +2446,13 @@ static void animation_get_keyframe_translation(
 				1584,
 				real_frame_index< (real)next_keyframe_frame_index);
 
-			points_interpolate(this_keyframe, next_keyframe, fraction, translation);
+			{
+				real_point3d this_point, next_point;
+
+				compressed_animation_point(this_keyframe, &this_point);
+				compressed_animation_point(next_keyframe, &next_point);
+				points_interpolate(&this_point, &next_point, fraction, translation);
+			}
 		}
 	}
 
@@ -2473,7 +2511,7 @@ static void animation_get_keyframe_scale(
 
 	if (keyframe_count==0)
 	{
-		*scale = default_scales[adjusted_node_index];
+		*scale = compressed_animation_real(&default_scales[adjusted_node_index]);
 	}
 	else
 	{
@@ -2498,23 +2536,23 @@ static void animation_get_keyframe_scale(
 		frame) holds the last one */
 		if (frame_index>keyframe_frame_indices[keyframe_count-1])
 		{
-			*scale = keyframe_scales[keyframe_count-1];
+			*scale = compressed_animation_real(&keyframe_scales[keyframe_count-1]);
 			return;
 		}
 
 		if (frame_index<keyframe_frame_indices[0])
 		{
 			this_keyframe_frame_index = 0;
-			this_keyframe_scale = default_scales[adjusted_node_index];
+			this_keyframe_scale = compressed_animation_real(&default_scales[adjusted_node_index]);
 			next_keyframe_frame_index = keyframe_frame_indices[0];
-			next_keyframe_scale = keyframe_scales[0];
+			next_keyframe_scale = compressed_animation_real(&keyframe_scales[0]);
 		}
 		else if (frame_index==keyframe_frame_indices[keyframe_count-1])
 		{
 			this_keyframe_frame_index = keyframe_frame_indices[keyframe_count-1];
-			this_keyframe_scale = keyframe_scales[keyframe_count-1];
+			this_keyframe_scale = compressed_animation_real(&keyframe_scales[keyframe_count-1]);
 			next_keyframe_frame_index = this_keyframe_frame_index+1;
-			next_keyframe_scale = default_scales[adjusted_node_index];
+			next_keyframe_scale = compressed_animation_real(&default_scales[adjusted_node_index]);
 		}
 		else
 		{
@@ -2526,9 +2564,9 @@ static void animation_get_keyframe_scale(
 				keyframe_index>=0 && keyframe_index<keyframe_count-1);
 
 			this_keyframe_frame_index = keyframe_frame_indices[keyframe_index];
-			this_keyframe_scale = keyframe_scales[keyframe_index];
+			this_keyframe_scale = compressed_animation_real(&keyframe_scales[keyframe_index]);
 			next_keyframe_frame_index = keyframe_frame_indices[keyframe_index+1];
-			next_keyframe_scale = keyframe_scales[keyframe_index+1];
+			next_keyframe_scale = compressed_animation_real(&keyframe_scales[keyframe_index+1]);
 		}
 
 		if (real_frame_index==(real)this_keyframe_frame_index)
