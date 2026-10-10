@@ -60,8 +60,11 @@ image (with WiiLibs checked out beside the repository) and keeps it as an artifa
   Direct3D 11 backend has exited without a word on the game's longer TEV programs. Earlier
   "exits" in dual-core mode were another program's test runner killing every Dolphin; WiiLibs'
   runner now acts only on its own (its `--name` user folder).
-- `tools/wii_dolphin.py` reports how long a frame takes in emulated time, split into draws,
-  textures, pixel shaders, the end of the frame and the game, every 60 frames.
+- The game's log (`src/d3d8_gx.c`, not the runner) reports how long a frame takes in emulated time
+  every 60 frames, split into draws, textures, pixel shaders, the end of the frame and the game,
+  with the draws' split (GX's transform, the processor's, immediate) and the processor's
+  vertices (fetch, program, store, emit). A frame of more than half a second (loading, mostly)
+  gets a split of its own.
 
 ## Game data
 
@@ -139,6 +142,8 @@ inflated it to, and the Wii reads it where it is.
   - the script engine's value cells (`port/linux/include/halo_cells.h`)
   - the halves of `LARGE_INTEGER`
   - the recorded animations' bitfield header byte (rewritten by the converter)
+  - the compressed animations' floats, read a byte at a time (the 750 can trap on a misaligned
+    float load)
 - **Floating point.** `_controlfp`/`_statusfp` map the MSVC control word onto the FPSCR
   (`port/linux/src/msvc_crt.c`).
 - **Movies.** Bink movies are skipped (`source/bink/bink_playback.c`).
@@ -222,7 +227,7 @@ and pixel shaders.
     only what the stages read: the program skips instructions that reach no output sent
     (`nv2a_cpu_run_live`), and the texture scale, sphere map and fog table apply only where set.
   - At build time, `tools/nv2a_codegen.c` decodes the game's 67 programs with the interpreter's own
-    decoder (`src/nv2a_cpu.c`) and writes each one as a C function (126 KB of code). Each takes the
+    decoder (`src/nv2a_cpu.c`) and writes each one as a C function (about 180 KB of code). Each takes the
     outputs a draw reads, and runs an instruction only if it reaches one of them (found backwards
     from the end, a register's component at a time). A program is found by a hash of its words.
   - Square roots and ARL's floor give the libraries' results without their calls
@@ -343,7 +348,15 @@ Dolphin runs the game, but these need the console:
    - the script engine's narrow values in 32-bit cells (`HALO_CELL_AT`);
    - a material type read as a long's low word;
    - the network message size and an AI vocalization type;
-   - `list_get`'s element index (the lockstep check found it).
+   - `list_get`'s element index (the lockstep check found it);
+   - a data array's first salt, copied from the array's name as a short (`source/memory/data.c`),
+     which changed every identifier and what the game computes from them (a needle's wander, a
+     tree's frame; the lockstep check found it in b30);
+   - an object's damage flags, a word read as a byte (`actor_perception.c`,
+     `device_machines.c`), and `device_group_get`'s argument (`hs.c`): a dead target read as
+     alive, a corpse opening doors;
+   - the compressed animations' sections, swapped by the layout the decoder reads
+     (`tools/wii_animation_check.py` compares every animation).
 4. Real hardware, from the Homebrew Channel (`ninja wii-package`).
 5. CI. The workflow's `wii` job passes when run locally in the devkitpro/devkitppc image. On
    GitHub it builds against WiiLibs' `dolphin-tests-and-fixed-claims` branch, which needs this

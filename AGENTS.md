@@ -25,7 +25,7 @@ end.
 | `port/assets/` | What the builds embed or ship: high-res HUD (`hud/`), fonts, titles, menus (`menus/`), icons, network brokers |
 | `port/third_party/` | Vendored libraries, each with a README naming its upstream, version and checksum |
 | `port/tools/` | Stand-alone tools (`cache_file_report.c`) |
-| `tools/` | Build scripts (`linux_build.py`, `windows_build.py`, `android_build.py`, `ci_build.py`), generators (`ce_menus.py`, `port_settings.py`, `hud_assets.py`, `title_assets.py`, `embed_assets.py`, `xdk_headers.py`), the Wii's (`wii_build.py`, `wii_link.py`, `wii_package.py`, `wii_convert_maps.py`, `wii_tag_layout.py`, `wii_gx_textures.py`, `wii_dolphin.py`, `lockstep_compare.py`) and tests |
+| `tools/` | Build scripts (`linux_build.py`, `windows_build.py`, `android_build.py`, `ci_build.py`), generators (`ce_menus.py`, `port_settings.py`, `hud_assets.py`, `title_assets.py`, `embed_assets.py`, `xdk_headers.py`), the Wii's (`wii_build.py`, `wii_link.py`, `wii_package.py`, `wii_convert_maps.py`, `wii_tag_layout.py`, `wii_gx_textures.py`, `wii_dolphin.py`, `lockstep_compare.py`, and the host checks `wii_gx_psh_check.py`, `wii_nv2a_check.py`, `wii_animation_check.py`) and tests |
 | `docs/` | Longer design notes (`custom_edition_caches.md`) |
 | `pgo/` | Profile-guided optimisation profiles |
 | `assets/` | Game data for local runs (gitignored: `maps/`, `custom_maps/`) |
@@ -212,7 +212,9 @@ converted, how it draws, and the lockstep check.
 - Host checks that need no emulator: `python3 tools/wii_gx_psh_check.py`
   (the TEV translation against the combiners) and
   `python3 tools/wii_nv2a_check.py` (the generated vertex programs against
-  the interpreter).
+  the interpreter), both in the CI's `wii` job. `tools/wii_animation_check.py`
+  (every animation of the Xbox's maps against the converted ones) needs the
+  maps, so it is not in the CI.
 - Dolphin (`tools/wii_dolphin.py`, WiiLibs' `tools/dolphin_run.py`) opens a
   window on the desktop of the person you work for. Run it only at a
   checkpoint, say so first, keep one run at a time, give the runner's own
@@ -293,8 +295,9 @@ Owns the map conversion: `tools/wii_convert_maps.py`,
   bitmaps in GX's formats, and converts the data blocks whose contents are
   not plain fields (vertices, animations, recorded animations, script
   syntax, cluster visibility).
-- Its checks: every map converts (`--output` into a scratch folder, never
-  the repository); the notes it prints (fields left as they are that hold
+- Its checks: `tools/wii_animation_check.py` (every animation, value by
+  value, against the game's own reading); every map converts (`--output`
+  into a scratch folder, never the repository); the notes it prints (fields left as they are that hold
   data, data not reached by the walk); a converted structure read back
   against the game's own reading of it.
 - A field the game reads through another structure than its tag's (as the
@@ -315,7 +318,8 @@ can. Fixes are made by the main session or a `gx-renderer` or
 ### gx-renderer
 
 Owns the Wii's Direct3D device: `port/wii/src/d3d8_gx.c`, `gx_psh.c`,
-`nv2a_cpu.c`, `port/wii/tools/nv2a_codegen.c`.
+`nv2a_cpu.c`, `nv2a_cpu.h`, `nv2a_cpu_native.h`,
+`port/wii/tools/nv2a_codegen.c`.
 - Drawing must match the processor's path: a change to GX's transform is
   checked by an A/B of the same moment with `debug.gpu_transform = false`
   (a checkpoint run the main session makes).
