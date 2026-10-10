@@ -41,6 +41,7 @@ tools/wii_convert_maps.py XBOX/maps/ui.map XBOX/maps/bloodgulch.map   # into bui
 tools/wii_dolphin.py --seconds 300 --until "frame 360:"            # run it in Dolphin from WSL
 tools/wii_gx_psh_check.py                   # the combiner translation, checked on the host (WIILIBS=DIR)
 tools/wii_nv2a_check.py                     # the compiled vertex programs against the interpreter
+tools/wii_math_check.py                     # the Wii's sqrtf against the host's, bit for bit (--all: every float)
 tools/wii_animation_check.py --converted DIR XBOX/maps/*.map   # the converted maps against the Xbox's (map conversion, below)
 tools/wii_data_check.py --converted DIR XBOX/maps/*.map
 tools/wii_placeholder_check.py XBOX/maps/*.map    # the game reads none of the tag bytes left as they are
@@ -89,7 +90,15 @@ inflated it to, and the Wii reads it where it is.
   the other ports.
 - **Flags.** The ABI flags reproduce the MSVC/Xbox environment, as the Linux build's do:
   - `-msvr4-struct-return` is PowerPC's spelling of `-freg-struct-return`
-  - `-ffp-contract=off` because PowerPC has fused multiply-adds
+  - `-ffp-contract=off` because PowerPC has fused multiply-adds. Clang has let them through in a
+    function it does not optimise (`#pragma optimize("", off)`: `ai_handle_spatial_effect`,
+    `source/ai/ai.c`, now with `#pragma clang fp contract(off)`), so `ninja wii` reads the game's
+    objects for them (`tools/wii_fp_check.py`). The sound mixer (`dsound_sdl.c`) alone has them on
+    (`CONTRACTED_SOURCES`, `tools/wii_build.py`): its output only reaches the speakers, and they take
+    14% off its instructions
+  - `-fomit-frame-pointer`, unlike the x86 builds: PowerPC's frames are chained through each
+    frame's first word whether or not r31 holds a frame pointer, and that chain is what WiiLibs'
+    backtraces follow. Without one the game's code is 2.3% smaller
   - `-femulated-tls`: native thread-local storage would use r2, which the EABI gives the small
     data area. WiiLibs provides `__emutls_get_address` for each libogc thread.
 - **Prefix header.** `include/halo_wii_prefix.h` is force-included and wraps the Linux one. Its
@@ -155,7 +164,11 @@ inflated it to, and the Wii reads it where it is.
     read of the pregame start request (a short on the wire, decoded into a long's first two bytes), and the textures the game writes itself (the device decodes them from a copy
     in the Xbox's byte order)
 - **Floating point.** `_controlfp`/`_statusfp` map the MSVC control word onto the FPSCR
-  (`port/linux/src/msvc_crt.c`).
+  (`port/linux/src/msvc_crt.c`). The 750 has no square root instruction, and newlib's `sqrtf` works
+  a bit at a time (about 290 instructions); the link wraps it (`-Wl,--wrap=sqrtf`) with
+  `src/wii_math.c`'s, which refines `frsqrte`'s estimate and gives the same correctly rounded root
+  in about 60 (`tools/wii_math_check.py` checks every float). The game calls it for every vector's
+  length (`square_root`).
 - **Movies.** Bink movies are skipped (`source/bink/bink_playback.c`).
 - **Sound.** The shared DirectSound mixer (`port/linux/src/dsound_sdl.c`) fills WiiLibs' audio
   stream (AESND, 32 kHz). Every 240 frames the log reports blocks mixed and played, underruns,
