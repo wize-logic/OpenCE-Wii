@@ -187,6 +187,11 @@ exactly as the i386 build's, and none use C bitfields. A map is converted as fol
 
 The converter reports what it doesn't reach for each map.
 
+`tools/wii_animation_check.py --converted DIR map.map...` reads every animation of the Xbox's maps
+and of the converted ones as `source/models/model_animations.c` does (the frame info, the default
+data and frames, and the compressed data's header, node headers, keyframe frame indices,
+keyframes and defaults) and compares the values element by element.
+
 ## Drawing
 
 `src/d3d8_gx.c` is a Direct3D 8 device on GX. It keeps the game's own rasterizer and its vertex
