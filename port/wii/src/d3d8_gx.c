@@ -4530,6 +4530,75 @@ static void lit_state(BOOL keyed, const struct draw_projection *projection, cons
 	}
 }
 
+/* the vertices of a draw in hardware of which the processor computes nothing:
+each index's matrix indices (keyed: its value's position matrix, and with
+sphere_matrices its normal's sphere map matrix), its position and texture
+coordinates by index, and a lit draw's normal. A loop for each case, so
+that an index costs only what it sends. */
+static void emit_indices(const WORD *indices, UINT first, UINT count, unsigned texture_count, BOOL keyed, BOOL normals,
+	BOOL sphere_matrices)
+{
+	UINT base = indices ? device.base_vertex_index : first, vertex;
+
+/* (each index's own value, u16 index, then body) */
+#define EMIT_EACH(body) \
+	do { \
+		if (indices) \
+			for (vertex = 0; vertex < count; vertex++) \
+			{ \
+				u16 index = (u16)(indices[vertex] + base); \
+				body \
+			} \
+		else \
+			for (vertex = 0; vertex < count; vertex++) \
+			{ \
+				u16 index = (u16)(vertex + base); \
+				body \
+			} \
+	} while (0)
+
+	if (!keyed && !normals)
+	{
+		switch (texture_count)
+		{
+		case 0: EMIT_EACH(GX_Position1x16(index);); break;
+		case 1: EMIT_EACH(GX_Position1x16(index); GX_TexCoord1x16(index);); break;
+		case 2: EMIT_EACH(GX_Position1x16(index); GX_TexCoord1x16(index); GX_TexCoord1x16(index);); break;
+		case 3:
+			EMIT_EACH(GX_Position1x16(index); GX_TexCoord1x16(index); GX_TexCoord1x16(index); GX_TexCoord1x16(index););
+			break;
+		default:
+			EMIT_EACH(GX_Position1x16(index); GX_TexCoord1x16(index); GX_TexCoord1x16(index); GX_TexCoord1x16(index);
+				GX_TexCoord1x16(index););
+			break;
+		}
+		return;
+	}
+	EMIT_EACH(
+		unsigned stage;
+
+		if (keyed)
+		{
+			unsigned key = vertex_keys[vertex];
+
+			GX_MatrixIndex1x8((u8)(GX_PNMTX1 + 3 * key));
+			if (sphere_matrices)
+				GX_MatrixIndex1x8((u8)(LIT_SPHERE_ROW + 2 * key));
+		}
+		GX_Position1x16(index);
+		if (normals)
+		{
+			float normal[3];
+
+			lit_normal(index, normal);
+			GX_Normal3f32(normal[0], normal[1], normal[2]);
+		}
+		for (stage = 0; stage < texture_count; stage++)
+			GX_TexCoord1x16(index);
+	);
+#undef EMIT_EACH
+}
+
 /* why a program's draws stay on the processor: once a program, for the log */
 static BOOL hardware_rejected(const struct nv2a_cpu_program *program, const char *reason)
 {
@@ -4567,7 +4636,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	struct draw_projection projection;
 	/* (position_read: a stage reads a coordinate GX makes from the position,
 	which a vertex the processor transforms does not give it) */
-	BOOL fogged = FALSE, cpu_colors = FALSE, position_read = FALSE, keyed, lit_on;
+	BOOL fogged = FALSE, cpu_colors = FALSE, position_read = FALSE, keyed, lit_on, plain;
 	const unsigned char *position_stream;
 	UINT position_stride;
 	unsigned long long key;
@@ -4689,14 +4758,24 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	display.gx_lighting) */
 	lit_on = lit_choose(program, shader, fetch, cpu_colors, cpu_spheres);
 	/* the vertices' range: GX's indices are 16 bits */
-	for (vertex = 0; vertex < count; vertex++)
+	if (indices)
 	{
-		unsigned long index = indices ? (unsigned long)indices[vertex] + device.base_vertex_index : first + vertex;
+		unsigned smallest = 0xFFFF, largest = 0;
 
-		if (index < least)
-			least = index;
-		if (index > most)
-			most = index;
+		for (vertex = 0; vertex < count; vertex++)
+		{
+			unsigned value = indices[vertex];
+
+			smallest = value < smallest ? value : smallest;
+			largest = value > largest ? value : largest;
+		}
+		least = smallest + (unsigned long)device.base_vertex_index;
+		most = largest + (unsigned long)device.base_vertex_index;
+	}
+	else
+	{
+		least = first;
+		most = first + count - 1;
 	}
 	if (most > 0xFFFF)
 		return hardware_rejected(program, "an index past 16 bits");
@@ -4949,147 +5028,152 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		}
 		vertex_memo_draw++;
 	}
+	/* (nothing of the vertices the processor's: emit_indices) */
+	plain = !cpu_colors && !cpu_spheres && !draw_keys.processor && !(lit_on && lit.alpha);
 
 	emitting = wl_platform_time_us();
 	GX_Begin(gx_primitive(primitive_type), HARDWARE_VERTEX_FORMAT, (u16)count);
-	for (vertex = 0; vertex < count; vertex++)
-	{
-		unsigned long whole = indices ? (unsigned long)indices[vertex] + device.base_vertex_index : first + vertex;
-		u16 index = (u16)whole;
-		BOOL processor = keyed && vertex_keys[vertex] == KEY_PROCESSOR;
-		struct gx_vertex local, *computed = &local;
-
-		if (keyed)
-			GX_MatrixIndex1x8((u8)(processor ? GX_PNMTX0 : GX_PNMTX1 + 3 * vertex_keys[vertex]));
-		if (lit_on && lit.reflection && keyed)
-			GX_MatrixIndex1x8((u8)(processor ? LIT_SPHERE_PROCESSOR_ROW : LIT_SPHERE_ROW + 2 * vertex_keys[vertex]));
-		if (processor || cpu_colors || cpu_spheres)
+	if (plain)
+		emit_indices(indices, first, count, texture_count, keyed, lit_on, lit_on && lit.reflection && keyed);
+	else
+		for (vertex = 0; vertex < count; vertex++)
 		{
-			/* what the processor computes of the vertex: its position (in
-			draw_run's (x w, y w, -w), through the identity) where it is the
-			processor's, its colours and sphere maps' coordinates where they
-			are */
-			unsigned long slot = whole - least;
+			unsigned long whole = indices ? (unsigned long)indices[vertex] + device.base_vertex_index : first + vertex;
+			u16 index = (u16)whole;
+			BOOL processor = keyed && vertex_keys[vertex] == KEY_PROCESSOR;
+			struct gx_vertex local, *computed = &local;
 
-			if (vertex_memo && slot < VERTEX_MEMO_SIZE)
-				computed = &vertex_memo[slot];
-			if (computed == &local || vertex_memo_stamps[slot] != vertex_memo_draw)
+			if (keyed)
+				GX_MatrixIndex1x8((u8)(processor ? GX_PNMTX0 : GX_PNMTX1 + 3 * vertex_keys[vertex]));
+			if (lit_on && lit.reflection && keyed)
+				GX_MatrixIndex1x8((u8)(processor ? LIT_SPHERE_PROCESSOR_ROW : LIT_SPHERE_ROW + 2 * vertex_keys[vertex]));
+			if (processor || cpu_colors || cpu_spheres)
 			{
-				struct nv2a_cpu_output out;
+				/* what the processor computes of the vertex: its position (in
+				draw_run's (x w, y w, -w), through the identity) where it is the
+				processor's, its colours and sphere maps' coordinates where they
+				are */
+				unsigned long slot = whole - least;
 
-				stream_fetch(fetch, vertex, inputs);
-				if (processor || cpu_spheres)
+				if (vertex_memo && slot < VERTEX_MEMO_SIZE)
+					computed = &vertex_memo[slot];
+				if (computed == &local || vertex_memo_stamps[slot] != vertex_memo_draw)
 				{
-					live = (processor ? NV2A_CPU_LIVE_POSITION : 0) |
-						(cpu_colors ? NV2A_CPU_LIVE_D0 | NV2A_CPU_LIVE_D1 : 0) | cpu_spheres * NV2A_CPU_LIVE_T0;
-					nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants,
-						(const float (*)[4])inputs, point_size, &out, live);
-					if (processor)
+					struct nv2a_cpu_output out;
+
+					stream_fetch(fetch, vertex, inputs);
+					if (processor || cpu_spheres)
 					{
-						clip_position(out.clip, computed->position);
-						processor_positions++;
+						live = (processor ? NV2A_CPU_LIVE_POSITION : 0) |
+							(cpu_colors ? NV2A_CPU_LIVE_D0 | NV2A_CPU_LIVE_D1 : 0) | cpu_spheres * NV2A_CPU_LIVE_T0;
+						nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants,
+							(const float (*)[4])inputs, point_size, &out, live);
+						if (processor)
+						{
+							clip_position(out.clip, computed->position);
+							processor_positions++;
+						}
+						for (stage = 0; stage < 4; stage++)
+							if (cpu_spheres & (1U << stage))
+								sphere_coordinates(out.t[stage], computed->texcoord[stage]);
+						if (cpu_spheres)
+							hardware_spheres_run++;
+						if (lit_on && processor)
+						{
+							/* (a lit draw's blended vertex: its normal and world position
+							by its own blend of the nodes, as the program skins them) */
+							const float (*constants)[4] = (const float (*)[4])device.vertex_constants + VERTEX_CONSTANT_BIAS;
+							float blend[3][4], world[3];
+							int row;
+
+							gx_lighting_skin(constants, inputs[NODE_INDICES], inputs[NODE_WEIGHT], blend);
+							for (row = 0; row < 3; row++)
+							{
+								computed->normal[row] = blend[row][0] * inputs[1][0] + blend[row][1] * inputs[1][1] +
+									blend[row][2] * inputs[1][2];
+								world[row] = blend[row][0] * inputs[0][0] + blend[row][1] * inputs[0][1] +
+									blend[row][2] * inputs[0][2] + blend[row][3];
+							}
+							if (lit.alpha)
+								computed->color0[3] = color_byte(gx_lighting_planar_fog(&lit.lighting, world));
+						}
 					}
-					for (stage = 0; stage < 4; stage++)
-						if (cpu_spheres & (1U << stage))
-							sphere_coordinates(out.t[stage], computed->texcoord[stage]);
-					if (cpu_spheres)
-						hardware_spheres_run++;
-					if (lit_on && processor)
+					else
+						nv2a_cpu_run_colors(program, (const float (*)[4])device.vertex_constants,
+							(const float (*)[4])inputs, &out);
+					if (cpu_colors)
 					{
-						/* (a lit draw's blended vertex: its normal and world position
-						by its own blend of the nodes, as the program skins them) */
-						const float (*constants)[4] = (const float (*)[4])device.vertex_constants + VERTEX_CONSTANT_BIAS;
-						float blend[3][4], world[3];
+						for (component = 0; component < 4; component++)
+						{
+							computed->color0[component] = color_byte(out.d0[component]);
+							computed->color1[component] = color_byte(out.d1[component]);
+						}
+						hardware_colors_run++;
+					}
+					if (computed != &local)
+						vertex_memo_stamps[slot] = vertex_memo_draw;
+				}
+			}
+			if (processor)
+				GX_Position3f32(computed->position[0], computed->position[1], computed->position[2]);
+			else if (draw_keys.processor)
+			{
+				float position[3];
+
+				word_copy(&position[0], position_stream + whole * position_stride);
+				word_copy(&position[1], position_stream + whole * position_stride + 4);
+				word_copy(&position[2], position_stream + whole * position_stride + 8);
+				GX_Position3f32(position[0], position[1], position[2]);
+			}
+			else
+				GX_Position1x16(index);
+			if (lit_on)
+			{
+				/* the normal (the map's, or the processor's skinned one), and D0's
+				alpha where it is the fog's */
+				if (processor)
+					GX_Normal3f32(computed->normal[0], computed->normal[1], computed->normal[2]);
+				else
+				{
+					float normal[3];
+
+					lit_normal(whole, normal);
+					GX_Normal3f32(normal[0], normal[1], normal[2]);
+				}
+				if (lit.alpha)
+				{
+					u8 alpha;
+
+					if (processor)
+						alpha = computed->color0[3];
+					else
+					{
+						const float (*rows)[4] = (const float (*)[4])lit.world[keyed ? vertex_keys[vertex] : 0];
+						float model[3], world[3];
 						int row;
 
-						gx_lighting_skin(constants, inputs[NODE_INDICES], inputs[NODE_WEIGHT], blend);
+						word_copy(&model[0], position_stream + whole * position_stride);
+						word_copy(&model[1], position_stream + whole * position_stride + 4);
+						word_copy(&model[2], position_stream + whole * position_stride + 8);
 						for (row = 0; row < 3; row++)
-						{
-							computed->normal[row] = blend[row][0] * inputs[1][0] + blend[row][1] * inputs[1][1] +
-								blend[row][2] * inputs[1][2];
-							world[row] = blend[row][0] * inputs[0][0] + blend[row][1] * inputs[0][1] +
-								blend[row][2] * inputs[0][2] + blend[row][3];
-						}
-						if (lit.alpha)
-							computed->color0[3] = color_byte(gx_lighting_planar_fog(&lit.lighting, world));
+							world[row] = rows[row][0] * model[0] + rows[row][1] * model[1] + rows[row][2] * model[2] + rows[row][3];
+						alpha = color_byte(gx_lighting_planar_fog(&lit.lighting, world));
 					}
+					GX_Color4u8(255, 255, 255, alpha);
 				}
-				else
-					nv2a_cpu_run_colors(program, (const float (*)[4])device.vertex_constants,
-						(const float (*)[4])inputs, &out);
-				if (cpu_colors)
-				{
-					for (component = 0; component < 4; component++)
-					{
-						computed->color0[component] = color_byte(out.d0[component]);
-						computed->color1[component] = color_byte(out.d1[component]);
-					}
-					hardware_colors_run++;
-				}
-				if (computed != &local)
-					vertex_memo_stamps[slot] = vertex_memo_draw;
 			}
-		}
-		if (processor)
-			GX_Position3f32(computed->position[0], computed->position[1], computed->position[2]);
-		else if (draw_keys.processor)
-		{
-			float position[3];
-
-			word_copy(&position[0], position_stream + whole * position_stride);
-			word_copy(&position[1], position_stream + whole * position_stride + 4);
-			word_copy(&position[2], position_stream + whole * position_stride + 8);
-			GX_Position3f32(position[0], position[1], position[2]);
-		}
-		else
-			GX_Position1x16(index);
-		if (lit_on)
-		{
-			/* the normal (the map's, or the processor's skinned one), and D0's
-			alpha where it is the fog's */
-			if (processor)
-				GX_Normal3f32(computed->normal[0], computed->normal[1], computed->normal[2]);
-			else
+			if (cpu_colors)
 			{
-				float normal[3];
-
-				lit_normal(whole, normal);
-				GX_Normal3f32(normal[0], normal[1], normal[2]);
+				/* (a colour's four bytes as one word: the same bytes in the FIFO) */
+				GX_Color1u32(color_word(computed->color0));
+				GX_Color1u32(color_word(computed->color1));
 			}
-			if (lit.alpha)
-			{
-				u8 alpha;
-
-				if (processor)
-					alpha = computed->color0[3];
-				else
-				{
-					const float (*rows)[4] = (const float (*)[4])lit.world[keyed ? vertex_keys[vertex] : 0];
-					float model[3], world[3];
-					int row;
-
-					word_copy(&model[0], position_stream + whole * position_stride);
-					word_copy(&model[1], position_stream + whole * position_stride + 4);
-					word_copy(&model[2], position_stream + whole * position_stride + 8);
-					for (row = 0; row < 3; row++)
-						world[row] = rows[row][0] * model[0] + rows[row][1] * model[1] + rows[row][2] * model[2] + rows[row][3];
-					alpha = color_byte(gx_lighting_planar_fog(&lit.lighting, world));
-				}
-				GX_Color4u8(255, 255, 255, alpha);
-			}
+			for (component = 0; component < texture_count; component++)
+				GX_TexCoord1x16(index);
+			for (stage = 0; stage < 4; stage++)
+				if (cpu_spheres & (1U << stage))
+					GX_TexCoord2f32(computed->texcoord[stage][0], computed->texcoord[stage][1]);
 		}
-		if (cpu_colors)
-		{
-			/* (a colour's four bytes as one word: the same bytes in the FIFO) */
-			GX_Color1u32(color_word(computed->color0));
-			GX_Color1u32(color_word(computed->color1));
-		}
-		for (component = 0; component < texture_count; component++)
-			GX_TexCoord1x16(index);
-		for (stage = 0; stage < 4; stage++)
-			if (cpu_spheres & (1U << stage))
-				GX_TexCoord2f32(computed->texcoord[stage][0], computed->texcoord[stage][1]);
-	}
 	GX_End();
 	if (lit_on)
 	{
