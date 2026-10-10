@@ -30,7 +30,13 @@ GX's inputs are unsigned and clamped: the signed mappings (expand, half
 bias) come out clamped to [0, 1], and a negation as 0, except in a dot
 product, whose signed terms TEV's lerp, bias and scale make exactly (the
 bump mapping it serves: signed dot products). A dot product of a register
-is taken as 1.
+is taken as 1, but for the environment's specular pass from its lightmaps,
+whose programs are recognized and made by hand (specular_lightmap_recipe).
+
+A bumped reflection's cube map (DOT_RFLCT_SPEC) is read through GX's
+indirect unit, two stages before each lookup making its offset from the bump
+map (bumped_lookups_place), and its normal's lookup (DOT_RFLCT_DIFF) is the
+flat normal, per vertex, in colour 1: the device makes both (d3d8_gx.c).
 
 The stages are WiiLibs' TEV program (wl/platform/tev.h), which builds them,
 merges what their inputs need of a stage's order, hands out the registers,
@@ -238,6 +244,9 @@ static struct operand texture_operand(struct translation *translation, int stage
 {
 	const struct gx_psh_textures *textures = translation->textures;
 
+	/* (what the device makes per vertex in colour 1: a normal's lookup) */
+	if (textures->vertex_color & (1U << stage))
+		return operand(_kind_ras, 1, _channel_natural);
 	if (!(textures->present & (1U << stage)))
 		return zero;
 	if (portion == _portion_color)
@@ -3056,6 +3065,447 @@ static void stages_compact(WlTevProgram *tev)
 	}
 }
 
+/* ---------- bumped lookups
+
+A stage that reads a bumped map (gx_psh_textures.bumped: a bumped
+reflection's cube map) looks it up where GX's indirect unit puts it, as GX's
+environment-mapped bump does (GX_SetTevIndBumpST): over the two stages before
+it, the first takes texture coordinate 1 times the bump map's x, the second
+adds coordinate 2 times its y, and the lookup adds its own coordinate. The
+two read no texture (their own lookups are not made). A lookup right after
+another repeats its coordinate. Where the stages before a lookup read a
+texture, stages that pass PREV on are put in. (The device makes the three
+coordinates per vertex, and sets the indirect unit: d3d8_gx.c.) */
+
+static BOOL stage_free_for_offset(const WlTevProgram *tev, const unsigned char *indirect, unsigned index)
+{
+	return tev->stages[index].texmap == WL_TEV_NONE && indirect[index] == _gx_psh_indirect_none;
+}
+
+/* a stage that passes PREV on, exactly, put in before stage `index` */
+static BOOL stage_insert_pass(WlTevProgram *tev, unsigned char *indirect, unsigned index)
+{
+	WlTevStage *stage;
+
+	if (tev->stage_count >= WL_TEV_MAX_STAGES)
+		return FALSE;
+	memmove(&tev->stages[index + 1], &tev->stages[index], (tev->stage_count - index) * sizeof(tev->stages[0]));
+	memmove(&indirect[index + 1], &indirect[index], tev->stage_count - index);
+	tev->stage_count++;
+	stage = &tev->stages[index];
+	memset(stage, 0, sizeof(*stage));
+	stage->texcoord = stage->texmap = stage->channel = WL_TEV_NONE;
+	stage->kcsel = stage->kasel = WL_TEV_KSEL_1;
+	wl_tev_stage_color(stage, WL_TEV_CC_ZERO, WL_TEV_CC_ZERO, WL_TEV_CC_ZERO, WL_TEV_CC_CPREV, WL_TEV_ADD,
+		WL_TEV_BIAS_ZERO, WL_TEV_SCALE_1, FALSE, WL_TEV_PREV);
+	wl_tev_stage_alpha(stage, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_APREV, WL_TEV_ADD,
+		WL_TEV_BIAS_ZERO, WL_TEV_SCALE_1, FALSE, WL_TEV_PREV);
+	indirect[index] = _gx_psh_indirect_none;
+	return TRUE;
+}
+
+/* each bumped lookup's two stages before it: FALSE when they do not fit */
+static BOOL bumped_lookups_place(struct gx_psh_program *program, unsigned bumped)
+{
+	WlTevProgram *tev = &program->tev;
+	unsigned char *indirect = program->indirect;
+	unsigned index;
+
+	memset(program->indirect, 0, sizeof(program->indirect));
+	for (index = 0; index < tev->stage_count; index++)
+	{
+		const WlTevStage *stage = &tev->stages[index];
+
+		if (stage->texmap >= GX_PSH_TEXTURES || !(bumped & (1u << stage->texmap)))
+			continue;
+		if (index > 0 && (indirect[index - 1] == _gx_psh_indirect_lookup ||
+			indirect[index - 1] == _gx_psh_indirect_repeat) && tev->stages[index - 1].texmap == stage->texmap &&
+			tev->stages[index - 1].texcoord == stage->texcoord)
+		{
+			indirect[index] = _gx_psh_indirect_repeat;
+			continue;
+		}
+		while (index < 2 || !stage_free_for_offset(tev, indirect, index - 1) ||
+			!stage_free_for_offset(tev, indirect, index - 2))
+		{
+			unsigned at = index >= 1 && stage_free_for_offset(tev, indirect, index - 1) ? index - 1 : index;
+
+			if (!stage_insert_pass(tev, indirect, at))
+				return FALSE;
+			index++;
+		}
+		indirect[index - 2] = _gx_psh_indirect_s;
+		indirect[index - 1] = _gx_psh_indirect_t;
+		indirect[index] = _gx_psh_indirect_lookup;
+	}
+	return TRUE;
+}
+
+/* ---------- the specular lights from lightmaps
+
+The environment's specular pass from its lightmaps
+(_rasterizer_environment_specular_lightmaps_begin and its draws, in
+rasterizer_xbox_environment.c) reflects the eye's direction e (t2, the
+normalization cube map) about the bump map's normal n (t0) and takes its dot
+product with the light's direction l (t3) to a power: r = 2n(n.e) - e, then
+(r.l)^8, or ^32 when extra shiny. Its colour is the Fresnel colour between
+the parallel and perpendicular ones by n.e, times the lightmap's intensity
+(t1 against 1/2), times the brightness and the self-shadowing of e and l
+(their z each 16 times sharper, clamped), times (r.l)^n, halved. The second
+is a dot product of a register, r, which no TEV swap reaches, and the general
+translation (combiner_portion) takes it as 1. Here the pass's programs are
+recognized and made by hand instead, with r.l as 2(n.e)(n.l) - e.l:
+
+- n.e and n.l are signed dot products, made as emit_signed_dot makes them,
+  of the bump map's channels loaded once for both (three stages a channel,
+  nine in all), and clamped to [0, 1] (NV2A keeps them signed);
+- e.l is the vertices', of their directions (normalized), in colour 0 as
+  (1 - e.l) / 2 (_gx_psh_vertices_specular): no stages are left for a third
+  dot product;
+- the alpha (the alpha test's: a mask where the colour is 0) is 1.
+
+When extra shiny, the two more squarings leave no room for n.l, which is
+the flat normal's (l's z). With the bump map as a specular mask (the flat
+normal, and the bump map's colour a factor), only e.l is approximated. And
+when there is n.l, the lightmap's intensity times the Fresnel colour is
+clamped after the shadows and the brightness multiply it (NV2A clamps it
+first). */
+
+struct specular_variant
+{
+	/* the bump map's normal, else the flat one and the bump map a mask */
+	BOOL bumped;
+	/* the scale of the Fresnel colour times the intensity (overbright: 4) */
+	unsigned char scale;
+	/* (r.l)^8, or ^32 */
+	int squarings;
+};
+
+static BOOL specular_lightmap_match(const DWORD *state, const struct gx_psh_textures *textures,
+	struct specular_variant *variant)
+{
+	static const unsigned long words[][5] =
+	{
+		/* (combiner stage: rgb inputs (0: the bumped or mask variant's),
+		rgb outputs (0: the variant's), alpha inputs and outputs) */
+		{ 0, 0, 0x000030C9, 0x4B204B20, 0x00020400 },
+		{ 1, 0, 0x00010D00, 0x4A204A20, 0x00020500 },
+		{ 2, 0xCD4B0809, 0, 0x2C120C11, 0x00000C00 },
+		{ 3, 0x2C020C01, 0x00000C00, 0x0D0D1415, 0x000000D5 },
+		{ 4, 0x0C091C09, 0, 0x1D1D151C, 0x000000D5 },
+		{ 5, 0x0C150D1D, 0x000010CD, 0x1D1D0000, 0x000000D0 },
+	};
+	DWORD count = state[D3DRS_PSCOMBINERCOUNT];
+	unsigned index;
+
+	if ((count != 0x00011006 && count != 0x00011008) || state[D3DRS_PSFINALCOMBINERINPUTSABCD] != 0x0C0F0000 ||
+		state[D3DRS_PSFINALCOMBINERINPUTSEFG] != 0x1D110D00 || (state[D3DRS_PSFINALCOMBINERCONSTANT0] >> 24) != 0x80 ||
+		(state[D3DRS_PSCONSTANT0_0] & 0xFF000000UL) != 0x80000000UL ||
+		(state[D3DRS_PSCONSTANT0_0] & 0x00FFFFFFUL) != 0x000000FF || (state[D3DRS_PSCONSTANT0_0 + 1] & 0x00FFFFFFUL) !=
+		0x000000FF || (state[D3DRS_PSCONSTANT0_0 + 2] >> 24) != (state[D3DRS_PSCONSTANT1_0 + 2] >> 24))
+		return FALSE;
+	/* (the bump map, the lightmap, and the two directions' sphere maps) */
+	if ((textures->present & 0xF) != 0xF || (textures->cube & 0xC) != 0xC || (textures->cube & 3) ||
+		textures->separate_alpha || textures->bumped || textures->vertex_color ||
+		textures->contents[0] != _gx_psh_texture_all || textures->contents[1] == _gx_psh_texture_alpha ||
+		textures->fog)
+		return FALSE;
+	for (index = 0; index < sizeof(words) / sizeof(words[0]); index++)
+	{
+		unsigned stage = (unsigned)words[index][0];
+
+		if ((words[index][1] && state[D3DRS_PSRGBINPUTS0 + stage] != words[index][1]) ||
+			(words[index][2] && state[D3DRS_PSRGBOUTPUTS0 + stage] != words[index][2]) ||
+			state[D3DRS_PSALPHAINPUTS0 + stage] != words[index][3] || state[D3DRS_PSALPHAOUTPUTS0 + stage] != words[index][4])
+			return FALSE;
+	}
+	if (state[D3DRS_PSRGBINPUTS0] == 0x484A0911 && state[D3DRS_PSRGBINPUTS0 + 1] == 0x48CC8A40 &&
+		state[D3DRS_PSRGBOUTPUTS0 + 2] == 0x000020D0)
+		variant->bumped = TRUE;
+	else if (state[D3DRS_PSRGBINPUTS0] == 0x014A0911 && state[D3DRS_PSRGBINPUTS0 + 1] == 0x01CC8A40 &&
+		state[D3DRS_PSRGBOUTPUTS0 + 2] == 0x000020D9)
+		variant->bumped = FALSE;
+	else
+		return FALSE;
+	if (state[D3DRS_PSRGBOUTPUTS0 + 4] == 0x000110CD)
+		variant->scale = WL_TEV_SCALE_2;
+	else if (state[D3DRS_PSRGBOUTPUTS0 + 4] == 0x000210CD)
+		variant->scale = WL_TEV_SCALE_4;
+	else
+		return FALSE;
+	variant->squarings = 3;
+	if ((count & 0xFF) == 8)
+	{
+		for (index = 6; index < 8; index++)
+		{
+			if (state[D3DRS_PSRGBINPUTS0 + index] || state[D3DRS_PSRGBOUTPUTS0 + index] ||
+				state[D3DRS_PSALPHAINPUTS0 + index] != 0x1D1D0000 || state[D3DRS_PSALPHAOUTPUTS0 + index] != 0x000000D0)
+				return FALSE;
+		}
+		variant->squarings = 5;
+	}
+	return TRUE;
+}
+
+/* a stage written to when a recipe has more than 16 (it then fails) */
+static WlTevStage recipe_overflow;
+static BOOL recipe_overflowed;
+
+/* a recipe's stage: the texture of stage `map` (-1: none) through swap
+table `swap`, and colour 0 */
+static WlTevStage *recipe_stage(WlTevProgram *tev, int map, unsigned char swap, BOOL ras)
+{
+	WlTevStage *stage = wl_tev_add_stage(tev);
+
+	if (!stage)
+	{
+		recipe_overflowed = TRUE;
+		stage = &recipe_overflow;
+	}
+	if (map >= 0)
+	{
+		stage->texcoord = stage->texmap = (uint8_t)map;
+		stage->tex_swap = swap;
+	}
+	if (ras)
+		stage->channel = WL_TEV_CH_COLOR0A0;
+	return stage;
+}
+
+static void recipe_color(WlTevStage *stage, uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint8_t bias, uint8_t scale,
+	BOOL clamp, uint8_t dest)
+{
+	wl_tev_stage_color(stage, a, b, c, d, WL_TEV_ADD, bias, scale, clamp != FALSE, dest);
+}
+
+static void recipe_alpha(WlTevStage *stage, uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint8_t bias, uint8_t scale,
+	BOOL clamp, uint8_t dest)
+{
+	wl_tev_stage_alpha(stage, a, b, c, d, WL_TEV_ADD, bias, scale, clamp != FALSE, dest);
+}
+
+enum { _map_bump = 0, _map_lightmap = 1, _map_eye = 2, _map_light = 3 };
+enum { _swap_rgba = 0, _swap_red = 1, _swap_green = 2, _swap_blue = 3 };
+
+/* a channel of the bump map loaded (REG0: 1 - x in the colour, x in the
+alpha), and its terms of n.e (into PREV's colour) and, unless `light` is
+FALSE, n.l (REG1's colour), each (x - 1/2)(y - 1/2) * 2 = lerp(1 - x, x, y) - 1/2
+added to the sum so far; the last term doubles the sum and clamps it */
+static WlTevStage *specular_dot_channel(WlTevProgram *tev, unsigned char swap, BOOL first, BOOL last, BOOL light,
+	WlTevStage **light_stage)
+{
+	WlTevStage *stage = recipe_stage(tev, _map_bump, swap, FALSE);
+
+	recipe_color(stage, WL_TEV_CC_ONE, WL_TEV_CC_ZERO, WL_TEV_CC_TEXC, WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO, WL_TEV_SCALE_1,
+		TRUE, WL_TEV_REG0);
+	recipe_alpha(stage, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_TEXA, WL_TEV_BIAS_ZERO, WL_TEV_SCALE_1,
+		TRUE, WL_TEV_REG0);
+	stage = recipe_stage(tev, _map_eye, swap, FALSE);
+	recipe_color(stage, WL_TEV_CC_C0, WL_TEV_CC_A0, WL_TEV_CC_TEXC, first ? WL_TEV_CC_ZERO : WL_TEV_CC_CPREV,
+		WL_TEV_BIAS_SUBHALF, last ? WL_TEV_SCALE_2 : WL_TEV_SCALE_1, last, WL_TEV_PREV);
+	*light_stage = NULL;
+	if (light)
+	{
+		*light_stage = recipe_stage(tev, _map_light, swap, FALSE);
+		recipe_color(*light_stage, WL_TEV_CC_C0, WL_TEV_CC_A0, WL_TEV_CC_TEXC, first ? WL_TEV_CC_ZERO : WL_TEV_CC_C1,
+			WL_TEV_BIAS_SUBHALF, last ? WL_TEV_SCALE_2 : WL_TEV_SCALE_1, last, WL_TEV_REG1);
+	}
+	return stage;
+}
+
+static BOOL specular_lightmap_recipe(const DWORD *state, const struct gx_psh_textures *textures,
+	struct gx_psh_program *program)
+{
+	WlTevProgram *tev = &program->tev;
+	struct specular_variant variant;
+	WlTevStage *stage, *light_stage, *squares[5];
+	uint8_t brightness, parallel;
+	int index, squaring = 0;
+
+	if (!specular_lightmap_match(state, textures, &variant))
+		return FALSE;
+	recipe_overflowed = FALSE;
+	memset(program, 0, sizeof(*program));
+	wl_tev_program_init(tev);
+	wl_tev_set_swap(tev, _swap_red, WL_TEV_SWAP_R, WL_TEV_SWAP_R, WL_TEV_SWAP_R, WL_TEV_SWAP_R);
+	wl_tev_set_swap(tev, _swap_green, WL_TEV_SWAP_G, WL_TEV_SWAP_G, WL_TEV_SWAP_G, WL_TEV_SWAP_G);
+	wl_tev_set_swap(tev, _swap_blue, WL_TEV_SWAP_B, WL_TEV_SWAP_B, WL_TEV_SWAP_B, WL_TEV_SWAP_B);
+	/* (the parallel colour a konst, the perpendicular one REG2's colour; the
+	brightness a konst's alpha) */
+	parallel = (uint8_t)wl_tev_konst_slot(tev, rgba(state[D3DRS_PSCONSTANT1_0 + 3] | 0xFF000000UL));
+	brightness = (uint8_t)wl_tev_konst_slot(tev, (uint32_t)(state[D3DRS_PSCONSTANT0_0 + 2] >> 24));
+	wl_tev_preload(tev, WL_TEV_REG2, rgba(state[D3DRS_PSCONSTANT0_0 + 3]));
+	program->vertices = _gx_psh_vertices_specular;
+	program->approximate = TRUE;
+	if (variant.bumped && variant.squarings == 3)
+	{
+		/* n.e into PREV's colour, n.l into REG1's; the shadows of e (REG1's
+		alpha) and of l (REG2's), from their z each made 2z - 1, clamped, then
+		8 times that */
+		program->approximation = "a specular light: e.l the vertices', n.e and n.l clamped, the intensity clamped last";
+		stage = specular_dot_channel(tev, _swap_blue, TRUE, FALSE, TRUE, &light_stage);
+		recipe_alpha(stage, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_TEXA, WL_TEV_BIAS_SUBHALF,
+			WL_TEV_SCALE_2, TRUE, WL_TEV_REG1);
+		recipe_alpha(light_stage, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_TEXA, WL_TEV_BIAS_SUBHALF,
+			WL_TEV_SCALE_2, TRUE, WL_TEV_REG2);
+		stage = specular_dot_channel(tev, _swap_red, FALSE, FALSE, TRUE, &light_stage);
+		recipe_alpha(stage, WL_TEV_CA_A1, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_A1, WL_TEV_BIAS_ZERO,
+			WL_TEV_SCALE_4, TRUE, WL_TEV_REG1);
+		recipe_alpha(light_stage, WL_TEV_CA_A2, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_A2, WL_TEV_BIAS_ZERO,
+			WL_TEV_SCALE_4, TRUE, WL_TEV_REG2);
+		/* (the shadows' product, then the brightness's) */
+		stage = specular_dot_channel(tev, _swap_green, FALSE, TRUE, TRUE, &light_stage);
+		recipe_alpha(stage, WL_TEV_CA_ZERO, WL_TEV_CA_A1, WL_TEV_CA_A2, WL_TEV_CA_ZERO, WL_TEV_BIAS_ZERO,
+			WL_TEV_SCALE_1, TRUE, WL_TEV_REG1);
+		light_stage->kasel = wl_tev_kasel(brightness, WL_TEV_K_A);
+		recipe_alpha(light_stage, WL_TEV_CA_ZERO, WL_TEV_CA_A1, WL_TEV_CA_KONST, WL_TEV_CA_ZERO, WL_TEV_BIAS_ZERO,
+			WL_TEV_SCALE_1, TRUE, WL_TEV_REG1);
+		/* r.l = 2(n.e)(n.l) - e.l into REG0's colour: ((1 - e.l) / 2 + (n.e)(n.l) - 1/2) * 2 */
+		squares[0] = recipe_stage(tev, _map_lightmap, _swap_red, TRUE);
+		recipe_color(squares[0], WL_TEV_CC_ZERO, WL_TEV_CC_CPREV, WL_TEV_CC_C1, WL_TEV_CC_RASC, WL_TEV_BIAS_SUBHALF,
+			WL_TEV_SCALE_2, TRUE, WL_TEV_REG0);
+		/* the lightmap's intensity into PREV's alpha (its channels each times
+		1/2, clamped at the end), while r.l is squared */
+		for (index = 0; index < 3; index++)
+		{
+			stage = index ? recipe_stage(tev, _map_lightmap, (unsigned char)(_swap_red + index), FALSE) : squares[0];
+			stage->kasel = WL_TEV_KSEL_1_2;
+			recipe_alpha(stage, WL_TEV_CA_ZERO, WL_TEV_CA_TEXA, WL_TEV_CA_KONST, index ? WL_TEV_CA_APREV : WL_TEV_CA_ZERO,
+				WL_TEV_BIAS_ZERO, WL_TEV_SCALE_1, index == 2, WL_TEV_PREV);
+			if (index)
+				recipe_color(stage, WL_TEV_CC_ZERO, WL_TEV_CC_C0, WL_TEV_CC_C0, WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO,
+					WL_TEV_SCALE_1, TRUE, WL_TEV_REG0);
+		}
+		/* (r.l)^8; the intensity times the shadows and the brightness */
+		stage = recipe_stage(tev, -1, 0, FALSE);
+		recipe_color(stage, WL_TEV_CC_ZERO, WL_TEV_CC_C0, WL_TEV_CC_C0, WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO,
+			WL_TEV_SCALE_1, TRUE, WL_TEV_REG0);
+		recipe_alpha(stage, WL_TEV_CA_ZERO, WL_TEV_CA_APREV, WL_TEV_CA_A1, WL_TEV_CA_ZERO, WL_TEV_BIAS_ZERO,
+			WL_TEV_SCALE_1, TRUE, WL_TEV_PREV);
+		/* the Fresnel colour, by n.e; times all that, scaled and clamped; times
+		(r.l)^8, halved */
+		stage = recipe_stage(tev, -1, 0, FALSE);
+		stage->kcsel = wl_tev_kcsel(parallel, WL_TEV_K_RGB);
+		recipe_color(stage, WL_TEV_CC_KONST, WL_TEV_CC_C2, WL_TEV_CC_CPREV, WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO,
+			WL_TEV_SCALE_1, TRUE, WL_TEV_PREV);
+		stage = recipe_stage(tev, -1, 0, FALSE);
+		recipe_color(stage, WL_TEV_CC_ZERO, WL_TEV_CC_CPREV, WL_TEV_CC_APREV, WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO,
+			variant.scale, TRUE, WL_TEV_PREV);
+	}
+	else
+	{
+		WlTevStage *free_colors[5];
+		int free_count = 0;
+
+		/* n.e into PREV's colour (the bump map's), or e's z (the flat
+		normal's: a mask); l's z into REG2's alpha, e's into REG1's; the
+		Fresnel colour into REG1's colour; r.l into REG0's colour, its powers
+		where a stage's colour is free */
+		if (variant.bumped)
+		{
+			program->approximation = "a specular light: e.l the vertices', n.l the flat normal's, n.e clamped";
+			stage = specular_dot_channel(tev, _swap_blue, TRUE, FALSE, FALSE, &light_stage);
+			recipe_alpha(stage, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_TEXA, WL_TEV_BIAS_SUBHALF,
+				WL_TEV_SCALE_2, TRUE, WL_TEV_REG1);
+			stage = specular_dot_channel(tev, _swap_red, FALSE, FALSE, FALSE, &light_stage);
+			/* (e's shadow into PREV's alpha) */
+			recipe_alpha(stage, WL_TEV_CA_A1, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_A1, WL_TEV_BIAS_ZERO,
+				WL_TEV_SCALE_4, TRUE, WL_TEV_PREV);
+			specular_dot_channel(tev, _swap_green, FALSE, TRUE, FALSE, &light_stage);
+		}
+		else
+		{
+			program->approximation = "a specular light: e.l the vertices'";
+			/* (n.e = e's z, into PREV's colour, and REG1's alpha; e's shadow
+			into PREV's alpha) */
+			stage = recipe_stage(tev, _map_eye, _swap_blue, FALSE);
+			recipe_color(stage, WL_TEV_CC_ZERO, WL_TEV_CC_ZERO, WL_TEV_CC_ZERO, WL_TEV_CC_TEXC, WL_TEV_BIAS_SUBHALF,
+				WL_TEV_SCALE_2, TRUE, WL_TEV_PREV);
+			recipe_alpha(stage, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_TEXA, WL_TEV_BIAS_SUBHALF,
+				WL_TEV_SCALE_2, TRUE, WL_TEV_REG1);
+			stage = recipe_stage(tev, -1, 0, FALSE);
+			recipe_alpha(stage, WL_TEV_CA_A1, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_A1, WL_TEV_BIAS_ZERO,
+				WL_TEV_SCALE_4, TRUE, WL_TEV_PREV);
+		}
+		/* l's z, 2z - 1 clamped (n.l of the flat normal), into REG2's alpha;
+		the Fresnel colour by n.e into REG1's colour */
+		stage = recipe_stage(tev, _map_light, _swap_blue, FALSE);
+		recipe_alpha(stage, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_TEXA, WL_TEV_BIAS_SUBHALF,
+			WL_TEV_SCALE_2, TRUE, WL_TEV_REG2);
+		stage->kcsel = wl_tev_kcsel(parallel, WL_TEV_K_RGB);
+		recipe_color(stage, WL_TEV_CC_KONST, WL_TEV_CC_C2, WL_TEV_CC_CPREV, WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO,
+			WL_TEV_SCALE_1, TRUE, WL_TEV_REG1);
+		/* r.l = 2(n.e)(n.l) - e.l into REG0's colour; l's shadow, 8 times its
+		z, into REG2's alpha */
+		stage = recipe_stage(tev, -1, 0, TRUE);
+		recipe_color(stage, WL_TEV_CC_ZERO, WL_TEV_CC_CPREV, WL_TEV_CC_A2, WL_TEV_CC_RASC, WL_TEV_BIAS_SUBHALF,
+			WL_TEV_SCALE_2, TRUE, WL_TEV_REG0);
+		recipe_alpha(stage, WL_TEV_CA_A2, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_A2, WL_TEV_BIAS_ZERO,
+			WL_TEV_SCALE_4, TRUE, WL_TEV_REG2);
+		/* the shadows' product, then the brightness's, into REG2's alpha; the
+		lightmap's intensity into PREV's alpha */
+		stage = recipe_stage(tev, -1, 0, FALSE);
+		recipe_alpha(stage, WL_TEV_CA_ZERO, WL_TEV_CA_APREV, WL_TEV_CA_A2, WL_TEV_CA_ZERO, WL_TEV_BIAS_ZERO,
+			WL_TEV_SCALE_1, TRUE, WL_TEV_REG2);
+		free_colors[free_count++] = stage;
+		stage = recipe_stage(tev, -1, 0, FALSE);
+		stage->kasel = wl_tev_kasel(brightness, WL_TEV_K_A);
+		recipe_alpha(stage, WL_TEV_CA_ZERO, WL_TEV_CA_A2, WL_TEV_CA_KONST, WL_TEV_CA_ZERO, WL_TEV_BIAS_ZERO,
+			WL_TEV_SCALE_1, TRUE, WL_TEV_REG2);
+		free_colors[free_count++] = stage;
+		for (index = 0; index < 3; index++)
+		{
+			stage = recipe_stage(tev, _map_lightmap, (unsigned char)(_swap_red + index), FALSE);
+			stage->kasel = WL_TEV_KSEL_1_2;
+			recipe_alpha(stage, WL_TEV_CA_ZERO, WL_TEV_CA_TEXA, WL_TEV_CA_KONST, index ? WL_TEV_CA_APREV : WL_TEV_CA_ZERO,
+				WL_TEV_BIAS_ZERO, WL_TEV_SCALE_1, index == 2, WL_TEV_PREV);
+			free_colors[free_count++] = stage;
+		}
+		/* (r.l)'s powers in the free colours, the rest in stages of their own */
+		for (squaring = 0; squaring < variant.squarings; squaring++)
+		{
+			stage = squaring < free_count ? free_colors[squaring] : recipe_stage(tev, -1, 0, FALSE);
+			recipe_color(stage, WL_TEV_CC_ZERO, WL_TEV_CC_C0, WL_TEV_CC_C0, WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO,
+				WL_TEV_SCALE_1, TRUE, WL_TEV_REG0);
+		}
+		/* the mask's colour times the Fresnel colour (NV2A: the bump map times
+		the lightmap's intensity, then times that) */
+		if (!variant.bumped)
+		{
+			stage = recipe_stage(tev, _map_bump, _swap_rgba, FALSE);
+			recipe_color(stage, WL_TEV_CC_ZERO, WL_TEV_CC_C1, WL_TEV_CC_TEXC, WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO,
+				WL_TEV_SCALE_1, TRUE, WL_TEV_REG1);
+		}
+		/* times the intensity, scaled and clamped; times the shadows and the
+		brightness */
+		stage = recipe_stage(tev, -1, 0, FALSE);
+		recipe_color(stage, WL_TEV_CC_ZERO, WL_TEV_CC_C1, WL_TEV_CC_APREV, WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO,
+			variant.scale, TRUE, WL_TEV_PREV);
+		stage = recipe_stage(tev, -1, 0, FALSE);
+		recipe_color(stage, WL_TEV_CC_ZERO, WL_TEV_CC_CPREV, WL_TEV_CC_A2, WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO,
+			WL_TEV_SCALE_1, TRUE, WL_TEV_PREV);
+	}
+	/* times (r.l)^n, halved (the final combiner's 128/255 as 1/2); alpha 1 */
+	stage = recipe_stage(tev, -1, 0, FALSE);
+	recipe_color(stage, WL_TEV_CC_ZERO, WL_TEV_CC_CPREV, WL_TEV_CC_C0, WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO,
+		WL_TEV_DIVIDE_2, TRUE, WL_TEV_PREV);
+	stage->kasel = WL_TEV_KSEL_1;
+	recipe_alpha(stage, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_KONST, WL_TEV_BIAS_ZERO,
+		WL_TEV_SCALE_1, TRUE, WL_TEV_PREV);
+	(void)squaring;
+	if (recipe_overflowed)
+	{
+		program->reason = "more than 16 stages";
+		return FALSE;
+	}
+	if (!wl_tev_validate(tev, NULL))
+	{
+		program->reason = "an invalid TEV program";
+		return FALSE;
+	}
+	return TRUE;
+}
+
 /* ---------- public code */
 
 /* the swap tables the stages read through (resources_add): as it is, the
@@ -3113,6 +3563,11 @@ static BOOL translate_once(const DWORD *render_state, const struct gx_psh_textur
 	if (translation.failed || program->tev.stage_count == 0)
 		return FALSE;
 	stages_compact(&program->tev);
+	if (textures->bumped && !bumped_lookups_place(program, textures->bumped))
+	{
+		program->reason = "more than 16 stages with the bumped lookups' offsets";
+		return FALSE;
+	}
 	/* (what the hardware would reject: a fault of the translation's) */
 	if (!wl_tev_validate(&program->tev, NULL))
 	{
@@ -3131,8 +3586,15 @@ BOOL gx_psh_translate(const DWORD *render_state, const struct gx_psh_textures *t
 	1, then as before */
 	static const struct { BOOL economical; signed char signed_dots; } attempts[] =
 		{ { FALSE, 2 }, { FALSE, 1 }, { FALSE, -1 }, { TRUE, 0 }, { TRUE, -1 } };
-	unsigned attempt;
+	unsigned attempt, stage;
 
+	/* (the specular lights' programs, made by hand) */
+	if (specular_lightmap_recipe(render_state, textures, program))
+	{
+		program->texcoords = (unsigned char)wl_tev_texcoords_mask(&program->tev);
+		program->channels = (unsigned char)wl_tev_channels_mask(&program->tev);
+		return TRUE;
+	}
 	/* each exact, then with constants beyond four approximated (their
 	registers free for the program) */
 	for (attempt = 0; attempt < sizeof(attempts) / sizeof(attempts[0]); attempt++)
@@ -3142,9 +3604,17 @@ BOOL gx_psh_translate(const DWORD *render_state, const struct gx_psh_textures *t
 			translate_once(render_state, textures, program, attempts[attempt].economical, FALSE,
 				attempts[attempt].signed_dots))
 		{
-			/* (what the stages read of the vertices) */
+			/* (what the stages read of the vertices; a bumped lookup's offsets
+			read the bump map at coordinate 0 and their terms at 1 and 2) */
 			program->texcoords = (unsigned char)wl_tev_texcoords_mask(&program->tev);
 			program->channels = (unsigned char)wl_tev_channels_mask(&program->tev);
+			for (stage = 0; stage < program->tev.stage_count; stage++)
+			{
+				if (program->indirect[stage] != _gx_psh_indirect_none)
+					program->texcoords |= 1u << 0 | 1u << GX_PSH_BUMP_TEXCOORD_S | 1u << GX_PSH_BUMP_TEXCOORD_T;
+			}
+			if (textures->bumped || textures->vertex_color)
+				program->vertices = _gx_psh_vertices_bumped_reflection;
 			return TRUE;
 		}
 	}

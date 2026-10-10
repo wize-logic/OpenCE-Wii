@@ -22,6 +22,47 @@ enum
 	GX_PSH_FOG_MAP = 8,
 	GX_PSH_FOG_TEXMAP = 7,
 	GX_PSH_FOG_TEXCOORD = 4,
+	/* a bumped lookup's offset (gx_psh_textures.bumped): the bump map read by
+	GX's indirect unit as map 5 (stage 0's texels through a TLUT of its
+	normals' x and y), at texture coordinate 0, and the two terms of the
+	offset, the sphere map's coordinates moved by the normal's x and by its
+	y, at texture coordinates 1 and 2 */
+	GX_PSH_BUMP_TEXMAP = 5,
+	GX_PSH_BUMP_TEXCOORD_S = 1,
+	GX_PSH_BUMP_TEXCOORD_T = 2,
+};
+
+/* a stage's part in a bumped lookup (gx_psh_program.indirect): GX's
+environment-mapped bump (GX_SetTevIndBumpST), the coordinate of each lookup
+made over the two stages before it */
+enum
+{
+	_gx_psh_indirect_none,
+	/* texture coordinate 1 times the bump's x (no texture read) */
+	_gx_psh_indirect_s,
+	/* plus texture coordinate 2 times the bump's y (no texture read) */
+	_gx_psh_indirect_t,
+	/* plus the stage's own coordinate: the lookup */
+	_gx_psh_indirect_lookup,
+	/* the stage before's coordinate again: a lookup right after one */
+	_gx_psh_indirect_repeat,
+};
+
+/* what the device puts in the vertices for a program (gx_psh_program.vertices) */
+enum
+{
+	/* what the vertex program made */
+	_gx_psh_vertices_program,
+	/* a bumped reflection (DOT_RFLCT_DIFF and DOT_RFLCT_SPEC): texture
+	coordinates 1 and 2 the bump's two terms, 3 the sphere map's coordinates
+	of the reflection of the flat normal, and colour 1 that normal, (n + 1) / 2
+	(all from texture coordinates 1 to 3: the tangent frame's rows, the eye in
+	their w) */
+	_gx_psh_vertices_bumped_reflection,
+	/* a specular light from a lightmap: colour 0 (1 - e.l) / 2 in red, green
+	and blue, of the directions of texture coordinates 2 and 3 (the eye's and
+	the light's), normalized */
+	_gx_psh_vertices_specular,
 };
 
 /* what a texture stage's texture holds */
@@ -50,6 +91,13 @@ struct gx_psh_textures
 	texture (a normalization cube map's direction, for a dot product with a
 	bump map, among them) */
 	unsigned cube;
+	/* the stages whose lookup GX's indirect unit makes, offset by stage 0's
+	bump map (a bumped reflection's DOT_RFLCT_SPEC: its cube map's sphere map,
+	at the flat normal's reflection moved by the bump; read as any texture) */
+	unsigned bumped;
+	/* the stages read as colour 1, which the device makes what the stage's
+	lookup would give of the flat normal (DOT_RFLCT_DIFF's normal) */
+	unsigned vertex_color;
 	/* fog (D3DRS_FOGENABLE, its ramp bound) and its colour */
 	unsigned char fog;
 	DWORD fog_color;
@@ -63,6 +111,11 @@ struct gx_psh_program
 	/* what the stages read of the vertices: the texture coordinates (bit n:
 	GX_TEXCOORDn) and the colour channels (bit 0 COLOR0A0, bit 1 COLOR1A1) */
 	unsigned char texcoords, channels;
+	/* each stage's part in a bumped lookup (_gx_psh_indirect_*: the device
+	sets GX's indirect unit by it), and what the device puts in the vertices
+	(_gx_psh_vertices_*) */
+	unsigned char indirect[GX_PSH_MAXIMUM_STAGES];
+	unsigned char vertices;
 	/* why it was not translated */
 	const char *reason;
 	/* something approximated: more constants than GX holds, a dot product
