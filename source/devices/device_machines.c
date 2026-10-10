@@ -248,7 +248,9 @@ boolean machine_update(
 				struct unit_definition *unit_definition = unit_definition_get(unit->definition_index);
 				boolean can_open = TRUE;
 
-				if (TEST_FLAG(*((byte *)unit + 0xb6), _object_function2_active_bit) ||
+				/* port: the object's damage flags, a word (0xb6), read whole: its
+				first byte is its high byte on a big-endian machine */
+				if (TEST_FLAG(*(word *)((byte *)unit + 0xb6), _object_function2_active_bit) ||
 					TEST_FLAG(*(unsigned long *)((byte *)unit_definition + 0x17c), _object_runtime_unit_cannot_open_doors_automatically_bit))
 				{
 					can_open = FALSE;

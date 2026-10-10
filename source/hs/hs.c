@@ -3008,7 +3008,8 @@ static void evaluator( \
 	if (arguments) \
 	{ \
 		union hs_real_value result; \
-		result.real_value = function(arguments[0]); \
+		/* port: the short at its cell's low-order end (halo_cells.h) */ \
+		result.real_value = function(HALO_CELL_AT(unsigned short, arguments)); \
 		hs_return(thread_index, result.long_value); \
 	} \
 	return; \

@@ -709,7 +709,9 @@ struct actor_perception_unit_view
 struct actor_perception_target_unit_view
 {
 	byte __unknown000[0xB6];
-	byte active_region_flags;
+	/* port: the object's damage flags, a word (its low byte on the Xbox, its
+	high byte on a big-endian machine, were a byte read here) */
+	word active_region_flags;
 };
 
 struct actor_perception_status_unit_view
