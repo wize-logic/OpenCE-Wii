@@ -20,11 +20,12 @@ end.
 | `port/linux/include/` | The port's headers: the limits (`halo_port_limits.h`, with `HALO_PORT_NETWORK_VERSION`), capacities (`halo_port_capacity.h`), the prefix header, `halo_linux_source_fixups.h` (port functions the game's sources call) |
 | `port/include/xdk/` | Stand-ins for the Xbox SDK's headers (declarations only) |
 | `port/windows/` | The Windows build's own files (`win32_*.c`, headers) |
+| `port/wii/` | The Wii port (branch `wii-port`): its platform files (`src/`), the Direct3D device on GX (`d3d8_gx.c`), the prefix header, the shared files it keeps (`port.json`), host checks (`tests/`), the vertex program compiler (`tools/nv2a_codegen.c`) |
 | `port/android/` | The Android app: the guest runtime, the host library (`host/`), the Java app (`app/`), host imports (`host_imports.list`) |
 | `port/assets/` | What the builds embed or ship: high-res HUD (`hud/`), fonts, titles, menus (`menus/`), icons, network brokers |
 | `port/third_party/` | Vendored libraries, each with a README naming its upstream, version and checksum |
 | `port/tools/` | Stand-alone tools (`cache_file_report.c`) |
-| `tools/` | Build scripts (`linux_build.py`, `windows_build.py`, `android_build.py`, `ci_build.py`), generators (`ce_menus.py`, `port_settings.py`, `hud_assets.py`, `title_assets.py`, `embed_assets.py`, `xdk_headers.py`) and tests |
+| `tools/` | Build scripts (`linux_build.py`, `windows_build.py`, `android_build.py`, `ci_build.py`), generators (`ce_menus.py`, `port_settings.py`, `hud_assets.py`, `title_assets.py`, `embed_assets.py`, `xdk_headers.py`), the Wii's (`wii_build.py`, `wii_link.py`, `wii_package.py`, `wii_convert_maps.py`, `wii_tag_layout.py`, `wii_gx_textures.py`, `wii_dolphin.py`, `lockstep_compare.py`) and tests |
 | `docs/` | Longer design notes (`custom_edition_caches.md`) |
 | `pgo/` | Profile-guided optimisation profiles |
 | `assets/` | Game data for local runs (gitignored: `maps/`, `custom_maps/`) |
@@ -38,6 +39,8 @@ ninja linux                    # build/linux/halo
 ninja android                  # the Android guest image and native libraries
 ninja android_apk              # the APK (Gradle)
 ninja windows                  # on Windows only
+ninja wii                      # build/wii/halo.dol (devkitPPC and ../WiiLibs; see port/wii/README.md)
+ninja wii-package              # build/wii/halo-wii.zip for the Homebrew Channel
 python tools/ci_build.py linux release   # what CI builds
 ```
 
@@ -64,6 +67,7 @@ python tools/ci_build.py linux release   # what CI builds
 | `HALO_GLES` | Android | The OpenGL ES renderer |
 | `HALO_ARM64_GUEST` | Android | The guest's ABI (ILP32 AArch64) |
 | `HALO_WINDOWS` | Windows (`halo_windows_prefix.h`) | The Windows build |
+| `HALO_WII` | Wii (`halo_wii_prefix.h`, `tools/wii_build.py`) | The Wii build: big-endian PowerPC, GX, the Xbox's capacities |
 | `HALO_RELEASE` | `--release` | No assertions checked |
 | `HALO_PROFILE` | `--profile` | The profiling build; a normal build must be unchanged by it |
 
