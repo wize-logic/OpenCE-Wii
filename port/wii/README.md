@@ -244,7 +244,19 @@ and pixel shaders.
     (fewer when the constant has zero channels). Swap tables put one channel in all three, as do
     the konst selections for constants.
   - Signed negation becomes TEV's subtraction. The other signed mappings are clamped to [0, 1],
-    as TEV's registers are.
+    as TEV's registers are, except in a dot product.
+  - A dot product of signed values (expanded or half-biased: a bump map against the
+    normalization cube map's direction, or against a constant) is made exactly, a channel at a
+    time, by TEV's lerp with its bias of -1/2 and its scale: (x - 1/2)(y - 1/2) is
+    (lerp(1 - x, x, y) - 1/2) / 2, and (x - 1/2)y is lerp(1/2, x, y) - 1/2.
+    - The sum stays signed between its stages (unclamped: TEV keeps -4 to 4 for a d input); the
+      last clamps it, so a negative one is 0.
+    - In the colour half it takes two stages a channel (1 - x and x as one stage's colour and
+      alpha, then the term). Where the alpha half reads its blue (the lightmap's bump term, a
+      reflection's Fresnel), it takes three in the alpha half, and the colour reads that
+      register's alpha, as it does products of it.
+    - A dot product of a register's colour is still taken as 1 (no swap reaches its channels).
+  - (1 - x)p + xq is TEV's lerp, one stage.
   - Constants read as 0 or 1 need no register. Those needed in every channel take the four konst
     registers first, and any beyond four are set in TEV registers kept for them.
   - The fog register reads the vertex's fog factor, sent as a fifth texture coordinate into a
@@ -267,8 +279,8 @@ and pixel shaders.
 - **Textures.** A map's bitmap is bound straight from the texture cache in its GX format. Any
   other texture is decoded to RGBA8 into a 1.5 MB cache, such as the glyph cache, which is
   re-decoded when its pixels change. A cube map is bound as its sphere map, and each vertex's
-  direction is mapped onto it (on the CPU). A dot product with a cube map (a bump map against a
-  normalization cube map, whose signed values TEV would clamp) is still taken as 1, unlit.
+  direction is mapped onto it (on the CPU): the normalization cube map's too, whose texel is the
+  direction a bump map's dot product takes.
 - **Depth.** A program's position matrix and its depth's a + b/w come from its constants alone,
   from two points along w's gradient. Both vertex paths take them, so a surface's passes meet
   their equal-depth tests whichever path each pass took.
@@ -326,10 +338,13 @@ Dolphin runs the game, but these need the console:
    `display.model_detail` (0.5 on the Wii) chooses simpler models sooner. Next: the blended
    vertices' cost on the CPU (the fetch, the program and the emission per vertex), and a profile
    on real hardware, where Dolphin's timing may not hold.
-2. The rest of the drawing: bump mapping (dot products of two registers: indirect texturing
-   where it maps), and the bumped reflections' dependent lookups. Sampling the cube maps put
-   the environment's lit pass (`10c30c53`, whose cube map direction comes from the tangent frame)
-   back on the CPU: a10's frame takes about 200 ms in Dolphin (150 without them).
+2. The rest of the drawing. Bump mapping's dot products of textures and constants are exact
+   (the lightmap's bump term, a light's diffuse, the flat cube map's reflection). Still taken as
+   1: the bumped specular's (dot products of registers, signed sums of products), the
+   self-illuminated lightmap's (more than 16 stages), a light's alpha test's (a register's), and
+   the bumped reflections' dependent lookups (indirect texturing where it maps). Sampling the
+   cube maps put the environment's lit pass (`10c30c53`, whose cube map direction comes from the
+   tangent frame) back on the CPU: a10's frame takes about 200 ms in Dolphin (150 without them).
 3. Playing on. The campaign beyond a10's opening, and the lockstep check over longer sessions and
    more levels. Big-endian faults found so far:
    - plain char's sign (fixed with `-fsigned-char`);
