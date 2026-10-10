@@ -147,7 +147,7 @@ static void instruction_code(FILE *out, const struct nv2a_cpu_instruction *instr
 	case _ilu_mov: fprintf(out, "\t\tI[0] = C[0]; I[1] = C[1]; I[2] = C[2]; I[3] = C[3];\n"); break;
 	case _ilu_rcp: fprintf(out, "\t\tI[0] = I[1] = I[2] = I[3] = 1.0f / C[0];\n"); break;
 	case _ilu_rcc: fprintf(out, "\t\tI[0] = I[1] = I[2] = I[3] = reciprocal_clamped(C[0]);\n"); break;
-	case _ilu_rsq: fprintf(out, "\t\tI[0] = I[1] = I[2] = I[3] = 1.0f / sqrtf(fabsf(C[0]));\n"); break;
+	case _ilu_rsq: fprintf(out, "\t\tI[0] = I[1] = I[2] = I[3] = 1.0f / nv2a_sqrtf(fabsf(C[0]));\n"); break;
 	case _ilu_exp: case _ilu_log: case _ilu_lit:
 		fprintf(out, "\t\tnv2a_cpu_ilu(%d, C, I);\n", instruction->ilu);
 		break;
@@ -158,7 +158,7 @@ static void instruction_code(FILE *out, const struct nv2a_cpu_instruction *instr
 	if (instruction->captures_clip && !colors_only)
 		fprintf(out, "\t\tmemcpy(o->clip, p, sizeof(o->clip));\n\t\to->clip_captured = 1;\n");
 	if (instruction->mac == _mac_arl)
-		fprintf(out, "\t\ta0 = (int)floorf(M[0] + 0.001f);\n");
+		fprintf(out, "\t\ta0 = nv2a_floor_index(M[0] + 0.001f);\n");
 	else if (instruction->mac != _mac_nop && instruction->mac_mask)
 		masked(out, temporary_name(instruction->temporary, text, sizeof(text)), "M", instruction->mac_mask);
 	if (instruction->ilu != _ilu_nop && instruction->ilu_mask)
@@ -199,6 +199,140 @@ static void instruction_code(FILE *out, const struct nv2a_cpu_instruction *instr
 	}
 	fprintf(out, "\t}\n");
 	(void)components;
+}
+
+/* the outputs each instruction's results reach (NV2A_CPU_LIVE_...), found
+backwards from the end a register's component at a time: a draw that reads
+none of them skips the instruction, and what it runs is the same, so the
+outputs it reads are too */
+static unsigned temporary_index(unsigned temporary)
+{
+	return temporary == 12 ? 12 : temporary < 12 ? temporary : 0;
+}
+
+static void live_needs(const struct nv2a_cpu_program *program, unsigned *needs)
+{
+	unsigned need[13][4], need_a0 = 0;
+	long index;
+	int component, which;
+
+	memset(need, 0, sizeof(need));
+	/* (the position is p as the program ends) */
+	for (component = 0; component < 4; component++)
+		need[12][component] = NV2A_CPU_LIVE_POSITION;
+	for (index = (long)program->count - 1; index >= 0; index--)
+	{
+		const struct nv2a_cpu_instruction *instruction = &program->instructions[index];
+		unsigned reaches = 0, kills[13] = { 0 };
+
+		/* what its writes reach */
+		if (instruction->mac == _mac_arl)
+			reaches |= need_a0;
+		else if (instruction->mac != _mac_nop && instruction->mac_mask)
+			kills[temporary_index(instruction->temporary)] |= instruction->mac_mask;
+		if (instruction->ilu != _ilu_nop && instruction->ilu_mask)
+			kills[temporary_index(instruction->mac != _mac_nop ? 1 : instruction->temporary)] |= instruction->ilu_mask;
+		if (instruction->output_mask && instruction->output_is_register &&
+			(instruction->output_from_ilu ? instruction->ilu : instruction->mac) != 0)
+		{
+			switch (instruction->output_address)
+			{
+			case _output_position: kills[12] |= instruction->output_mask; break;
+			case _output_d0: reaches |= NV2A_CPU_LIVE_D0; break;
+			case _output_d1: reaches |= NV2A_CPU_LIVE_D1; break;
+			case _output_b0: case _output_b1: reaches |= NV2A_CPU_LIVE_BACK; break;
+			case _output_fog: if (instruction->output_mask & 8) reaches |= NV2A_CPU_LIVE_FOG; break;
+			case _output_point_size: if (instruction->output_mask & 8) reaches |= NV2A_CPU_LIVE_POINT_SIZE; break;
+			default:
+				if (instruction->output_address >= _output_t0 && instruction->output_address < _output_t0 + 4)
+					reaches |= NV2A_CPU_LIVE_T0 << (instruction->output_address - _output_t0);
+				break;
+			}
+		}
+		for (which = 0; which < 13; which++)
+			for (component = 0; component < 4; component++)
+				if (kills[which] & (8u >> component))
+				{
+					reaches |= need[which][component];
+					need[which][component] = 0;
+				}
+		if (instruction->mac == _mac_arl)
+			need_a0 = 0;
+		/* (the clip-space position: p before this instruction's writes) */
+		if (instruction->captures_clip)
+		{
+			reaches |= NV2A_CPU_LIVE_POSITION;
+			for (component = 0; component < 4; component++)
+				need[12][component] |= NV2A_CPU_LIVE_POSITION;
+		}
+		/* what it reads: its operands, whole */
+		if (reaches)
+		{
+			int reads[3] = { 0, 0, 0 };
+
+			if (instruction->mac != _mac_nop)
+			{
+				reads[0] = 1;
+				if (instruction->mac != _mac_mov && instruction->mac != _mac_arl && instruction->mac != _mac_add)
+					reads[1] = 1;
+			}
+			if (instruction->ilu != _ilu_nop || instruction->mac == _mac_add || instruction->mac == _mac_mad)
+				reads[2] = 1;
+			for (which = 0; which < 3; which++)
+			{
+				const struct nv2a_cpu_operand *operand = &instruction->operands[which];
+
+				if (!reads[which])
+					continue;
+				if (operand->mux == _mux_temporary)
+					for (component = 0; component < 4; component++)
+						need[temporary_index(operand->index)][operand->swizzle[component] & 3] |= reaches;
+				else if (operand->mux == _mux_constant && instruction->relative)
+					need_a0 |= reaches;
+			}
+		}
+		needs[index] = reaches;
+	}
+}
+
+/* the outputs' components no instruction writes, as nv2a_cpu_run leaves
+them (but the point size, which nv2a_cpu_run_live sets) */
+static void live_defaults(FILE *out, const struct nv2a_cpu_program *program)
+{
+	static const char *const names[] = { "d0", "d1", "b0", "b1", "t[0]", "t[1]", "t[2]", "t[3]" };
+	unsigned written[8] = { 0 };
+	int fog = 0, captured = 0, which, component;
+	unsigned long index;
+
+	for (index = 0; index < program->count; index++)
+	{
+		const struct nv2a_cpu_instruction *instruction = &program->instructions[index];
+
+		captured |= instruction->captures_clip;
+		if (!(instruction->output_mask && instruction->output_is_register &&
+			(instruction->output_from_ilu ? instruction->ilu : instruction->mac) != 0))
+			continue;
+		switch (instruction->output_address)
+		{
+		case _output_d0: written[0] |= instruction->output_mask; break;
+		case _output_d1: written[1] |= instruction->output_mask; break;
+		case _output_b0: written[2] |= instruction->output_mask; break;
+		case _output_b1: written[3] |= instruction->output_mask; break;
+		case _output_fog: fog |= instruction->output_mask & 8; break;
+		default:
+			if (instruction->output_address >= _output_t0 && instruction->output_address < _output_t0 + 4)
+				written[4 + instruction->output_address - _output_t0] |= instruction->output_mask;
+			break;
+		}
+	}
+	for (which = 0; which < 8; which++)
+		for (component = 0; component < 4; component++)
+			if (!(written[which] & (8u >> component)))
+				fprintf(out, "\to->%s[%d] = %s;\n", names[which], component, component == 3 ? "1.0f" : "0.0f");
+	if (!fog)
+		fprintf(out, "\to->fog = 1.0f;\n");
+	if (!captured)
+		fprintf(out, "\to->clip[0] = o->clip[1] = o->clip[2] = o->clip[3] = 0.0f;\n\to->clip_captured = 0;\n");
 }
 
 /* one output's dependencies: its components' input registers, "!" where it
@@ -245,6 +379,7 @@ int main(int argc, char **argv)
 	static DWORD words[MAXIMUM_WORDS];
 	static unsigned long hashes[MAXIMUM_PROGRAMS], counts[MAXIMUM_PROGRAMS];
 	static struct nv2a_cpu_program program;
+	static unsigned needs[NV2A_CPU_MAXIMUM_INSTRUCTIONS];
 	unsigned long word_count = 0, position, program_count = 0, index;
 	char line[512];
 	FILE *in, *out;
@@ -332,13 +467,6 @@ int main(int argc, char **argv)
 		program_count++;
 		nv2a_cpu_compile(instructions, count, &program);
 		dependencies_comment(out, &program);
-		fprintf(out, "static void program_%08lx(const float (*c)[4], const float (*v)[4], struct nv2a_cpu_output *o)\n"
-			"{\n\tfloat r[12][4] = { { 0.0f } };\n\tfloat p[4] = { 0.0f, 0.0f, 0.0f, 1.0f };\n"
-			"\tfloat A[4], B[4], C[4], M[4], I[4];\n\tint a0 = 0;\n\n"
-			"\t(void)c;\n\t(void)v;\n\t(void)a0;\n\t(void)A;\n\t(void)B;\n\t(void)C;\n\t(void)r;\n", hash);
-		for (index = 0; index < program.count; index++)
-			instruction_code(out, &program.instructions[index], index);
-		fprintf(out, "\tmemcpy(o->position, p, sizeof(o->position));\n}\n\n");
 		/* (its colours and fog alone) */
 		fprintf(out, "static void program_%08lx_colors(const float (*c)[4], const float (*v)[4], struct nv2a_cpu_output *o)\n"
 			"{\n\tfloat r[12][4] = { { 0.0f } };\n\tfloat p[4] = { 0.0f, 0.0f, 0.0f, 1.0f };\n"
@@ -349,6 +477,35 @@ int main(int argc, char **argv)
 			instruction_code(out, &program.instructions[index], index);
 		colors_only = 0;
 		fprintf(out, "}\n\n");
+		/* (the program, for the outputs a draw reads: each instruction
+		that reaches none of them skipped) */
+		fprintf(out, "static void program_%08lx(const float (*c)[4], const float (*v)[4], struct nv2a_cpu_output *o,\n"
+			"\tunsigned live)\n"
+			"{\n\tfloat r[12][4] = { { 0.0f } };\n\tfloat p[4] = { 0.0f, 0.0f, 0.0f, 1.0f };\n"
+			"\tfloat A[4], B[4], C[4], M[4], I[4];\n\tint a0 = 0;\n\n"
+			"\t(void)c;\n\t(void)v;\n\t(void)a0;\n\t(void)A;\n\t(void)B;\n\t(void)C;\n\t(void)r;\n\t(void)live;\n", hash);
+		live_defaults(out, &program);
+		live_needs(&program, needs);
+		{
+			unsigned open = 0;
+
+			for (index = 0; index < program.count; index++)
+			{
+				if (needs[index] != open)
+				{
+					if (open)
+						fprintf(out, "\t}\n");
+					open = needs[index];
+					if (open)
+						fprintf(out, "\tif (live & 0x%xu)\n\t{\n", open);
+				}
+				if (open)
+					instruction_code(out, &program.instructions[index], index);
+			}
+			if (open)
+				fprintf(out, "\t}\n");
+		}
+		fprintf(out, "\tmemcpy(o->position, p, sizeof(o->position));\n}\n\n");
 	}
 	fprintf(out, "const struct nv2a_cpu_native nv2a_cpu_natives[] =\n{\n");
 	for (index = 0; index < program_count; index++)

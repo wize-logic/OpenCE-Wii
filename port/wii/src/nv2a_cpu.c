@@ -425,8 +425,51 @@ void nv2a_cpu_run_colors(const struct nv2a_cpu_program *program, const float (*c
 	program->native_colors(constants, inputs, output);
 }
 
+/* an output as a program leaves what it doesn't write */
+static void output_clear(struct nv2a_cpu_output *output, float point_size)
+{
+	int component;
+
+	memset(output, 0, sizeof(*output));
+	output->d0[3] = output->d1[3] = output->b0[3] = output->b1[3] = 1.0f;
+	for (component = 0; component < 4; component++)
+		output->t[component][3] = 1.0f;
+	output->fog = 1.0f;
+	output->point_size = point_size;
+}
+
+static void nv2a_cpu_interpret(const struct nv2a_cpu_program *program, const float (*constants)[4],
+	const float (*inputs)[4], float point_size, struct nv2a_cpu_output *output);
+
 void nv2a_cpu_run(const struct nv2a_cpu_program *program, const float (*constants)[4], const float (*inputs)[4],
 	float point_size, struct nv2a_cpu_output *output)
+{
+	if (program->native)
+	{
+		output_clear(output, point_size);
+		program->native(constants, inputs, output, NV2A_CPU_LIVE_ALL);
+		return;
+	}
+	nv2a_cpu_interpret(program, constants, inputs, point_size, output);
+}
+
+void nv2a_cpu_run_live(const struct nv2a_cpu_program *program, const float (*constants)[4], const float (*inputs)[4],
+	float point_size, struct nv2a_cpu_output *output, unsigned live)
+{
+	/* (the function sets what the program leaves of the outputs it reads,
+	but the point size) */
+	if (program->native)
+	{
+		if (live & NV2A_CPU_LIVE_POINT_SIZE)
+			output->point_size = point_size;
+		program->native(constants, inputs, output, live);
+		return;
+	}
+	nv2a_cpu_run(program, constants, inputs, point_size, output);
+}
+
+static void nv2a_cpu_interpret(const struct nv2a_cpu_program *program, const float (*constants)[4],
+	const float (*inputs)[4], float point_size, struct nv2a_cpu_output *output)
 {
 	struct registers registers;
 	unsigned long index;
@@ -436,17 +479,7 @@ void nv2a_cpu_run(const struct nv2a_cpu_program *program, const float (*constant
 	registers.position[3] = 1.0f;
 	registers.inputs = inputs;
 	registers.constants = constants;
-	memset(output, 0, sizeof(*output));
-	output->d0[3] = output->d1[3] = output->b0[3] = output->b1[3] = 1.0f;
-	for (component = 0; component < 4; component++)
-		output->t[component][3] = 1.0f;
-	output->fog = 1.0f;
-	output->point_size = point_size;
-	if (program->native)
-	{
-		program->native(constants, inputs, output);
-		return;
-	}
+	output_clear(output, point_size);
 
 	for (index = 0; index < program->count; index++)
 	{
