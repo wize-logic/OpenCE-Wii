@@ -71,8 +71,14 @@ void test_input_gamepad(XINPUT_GAMEPAD *pad, unsigned long long milliseconds)
 	same input at the same tick on every machine, for a lockstep check) */
 	if (fixed_ticks < 0)
 		fixed_ticks = config_boolean("debug.fixed_ticks") ? 1 : 0;
-	if (fixed_ticks && network_test_game_tick >= 0)
+	if (fixed_ticks)
+	{
+		/* (no input until a game's tick is known: a frame of the menu's
+		clock would differ from machine to machine) */
+		if (network_test_game_tick < 0)
+			return;
 		milliseconds = (unsigned long long)network_test_game_tick * 1000ULL / 30ULL + 1;
+	}
 	if (test_input_holding_action)
 	{
 		/* (standing still, the button held from a second on) */
