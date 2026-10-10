@@ -793,19 +793,21 @@ void network_test_update(
 		game_time_get() != network_test.lockstep_logged && game_time_get() % network_test.lockstep_ticks == 0)
 	{
 		struct object_iterator objects;
+		struct object_datum *datum;
 		struct _object_datum *object;
 		unsigned long hash = 2166136261UL, words[14];
 		long count = 0, word;
 
 		network_test.lockstep_logged = game_time_get();
 		object_iterator_new(&objects, 0xFFFFFFFFUL, 0);
-		while ((object = object_iterator_next(&objects)) != NULL)
+		while ((datum = object_iterator_next(&objects)) != NULL)
 		{
+			object = &datum->object;
 			/* (the index, not the salt: that counts the identifiers handed out
 			since the game started, the menu's too, which ran for longer or
 			shorter on another machine) */
 			words[0] = (unsigned long)objects.index & 0xFFFF;
-			words[1] = (unsigned long)object->type;
+			words[1] = (unsigned long)datum->definition_index & 0xFFFF;
 			memcpy(&words[2], &object->position, 3 * sizeof(unsigned long));
 			memcpy(&words[5], &object->translational_velocity, 3 * sizeof(unsigned long));
 			memcpy(&words[8], &object->forward, 3 * sizeof(unsigned long));
