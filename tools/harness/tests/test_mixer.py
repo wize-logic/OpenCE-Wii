@@ -32,7 +32,12 @@ def generated(source=None, fault=None, scalar=False):
     """the mixer: dsound_sdl.c from its constants to the end of the mixing (before the output), its resampler adding
     tap by tap if scalar"""
     text = source if source is not None else read(SOURCE)
-    code = text[text.index("#define OUTPUT_RATE"):text.index("/* ---------- output")]
+    start = text.index("#define OUTPUT_RATE")
+    # (from the #ifdef HALO_WII that picks the Wii's rate, when there is one, so its #else and #endif come whole)
+    wii = text.rfind("#ifdef HALO_WII", 0, start)
+    if wii >= 0 and "#endif" not in text[wii:start]:
+        start = wii
+    code = text[start:text.index("/* ---------- output")]
     if fault:
         code = mutated(code, *fault)
     return (("under_test.inc", ("#define RESAMPLER_SCALAR\n" if scalar else "") + code),)
