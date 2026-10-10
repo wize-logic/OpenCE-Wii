@@ -1204,11 +1204,34 @@ static unsigned long texture_hash(const D3DBaseTexture *texture, unsigned long b
 	return hash;
 }
 
+/* the pixels of textures evicted while a frame is open: GX may still read
+them for the frame's draws, so they are freed once it has drawn them
+(texture_frees_flush, at the frame's end) */
+#define PENDING_TEXTURE_FREES 256
+static void *pending_texture_frees[PENDING_TEXTURE_FREES];
+static unsigned pending_texture_free_count;
+
+static void texture_frees_flush(void)
+{
+	while (pending_texture_free_count)
+		free(pending_texture_frees[--pending_texture_free_count]);
+}
+
 static void texture_evict(struct texture_entry *entry)
 {
 	if (entry->texels && !entry->native)
 	{
-		free(entry->texels);
+		if (device.frame_open)
+		{
+			if (pending_texture_free_count == PENDING_TEXTURE_FREES)
+			{
+				GX_DrawDone();
+				texture_frees_flush();
+			}
+			pending_texture_frees[pending_texture_free_count++] = entry->texels;
+		}
+		else
+			free(entry->texels);
 		texture_cache_bytes -= entry->bytes;
 	}
 	memset(entry, 0, sizeof(*entry));
@@ -1336,7 +1359,11 @@ static struct texture_entry *texture_get(const D3DBaseTexture *texture, const D3
 		if (!oldest || candidate->used_frame < oldest->used_frame || !candidate->texels)
 			oldest = candidate;
 	}
-	if (entry && !entry->native && entry->used_frame != device.frames &&
+	/* (a texture the game writes as it draws, outside the map's texture
+	cache: the glyph cache, whose strings bring their glyphs in just before
+	they are drawn, checked at each bind; the others once a frame) */
+	if (entry && !entry->native &&
+		(entry->used_frame != device.frames || !texture_in_texture_cache(texture)) &&
 		texture_hash(texture, entry->source_bytes) != entry->hash)
 	{
 		/* (rewritten since it was decoded: again) */
@@ -3918,6 +3945,9 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		wl_gx_invalidate_shadow();
 		wl_gx_end_frame();
 		device.frame_open = FALSE;
+		/* (the frame drawn: the textures evicted during it can go) */
+		GX_DrawDone();
+		texture_frees_flush();
 		timing.present += wl_platform_time_us() - started;
 	}
 	flip_count++;
