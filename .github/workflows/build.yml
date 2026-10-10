@@ -289,10 +289,11 @@ jobs:
           key: ccache-wii-${{ github.sha }}
           restore-keys: ccache-wii-
 
-      - name: Check the GX translations on the host
+      - name: Check the GX translations and the controllers' mapping on the host
         run: |
           python3 tools/wii_gx_psh_check.py
           python3 tools/wii_nv2a_check.py
+          python3 tools/wii_input_check.py
 
       - name: Build
         run: |

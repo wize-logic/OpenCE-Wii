@@ -39,6 +39,7 @@ tools/wii_convert_maps.py XBOX/maps/ui.map XBOX/maps/bloodgulch.map   # into bui
 tools/wii_dolphin.py --seconds 300 --until "frame 360:"            # run it in Dolphin from WSL
 tools/wii_gx_psh_check.py                   # the combiner translation, checked on the host (WIILIBS=DIR)
 tools/wii_nv2a_check.py                     # the compiled vertex programs against the interpreter
+tools/wii_input_check.py                    # the controllers' mapping to the Xbox gamepad (WIILIBS=DIR)
 tools/wii_animation_check.py --converted DIR XBOX/maps/*.map   # the converted maps against the Xbox's (map conversion, below)
 tools/wii_data_check.py --converted DIR XBOX/maps/*.map
 tools/wii_placeholder_check.py XBOX/maps/*.map    # the game reads none of the tag bytes left as they are
@@ -47,7 +48,7 @@ ninja wii-package                           # build/wii/halo-wii.zip for the Hom
 
 `ninja wii-package` zips `apps/halo` as the Homebrew Channel reads it: `boot.dol`, `meta.xml`
 and an icon drawn by `tools/wii_package.py`. It holds no game data. The `wii` job in
-`.github/workflows/build.yml` runs both host checks, builds the zip in devkitPro's devkitPPC
+`.github/workflows/build.yml` runs the three host checks, builds the zip in devkitPro's devkitPPC
 image (with WiiLibs checked out beside the repository) and keeps it as an artifact.
 
 `tools/wii_dolphin.py` runs WiiLibs' Dolphin runner (`tools/dolphin_run.py` there) on the build:
@@ -108,7 +109,8 @@ inflated it to, and the Wii reads it where it is.
   | --- | --- |
   | `wii_platform.c` | log, messages and quitting |
   | `wii_posix.c` | POSIX threads, files and time over newlib and libogc |
-  | `xinput_wii.c` | XInput over the Wii Remote with Nunchuk or Classic Controller, and the GameCube controller |
+  | `xinput_wii.c` | XInput over the Wii Remote with Nunchuk or Classic Controller, and the GameCube controller; the pointer's aim |
+  | `xinput_wii_map.c` | what each button and stick of those controllers is as the Xbox gamepad (checked on the host) |
   | `posix_net_wii.c` | sockets over IOS, for system link |
   | `d3d8_gx.c` | the Direct3D device |
   | `wii_extras.c` | the desktop additions the Wii goes without |
@@ -401,6 +403,74 @@ It found `list_get`'s element index read from the wrong end of its cell, which m
 teleport player 0 to player 1's flag. With that fixed, a10's opening (the cryo bay, the cinematic and
 its skip, the scripted player) agrees at every tick of 2,600.
 
+## The controllers
+
+`src/xinput_wii.c` is the Xbox's XInput over WiiLibs' raw input (`wl_platform_input_poll`);
+`src/xinput_wii_map.c` says what each button is. Port N (the player on controller N, four at
+most, so the game's split screen works) is the Nth Wii Remote, with its Nunchuk or Classic
+Controller; when no Remote is connected there, the Nth GameCube controller. A controller that
+comes or goes is a controller inserted or removed for the game, as on the Xbox; a Remote that
+loses its data for a moment (a Nunchuk plugged in) stays, for up to two seconds.
+
+The game's controls are its defaults: the left stick moves, the right looks, A jumps, B melees, X
+is the action and reload, Y switches weapons, the left trigger throws a grenade, the right fires,
+Black switches grenade type, White is the flashlight, a click of the left stick crouches and a
+click of the right zooms, Back shows the scores, Start pauses. In the menus A accepts, B and Back
+go back, and the D-pad or the left stick moves.
+
+Sticks and triggers arrive from WiiLibs over their whole travel (the GameCube's sticks are
+full at the end of their gates, its triggers run from 30 to 180 as `PAD_Clamp` takes them, the
+Classic Controller's five-bit triggers are scaled to a byte). The game applies its own dead zone
+to the sticks (`input_xbox.c`), so none is added here. A trigger is pressed fully when its digital
+button is (the Classic Controller Pro has nothing else).
+
+Where a controller has fewer buttons than the Xbox's, the D-pad's buttons do two jobs in play
+(a press is the D-pad and the Xbox button). While any menu is up they do only the D-pad's, so
+that a menu's left, right, up and down never also mean Back, a click or a weapon.
+
+| Xbox control | Classic Controller (and Pro) | Wii Remote + Nunchuk | GameCube controller |
+| --- | --- | --- | --- |
+| Left stick (move) | left stick | Nunchuk stick | main stick |
+| Right stick (look) | right stick | the pointer, below | C stick |
+| A (jump; accept) | b | A | A |
+| B (melee; back) | a | 1 (and B in the menus) | B |
+| X (action, reload) | y | D-pad down | X |
+| Y (switch weapons) | x | D-pad up | Y |
+| Left trigger (grenade) | L | Z | L |
+| Right trigger (fire) | R | B | R |
+| Black (switch grenades) | ZL | D-pad left | Z |
+| White (flashlight) | ZR | D-pad right | D-pad right |
+| Left stick click (crouch) | D-pad down | C | D-pad down |
+| Right stick click (zoom) | D-pad up | 2 | D-pad up |
+| Back (scores) | - | - | D-pad left |
+| Start (pause) | + | + | Start |
+| D-pad (menus) | D-pad | D-pad | D-pad |
+
+The Home button does nothing in the game (the menus' Quit returns to the loader). The Remote
+without a Nunchuk has no way to move (its buttons and pointer work); the Classic Controller's
+pointer is not used; the Wii U Pro Controller is not supported (its stick clicks are not read).
+
+**The pointer** (a Remote without a Classic Controller) aims like a mouse's direct look
+(`halo_linux_mouse_look`): the view does not turn while the pointer is within 35% of the half
+screen of the middle, in either direction. Outside that box it turns toward the pointer, slowly
+at first (the square of the distance from the box's edge) and at the player's own look speed
+(the profile's look sensitivity) at the screen's edge. A pointer to the right turns right, one
+above the middle looks up. Aim magnetism is off while the pointer is turning the view and on
+within the box, where it helps to hold a target. When the sensor bar is lost the last position
+carries on for 150 ms, then the view stops. The profile's inverted look does not apply to it.
+
+Checking the mapping: `tools/wii_input_check.py` builds `tests/wii_input_check.c` for the host
+with WiiLibs' `input_shape.c` and maps synthetic input states, comparing the Xbox gamepad with
+this table (each button on its own in play and in the menus, every Xbox control reachable from
+each controller, the sticks' signs and extremes, the triggers, the pointer's turn and its loss).
+WiiLibs' own tests cover the reading (`test_platform_input_wii`: the backend against stand-ins
+for libogc's, with the sticks' and triggers' ranges and a Remote's drop-out) and the shaping
+(`test_platform_input_shape`). On a run (Dolphin or the console) `debug.input_log = true`
+(`HALO_INPUT_LOG=1`) writes each controller's gamepad state to the log whenever it changes, and
+`tools/wii_input_log.py LOG --expect classic|remote|gamecube` decodes those lines into button
+names and checks that pressing each button in turn gave what the table says. What the host cannot
+show is in the next section.
+
 ## What only a real Wii can show
 
 Dolphin runs the game, but these need the console:
@@ -416,8 +486,10 @@ Dolphin runs the game, but these need the console:
   from `frsqrte`, checked on the host for estimates as coarse as the 750's
   documented 1/32; Broadway's own is not documented.
 - **The SD card and USB drive's speed** (a level loads in about 11 seconds
-  in Dolphin) and **the controllers** (the Classic Controller, the
-  GameCube pad, the Wiimote and Nunchuk mappings in `xinput_wii.c`).
+  in Dolphin) and **the controllers** ("The controllers", above: that the sticks'
+  and triggers' real ranges are the ones read, a Remote's drop-outs, the pointer's feel and
+  look speed, the Classic Controller Pro's triggers, whether the Wii U Pro Controller and the
+  Home button need handling; `debug.input_log` writes each state to the log).
 - **Memory.** MEM1 and MEM2 as the console's IOS leaves them, with the
   Homebrew Channel's loader (the memory report in the log).
 - **TEV's arithmetic.** The bump mapping's signed sums rely on TEV's lerp with a bias of -1/2,

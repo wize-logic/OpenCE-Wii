@@ -25,7 +25,7 @@ end.
 | `port/assets/` | What the builds embed or ship: high-res HUD (`hud/`), fonts, titles, menus (`menus/`), icons, network brokers |
 | `port/third_party/` | Vendored libraries, each with a README naming its upstream, version and checksum |
 | `port/tools/` | Stand-alone tools (`cache_file_report.c`) |
-| `tools/` | Build scripts (`linux_build.py`, `windows_build.py`, `android_build.py`, `ci_build.py`), generators (`ce_menus.py`, `port_settings.py`, `hud_assets.py`, `title_assets.py`, `embed_assets.py`, `xdk_headers.py`), the Wii's (`wii_build.py`, `wii_link.py`, `wii_package.py`, `wii_convert_maps.py`, `wii_tag_layout.py`, `wii_gx_textures.py`, `wii_dolphin.py`, `lockstep_compare.py`, and the host checks `wii_gx_psh_check.py`, `wii_nv2a_check.py`, and on converted maps `wii_animation_check.py`, `wii_data_check.py`, `wii_placeholder_check.py`) and tests |
+| `tools/` | Build scripts (`linux_build.py`, `windows_build.py`, `android_build.py`, `ci_build.py`), generators (`ce_menus.py`, `port_settings.py`, `hud_assets.py`, `title_assets.py`, `embed_assets.py`, `xdk_headers.py`), the Wii's (`wii_build.py`, `wii_link.py`, `wii_package.py`, `wii_convert_maps.py`, `wii_tag_layout.py`, `wii_gx_textures.py`, `wii_dolphin.py`, `lockstep_compare.py`, and the host checks `wii_gx_psh_check.py`, `wii_nv2a_check.py`, `wii_input_check.py`, and on converted maps `wii_animation_check.py`, `wii_data_check.py`, `wii_placeholder_check.py`) and tests |
 | `docs/` | Longer design notes (`custom_edition_caches.md`) |
 | `pgo/` | Profile-guided optimisation profiles |
 | `assets/` | Game data for local runs (gitignored: `maps/`, `custom_maps/`) |
@@ -218,7 +218,8 @@ converted, how it draws, and the lockstep check.
 - Host checks that need no emulator: `python3 tools/wii_gx_psh_check.py`
   (the TEV translation against the combiners) and
   `python3 tools/wii_nv2a_check.py` (the generated vertex programs against
-  the interpreter), both in the CI's `wii` job. `tools/wii_animation_check.py`
+  the interpreter) and `python3 tools/wii_input_check.py` (the controllers'
+  mapping to the Xbox gamepad), all in the CI's `wii` job. `tools/wii_animation_check.py`
   (every animation of the Xbox's maps against the converted ones) needs the
   maps, so it is not in the CI.
 - Dolphin (`tools/wii_dolphin.py`, WiiLibs' `tools/dolphin_run.py`) opens a
