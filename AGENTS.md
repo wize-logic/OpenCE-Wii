@@ -296,7 +296,8 @@ Owns the map conversion: `tools/wii_convert_maps.py`,
 - Its checks: every map converts (`--output` into a scratch folder, never
   the repository); the notes it prints (fields left as they are that hold
   data, data not reached by the walk); a converted structure read back
-  against the game's own reading of it.
+  against the game's own reading of it (`tools/wii_animation_check.py`,
+  `tools/wii_data_check.py`: nothing may differ on the 24 maps).
 - A field the game reads through another structure than its tag's (as the
   contrail's shader) is listed in `Schema.EMBEDDED`.
 
