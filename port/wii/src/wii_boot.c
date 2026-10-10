@@ -123,14 +123,16 @@ chain, for addr2line on build/wii/halo.elf). */
 void __real_exit(int code) __attribute__((noreturn));
 void __real_abort(void) __attribute__((noreturn));
 
-static void wii_log_callers(const char *what, int code)
+void wii_log_callers(const char *what, int code);
+
+void wii_log_callers(const char *what, int code)
 {
 	unsigned long *frame = __builtin_frame_address(0);
-	char line[160];
+	char line[240];
 	int length = snprintf(line, sizeof(line), "%s(%d) from", what, code);
 	int depth;
 
-	for (depth = 0; depth < 10 && frame && (unsigned long)frame >= 0x80000000UL &&
+	for (depth = 0; depth < 18 && frame && (unsigned long)frame >= 0x80000000UL &&
 		(unsigned long)frame < 0x94000000UL; depth++)
 	{
 		unsigned long *caller = (unsigned long *)frame[0];

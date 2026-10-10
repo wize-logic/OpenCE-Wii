@@ -40,6 +40,7 @@ drive the controller.
 #include "platform.h"
 #include "sdl_platform.h"
 #include "port_config.h"
+#include "test_input.h"
 #include "halo_keyboard.h"
 
 #include <SDL3/SDL.h>
@@ -541,74 +542,6 @@ once a frame, at the display's refresh rate. */
 #define WHEEL_PRESS_MS 50
 #define WHEEL_SCROLL_GAP_MS 200
 
-/* debug.test_input "bot:<seed>": a scripted player for the automated
-network tests (port/linux/game/network_test.c), different for each seed:
-it walks and strafes in circles, turns, fires every few seconds, jumps now
-and then and throws a grenade every seven seconds; "look:<seed>" stands
-still, only turning and looking up and down (where remote players aim and
-whether they stand) */
-static int test_input_holding_action;
-static Uint64 test_input_holding_action_since;
-
-/* the automated tests (port/linux/game/network_test.c): the scripted player
-stands still, holding the action button (X: picking up, swapping weapons)
-after a second */
-void test_input_hold_action(int hold)
-{
-	if (hold && !test_input_holding_action)
-		test_input_holding_action_since = SDL_GetTicks();
-	test_input_holding_action = hold;
-}
-
-static void test_input_gamepad(XINPUT_GAMEPAD *pad)
-{
-	static int checked;
-	static int seed = -1;
-	static int looking;
-	double t;
-
-	if (!checked)
-	{
-		const char *setting = config_string("debug.test_input");
-
-		checked = 1;
-		if (!strncmp(setting, "bot:", 4))
-			seed = atoi(setting + 4);
-		else if (!strcmp(setting, "bot"))
-			seed = 0;
-		else if (!strncmp(setting, "look:", 5))
-		{
-			seed = atoi(setting + 5);
-			looking = 1;
-		}
-	}
-	if (seed < 0)
-		return;
-	if (test_input_holding_action)
-	{
-		/* (standing still, the button held from a second on) */
-		if (SDL_GetTicks() - test_input_holding_action_since >= 1000)
-			pad->bAnalogButtons[XINPUT_GAMEPAD_X] = 255;
-		return;
-	}
-	t = (double)SDL_GetTicks() / 1000.0 + seed * 1.7;
-	if (looking)
-	{
-		pad->sThumbRX = (SHORT)(sin(t * 0.5) * 14000.0);
-		pad->sThumbRY = (SHORT)(sin(t * 0.3) * 32000.0);
-		return;
-	}
-	pad->sThumbLY = (SHORT)(sin(t * 0.9) * 32000.0);
-	pad->sThumbLX = (SHORT)(cos(t * 0.6 + seed) * 20000.0);
-	pad->sThumbRX = (SHORT)(sin(t * 0.4) * 14000.0);
-	if (fmod(t, 3.0) < 0.3)
-		pad->bAnalogButtons[XINPUT_GAMEPAD_RIGHT_TRIGGER] = 255;
-	if (fmod(t, 5.0) < 0.1)
-		pad->bAnalogButtons[XINPUT_GAMEPAD_A] = 255;
-	if (fmod(t, 7.0) < 0.2)
-		pad->bAnalogButtons[XINPUT_GAMEPAD_LEFT_TRIGGER] = 255;
-}
-
 static void wheel_update(void)
 {
 	Uint64 now = SDL_GetTicks();
@@ -909,7 +842,7 @@ DWORD WINAPI XInputGetState(HANDLE device, PXINPUT_STATE state)
 		}
 		if (port_gamepad(gamepads, count, 0))
 			sdl_gamepad_state(gamepads[0], &state->Gamepad);
-		test_input_gamepad(&state->Gamepad);
+		test_input_gamepad(&state->Gamepad, (unsigned long long)SDL_GetTicks());
 		if (abs(state->Gamepad.sThumbRX) > STICK_AIMING_DEFLECTION ||
 			abs(state->Gamepad.sThumbRY) > STICK_AIMING_DEFLECTION)
 		{

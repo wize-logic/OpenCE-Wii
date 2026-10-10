@@ -30,6 +30,8 @@ crouch and of the right zoom.
 
 #include "wl/platform/platform.h"
 
+#include "test_input.h"
+
 #define PORT_COUNT 4
 /* the pointer's box in which the view does not turn (a fraction of the
 screen's half width and height), and the fastest turn, at the edge */
@@ -67,9 +69,11 @@ static const WlRawInput *input_read(void)
 	return &input;
 }
 
+/* (the scripted player of the automated tests is controller 1:
+port/linux/src/test_input.c) */
 static BOOL port_connected(const WlRawInput *raw, int port)
 {
-	return raw->remotes[port].connected || raw->pads[port].connected;
+	return raw->remotes[port].connected || raw->pads[port].connected || (port == 0 && test_input_active());
 }
 
 static short stick(int8_t value)
@@ -252,10 +256,12 @@ DWORD WINAPI XInputGetState(HANDLE device, PXINPUT_STATE state)
 	{
 		gamecube_state(&raw->pads[port], &state->Gamepad);
 	}
-	else
+	else if (!(port == 0 && test_input_active()))
 	{
 		return ERROR_DEVICE_NOT_CONNECTED;
 	}
+	if (port == 0)
+		test_input_gamepad(&state->Gamepad, wl_platform_time_us() / 1000);
 	if (memcmp(&state->Gamepad, &controllers[port].previous, sizeof(state->Gamepad)))
 	{
 		controllers[port].packet_number++;
@@ -376,11 +382,6 @@ void halo_input_name(int input_code, char *name, unsigned int size)
 	(void)input_code;
 	if (size)
 		name[0] = '\0';
-}
-
-void test_input_hold_action(int hold)
-{
-	(void)hold;
 }
 
 void platform_text_typing(int typing)

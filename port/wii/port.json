@@ -10,6 +10,7 @@
     "msvc_wide.c",
     "port_config.c",
     "posix_files.c",
+    "test_input.c",
     "xbdm.c",
     "xbox_files.c",
     "xbox_kernel.c",

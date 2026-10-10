@@ -440,6 +440,15 @@ void display_assert(
 	if (fatal)
 	{
 		stack_walk(0);
+#ifdef HALO_WII
+		/* port: and the return addresses up the frame chain, which the
+		Wii's stack walk does not give (port/wii/src/wii_boot.c) */
+		{
+			extern void wii_log_callers(const char *what, int code);
+
+			wii_log_callers("assert", (int)line);
+		}
+#endif
 	}
 	
 	error(_error_silent, "EXCEPTION %s in %s,#%d: %s", fatal ? "halt" : "warn", file, line, information ? information : "<no reason given>");
