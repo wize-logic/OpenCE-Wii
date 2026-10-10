@@ -85,11 +85,6 @@ enum
 
 enum
 {
-	RASTERIZER_DEBUG_LINE_ZBIAS = 16
-};
-
-enum
-{
 	_rasterizer_stats_none = 0,
 	_rasterizer_stats_summary,
 	_rasterizer_stats_geometry,
@@ -393,7 +388,7 @@ void rasterizer_debug_draw(
 					}
 
 					rasterizer_dynamic_vertices_unlock(vertex_buffer_index);
-					rasterizer_debug_drawing_begin(TRUE, 0);
+					rasterizer_debug_drawing_begin(TRUE);
 					rasterizer_draw_dynamic_vertices(
 						0,
 						triangle_count,
@@ -445,7 +440,7 @@ void rasterizer_debug_draw(
 					}
 
 					rasterizer_dynamic_vertices_unlock(vertex_buffer_index);
-					rasterizer_debug_drawing_begin(TRUE, RASTERIZER_DEBUG_LINE_ZBIAS);
+					rasterizer_debug_drawing_begin(TRUE);
 					rasterizer_draw_dynamic_vertices(
 						0,
 						line_count,
@@ -490,7 +485,7 @@ void rasterizer_debug_draw(
 							primitive->vertices,
 							primitive->vertex_count*sizeof(struct rasterizer_debug_vertex));
 						rasterizer_dynamic_vertices_unlock(vertex_buffer_index);
-						rasterizer_debug_drawing_begin(FALSE, 0);
+						rasterizer_debug_drawing_begin(FALSE);
 						rasterizer_draw_dynamic_vertices(
 							0,
 							1,

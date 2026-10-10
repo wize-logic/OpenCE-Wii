@@ -80,6 +80,27 @@ long hud_hires_asset_fits(long asset, long width, long height)
 	return 0;
 }
 
+/* (the sprites drawn from a high-res texture: none here) */
+unsigned long hud_hires_asset_sprites(long asset)
+{
+	(void)asset;
+	return 0;
+}
+
+int hud_hires_sprites_drawable(long asset, unsigned long address, unsigned long level0_size)
+{
+	(void)asset;
+	(void)address;
+	(void)level0_size;
+	return 0;
+}
+
+void hud_hires_register_placeholder(long asset, const unsigned long *texture)
+{
+	(void)asset;
+	(void)texture;
+}
+
 /* ---------- the XML menus */
 
 struct halo_menus;

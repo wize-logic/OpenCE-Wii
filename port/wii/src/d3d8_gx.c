@@ -4052,6 +4052,12 @@ long halo_screen_commit(void)
 	return SCREEN_WIDTH;
 }
 
+/* (the screen's targets draw a pixel for each of the Xbox's) */
+float halo_screen_scale(void)
+{
+	return 1.0f;
+}
+
 long halo_shadow_map_scale(void)
 {
 	return 1;

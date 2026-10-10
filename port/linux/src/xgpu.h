@@ -14,7 +14,7 @@ device itself (d3d8_gl.c).
 #include "gl.h"
 #include "xbox_texture_formats.h"
 
-#ifdef HALO_ANDROID
+#ifdef HALO_GLES
 /* OpenGL ES features that are optional (d3d8_gl.c gl_initialize) */
 struct xgpu_capabilities
 {
@@ -148,7 +148,7 @@ struct nv2a_pixel_shader_key
 
 char *nv2a_pixel_shader_to_glsl(const struct nv2a_pixel_shader_key *key);
 
-#ifdef HALO_ANDROID
+#ifdef HALO_GLES
 /* ES samplers have no LOD bias of their own */
 #define XGPU_PIXEL_UNIFORMS_ES "uniform vec4 texture_lod_bias;\n"
 #else
