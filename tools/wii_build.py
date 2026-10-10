@@ -325,4 +325,10 @@ def generate_wii_build(n: Writer, sln: Any) -> None:
            description="WII CHECK no .init_array or native thread-local data in $in")
     n.build(outputs=build_dir / "no_constructors.stamp", rule="wii_no_constructors", inputs=elf)
     n.build(outputs="wii", rule="phony", inputs=[dol, build_dir / "no_constructors.stamp"])
+    # the Homebrew Channel's zip (apps/halo: boot.dol, meta.xml, icon.png; no game data)
+    n.rule(name="wii_package", command="$python tools/wii_package.py --dol $in --output $out",
+           description="WII PACKAGE $out")
+    n.build(outputs=build_dir / "halo-wii.zip", rule="wii_package", inputs=dol,
+            implicit=[Path("tools/wii_package.py")])
+    n.build(outputs="wii-package", rule="phony", inputs=[build_dir / "halo-wii.zip"])
     n.newline()

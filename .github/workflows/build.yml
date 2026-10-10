@@ -243,6 +243,54 @@ jobs:
           path: dist/halo-windows-release-symbols
           retention-days: 3
 
+  wii:
+    # The Wii build (port/wii) in devkitPro's devkitPPC image, which has
+    # libogc; clang (with its PowerPC target) compiles the game, as the port
+    # does (tools/wii_build.py). WiiLibs is checked out beside the repository.
+    # The host checks of the GX translations run first; the artifact is the
+    # Homebrew Channel's zip (tools/wii_package.py: no game data). Not part of
+    # the release yet: the port is in bring-up.
+    runs-on: ubuntu-24.04
+    container: devkitpro/devkitppc:latest
+    timeout-minutes: 40
+    steps:
+      - name: Install the toolchain
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends clang lld git python3 ninja-build cmake ccache
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: wize-logic/WiiLibs
+          ref: dolphin-tests-and-fixed-claims
+          path: WiiLibs
+
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-wii-${{ github.sha }}
+          restore-keys: ccache-wii-
+
+      - name: Check the GX translations on the host
+        run: |
+          python3 tools/wii_gx_psh_check.py
+          python3 tools/wii_nv2a_check.py
+
+      - name: Build
+        run: |
+          python3 configure.py --devkitpro "$DEVKITPRO" --wiilibs WiiLibs
+          ninja wii-package
+
+      - run: ccache --show-stats
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: halo-wii
+          path: build/wii/halo-wii.zip
+          retention-days: 3
+
   release:
     # The six builds (and the Windows builds' PDBs) as a release, tagged
     # build-<run number> and marked latest

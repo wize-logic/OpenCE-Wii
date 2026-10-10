@@ -20,7 +20,13 @@ tools/wii_convert_maps.py XBOX/maps/ui.map XBOX/maps/bloodgulch.map   # into bui
 tools/wii_dolphin.py --seconds 300 --until "frame 360:"            # run it in Dolphin from WSL
 tools/wii_gx_psh_check.py                   # the combiner translation, checked on the host
 tools/wii_nv2a_check.py                     # the compiled vertex programs against the interpreter
+ninja wii-package                           # build/wii/halo-wii.zip for the Homebrew Channel
 ```
+
+`ninja wii-package` zips `apps/halo` as the Homebrew Channel reads it: `boot.dol`, `meta.xml`
+and an icon drawn by `tools/wii_package.py`. It holds no game data. The `wii` job in
+`.github/workflows/build.yml` runs both host checks, builds the zip in devkitPro's devkitPPC
+image (with WiiLibs checked out beside the repository) and keeps it as an artifact.
 
 `tools/wii_dolphin.py` runs WiiLibs' Dolphin runner (`tools/dolphin_run.py` there) on the build:
 
@@ -195,4 +201,4 @@ and pixel shaders.
 3. Dolphin's dual-core exit, to be told apart from a fault in the GX stream on hardware.
 4. Playing a level (Blood Gulch, then a10), and the game core's endianness checked under qemu
    against the x86 build.
-5. Real hardware, then packaging for the Homebrew Channel (`meta.xml`, an icon) and a CI job.
+5. Real hardware, from the Homebrew Channel (`ninja wii-package`).
