@@ -11,6 +11,8 @@ port/linux/src/nv2a_psh.c translates them for OpenGL, become TEV stages.
 
 #include "platform.h"
 
+#include "wl/platform/tev.h"
+
 enum
 {
 	GX_PSH_MAXIMUM_STAGES = 16,
@@ -53,31 +55,16 @@ struct gx_psh_textures
 	DWORD fog_color;
 };
 
-struct gx_psh_stage
-{
-	unsigned char texture_map, ras_channel;
-	unsigned char texture_swap, ras_swap;
-	unsigned char konst_color, konst_alpha;
-	unsigned char color_in[4], color_op, color_bias, color_scale, color_dest;
-	unsigned char alpha_in[4], alpha_op, alpha_bias, alpha_scale, alpha_dest;
-	/* a result not clamped to [0, 1]: a signed sum TEV keeps (-4 to 4) for
-	a later stage's d */
-	unsigned char color_unclamped, alpha_unclamped;
-};
-
 struct gx_psh_program
 {
-	unsigned stage_count;
-	struct gx_psh_stage stages[GX_PSH_MAXIMUM_STAGES];
-	unsigned konst_count;
-	DWORD konst[4];
+	/* the stages, konst colours, preloaded registers and swap tables
+	(WiiLibs' TEV program, wl/platform/tev.h) */
+	WlTevProgram tev;
+	/* what the stages read of the vertices: the texture coordinates (bit n:
+	GX_TEXCOORDn) and the colour channels (bit 0 COLOR0A0, bit 1 COLOR1A1) */
+	unsigned char texcoords, channels;
 	/* why it was not translated */
 	const char *reason;
-	/* constants beyond the four konst registers: TEV registers given their
-	values before the stages run (GX_SetTevColor) */
-	unsigned preload_count;
-	unsigned char preload_register[3];
-	DWORD preload_color[3];
 	/* something approximated: more constants than GX holds, a dot product
 	or mapping that did not fit */
 	BOOL approximate;
@@ -88,8 +75,7 @@ struct gx_psh_program
 usable) */
 BOOL gx_psh_translate(const DWORD *render_state, const struct gx_psh_textures *textures,
 	struct gx_psh_program *program);
+/* the stages to GX (their swap tables, konst colours and preloads too) */
 void gx_psh_apply(const struct gx_psh_program *program);
-/* the swap tables the stages use, once */
-void gx_psh_initialize(void);
 
 #endif

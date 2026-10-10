@@ -796,7 +796,6 @@ static void frame_begin(D3DCOLOR clear_color)
 	GX_SetVtxAttrFmt(DEVICE_VERTEX_FORMAT, GX_VA_TEX3, GX_TEX_ST, GX_F32, 0);
 	/* (the fog factor, on the fog ramp: fog_coordinate) */
 	GX_SetVtxAttrFmt(DEVICE_VERTEX_FORMAT, GX_VA_TEX4, GX_TEX_S, GX_F32, 0);
-	gx_psh_initialize();
 	GX_SetNumChans(2);
 	GX_SetNumTexGens(5);
 	transform_hardware = TRUE;
@@ -1859,18 +1858,8 @@ static void tev_setup(unsigned stages)
 	if (entry->usable)
 	{
 		gx_psh_apply(&entry->program);
-		tev_texcoords = tev_channels = 0;
-		for (index = 0; index < entry->program.stage_count; index++)
-		{
-			const struct gx_psh_stage *tev = &entry->program.stages[index];
-
-			if (tev->texture_map == GX_PSH_FOG_MAP)
-				tev_texcoords |= 1U << GX_PSH_FOG_TEXCOORD;
-			else if (tev->texture_map < GX_PSH_FOG_MAP)
-				tev_texcoords |= 1U << (tev->texture_map & 3);
-			if (tev->ras_channel < 2)
-				tev_channels |= 1U << tev->ras_channel;
-		}
+		tev_texcoords = entry->program.texcoords;
+		tev_channels = entry->program.channels;
 	}
 	else
 		tev_fallback(stages);

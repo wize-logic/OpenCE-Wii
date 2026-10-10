@@ -3,8 +3,8 @@ GX_PSH_CHECK.C
 
 A host check of port/wii/src/gx_psh.c (tools/wii_gx_psh_check.py builds and
 runs it): random register combiner programs, and two of the game's, are
-translated, and the TEV program, simulated here, is compared with the
-combiners evaluated directly, with the translation's own model of them
+translated, and the TEV program (WiiLibs' WlTevProgram), simulated here, is
+compared with the combiners evaluated directly, with the translation's own model of them
 (signed mappings clamped to [0, 1] outside dot products, registers clamped
 to [0, 1], an unsigned dot product saturating at 1, the mux as a blend by
 r0's alpha). A dot product with a signed mapping is NV2A's, of the signed
@@ -14,6 +14,11 @@ counted apart, not compared.
 The simulation is TEV's: a, b and c read 8 bits (a register's value outside
 [0, 1] wraps), d the whole signed value, and an unclamped result is kept
 from -4 to 4.
+
+Every program translated is also checked by WiiLibs' validator
+(wl_tev_validate: its errors and warnings are counted; the translation
+refuses a program with errors, but for a bias with DIVIDE_2, which GX takes), and evaluated by WiiLibs' own evaluator (wl_tev_eval) on the
+same pixels as the simulation, the largest difference reported.
 
 usage: gx_psh_check [programs [seed]] (SIM_TRACE=1 prints the stages)
 */
@@ -28,6 +33,7 @@ static float clamp01(float x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
 static float frand(void) { return (float)(rand() % 256) / 255.0f; }
 static v4 rand4(void) { v4 v; for (int i = 0; i < 4; i++) v.c[i] = frand(); return v; }
 static v4 argb_to_v4(DWORD d) { v4 v = {{ ((d >> 16) & 255) / 255.0f, ((d >> 8) & 255) / 255.0f, (d & 255) / 255.0f, (d >> 24) / 255.0f }}; return v; }
+static v4 rgba_to_v4(uint32_t d) { v4 v = {{ (d >> 24) / 255.0f, ((d >> 16) & 255) / 255.0f, ((d >> 8) & 255) / 255.0f, (d & 255) / 255.0f }}; return v; }
 
 /* ---------- the reference */
 struct inputs_set { v4 t[4]; v4 v0, v1; };
@@ -212,41 +218,36 @@ static float konst_sel(const struct gx_psh_program *p, unsigned sel, int ch, int
 {
 	static const float fractions[8] = { 1, 7/8.f, 6/8.f, 5/8.f, 4/8.f, 3/8.f, 2/8.f, 1/8.f };
 	if (sel < 8) return fractions[sel];
-	if (sel >= 0x0c && sel <= 0x0f && !alpha_half) { v4 k = argb_to_v4(p->konst[sel - 0x0c]); return k.c[ch]; }
-	if (sel >= 0x10) { int which = (sel - 0x10) / 4, slot = (sel - 0x10) % 4; v4 k = argb_to_v4(p->konst[slot]); return k.c[which]; }
+	if (sel >= 0x0c && sel <= 0x0f && !alpha_half) { v4 k = rgba_to_v4(p->tev.konst[sel - 0x0c]); return k.c[ch]; }
+	if (sel >= 0x10) { int which = (sel - 0x10) / 4, slot = (sel - 0x10) % 4; v4 k = rgba_to_v4(p->tev.konst[slot]); return k.c[which]; }
 	return 0;
 }
-/* gx_psh_initialize's swap tables: as it is, red, green, the blue in the alpha */
-static v4 swapped(v4 value, unsigned table)
+/* a texel or colour through one of the program's swap tables */
+static v4 swapped(const struct gx_psh_program *p, v4 value, unsigned table)
 {
-	v4 out = value;
-	switch (table) {
-	case 1: out.c[0] = out.c[1] = out.c[2] = out.c[3] = value.c[0]; break;
-	case 2: out.c[0] = out.c[1] = out.c[2] = out.c[3] = value.c[1]; break;
-	case 3: out.c[3] = value.c[2]; break;
-	default: break;
-	}
+	v4 out;
+	for (int i = 0; i < 4; i++) out.c[i] = value.c[p->tev.swap[table][i] & 3];
 	return out;
 }
 
-static v4 simulate(const struct gx_psh_program *p, const struct inputs_set *in, v4 *maps /* 9: 8 the fog ramp */)
+static v4 simulate(const struct gx_psh_program *p, const struct inputs_set *in, v4 *maps /* by texture map: 7 the fog ramp */)
 {
 	v4 regs[4]; memset(regs, 0, sizeof(regs));
 	/* (constants the program set in TEV registers) */
-	for (unsigned i = 0; i < p->preload_count; i++)
-		regs[p->preload_register[i]] = argb_to_v4(p->preload_color[i]);
-	for (unsigned i = 0; i < p->stage_count; i++) {
-		const struct gx_psh_stage *st = &p->stages[i];
+	for (unsigned i = 0; i < 4; i++)
+		if (p->tev.preload_mask & (1u << i)) regs[i] = rgba_to_v4(p->tev.preload[i]);
+	for (unsigned i = 0; i < p->tev.stage_count; i++) {
+		const WlTevStage *st = &p->tev.stages[i];
 		v4 tex = {{0}}, ras = {{0}};
-		if (st->texture_map != 0xFF) tex = maps[st->texture_map];
-		tex = swapped(tex, st->texture_swap);
-		if (st->ras_channel != 0xFF) ras = st->ras_channel ? in->v1 : in->v0;
-		ras = swapped(ras, st->ras_swap);
+		if (st->texmap != WL_TEV_NONE) tex = maps[st->texmap];
+		tex = swapped(p, tex, st->tex_swap);
+		if (st->channel != WL_TEV_NONE) ras = st->channel == WL_TEV_CH_COLOR1A1 ? in->v1 : in->v0;
+		ras = swapped(p, ras, st->ras_swap);
 		v4 out = regs[0]; v4 nregs[4]; memcpy(nregs, regs, sizeof(regs));
 		for (int ch = 0; ch < 3; ch++) {
 			float v[4];
 			for (int k = 0; k < 4; k++) {
-				unsigned code = st->color_in[k];
+				unsigned code = st->color.in[k];
 				float x;
 				switch (code) {
 				case 0: x = regs[0].c[ch]; break; case 1: x = regs[0].c[3]; break;
@@ -256,36 +257,36 @@ static v4 simulate(const struct gx_psh_program *p, const struct inputs_set *in, 
 				case 8: x = tex.c[ch]; break; case 9: x = tex.c[3]; break;
 				case 10: x = ras.c[ch]; break; case 11: x = ras.c[3]; break;
 				case 12: x = 1; break; case 13: x = 0.5f; break;
-				case 14: x = konst_sel(p, st->konst_color, ch, 0); break;
+				case 14: x = konst_sel(p, st->kcsel, ch, 0); break;
 				default: x = 0; break;
 				}
 				v[k] = (k < 3) ? tev_abc(x) : x;
 			}
 			float r = v[3] + (1 - v[2]) * v[0] + v[2] * v[1];
-			if (st->color_op == 1) r = v[3] - ((1 - v[2]) * v[0] + v[2] * v[1]);
-			r += st->color_bias == 1 ? 0.5f : st->color_bias == 2 ? -0.5f : 0;
-			r *= st->color_scale == 1 ? 2 : st->color_scale == 2 ? 4 : st->color_scale == 3 ? 0.5f : 1;
-			nregs[st->color_dest].c[ch] = tev_result(r, st->color_unclamped);
+			if (st->color.op == 1) r = v[3] - ((1 - v[2]) * v[0] + v[2] * v[1]);
+			r += st->color.bias == 1 ? 0.5f : st->color.bias == 2 ? -0.5f : 0;
+			r *= st->color.scale == 1 ? 2 : st->color.scale == 2 ? 4 : st->color.scale == 3 ? 0.5f : 1;
+			nregs[st->color.dest].c[ch] = tev_result(r, !st->color.clamp);
 		}
 		{
 			float v[4];
 			for (int k = 0; k < 4; k++) {
-				unsigned code = st->alpha_in[k];
+				unsigned code = st->alpha.in[k];
 				float x;
 				switch (code) {
 				case 0: x = regs[0].c[3]; break; case 1: x = regs[1].c[3]; break;
 				case 2: x = regs[2].c[3]; break; case 3: x = regs[3].c[3]; break;
 				case 4: x = tex.c[3]; break; case 5: x = ras.c[3]; break;
-				case 6: x = konst_sel(p, st->konst_alpha, 3, 1); break;
+				case 6: x = konst_sel(p, st->kasel, 3, 1); break;
 				default: x = 0; break;
 				}
 				v[k] = (k < 3) ? tev_abc(x) : x;
 			}
 			float r = v[3] + (1 - v[2]) * v[0] + v[2] * v[1];
-			if (st->alpha_op == 1) r = v[3] - ((1 - v[2]) * v[0] + v[2] * v[1]);
-			r += st->alpha_bias == 1 ? 0.5f : st->alpha_bias == 2 ? -0.5f : 0;
-			r *= st->alpha_scale == 1 ? 2 : st->alpha_scale == 2 ? 4 : st->alpha_scale == 3 ? 0.5f : 1;
-			nregs[st->alpha_dest].c[3] = tev_result(r, st->alpha_unclamped);
+			if (st->alpha.op == 1) r = v[3] - ((1 - v[2]) * v[0] + v[2] * v[1]);
+			r += st->alpha.bias == 1 ? 0.5f : st->alpha.bias == 2 ? -0.5f : 0;
+			r *= st->alpha.scale == 1 ? 2 : st->alpha.scale == 2 ? 4 : st->alpha.scale == 3 ? 0.5f : 1;
+			nregs[st->alpha.dest].c[3] = tev_result(r, !st->alpha.clamp);
 		}
 		(void)out;
 		memcpy(regs, nregs, sizeof(regs));
@@ -309,6 +310,55 @@ static unsigned rand_output(void)
 	static const unsigned names[] = { 0, 0, 0, 12, 13, 8, 9, 4 };
 	return names[rand() % 8];
 }
+/* WiiLibs' validator: the programs checked, those it refuses, and those with
+each error or warning */
+static unsigned long validated, refused, issued[32];
+static int validate(const struct gx_psh_program *program)
+{
+	WlTevReport report;
+	unsigned seen = 0;
+	int valid = wl_tev_validate(&program->tev, &report);
+	validated++;
+	refused += !valid;
+	for (unsigned i = 0; i < report.count; i++) seen |= 1u << report.issues[i].code;
+	for (unsigned code = 1; code < 32; code++) if (seen & (1u << code)) issued[code]++;
+	return valid;
+}
+static void validate_summary(void)
+{
+	printf("wl_tev_validate: %lu programs, %lu refused", validated, refused);
+	for (unsigned code = WL_TEV_E_NO_STAGES; code <= WL_TEV_W_NO_RESULT; code++)
+		if (issued[code]) printf("; %lu %s \"%s\"", issued[code], code < WL_TEV_W_KONST_UNSET ? "error" : "warn",
+			wl_tev_code_name((WlTevCode)code));
+	printf("\n");
+}
+/* wl_tev_eval against the simulation: the largest difference, in 255ths, of
+programs with unclamped stages and of the others (those WiiLibs' validator
+refuses it evaluates as 0: not compared) */
+static int eval_worst[2];
+static unsigned long eval_programs[2], eval_differ[2], eval_refused;
+static int has_unclamped(const struct gx_psh_program *p)
+{
+	for (unsigned i = 0; i < p->tev.stage_count; i++) if (!p->tev.stages[i].color.clamp || !p->tev.stages[i].alpha.clamp) return 1;
+	return 0;
+}
+static uint8_t byte_of(float x) { return (uint8_t)lroundf(clamp01(x) * 255.0f); }
+static int eval_compare(const struct gx_psh_program *p, const struct inputs_set *in, const v4 *maps, v4 got)
+{
+	WlTevPixel px;
+	uint32_t rgba;
+	int worst = 0;
+	memset(&px, 0, sizeof(px));
+	for (int m = 0; m < 8; m++) for (int ch = 0; ch < 4; ch++) px.tex[m][ch] = byte_of(maps[m].c[ch]);
+	for (int ch = 0; ch < 4; ch++) { px.ras[0][ch] = byte_of(in->v0.c[ch]); px.ras[1][ch] = byte_of(in->v1.c[ch]); }
+	rgba = wl_tev_eval_rgba(&p->tev, &px);
+	for (int ch = 0; ch < 4; ch++) {
+		int d = abs((int)((rgba >> (24 - 8 * ch)) & 255) - (int)byte_of(got.c[ch]));
+		if (d > worst) worst = d;
+	}
+	return worst;
+}
+
 /* the stages whose cube maps are sampled as sphere maps (for the game's) */
 static unsigned check_cube;
 static int check(const DWORD *state, unsigned present, const char *name, int verbose)
@@ -319,30 +369,52 @@ static int check(const DWORD *state, unsigned present, const char *name, int ver
 	textures.fog = (unsigned char)fog_on;
 	textures.fog_color = fog_color & 0x00FFFFFFUL;
 	if (!gx_psh_translate(state, &textures, &program)) { if (verbose) printf("%s: not translated (%s)\n", name, program.reason); return -1; }
+	int valid = validate(&program);
 	if (program.approximate) return -2;
 	float worst = 0;
+	int unclamped = has_unclamped(&program), eval_program_worst = 0;
 	for (int trial = 0; trial < 50; trial++) {
-		struct inputs_set in; v4 maps[9];
+		struct inputs_set in; v4 maps[8];
 		for (int i = 0; i < 4; i++) in.t[i] = rand4();
 		in.t[0].c[3] = rand() % 2; /* (r0.a starts as t0.a: binary, for the mux) */
 		in.v0 = rand4(); in.v1 = rand4();
 		memset(maps, 0, sizeof(maps));
 		fog_factor = frand();
-		for (int ch = 0; ch < 4; ch++) maps[8].c[ch] = fog_factor;
+		for (int ch = 0; ch < 4; ch++) maps[GX_PSH_FOG_TEXMAP].c[ch] = fog_factor;
 		for (int i = 0; i < 4; i++) maps[i] = in.t[i];
 		v4 want = reference(state, &in, present), got = simulate(&program, &in, maps);
 		for (int ch = 0; ch < 4; ch++) { float d = fabsf(want.c[ch] - got.c[ch]); if (d > worst) worst = d; }
+		if (valid) { int e = eval_compare(&program, &in, maps, got); if (e > eval_program_worst) eval_program_worst = e; }
 		if (worst > 0.01f) {
 			if (verbose) { printf("  v0 %.3f %.3f %.3f %.3f v1 %.3f %.3f %.3f %.3f t0 %.3f %.3f %.3f %.3f\n", in.v0.c[0], in.v0.c[1], in.v0.c[2], in.v0.c[3], in.v1.c[0], in.v1.c[1], in.v1.c[2], in.v1.c[3], in.t[0].c[0], in.t[0].c[1], in.t[0].c[2], in.t[0].c[3]);
-				for (unsigned k = 0; k < program.konst_count; k++) printf("  K%u %08x\n", k, program.konst[k]);
+				for (unsigned k = 0; k < 4; k++) if (program.tev.konst_mask & (1u << k)) printf("  K%u %08x\n", k, program.tev.konst[k]);
 				printf("  c0 %08x c1 %08x f0 %08x f1 %08x\n", state[D3DRS_PSCONSTANT0_0], state[D3DRS_PSCONSTANT1_0], state[D3DRS_PSFINALCOMBINERCONSTANT0], state[D3DRS_PSFINALCOMBINERCONSTANT1]); }
 			if (verbose) printf("%s: MISMATCH want %.3f %.3f %.3f %.3f got %.3f %.3f %.3f %.3f (%u stages)\n", name,
-				want.c[0], want.c[1], want.c[2], want.c[3], got.c[0], got.c[1], got.c[2], got.c[3], program.stage_count);
+				want.c[0], want.c[1], want.c[2], want.c[3], got.c[0], got.c[1], got.c[2], got.c[3], program.tev.stage_count);
 			return 0;
 		}
 	}
+	if (!valid) { eval_refused++; return 1; }
+	eval_programs[unclamped]++;
+	if (eval_program_worst > 1) eval_differ[unclamped]++;
+	if (eval_program_worst > eval_worst[unclamped]) eval_worst[unclamped] = eval_program_worst;
 	return 1;
 }
+static void print_stages(const struct gx_psh_program *program)
+{
+	for (unsigned i = 0; i < program->tev.stage_count; i++)
+	{
+		const WlTevStage *q = &program->tev.stages[i];
+
+		printf("  tev %2u: coord %2d map %2d ras %2d sw %d/%d kc %02x ka %02x | C %2d %2d %2d %2d b%d s%d op%d%s -> %d | A %d %d %d %d b%d s%d op%d%s -> %d\n",
+			i, q->texcoord == WL_TEV_NONE ? -1 : q->texcoord, q->texmap == WL_TEV_NONE ? -1 : q->texmap,
+			q->channel == WL_TEV_NONE ? -1 : q->channel, q->tex_swap, q->ras_swap, q->kcsel, q->kasel,
+			q->color.in[0], q->color.in[1], q->color.in[2], q->color.in[3], q->color.bias, q->color.scale, q->color.op,
+			q->color.clamp ? "" : " unclamped", q->color.dest, q->alpha.in[0], q->alpha.in[1], q->alpha.in[2],
+			q->alpha.in[3], q->alpha.bias, q->alpha.scale, q->alpha.op, q->alpha.clamp ? "" : " unclamped", q->alpha.dest);
+	}
+}
+
 /* the game's, which must translate: two of its main menu's, a fog pass, and
 its bump mapping (rasterizer_xbox_environment.c) */
 static int game_programs(void)
@@ -461,18 +533,8 @@ static int game_programs(void)
 			if (getenv("DUMP_GAME") && atoi(getenv("DUMP_GAME")) == index * 8 + (int)separate)
 			{
 				gx_psh_translate(state, &textures, &program);
-				printf("  %u stages (%s)\n", program.stage_count, program.reason ? program.reason : "ok");
-				for (unsigned i = 0; i < program.stage_count; i++)
-				{
-					const struct gx_psh_stage *q = &program.stages[i];
-
-					printf("  tev %2u: map %2d ras %2d sw %d/%d kc %02x ka %02x | C %2d %2d %2d %2d b%d s%d op%d -> %d | A %d %d %d %d b%d s%d op%d -> %d\n",
-						i, q->texture_map == 255 ? -1 : q->texture_map, q->ras_channel == 255 ? -1 : q->ras_channel,
-						q->texture_swap, q->ras_swap, q->konst_color, q->konst_alpha, q->color_in[0], q->color_in[1],
-						q->color_in[2], q->color_in[3], q->color_bias, q->color_scale, q->color_op, q->color_dest,
-						q->alpha_in[0], q->alpha_in[1], q->alpha_in[2], q->alpha_in[3], q->alpha_bias, q->alpha_scale,
-						q->alpha_op, q->alpha_dest);
-				}
+				printf("  %u stages (%s)\n", program.tev.stage_count, program.reason ? program.reason : "ok");
+				print_stages(&program);
 			}
 			if (!gx_psh_translate(state, &textures, &program))
 			{
@@ -480,7 +542,9 @@ static int game_programs(void)
 					separate, program.reason);
 				failures++;
 			}
-			else if (separate == 0)
+			else if (separate)
+				validate(&program);
+			else
 			{
 				char name[32];
 				int agrees;
@@ -490,7 +554,7 @@ static int game_programs(void)
 				check_cube = programs[index].cube;
 				agrees = check(state, programs[index].present, name, 1);
 				check_cube = 0;
-				printf("game program %d (%s): %u stages, %s%s%s\n", index, programs[index].what, program.stage_count,
+				printf("game program %d (%s): %u stages, %s%s%s\n", index, programs[index].what, program.tev.stage_count,
 					program.approximate ? "approximate: " : "exact",
 					program.approximate && program.approximation ? program.approximation : "",
 					program.approximate ? "" : agrees > 0 ? ", agrees with the combiners" : ", DIFFERS from the combiners");
@@ -547,12 +611,9 @@ int main(int argc, char **argv)
 			struct gx_psh_textures tx; struct gx_psh_program pg; memset(&tx, 0, sizeof(tx)); tx.present = 7;
 			tx.fog = (unsigned char)fog_on; tx.fog_color = fog_color & 0x00FFFFFFUL;
 			gx_psh_translate(state, &tx, &pg);
-			printf("  %u stages, %s%s\n", pg.stage_count, pg.reason ? pg.reason : pg.approximate ? "approximate: " : "exact",
+			printf("  %u stages, %s%s\n", pg.tev.stage_count, pg.reason ? pg.reason : pg.approximate ? "approximate: " : "exact",
 				pg.approximate && pg.approximation ? pg.approximation : "");
-			for (unsigned i = 0; i < pg.stage_count; i++) { const struct gx_psh_stage *q = &pg.stages[i];
-				printf("  tev %u: map %d ras %d kc %02x ka %02x | C %d %d %d %d b%d s%d -> %d | A %d %d %d %d b%d s%d -> %d\n", i, q->texture_map == 255 ? -1 : q->texture_map, q->ras_channel == 255 ? -1 : q->ras_channel, q->konst_color, q->konst_alpha,
-					q->color_in[0], q->color_in[1], q->color_in[2], q->color_in[3], q->color_bias, q->color_scale, q->color_dest,
-					q->alpha_in[0], q->alpha_in[1], q->alpha_in[2], q->alpha_in[3], q->alpha_bias, q->alpha_scale, q->alpha_dest); }
+			print_stages(&pg);
 		}
 		int r = check(state, 0x7, name, bad < 6);
 		if (r > 0) { ok++; if (getenv("LIST")) printf("AGREE %d\n", seed); }
@@ -564,7 +625,14 @@ int main(int argc, char **argv)
 		int game = only < 0 ? game_programs() : 0;
 
 		if (only < 0)
+		{
 			printf("the game's programs: %s\n", game ? "NOT ALL TRANSLATED" : "translated");
+			validate_summary();
+			printf("wl_tev_eval against the simulation: %lu programs clamped throughout, %lu differ by more than 1/255 "
+				"(worst %d/255); %lu with unclamped stages, %lu differ (worst %d/255); %lu refused by the validator\n",
+				eval_programs[0], eval_differ[0], eval_worst[0], eval_programs[1], eval_differ[1], eval_worst[1],
+				eval_refused);
+		}
 		return bad != 0 || game != 0;
 	}
 }
