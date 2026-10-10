@@ -234,6 +234,7 @@ What changed in MEM1:
 | the window's page tables (`window_protection`, `window_blocks`) | 96 | 51 | 16 bits a page |
 | the console's framebuffer (in the MEM1 heap) | 600 | 0 | the bring-up console writes into one of WiiLibs' two |
 | the game state revert's copy (malloc'd, 4352: never had) | | | read into the game state, as the Xbox did (`source/saved games/game_state_xbox.c`) |
+| the sounds' packets, decoded (malloc'd as the game queued them: 8 to 32 KB each, up to 4 a voice) | | | read where the sound cache keeps them as they play, an ADPCM block of 64 frames at a time into the voice (`port/linux/src/dsound_sdl.c`; the same samples) |
 
 The largest zeroed data now: `render` 692 (the game's render globals), `ai_debug` 534 (the AI's
 debug state, whose layout is asserted), `update_client_globals` 513 and `update_server_globals`
