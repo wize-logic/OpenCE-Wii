@@ -23,8 +23,8 @@ def main() -> int:
     parser.add_argument("--screenshot", type=Path, default=Path("build/wii/dolphin.png"))
     # (Dolphin's Direct3D 11 backend exits without a word on the game's longer TEV programs)
     parser.add_argument("--video", default="Vulkan")
-    # (dual core: Dolphin exits without a word in the menu once the vertices come fast; the cause
-    # is open, port/wii/README.md)
+    # (single core is the default, dual core faster. The exits once seen in
+    # dual core were another program's test runner killing every Dolphin, port/wii/README.md)
     parser.add_argument("--dual-core", action="store_true")
     args, rest = parser.parse_known_args()
     runner = args.wiilibs / "tools" / "dolphin_run.py"
