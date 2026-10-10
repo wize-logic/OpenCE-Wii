@@ -432,13 +432,56 @@ It found `list_get`'s element index read from the wrong end of its cell, which m
 teleport player 0 to player 1's flag. With that fixed, a10's opening (the cryo bay, the cinematic and
 its skip, the scripted player) agrees at every tick of 2,600.
 
+## Where the processor's time goes (the sampling profiler)
+
+The log's frame split (draws, textures, pixel shaders, the end of the frame, the rest) says which
+half of a frame is slow; the profiler says which functions. WiiLibs' sampling profiler
+(`wl/platform/profile.h`; its README has the design, the cost and the caveats) takes the decrementer
+interrupt's view of the processor 500 times a second: where it was, and who called there.
+
+It is off unless the game's folder holds `profile.txt` (`sd:/apps/halo/profile.txt`, or the USB
+drive's). It is a file and not a setting of `port_config.c`, so that a normal run knows nothing of
+it. `src/wii_profile.c` reads it at start-up and starts a watcher thread:
+
+```
+# sd:/apps/halo/profile.txt: "name value" lines; these are the defaults
+seconds 20     # how long to sample once the level is playing
+after 10       # seconds of the level's game time to let go by first
+hz 500         # samples a second (1 to 10000)
+depth 12       # callers kept per sample (0 to 16)
+skip 1         # maps to let load first: the main menu is the first
+repeat 1       # levels to profile one after another (a tour of levels)
+log 1          # also write the samples to the log (Dolphin's OSREPORT)
+note b30       # words for the header of the dump
+```
+
+The watcher waits for a level (the game clock running, no map loading, the clock past `after`
+seconds, `skip` maps already loaded), samples for `seconds` or until the next map starts to load,
+then writes `profile<N>.txt` beside `profile.txt` and, with `log`, the same lines to the log. The
+ring is malloc'd (700 KB for the defaults), memory the game then does not have. `tools/wii_profile.py`
+writes the file and runs the tables:
+
+```sh
+tools/wii_profile.py setup --note b30 --repeat 2        # build/wii/sd/apps/halo/profile.txt; prints the config.toml lines
+tools/wii_dolphin.py --seconds 900 --until "[profile] done" > build/wii/profile.log   # a checkpoint run
+tools/wii_profile.py report build/wii/profile.log --top 40 --callers update --tree 2 --timeline
+tools/wii_profile.py setup --remove                     # the game profiles nothing without the file
+```
+
+`wl_profile.py` prints the threads (the game's is the busiest), the functions by their own samples
+and by samples anywhere on the stack, `--callers F` (who calls F, where its time goes), `--tree`,
+`--hot` (instructions, with lines), `--timeline` and `--collapsed` (flame graph input). Under
+Dolphin it counts instructions executed (about one cycle each, no cache or bus waits, and a sample
+is taken at the end of a translated block); on the console it counts where the processor waits as
+well. Use Dolphin's profile to find what the game does, and the console's to find what it costs.
+
 ## What only a real Wii can show
 
 Dolphin runs the game, but these need the console:
 - **Speed.** Dolphin's emulated timing does not follow this code's cost (a
   short function can measure several times its instruction count); a
-  frame's time, and where it goes (the log's "a frame's draws" lines), on
-  the console.
+  frame's time, and where it goes (the log's "a frame's draws" lines, and
+  the sampling profiler's tables, above), on the console.
 - **Alignment exceptions.** The PowerPC 750 can trap a floating-point load
   from an address that is not a multiple of 4; Dolphin does not. The
   compressed animations' floats are read a byte at a time for this; any

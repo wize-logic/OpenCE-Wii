@@ -10,6 +10,8 @@ __wrap_main here, which then calls the game's:
 - WiiLibs: the reset and power buttons, the log, its heaps (sized for what
   the port uses it for), IOS 58 for USB 2.0, the SD card and a USB drive;
 - for the bring-up, a text console on the screen;
+- the sampling profiler's watcher, when the game's folder holds profile.txt
+  (port/wii/src/wii_profile.c);
 - the game's main runs on a thread of its own with a 1 MB stack (WiiLibs'
   wl_platform_run_on_stack; libogc's
   main thread has 128 KB, below which lie its audio DSP structures: a deep
@@ -37,6 +39,7 @@ function the port does not provide yet stops the game, naming it.
 void wii_missing_symbol(const char *name) __attribute__((noreturn));
 int wii_memory_claim(void);
 void wii_network_start(void);
+void wii_profile_arm(void);
 int __real_main(void);
 
 /* WiiLibs' heaps, all in MEM2: thread stacks, the audio output's buffers, the
@@ -138,6 +141,8 @@ int __wrap_main(void)
 	wl_platform_fs_mount(WL_DEVICE_USB);
 	/* the network, without waiting for it (src/posix_net_wii.c) */
 	wii_network_start();
+	/* the sampling profiler, only if profile.txt is in the game's folder (src/wii_profile.c) */
+	wii_profile_arm();
 	wii_report("IOS %u; SD card %s, USB drive %s\n", (unsigned)ios,
 		wl_platform_fs_mounted(WL_DEVICE_SD) ? "mounted" : "absent",
 		wl_platform_fs_mounted(WL_DEVICE_USB) ? "mounted" : "absent");
