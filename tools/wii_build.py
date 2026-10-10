@@ -76,6 +76,9 @@ def wii_abi_flags(devkitpro: Path) -> List[str]:
         "-DGEKKO",
         "-DHW_RVL",
         "-D__wii__",
+        # not the host's /usr/include (some clangs add it for this target: glibc's limits.h
+        # then fails); clang's own headers stay, and devkitPPC's newlib follows them
+        "-nostdlibinc",
         f"-isystem {devkitpro / 'libogc' / 'include'}",
         f"-isystem {devkitpro / 'devkitPPC' / 'powerpc-eabi' / 'include'}",
         # newlib's wide string functions assume its own wchar_t; keep clang
