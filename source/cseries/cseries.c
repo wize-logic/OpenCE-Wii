@@ -252,16 +252,20 @@ void cseries_dispose(
 tag string_to_tag(
 	const char *s)
 {
-	tag t = *(tag*)s;
-	
-	return SWAP4(t);
+	/* port: the first character is the high byte, on any host */
+	return (tag)((unsigned long)(unsigned char)s[0] << 24 | (unsigned long)(unsigned char)s[1] << 16 |
+		(unsigned long)(unsigned char)s[2] << 8 | (unsigned char)s[3]);
 }
 
 char *tag_to_string(
 	tag t,
 	char *s)
 {
-	*(unsigned long *)s = SWAP4(t);
+	/* port: the high byte first, on any host */
+	s[0] = (char)(t >> 24);
+	s[1] = (char)(t >> 16);
+	s[2] = (char)(t >> 8);
+	s[3] = (char)t;
 	s[4] = '\0';
 
 	return s;

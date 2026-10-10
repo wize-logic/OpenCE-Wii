@@ -325,7 +325,13 @@ static short *decode_pcm(const unsigned char *source, unsigned long size, unsign
 	short *samples = malloc((frames ? frames : 1) * channels * sizeof(short));
 
 	if (samples)
-		memcpy(samples, source, frames * channels * sizeof(short));
+	{
+		unsigned long index;
+
+		/* little-endian samples, as the maps keep them, on any host */
+		for (index = 0; index < frames * channels; index++)
+			samples[index] = (short)(source[index * 2] | source[index * 2 + 1] << 8);
+	}
 	*frame_count = samples ? frames : 0;
 	return samples;
 }

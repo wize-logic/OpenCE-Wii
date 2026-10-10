@@ -1491,6 +1491,7 @@ void tgaLoadHeader(
 {
 	unsigned char ignored_byte;
 	short ignored_short;
+	unsigned char size_bytes[4]; /* port: the width and height */
 
 	fread(&ignored_byte, 1, 1, file);
 	fread(&ignored_byte, 1, 1, file);
@@ -1500,8 +1501,10 @@ void tgaLoadHeader(
 	fread(&ignored_byte, 1, 1, file);
 	fread(&ignored_short, 2, 1, file);
 	fread(&ignored_short, 2, 1, file);
-	fread(&image->width, 2, 1, file);
-	fread(&image->height, 2, 1, file);
+	/* port: the header's little-endian shorts, on any host */
+	fread(size_bytes, 1, 4, file);
+	image->width = (short)(size_bytes[0] | size_bytes[1] << 8);
+	image->height = (short)(size_bytes[2] | size_bytes[3] << 8);
 	fread(&image->pixel_depth, 1, 1, file);
 	fread(&ignored_byte, 1, 1, file);
 
