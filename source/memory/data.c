@@ -385,7 +385,12 @@ void data_delete_all(
 	data->count = 0;
 	data->actual_count = 0;
 	data->first_free_absolute_index = 0;
-	csstrncpy((char *)&data->next_identifier, data->name, sizeof(data->next_identifier));
+	/* port: the name's first two characters as the Xbox's little-endian
+	short (copied into it, a big-endian machine's short read them the other
+	way round: every identifier's salt differed, and what is computed from
+	identifiers, as a needle's wander and a swaying tree's frame, with it) */
+	data->next_identifier = (short)((unsigned char)data->name[0] |
+		((data->name[0] ? (unsigned char)data->name[1] : 0) << 8));
 	data->next_identifier |= 0x8000;
 
 	for (absolute_index = 0; absolute_index<data->maximum_count; absolute_index++)

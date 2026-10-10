@@ -804,8 +804,8 @@ void network_test_update(
 		{
 			object = &datum->object;
 			/* (the index, not the salt: that counts the identifiers handed out
-			since the game started, the menu's too, which ran for longer or
-			shorter on another machine) */
+			since the pool was emptied, which the menu's longer or shorter run
+			on another machine changes for some pools) */
 			words[0] = (unsigned long)objects.index & 0xFFFF;
 			words[1] = (unsigned long)datum->definition_index & 0xFFFF;
 			memcpy(&words[2], &object->position, 3 * sizeof(unsigned long));
