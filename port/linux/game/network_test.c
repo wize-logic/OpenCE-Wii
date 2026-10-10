@@ -830,8 +830,9 @@ void network_test_update(
 				for (node_word = 0; nodes && node_word < (unsigned long)node_words; node_word++)
 					node_hash = (node_hash ^ nodes[node_word]) * 16777619UL;
 				platform_log("lockstep object %ld: %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx "
-					"%08lx %08lx %08lx nodes %ld %08lx", count, words[0], words[1], words[2], words[3], words[4],
-					words[5], words[6], words[7], words[8], words[9], words[10], words[11], words[12], words[13],
+					"%08lx %08lx %08lx", count, words[0], words[1], words[2], words[3], words[4],
+					words[5], words[6], words[7], words[8], words[9], words[10], words[11], words[12], words[13]);
+				platform_log("lockstep nodes %ld: %ld %08lx", count,
 					node_words / (long)(sizeof(real_matrix4x3) / sizeof(unsigned long)), node_hash);
 			}
 			count++;
