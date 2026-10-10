@@ -988,8 +988,10 @@ static BOOL dot_unavailable(struct translation *translation, unsigned long input
 		int name = name_of(reg);
 
 		if (reg >= _register_t0 && reg <= _register_t3 &&
-			(translation->textures->unavailable & (1u << (reg - _register_t0))) &&
-			translation->names[_portion_color][name].kind == _kind_zero)
+			(((translation->textures->unavailable & (1u << (reg - _register_t0))) &&
+				translation->names[_portion_color][name].kind == _kind_zero) ||
+			((translation->textures->cube & (1u << (reg - _register_t0))) &&
+				translation->names[_portion_color][name].kind == _kind_texture)))
 		{
 			approximate(translation->program, "a dot product with a cube map");
 			return TRUE;

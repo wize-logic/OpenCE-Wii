@@ -47,6 +47,7 @@ SCENARIO_GROUP_TAG = 0x73636E72  # 'scnr'
 STRUCTURE_BSP_GROUP_TAG = 0x73627370  # 'sbsp'
 BITMAP_GROUP_TAG = 0x6269746D  # 'bitm'
 BITMAP_TYPE_2D = 0
+BITMAP_TYPE_CUBE = 2
 BITMAP_GROUP_TYPE_INTERFACE = 4
 # struct bitmap_data's flags (source/bitmaps/bitmaps.c)
 BITMAP_POWER_OF_TWO_BIT, BITMAP_COMPRESSED_BIT, BITMAP_LINEAR_BIT, BITMAP_V16U16_BIT = 0, 1, 4, 5
@@ -545,7 +546,26 @@ class Converter:
             outcome = kind or f"format {bitmap_format}"
             linear = flags >> BITMAP_LINEAR_BIT & 1
             compressed = flags >> BITMAP_COMPRESSED_BIT & 1
-            if (kind is None or bitmap_type != BITMAP_TYPE_2D or flags >> BITMAP_V16U16_BIT & 1 or width <= 0 or
+            if (kind is not None and bitmap_type == BITMAP_TYPE_CUBE and not linear and width == height and width > 0 and
+                    not flags >> BITMAP_V16U16_BIT & 1 and kind != "p8"):
+                # (a cube map as a sphere map, which GX can sample: wii_gx_textures.py's convert_cube)
+                levels = 1
+                if flags >> BITMAP_POWER_OF_TWO_BIT & 1:
+                    largest = max(width // 4, 1) if compressed else width
+                    levels = min(mipmap_count, max(largest, 1).bit_length() - 1) + 1
+                face = sum(wii_gx_textures.xbox_level_bytes(kind, width, width, level) for level in range(levels))
+                face = (face + wii_gx_textures.CUBE_FACE_ALIGNMENT - 1) & ~(wii_gx_textures.CUBE_FACE_ALIGNMENT - 1)
+                if pixels_offset < 0 or pixels_offset + 6 * face > len(self.source):
+                    self.notes.append(f"a cube map's pixels are outside the map ({pixels_offset:x})")
+                    continue
+                converted = wii_gx_textures.convert_cube(self.source[pixels_offset:pixels_offset + 6 * face], kind, width,
+                                                         levels)
+                if converted is None:
+                    outcome = "left: a cube map too small for a sphere map"
+                else:
+                    self.output[pixels_offset:pixels_offset + 6 * face] = converted
+                    outcome = f"cube map ({kind}) as a sphere map"
+            elif (kind is None or bitmap_type != BITMAP_TYPE_2D or flags >> BITMAP_V16U16_BIT & 1 or width <= 0 or
                     height <= 0 or (linear and kind.startswith("dxt"))):
                 outcome = "left: " + (outcome if kind is None else "type or shape")
             else:

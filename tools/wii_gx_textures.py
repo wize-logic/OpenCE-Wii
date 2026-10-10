@@ -23,6 +23,7 @@ whose first level does not fit, a cube map and a 3D texture are left as they are
 device decodes them.
 """
 
+import struct
 from typing import Optional, Tuple
 
 import numpy as np
@@ -239,6 +240,139 @@ def i4(alpha_blocks: np.ndarray, width: int, height: int) -> bytes:
     image = image[:max(height, 1), :max(width, 1)]
     tiles = tiled(image >> 4, 8, 8).reshape(-1, 64)
     return (tiles[:, 0::2] << 4 | tiles[:, 1::2]).astype(np.uint8).tobytes()
+
+
+# ---------- cube maps as sphere maps
+
+# a converted cube map's last bytes (d3d8_gx.c's sphere_trailer): the magic, the sphere map's
+# size and GX format, big-endian
+SPHERE_MAGIC = b"GXSPHERE"
+SPHERE_TRAILER = 32
+GX_TF_RGB565, GX_TF_RGB5A3 = 0x4, 0x5
+CUBE_FACE_ALIGNMENT = 128
+
+
+def decode_rgba(data: bytes, kind: str, width: int, height: int) -> np.ndarray:
+    """one level as (height, width, 4) R, G, B, A bytes"""
+    if kind.startswith("dxt"):
+        blocks = dxt_blocks(data, kind, width, height)
+        colour = blocks[..., 8:16] if kind != "dxt1" else blocks[..., 0:8]
+        c0 = (colour[..., 0].astype(np.int32) | colour[..., 1].astype(np.int32) << 8)
+        c1 = (colour[..., 2].astype(np.int32) | colour[..., 3].astype(np.int32) << 8)
+
+        def rgb(c):
+            return np.stack([(c >> 11 & 31) * 255 // 31, (c >> 5 & 63) * 255 // 63, (c & 31) * 255 // 31], axis=-1)
+
+        p0, p1 = rgb(c0), rgb(c1)
+        four = (c0 > c1) if kind == "dxt1" else np.ones(c0.shape, dtype=bool)
+        p2 = np.where(four[..., None], (2 * p0 + p1) // 3, (p0 + p1) // 2)
+        p3 = np.where(four[..., None], (p0 + 2 * p1) // 3, 0)
+        palette = np.stack([p0, p1, p2, p3], axis=-2)
+        alpha_palette = np.full(c0.shape + (4,), 255, dtype=np.int32)
+        if kind == "dxt1":
+            alpha_palette[..., 3] = np.where(four, 255, 0)
+        codes = np.stack([(colour[..., 4 + row].astype(np.int32) >> (2 * column)) & 3
+                          for row in range(4) for column in range(4)], axis=-1)
+        colours = np.take_along_axis(palette, codes[..., None].repeat(3, axis=-1), axis=-2)
+        if kind == "dxt1":
+            alpha = np.take_along_axis(alpha_palette, codes, axis=-1)
+        else:
+            alpha = dxt_alpha(blocks, kind).astype(np.int32)
+        image = np.concatenate([colours, alpha[..., None]], axis=-1)
+        rows, columns = image.shape[:2]
+        image = image.reshape(rows, columns, 4, 4, 4).transpose(0, 2, 1, 3, 4).reshape(rows * 4, columns * 4, 4)
+        return image[:height, :width].astype(np.uint8)
+    texel = texels(data, kind, width, height, 0).astype(np.int32)
+    out = np.zeros((height, width, 4), dtype=np.int32)
+    if kind in ("a8r8g8b8", "x8r8g8b8"):
+        out[..., 0], out[..., 1], out[..., 2], out[..., 3] = texel[..., 2], texel[..., 1], texel[..., 0], texel[..., 3]
+        if kind == "x8r8g8b8":
+            out[..., 3] = 255
+    elif kind in ("r5g6b5", "a1r5g5b5", "a4r4g4b4", "a8l8"):
+        word = texel[..., 0] | texel[..., 1] << 8
+        if kind == "r5g6b5":
+            out[..., 0], out[..., 1], out[..., 2], out[..., 3] = \
+                (word >> 11 & 31) * 255 // 31, (word >> 5 & 63) * 255 // 63, (word & 31) * 255 // 31, 255
+        elif kind == "a1r5g5b5":
+            out[..., 0], out[..., 1], out[..., 2], out[..., 3] = \
+                (word >> 10 & 31) * 255 // 31, (word >> 5 & 31) * 255 // 31, (word & 31) * 255 // 31, (word >> 15) * 255
+        elif kind == "a4r4g4b4":
+            out[..., 0], out[..., 1], out[..., 2], out[..., 3] = \
+                (word >> 8 & 15) * 17, (word >> 4 & 15) * 17, (word & 15) * 17, (word >> 12 & 15) * 17
+        else:
+            out[..., 0] = out[..., 1] = out[..., 2] = word & 255
+            out[..., 3] = word >> 8
+    elif kind == "a8":
+        out[..., 0:3] = 255
+        out[..., 3] = texel[..., 0]
+    else:
+        out[..., 0] = out[..., 1] = out[..., 2] = texel[..., 0]
+        out[..., 3] = 255 if kind == "l8" else texel[..., 0]
+    return out.astype(np.uint8)
+
+
+def sphere_directions(size: int) -> np.ndarray:
+    """the direction each texel of a sphere map shows (size, size, 3): the mirror ball's, the
+    inverse of d3d8_gx.c's sphere_coordinates, the disc's outside taken to its edge"""
+    centres = (np.arange(size) + 0.5) / size * 2.0 - 1.0
+    x, y = np.meshgrid(centres, centres)
+    radius = np.sqrt(x * x + y * y)
+    scale = np.where(radius > 1.0, 1.0 / np.maximum(radius, 1e-9), 1.0)
+    x, y = x * scale, y * scale
+    z = np.sqrt(np.maximum(0.0, 1.0 - x * x - y * y))
+    # (the reflection of (0, 0, -1) by the ball's normal (x, y, z))
+    return np.stack([2 * z * x, 2 * z * y, 2 * z * z - 1], axis=-1)
+
+
+def cube_sample(faces, directions: np.ndarray) -> np.ndarray:
+    """each direction's texel of a cube map (faces +X, -X, +Y, -Y, +Z, -Z, as Direct3D reads them)"""
+    x, y, z = directions[..., 0], directions[..., 1], directions[..., 2]
+    ax, ay, az = np.abs(x), np.abs(y), np.abs(z)
+    face = np.where((ax >= ay) & (ax >= az), np.where(x >= 0, 0, 1),
+                    np.where(ay >= az, np.where(y >= 0, 2, 3), np.where(z >= 0, 4, 5)))
+    major = np.maximum(np.maximum(ax, ay), az)
+    sc = np.select([face == 0, face == 1, face == 2, face == 3, face == 4], [-z, z, x, x, x], -x)
+    tc = np.select([face == 2, face == 3], [z, -z], -y)
+    s = (sc / np.maximum(major, 1e-9) + 1) / 2
+    t = (tc / np.maximum(major, 1e-9) + 1) / 2
+    out = np.zeros(directions.shape[:2] + (4,), dtype=np.uint8)
+    for index, image in enumerate(faces):
+        height, width = image.shape[:2]
+        mask = face == index
+        column = np.clip((s[mask] * width).astype(np.int32), 0, width - 1)
+        row = np.clip((t[mask] * height).astype(np.int32), 0, height - 1)
+        out[mask] = image[row, column]
+    return out
+
+
+def convert_cube(data: bytes, kind: str, size: int, levels: int) -> Optional[bytes]:
+    """a cube map's bytes (six faces, each its levels, each face 128-byte aligned) as a sphere
+    map in RGB565 (RGB5A3 where it has alpha) and the trailer, padded to the same size; None
+    when no sphere map fits"""
+    face_bytes = sum(xbox_level_bytes(kind, size, size, level) for level in range(levels))
+    face_bytes = (face_bytes + CUBE_FACE_ALIGNMENT - 1) & ~(CUBE_FACE_ALIGNMENT - 1)
+    if len(data) < 6 * face_bytes or size > GX_MAXIMUM_DIMENSION:
+        return None
+    sphere = 1
+    while sphere * 2 <= 2 * size and (sphere * 2) ** 2 * 2 + SPHERE_TRAILER <= 6 * face_bytes and sphere * 2 <= 512:
+        sphere *= 2
+    if sphere < 8:
+        return None
+    first_level = xbox_level_bytes(kind, size, size, 0)
+    faces = [decode_rgba(data[face * face_bytes:face * face_bytes + first_level], kind, size, size) for face in range(6)]
+    image = cube_sample(faces, sphere_directions(sphere)).astype(np.uint32)
+    r, g, b, a = (image[..., index] for index in range(4))
+    if (a < 255).any():
+        opaque = 0x8000 | (r >> 3) << 10 | (g >> 3) << 5 | (b >> 3)
+        clear = (a >> 5) << 12 | (r >> 4) << 8 | (g >> 4) << 4 | (b >> 4)
+        words, gx_format = np.where(a >= 0xE0, opaque, clear), GX_TF_RGB5A3
+    else:
+        words, gx_format = (r >> 3) << 11 | (g >> 2) << 5 | (b >> 3), GX_TF_RGB565
+    pixels = big_words(words.astype(np.uint16), 4, 4)
+    trailer = SPHERE_MAGIC + struct.pack(">HB", sphere, gx_format)
+    trailer += bytes(SPHERE_TRAILER - len(trailer))
+    body = pixels + bytes(6 * face_bytes - len(pixels) - SPHERE_TRAILER) + trailer
+    return body + data[len(body):]
 
 
 # ---------- one texture

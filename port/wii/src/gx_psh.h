@@ -44,6 +44,10 @@ struct gx_psh_textures
 	dot product mode): read as 0, but a dot product with one is taken as 1
 	(a bump map against a normalization cube map, unlit) */
 	unsigned unavailable;
+	/* the stages whose cube map is sampled as a sphere map: a lookup reads
+	it, but a dot product with it (a bump map against a normalization cube
+	map, whose signed values TEV clamps) is still taken as 1 */
+	unsigned cube;
 	/* fog (D3DRS_FOGENABLE, its ramp bound) and its colour */
 	unsigned char fog;
 	DWORD fog_color;

@@ -984,6 +984,8 @@ struct texture_entry
 	/* DXT3 and DXT5: the colour in CMPR, the alpha in I4 after it */
 	void *alpha_texels;
 	BOOL linear;
+	/* a cube map the converter made a sphere map (sphere_coordinates) */
+	BOOL sphere;
 	/* a decoded texture's pixels when it was decoded, hashed: the game
 	rewrites some (its text's glyph cache) */
 	unsigned long hash, source_bytes;
@@ -1354,6 +1356,37 @@ static struct texture_entry *texture_get(const D3DBaseTexture *texture, const D3
 			return entry;
 		}
 	}
+	if (description.cube_map && texture_in_texture_cache(texture))
+	{
+		/* a cube map as the converter left it: a sphere map, and its
+		trailer at the cube's end (tools/wii_gx_textures.py's convert_cube) */
+		unsigned long total = 6 * xgpu_texture_face_size(&description);
+		const unsigned char *pixels = (const unsigned char *)PLATFORM_PHYSICAL_TO_VIRTUAL(texture->Data);
+		const unsigned char *trailer = pixels + total - 32;
+
+		if (total > 32 && !memcmp(trailer, "GXSPHERE", 8))
+		{
+			unsigned size = (unsigned)(trailer[8] << 8 | trailer[9]);
+
+			if (oldest->texels)
+				texture_evict(oldest);
+			entry = oldest;
+			entry->data = texture->Data;
+			entry->format = texture->Format;
+			entry->size = texture->Size;
+			entry->width = entry->height = size;
+			entry->bytes = (unsigned long)size * size * 2;
+			entry->texels = (void *)pixels;
+			entry->native = TRUE;
+			entry->gx_format = trailer[10];
+			entry->levels = 1;
+			entry->channels = _channels_all;
+			entry->sphere = TRUE;
+			entry->used_frame = device.frames;
+			DCFlushRange(entry->texels, entry->bytes);
+			return entry;
+		}
+	}
 	if (description.width > 1024 || description.height > 1024 || description.cube_map || description.depth > 1)
 	{
 		texture_failures[_failure_shape]++;
@@ -1494,12 +1527,17 @@ static float texcoord_scale[D3DTSS_MAXSTAGES][2] = { { 1, 1 }, { 1, 1 }, { 1, 1 
 
 /* the stages' textures bound to GX's texture maps (a DXT3 or DXT5 texture's
 alpha to the map four after); which stages have one */
+/* the stages bound to a cube map the converter made a sphere map: their
+texture coordinates are a direction, which sphere_coordinates maps */
+static unsigned sphere_stages;
+
 static unsigned textures_bind(void)
 {
 	unsigned stages = 0;
 	DWORD stage;
 
 	GX_InvalidateTexAll();
+	sphere_stages = 0;
 	for (stage = 0; stage < D3DTSS_MAXSTAGES; stage++)
 	{
 		struct texture_entry *entry;
@@ -1524,8 +1562,10 @@ static unsigned textures_bind(void)
 		device.statistics.textures_bound++;
 		repeatable = power_of_two(entry->width) && power_of_two(entry->height);
 		mipmapped = entry->levels > 1 && repeatable;
-		wrap_s = repeatable ? gx_wrap(D3D__TextureState[stage][D3DTSS_ADDRESSU]) : GX_CLAMP;
-		wrap_t = repeatable ? gx_wrap(D3D__TextureState[stage][D3DTSS_ADDRESSV]) : GX_CLAMP;
+		wrap_s = repeatable && !entry->sphere ? gx_wrap(D3D__TextureState[stage][D3DTSS_ADDRESSU]) : GX_CLAMP;
+		wrap_t = repeatable && !entry->sphere ? gx_wrap(D3D__TextureState[stage][D3DTSS_ADDRESSV]) : GX_CLAMP;
+		if (entry->sphere)
+			sphere_stages |= 1U << stage;
 		minification = gx_minification(stage, mipmapped);
 		if (entry->gx_format == GX_TF_CI8)
 		{
@@ -1658,13 +1698,16 @@ static void tev_setup(unsigned stages)
 
 		/* (2D and projected lookups: the rest, cube maps, dot products and
 		bump maps, read as nothing) */
-		if (!(stages & (1U << stage)) || !bound_entries[stage] || (mode != 1 && mode != 2))
+		if (!(stages & (1U << stage)) || !bound_entries[stage] ||
+			(mode != 1 && mode != 2 && !(mode == 3 && bound_entries[stage]->sphere)))
 		{
 			if (mode)
 				textures.unavailable |= 1U << stage;
 			continue;
 		}
 		textures.present |= 1U << stage;
+		if (mode == 3)
+			textures.cube |= 1U << stage;
 		if (bound_entries[stage]->alpha_texels)
 			textures.separate_alpha |= 1U << stage;
 		textures.contents[stage] = bound_entries[stage]->channels;
@@ -1946,6 +1989,34 @@ static float fog_coordinate(float fog)
 	return (factor * 255.0f + 0.5f) / 256.0f;
 }
 
+/* a cube map's direction (s, t, r) on its sphere map: the mirror ball's
+mapping, whose inverse made the map (tools/wii_gx_textures.py's
+sphere_directions); only straight behind (0, 0, -1) has no place, and
+reads the disc's edge */
+static void sphere_coordinates(const float direction[4], float out[2])
+{
+	float x = direction[0], y = direction[1], z = direction[2];
+	float length = sqrtf(x * x + y * y + z * z), m;
+
+	if (!(length > 1.0e-12f))
+	{
+		out[0] = out[1] = 0.5f;
+		return;
+	}
+	x /= length;
+	y /= length;
+	z /= length;
+	m = 2.0f * sqrtf(x * x + y * y + (z + 1.0f) * (z + 1.0f));
+	if (!(m > 1.0e-6f))
+	{
+		out[0] = 0.5f;
+		out[1] = 1.0f;
+		return;
+	}
+	out[0] = x / m + 0.5f;
+	out[1] = y / m + 0.5f;
+}
+
 /* a vertex as GX takes it (DEVICE_VERTEX_FORMAT's attributes, in order) */
 struct gx_vertex
 {
@@ -1995,8 +2066,13 @@ static void vertex_store(const struct nv2a_cpu_output *out, const struct draw_pr
 	{
 		vertex->color0[stage] = color_byte(out->d0[stage]);
 		vertex->color1[stage] = color_byte(out->d1[stage]);
-		vertex->texcoord[stage][0] = out->t[stage][0] * texcoord_scale[stage][0];
-		vertex->texcoord[stage][1] = out->t[stage][1] * texcoord_scale[stage][1];
+		if (sphere_stages & (1U << stage))
+			sphere_coordinates(out->t[stage], vertex->texcoord[stage]);
+		else
+		{
+			vertex->texcoord[stage][0] = out->t[stage][0] * texcoord_scale[stage][0];
+			vertex->texcoord[stage][1] = out->t[stage][1] * texcoord_scale[stage][1];
+		}
 	}
 	vertex->fog = fog_coordinate(out->fog);
 }
@@ -2240,12 +2316,70 @@ static void matrix_inputs(const struct vertex_shader_object *shader, float (*inp
 }
 
 static Mtx position_matrix_rows;
+/* the depth's a + b / w for the same constants (position_matrix): from the
+program's outputs for the origin and the axes, not from a draw's vertices,
+so every draw of these constants has the same, to the bit */
+static struct draw_projection position_projection;
 /* (config.toml's debug.gpu_transform; -1 not read yet) */
 static int gpu_transform = -1;
 
-static void position_matrix(const struct vertex_shader_object *shader, struct nv2a_cpu_program *program, int reg,
+/* the matrices and depths of recent constants, by the program, its vertex
+declaration, the constants it reads and the viewport's */
+#define POSITION_CACHE_ENTRIES 64
+static struct
+{
+	unsigned long long key;
+	Mtx rows;
+	struct draw_projection projection;
+} position_cache[POSITION_CACHE_ENTRIES];
+
+static unsigned long long constants_key(const struct vertex_shader_object *shader, const struct nv2a_cpu_program *program)
+{
+	const struct nv2a_cpu_dependencies *dependencies = &shader->dependencies;
+	unsigned long long hash = 14695981039346656037ULL ^ (unsigned long)program;
+	unsigned long row, word;
+
+	hash = (hash ^ (unsigned long)shader) * 1099511628211ULL;
+	for (row = 0; row < NV2A_CPU_CONSTANT_COUNT; row++)
+		if (dependencies->relative || (dependencies->constants[row / 32] & (1UL << (row % 32))) ||
+			row == VERTEX_CONSTANT_BIAS - 38 || row == VERTEX_CONSTANT_BIAS - 37)
+		{
+			const unsigned long *words = (const unsigned long *)device.vertex_constants[row];
+
+			hash = (hash ^ row) * 1099511628211ULL;
+			for (word = 0; word < 4; word++)
+				hash = (hash ^ words[word]) * 1099511628211ULL;
+		}
+	return hash ? hash : 1;
+}
+
+static BOOL position_matrix_compute(const struct vertex_shader_object *shader, struct nv2a_cpu_program *program,
+	int reg, float point_size);
+
+static BOOL position_matrix(const struct vertex_shader_object *shader, struct nv2a_cpu_program *program, int reg,
 	float point_size)
 {
+	unsigned long long key = constants_key(shader, program);
+	unsigned slot = (unsigned)(key % POSITION_CACHE_ENTRIES);
+
+	if (position_cache[slot].key == key)
+	{
+		memcpy(position_matrix_rows, position_cache[slot].rows, sizeof(position_matrix_rows));
+		position_projection = position_cache[slot].projection;
+		return TRUE;
+	}
+	if (!position_matrix_compute(shader, program, reg, point_size))
+		return FALSE;
+	position_cache[slot].key = key;
+	memcpy(position_cache[slot].rows, position_matrix_rows, sizeof(position_matrix_rows));
+	position_cache[slot].projection = position_projection;
+	return TRUE;
+}
+
+static BOOL position_matrix_compute(const struct vertex_shader_object *shader, struct nv2a_cpu_program *program,
+	int reg, float point_size)
+{
+	float ws[4];
 	const float *scale = device.vertex_constants[VERTEX_CONSTANT_BIAS - 38];
 	const float *offset = device.vertex_constants[VERTEX_CONSTANT_BIAS - 37];
 	float inputs[NV2A_CPU_INPUT_COUNT][4];
@@ -2271,7 +2405,43 @@ static void position_matrix(const struct vertex_shader_object *shader, struct nv
 		position_matrix_rows[0][component] = x * scale[0] + (offset[0] + 0.5f) * w;
 		position_matrix_rows[1][component] = y * scale[1] + (offset[1] + 0.5f) * w;
 		position_matrix_rows[2][component] = -w;
+		ws[component] = component < 3 ? column.clip[3] : base.clip[3];
 	}
+	/* two points along w's gradient, at w 1 and 1000, give the fit (draw_run's
+	projection_fit, for points of the program's own choosing) */
+	{
+		float gradient[3], length = 0.0f, targets[2] = { 1.0f, 1000.0f }, d[2], v[2];
+		int point;
+
+		for (component = 0; component < 3; component++)
+		{
+			gradient[component] = ws[component] - ws[3];
+			length += gradient[component] * gradient[component];
+		}
+		position_projection.perspective = TRUE;
+		position_projection.fitted = FALSE;
+		if (!(length > 1.0e-12f))
+			return FALSE;
+		for (point = 0; point < 2; point++)
+		{
+			float t = (targets[point] - ws[3]) / length;
+
+			for (component = 0; component < 3; component++)
+				inputs[reg][component] = t * gradient[component];
+			nv2a_cpu_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
+				&column);
+			d[point] = column.position[2] / 16777215.0f;
+			v[point] = column.clip[3];
+		}
+		for (component = 0; component < 3; component++)
+			inputs[reg][component] = 0.0f;
+		if (!(fabsf(v[0]) > 1.0e-6f) || !(fabsf(v[1]) > 1.0e-6f) || !(fabsf(1.0f / v[1] - 1.0f / v[0]) > 1.0e-6f))
+			return FALSE;
+		position_projection.b = (d[1] - d[0]) / (1.0f / v[1] - 1.0f / v[0]);
+		position_projection.a = d[0] - position_projection.b / v[0];
+		position_projection.fitted = TRUE;
+	}
+	return position_projection.fitted;
 }
 
 /* (after transform_software, which takes GX back to the identity) */
@@ -2345,16 +2515,19 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 	UINT vertex;
 
 	memcpy(&point_size, &D3D__RenderState[D3DRS_POINTSIZE], sizeof(point_size));
-	projection = projection_fit(program, count, fetch, context, point_size);
-	projection_load(&projection);
 	if (gpu_transform < 0)
 		gpu_transform = config_boolean("debug.gpu_transform") ? 1 : 0;
-	if (shader && projection.perspective && gpu_transform)
+	if (shader && gpu_transform)
 	{
 		position_register = position_register_of(shader, program);
-		if (position_register >= 0)
-			position_matrix(shader, program, position_register, point_size);
+		if (position_register >= 0 && position_matrix(shader, program, position_register, point_size))
+			projection = position_projection;
+		else
+			position_register = -1;
 	}
+	if (position_register < 0)
+		projection = projection_fit(program, count, fetch, context, point_size);
+	projection_load(&projection);
 	if (DRAW_LOG_FRAME && device.frames == DRAW_LOG_FRAME)
 		draw_log(primitive_type, count, &projection, fetch, context, program, point_size);
 	if (indices && count > 3 && !vertex_memo)
@@ -2899,7 +3072,8 @@ static unsigned long long hardware_key(const struct vertex_shader_object *shader
 	hash = hash_words(hash, state, sizeof(state));
 	hash = hash_words(hash, texcoord_scale, sizeof(texcoord_scale));
 	for (row = 0; row < NV2A_CPU_CONSTANT_COUNT; row++)
-		if (dependencies->relative || (dependencies->constants[row / 32] & (1UL << (row % 32))))
+		if (dependencies->relative || (dependencies->constants[row / 32] & (1UL << (row % 32))) ||
+			row == VERTEX_CONSTANT_BIAS - 38 || row == VERTEX_CONSTANT_BIAS - 37)
 			hash = hash_words(hash ^ row, device.vertex_constants[row], sizeof(device.vertex_constants[row]));
 	/* (0 is an empty entry's) */
 	return hash ? hash : 1;
@@ -2965,6 +3139,8 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		stage_unread[stage] = !(tev_texcoords & (1U << stage));
 		if (stage_unread[stage])
 			continue;
+		if (sphere_stages & (1U << stage))
+			return hardware_rejected(program, "a cube map's direction (a sphere map's coordinates)");
 		if (mask & NV2A_CPU_NOT_AFFINE)
 			return hardware_rejected(program, "a texture coordinate read is not affine");
 		if (!(mask & 0xFFFF) || reg == position_register)
@@ -3111,13 +3287,10 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	}
 	memset(stage_rows[4][1], 0, sizeof(stage_rows[4][1]));
 
-	projection = projection_fit(program, count, stream_fetch, fetch, point_size);
-	if (!projection.perspective)
-		return FALSE;
-	/* (the position's matrix as draw_run makes it, to the bit) */
-	position_matrix(shader, program, position_register, point_size);
-	/* (a fit from these vertices, not the last draw's, is the constants') */
-	if (projection.fitted)
+	/* (the position's matrix and depth as draw_run makes them, to the bit) */
+	if (!position_matrix(shader, program, position_register, point_size))
+		return hardware_rejected(program, "no depth to fit (every w the same)");
+	projection = position_projection;
 	{
 		cached->key = key;
 		memcpy(cached->stage_rows, stage_rows, sizeof(stage_rows));
