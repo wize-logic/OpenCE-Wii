@@ -14,7 +14,8 @@ This port is in bring-up. In Dolphin, the game boots from the SD card and loads 
   fault: a10, a30, a50, b30, b40, c10, c20, c40, d20 and d40 (a tour:
   `debug.network_test = "solo:levels\\a30\\a30,levels\\b30\\b30"` with
   `debug.network_test_tour` seconds of game time in each). The outdoor levels run at about two
-  frames a second in Dolphin: their skinned characters' vertices are the CPU's. On the Wii,
+  frames a second in Dolphin (measured while their skinned characters' vertices were the CPU's;
+  most go to GX now, see "Drawing", and these levels are not timed again here). On the Wii,
   `display.object_shadows` is off by default (each object's shadow draws it again, a pass of
   skinned vertices) and `display.model_detail` is 0.5.
 - **Loading**: the menu is up within a second of the game's start.
@@ -47,7 +48,7 @@ ninja wii-package                           # build/wii/halo-wii.zip for the Hom
 `ninja wii-package` zips `apps/halo` as the Homebrew Channel reads it: `boot.dol`, `meta.xml`
 and an icon drawn by `tools/wii_package.py`. It holds no game data. The `wii` job in
 `.github/workflows/build.yml` runs both host checks, builds the zip in devkitPro's devkitPPC
-image (with WiiLibs checked out beside the repository) and keeps it as an artifact.
+image (with WiiLibs checked out into `./WiiLibs`) and keeps it as an artifact.
 
 `tools/wii_dolphin.py` runs WiiLibs' Dolphin runner (`tools/dolphin_run.py` there) on the build:
 
@@ -148,9 +149,18 @@ inflated it to, and the Wii reads it where it is.
   - the compressed animations' floats, read a byte at a time (the 750 can trap on a misaligned
     float load)
   - values written at one width and read at another: a profile count passed as a `word *` to a
-    function that writes a word, a chicago shader's `extra_flags` (the tag's long), the server's
-    read of the pregame start request (a short on the wire, decoded into a long's first two bytes), and the textures the game writes itself (the device decodes them from a copy
-    in the Xbox's byte order)
+    function that writes a word, a chicago shader's `extra_flags` (the tag's long), a fog's
+    `flags` (the tag's word, read as a byte), the server's read of the pregame start request (a
+    short on the wire, decoded into a long's first two bytes), and the textures the game writes
+    itself (the device decodes them from a copy in the Xbox's byte order)
+  - network byte order: `htonl`, `ntohl`, `htons` and `ntohs` (`port/linux/src/xnet.c`) do nothing
+    on a big-endian machine, and the transport's address and port conversions
+    (`source/bungie_net/network/transport_endpoint_winsock.c`, `transport_endpoint_set_winsock.c`)
+    use them where they swapped bytes by hand, which is right only on a little-endian one
+  - little-endian file values read byte by byte: the TGA header's width and height
+    (`source/interface/progress_bar.c`), a tag's four-character name (`string_to_tag` and
+    `tag_to_string`, `source/cseries/cseries.c`, the first character the high byte) and the PCM
+    samples of the sounds the shared mixer plays (`port/linux/src/dsound_sdl.c`)
 - **Floating point.** `_controlfp`/`_statusfp` map the MSVC control word onto the FPSCR
   (`port/linux/src/msvc_crt.c`).
 - **Movies.** Bink movies are skipped (`source/bink/bink_playback.c`).
@@ -243,11 +253,13 @@ and pixel shaders.
   - A skinned model's draw is keyed by what its vertices' node indices and weights make
     (`node_keys`). A vertex of weight 1 or 0 hangs off one node, whatever its other index: the
     game's programs give it what that node alone gives (`tests/nv2a_native_check.c` checks each
-    program). A blended vertex is its two nodes and its weight. Up to nine values a draw get a
-    position matrix each, which GX picks per vertex by its matrix index. The other vertices (of a
-    value with fewer than six of the draw's indices, or past the nine) are the CPU's: their
-    position is sent in the same draw, through the identity and the same projection, and every
-    pass of the model makes the same choice, as it depends on the vertices alone.
+    program). A blended vertex is its two nodes and its weight (up to 64 blends a draw). Up to
+    nine values a draw get a position matrix each (`GX_PNMTX1` to `GX_PNMTX9`), which GX picks per
+    vertex by its matrix index. Where the draw's values are more than nine, or some blend is past
+    the 64, a value needs six of the draw's indices to have a matrix. The other vertices (those of
+    a value without one) are the CPU's: their position is sent in the same draw, through the
+    identity (`GX_PNMTX0`) and the same projection, and every pass of the model makes the same
+    choice, as it depends on the vertices alone.
   - In the model parts of eleven maps (the campaign and Blood Gulch), GX now computes the position
     of 89 to 96% of the vertices, where it computed 49 to 80% (a draw of more than nine values was
     all the CPU's): b30 60% to 93%, c10 49% to 91%. 2 to 14% of them blend two nodes.
@@ -354,10 +366,23 @@ and pixel shaders.
 The same session, played by the x86 Linux build and by the Wii in Dolphin, compared tick by tick:
 the big-endian game core against the little-endian one, with the maps the Wii's converter wrote.
 
-- Both builds run a solo network test with `debug.fixed_ticks = true` (a game tick each frame, and
-  the scripted player's clock the game's ticks, so both see the same input at the same tick) and
-  `debug.lockstep_log = 10`. Every 10 ticks they log a hash of every object's position, velocity,
-  facing, vitality and parent, and the game's random seed (`port/linux/game/network_test.c`).
+- Both builds run a solo network test with `debug.fixed_ticks = true` and `debug.lockstep_log = 10`.
+  Every 10 ticks they log a hash of every object's position, velocity, facing, vitality and
+  parent, and the game's random seed (`port/linux/game/network_test.c`). `debug.fixed_ticks`
+  takes the machine's clocks out of the game:
+  - A game tick each frame (`source/game/game_time.c`), whatever time passed.
+  - Every frame is 1/30 s long to what runs on the frame's time (`source/main/main.c`; not in a
+    movie): the players' turning, the camera and the menus. Two x86 runs of the same build had
+    differed in b30 once the scripted player had control.
+  - The scripted player's clock is the game's ticks (`port/linux/src/test_input.c`), and it gives
+    no input before a game's first tick, so both see the same input at the same tick.
+  - A speaking unit's mouth stays closed (`game_sound_set_mouth_aperture`,
+    `source/sound/game_sound.c`): it follows the sound as the audio device plays it, in real
+    time, and its overlay moves the unit's nodes, from which weapons aim and fire.
+  - The test's waits in seconds (`debug.network_test_start`, 15 s by default, in the menu before a
+    solo game) are summed from the frames' lengths, so they count frames (450 of them), and the
+    game starts at the same frame on a machine that draws at 2 frames a second and on one that
+    draws at 200.
 - The Linux build runs headless (`debug.null_renderer`, SDL's dummy video and audio drivers) in the
   CI's Arch Linux image, with the Xbox maps. Both builds use musl's maths functions, so the floats
   agree to the bit.
@@ -438,6 +463,14 @@ Dolphin runs the game, but these need the console:
    - a profile count (`playlist_profiles_enumerate_available_to_local_player_index`) written as a
      word into a long, so the multiplayer game-type list read the other half;
    - a chicago shader's `extra_flags`, two words in the game's structure over the tag's long;
+   - a fog's `flags`, a byte in the game's structure over the tag's word (it read the word's high
+     half);
+   - a vehicle's slide acceleration and deceleration (0x338 and 0x33c), which the schema and
+     `source/units/vehicles.c` left as bytes while `physics_variable_speed_parameters` reads
+     them through a cast at 0x330: now named floats, so the converter swaps them;
+   - network byte order, which the shared socket layer and the transport swapped by hand (right
+     only on a little-endian machine), and little-endian file values read in the machine's order
+     (the TGA header's size, a tag's four-character name, the PCM samples);
    - the pregame start request: the packet carries one short, which the server decodes into the
      first two bytes of a long and read as the long's low half, its other half on big-endian
      (nothing sent changes);
@@ -445,6 +478,9 @@ Dolphin runs the game, but these need the console:
    - not big-endian: a shadow's bounding radius left unset in the mirror's window, which the
      object shadow pass then read (a NaN halted c40).
 4. Real hardware, from the Homebrew Channel (`ninja wii-package`).
-5. CI. The workflow's `wii` job passes when run locally in the devkitpro/devkitppc image. On
-   GitHub it builds against WiiLibs' `dolphin-tests-and-fixed-claims` branch, which needs this
-   port's WiiLibs changes pushed first.
+5. CI. The workflow's `wii` job passes when run locally in the devkitpro/devkitppc image against
+   the local WiiLibs. On GitHub it checks out WiiLibs' `dolphin-tests-and-fixed-claims` branch,
+   which lacks what this port now needs from it: `wl/platform/tev.h` (the TEV programs and
+   their fixes) and the thread functions (`__wrap_sched_yield`, `wl_platform_run_on_stack`).
+   Against that branch the host check stops at "WiiLibs not found" and the build at
+   `gx_psh.h`. WiiLibs' threads, codec, TEV and TEV-fix commits must be pushed first.
