@@ -732,12 +732,15 @@ static void cull_measure(void);
 colour sources; transform_software puts back what the draws in screen
 space (draw_run, the clears, the render targets' copies) take */
 static BOOL transform_hardware;
+/* (the draw's vertices carry a position matrix index: draw_keys) */
+static BOOL emit_matrix_index;
 
 static void transform_software(void)
 {
 	if (!transform_hardware)
 		return;
 	transform_hardware = FALSE;
+	emit_matrix_index = FALSE;
 	GX_SetCurrentMtx(GX_PNMTX0);
 	GX_ClearVtxDesc();
 	GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
@@ -2028,6 +2031,8 @@ static void sphere_coordinates(const float direction[4], float out[2])
 /* a vertex as GX takes it (DEVICE_VERTEX_FORMAT's attributes, in order) */
 struct gx_vertex
 {
+	/* (its position matrix's index, sent when emit_matrix_index: draw_keys) */
+	u8 matrix;
 	float position[3];
 	u8 color0[4], color1[4];
 	float texcoord[4][2];
@@ -2089,6 +2094,8 @@ static inline void vertex_emit(const struct gx_vertex *vertex)
 {
 	int stage;
 
+	if (emit_matrix_index)
+		GX_MatrixIndex1x8(vertex->matrix);
 	GX_Position3f32(vertex->position[0], vertex->position[1], vertex->position[2]);
 	GX_Color4u8(vertex->color0[0], vertex->color0[1], vertex->color0[2], vertex->color0[3]);
 	GX_Color4u8(vertex->color1[0], vertex->color1[1], vertex->color1[2], vertex->color1[3]);
@@ -2293,9 +2300,24 @@ static struct
 	float values[NV2A_CPU_INPUT_COUNT][4];
 } draw_uniform;
 
+/* ... or, where those inputs take a few values (a model of several nodes, each
+vertex bound to one), each value's vertices: a position matrix each, which
+GX picks per vertex by its matrix index (GX_PNMTX1 on: GX_PNMTX0 is the
+identity of the draws in screen space) */
+#define MATRIX_KEYS 9
+static struct
+{
+	unsigned count;
+	/* a vertex of each value, of the draw's */
+	UINT representative[MATRIX_KEYS];
+	Mtx rows[MATRIX_KEYS];
+} draw_keys;
+static unsigned char vertex_keys[65536];
+
 struct stream_fetch;
 static const struct nv2a_cpu_dependencies *draw_dependencies(struct vertex_shader_object *shader,
 	struct nv2a_cpu_program *program, struct stream_fetch *fetch, UINT count);
+static void stream_fetch(void *context, UINT vertex, float (*inputs)[4]);
 
 /* ---------- the position in hardware
 
@@ -2479,9 +2501,42 @@ static BOOL position_matrix_compute(const struct vertex_shader_object *shader, s
 /* (after transform_software, which takes GX back to the identity) */
 static void position_matrix_load(void)
 {
-	GX_LoadPosMtxImm(position_matrix_rows, GX_PNMTX1);
-	GX_SetCurrentMtx(GX_PNMTX1);
+	if (draw_keys.count > 1)
+	{
+		unsigned key;
+
+		for (key = 0; key < draw_keys.count; key++)
+			GX_LoadPosMtxImm(draw_keys.rows[key], (u32)(GX_PNMTX1 + 3 * key));
+		GX_SetVtxDesc(GX_VA_PTNMTXIDX, GX_DIRECT);
+	}
+	else
+	{
+		GX_LoadPosMtxImm(position_matrix_rows, GX_PNMTX1);
+		GX_SetCurrentMtx(GX_PNMTX1);
+	}
 	transform_hardware = TRUE;
+}
+
+/* each of the draw's values a position matrix (draw_keys), its first's left
+in position_matrix_rows and position_projection, and in draw_uniform */
+static BOOL position_keys(const struct vertex_shader_object *shader, struct nv2a_cpu_program *program, void *fetch,
+	int reg, float point_size)
+{
+	float inputs[NV2A_CPU_INPUT_COUNT][4];
+	unsigned key;
+	int index;
+
+	for (key = draw_keys.count; key-- > 0; )
+	{
+		stream_fetch(fetch, draw_keys.representative[key], inputs);
+		for (index = 0; index < NV2A_CPU_INPUT_COUNT; index++)
+			if (draw_uniform.mask & (1UL << index))
+				memcpy(draw_uniform.values[index], inputs[index], sizeof(inputs[index]));
+		if (!position_matrix(shader, program, reg, point_size))
+			return FALSE;
+		memcpy(draw_keys.rows[key], position_matrix_rows, sizeof(position_matrix_rows));
+	}
+	return TRUE;
 }
 
 /* the vertices each program ran for, in the statistics' window: which to
@@ -2553,7 +2608,9 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 	{
 		position_register = position_register_of(shader,
 			draw_dependencies((struct vertex_shader_object *)shader, program, (struct stream_fetch *)context, count));
-		if (position_register >= 0 && position_matrix(shader, program, position_register, point_size))
+		if (position_register >= 0 && (draw_keys.count > 1 ?
+			position_keys(shader, program, context, position_register, point_size) :
+			position_matrix(shader, program, position_register, point_size)))
 			projection = position_projection;
 		else
 			position_register = -1;
@@ -2594,7 +2651,10 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 			vertex_memo_draw++;
 			transform_software();
 			if (position_register >= 0)
+			{
 				position_matrix_load();
+				emit_matrix_index = draw_keys.count > 1;
+			}
 
 			GX_Begin(gx_primitive(primitive_type), DEVICE_VERTEX_FORMAT, (u16)count);
 			for (vertex = 0; vertex < count; vertex++)
@@ -2608,6 +2668,7 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 						point_size, &out);
 					vertex_store(&out, &projection, position_register >= 0 ? inputs[position_register] : NULL,
 						&vertex_memo[slot]);
+					vertex_memo[slot].matrix = (u8)(GX_PNMTX1 + 3 * vertex_keys[vertex]);
 					vertex_memo_stamps[slot] = vertex_memo_draw;
 					device.statistics.vertices_run++;
 				}
@@ -2622,13 +2683,17 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 	{
 		transform_software();
 		if (position_register >= 0)
+		{
 			position_matrix_load();
+			emit_matrix_index = draw_keys.count > 1;
+		}
 
 		GX_Begin(gx_primitive(primitive_type), DEVICE_VERTEX_FORMAT, (u16)count);
 		for (vertex = 0; vertex < count; vertex++)
 		{
 			struct gx_vertex sent;
 
+			sent.matrix = (u8)(GX_PNMTX1 + 3 * vertex_keys[vertex]);
 			fetch(context, vertex, inputs);
 			nv2a_cpu_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
 				&out);
@@ -3041,7 +3106,7 @@ each input component alone) and the projection's fit. What GX can take:
   skinned ones (a product of a weight and a matrix) and the lit ones stay on
   the processor (draw_run). */
 
-static unsigned long hardware_draws, hardware_vertices, hardware_colors_run;
+static unsigned long hardware_draws, hardware_vertices, hardware_colors_run, hardware_keyed_draws;
 
 static int single_register(unsigned long mask)
 {
@@ -3081,6 +3146,7 @@ static const struct nv2a_cpu_dependencies *draw_dependencies(struct vertex_shade
 	int reg;
 
 	draw_uniform.mask = 0;
+	draw_keys.count = 0;
 	if (!fetch || !count || !general->clip_captured || !(clip & NV2A_CPU_NOT_AFFINE))
 		return general;
 	for (reg = 0; reg < NV2A_CPU_INPUT_COUNT; reg++)
@@ -3097,27 +3163,54 @@ static const struct nv2a_cpu_dependencies *draw_dependencies(struct vertex_shade
 	}
 	if (!candidates)
 		return general;
-	for (reg = 0; reg < NV2A_CPU_INPUT_COUNT; reg++)
 	{
-		const struct vertex_element *element;
-		const unsigned char *stream, *first;
-		UINT stride, vertex;
+		/* the candidates' bytes in each vertex, grouped by value */
+		const unsigned char *streams[NV2A_CPU_INPUT_COUNT];
+		UINT strides[NV2A_CPU_INPUT_COUNT], bytes[NV2A_CPU_INPUT_COUNT], vertex, key;
+		unsigned long wholes[MATRIX_KEYS];
+		int regs[NV2A_CPU_INPUT_COUNT], reg_count = 0, which;
 
-		if (!(candidates & (1UL << reg)))
-			continue;
-		element = element_of(shader, reg);
-		stream = fetch->streams[element->stream & (MAXIMUM_STREAMS - 1)] + element->offset;
-		stride = device.streams[element->stream & (MAXIMUM_STREAMS - 1)].stride;
-		first = stream + (fetch->indices ? (unsigned long)fetch->indices[0] + device.base_vertex_index : fetch->first) *
-			stride;
-		for (vertex = 1; vertex < count; vertex++)
+		for (reg = 0; reg < NV2A_CPU_INPUT_COUNT; reg++)
+		{
+			const struct vertex_element *element;
+
+			if (!(candidates & (1UL << reg)))
+				continue;
+			element = element_of(shader, reg);
+			streams[reg_count] = fetch->streams[element->stream & (MAXIMUM_STREAMS - 1)] + element->offset;
+			strides[reg_count] = device.streams[element->stream & (MAXIMUM_STREAMS - 1)].stride;
+			bytes[reg_count] = element->bytes;
+			regs[reg_count++] = reg;
+		}
+		draw_keys.count = 0;
+		for (vertex = 0; vertex < count; vertex++)
 		{
 			unsigned long whole = fetch->indices ? (unsigned long)fetch->indices[vertex] + device.base_vertex_index :
 				fetch->first + vertex;
 
-			if (memcmp(stream + whole * stride, first, element->bytes))
-				return general;
+			for (key = 0; key < draw_keys.count; key++)
+			{
+				for (which = 0; which < reg_count; which++)
+					if (memcmp(streams[which] + whole * strides[which], streams[which] + wholes[key] * strides[which],
+						bytes[which]))
+						break;
+				if (which == reg_count)
+					break;
+			}
+			if (key == draw_keys.count)
+			{
+				if (draw_keys.count == MATRIX_KEYS || count > sizeof(vertex_keys))
+				{
+					draw_keys.count = 0;
+					return general;
+				}
+				wholes[key] = whole;
+				draw_keys.representative[key] = vertex;
+				draw_keys.count++;
+			}
+			vertex_keys[vertex] = (unsigned char)key;
 		}
+		(void)regs;
 	}
 	stream_fetch(fetch, 0, inputs);
 	for (reg = 0; reg < NV2A_CPU_INPUT_COUNT; reg++)
@@ -3166,7 +3259,7 @@ static unsigned long long hardware_key(const struct vertex_shader_object *shader
 
 	state[0] = (unsigned long)program;
 	state[1] = (unsigned long)shader;
-	state[2] = tev_texcoords;
+	state[2] = tev_texcoords | sphere_stages << 8;
 	state[3] = D3D__RenderState[D3DRS_FOGTABLEMODE];
 	state[4] = D3D__RenderState[D3DRS_FOGSTART];
 	state[5] = D3D__RenderState[D3DRS_FOGEND];
@@ -3246,7 +3339,13 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		if (stage_unread[stage])
 			continue;
 		if (sphere_stages & (1U << stage))
-			return hardware_rejected(program, "a cube map's direction (a sphere map's coordinates)");
+		{
+			/* (a direction the vertices give is the processor's; one the
+			same for every vertex is one point of the sphere map) */
+			if ((dependencies->t[stage][0] | dependencies->t[stage][1] | dependencies->t[stage][2]) & 0xFFFF)
+				return hardware_rejected(program, "a cube map's direction (a sphere map's coordinates)");
+			continue;
+		}
 		if (mask & NV2A_CPU_NOT_AFFINE)
 			return hardware_rejected(program, "a texture coordinate read is not affine");
 		if (!(mask & 0xFFFF) || reg == position_register)
@@ -3283,6 +3382,31 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 			(mode != D3DFOG_NONE && mode != D3DFOG_LINEAR))
 			return hardware_rejected(program, "the fog is not affine in the position, or its table is exponential");
 		fogged = TRUE;
+	}
+	/* (with several values of the inputs, what is read besides the position
+	and the colours, which the processor gives, may not depend on them: one
+	texture matrix serves every vertex) */
+	if (draw_keys.count > 1)
+	{
+		const struct nv2a_cpu_dependencies *general = &shader->dependencies;
+
+		for (stage = 0; stage < 4; stage++)
+			if (!stage_unread[stage] && ((general->t[stage][0] | general->t[stage][1]) & draw_uniform.mask))
+				return hardware_rejected(program, "a texture coordinate from a model's nodes");
+		if (fogged && (general->fog & draw_uniform.mask))
+			return hardware_rejected(program, "the fog from a model's nodes");
+		for (component = 0; component < 2; component++)
+		{
+			const unsigned long *color = component ? general->d1 : general->d0;
+
+			if (((color[0] | color[1] | color[2] | color[3]) & draw_uniform.mask) &&
+				(tev_channels & (1U << component)))
+			{
+				if (!program->native_colors)
+					return hardware_rejected(program, "a colour from a model's nodes, on the interpreter");
+				cpu_colors = TRUE;
+			}
+		}
 	}
 	/* the vertices' range: GX's indices are 16 bits */
 	for (vertex = 0; vertex < count; vertex++)
@@ -3370,6 +3494,16 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	{
 		if (stage_unread[stage])
 			memset(stage_rows[stage], 0, sizeof(stage_rows[stage]));
+		else if (sphere_stages & (1U << stage))
+		{
+			float point[2];
+
+			sphere_coordinates(base.t[stage], point);
+			memset(stage_rows[stage], 0, sizeof(stage_rows[stage]));
+			stage_rows[stage][0][3] = point[0];
+			stage_rows[stage][1][3] = point[1];
+			continue;
+		}
 		for (component = 0; component < 4; component++)
 		{
 			stage_rows[stage][0][component] *= texcoord_scale[stage][0];
@@ -3408,9 +3542,12 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	}
 	projection_load(&projection);
 
-	/* GX's state for the game's vertices */
-	position_matrix_load();
+	/* GX's state for the game's vertices (each value's matrix: the first's
+	is the cache's) */
+	if (draw_keys.count > 1 && !position_keys(shader, program, fetch, position_register, point_size))
+		return hardware_rejected(program, "no depth to fit for a model's node");
 	GX_ClearVtxDesc();
+	position_matrix_load();
 	GX_SetVtxDesc(GX_VA_POS, GX_INDEX16);
 	GX_SetVtxAttrFmt(HARDWARE_VERTEX_FORMAT, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
 	{
@@ -3490,6 +3627,8 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		unsigned long whole = indices ? (unsigned long)indices[vertex] + device.base_vertex_index : first + vertex;
 		u16 index = (u16)whole;
 
+		if (draw_keys.count > 1)
+			GX_MatrixIndex1x8((u8)(GX_PNMTX1 + 3 * vertex_keys[vertex]));
 		GX_Position1x16(index);
 		if (cpu_colors)
 		{
@@ -3523,6 +3662,8 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	GX_End();
 	hardware_draws++;
 	hardware_vertices += count;
+	if (draw_keys.count > 1)
+		hardware_keyed_draws++;
 	timing.hardware_setup += emitting - started;
 	timing.hardware_vertices += wl_platform_time_us() - emitting;
 	return TRUE;
@@ -3766,9 +3907,10 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			device.draws_elsewhere, device.statistics.textures_bound, device.statistics.textures_failed,
 			device.statistics.stages_without_mode, STATISTICS_FRAMES);
 		program_statistics_log();
-		platform_log("Direct3D: in hardware: %lu draws (%lu of their matrices kept), %lu vertices (%lu with the "
-			"processor's colours)", hardware_draws, hardware_cache_hits, hardware_vertices, hardware_colors_run);
-		hardware_draws = hardware_vertices = hardware_colors_run = hardware_cache_hits = 0;
+		platform_log("Direct3D: in hardware: %lu draws (%lu of their matrices kept, %lu of several nodes), %lu vertices "
+			"(%lu with the processor's colours)", hardware_draws, hardware_cache_hits, hardware_keyed_draws,
+			hardware_vertices, hardware_colors_run);
+		hardware_draws = hardware_vertices = hardware_colors_run = hardware_cache_hits = hardware_keyed_draws = 0;
 		platform_log("Direct3D: textures not drawn: %lu without data, %lu of a shape, %lu of a format, "
 			"%lu without memory, %lu not decoded; %lu converted bitmaps found", texture_failures[_failure_no_data],
 			texture_failures[_failure_shape],

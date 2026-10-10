@@ -459,7 +459,19 @@ static real object_get_level_of_detail_pixels(
 
 	object_get_bounding_sphere(object_index, &center, &radius);
 
-	return render_frustum_sphere_diameter_in_pixels(&render.frustum, &center, radius);
+	/* port: scaled by config.toml's display.model_detail (port_config.c) */
+	{
+		extern double config_real(char const *name);
+		static real model_detail = -1.0f;
+
+		if (model_detail < 0.0f)
+		{
+			model_detail = (real)config_real("display.model_detail");
+			if (!(model_detail > 0.0f))
+				model_detail = 1.0f;
+		}
+		return render_frustum_sphere_diameter_in_pixels(&render.frustum, &center, radius) * model_detail;
+	}
 }
 
 static void render_object_list(

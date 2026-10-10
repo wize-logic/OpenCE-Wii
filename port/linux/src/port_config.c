@@ -68,6 +68,14 @@ struct config_setting
 	const char *comment;
 };
 
+/* (display.model_detail's: the Wii's processor runs the skinned models'
+vertices, and draws simpler ones sooner) */
+#ifdef HALO_WII
+#define MODEL_DETAIL_DEFAULT "0.5"
+#else
+#define MODEL_DETAIL_DEFAULT "1.0"
+#endif
+
 static const struct config_setting config_settings[] =
 {
 	{ "display.fullscreen", _config_boolean, "true", "HALO_FULLSCREEN", _environment_value, _platform_desktop,
@@ -150,6 +158,10 @@ static const struct config_setting config_settings[] =
 		_environment_value, _platform_all,
 		"The scoreboard panel's colour: \"red, green, blue, alpha\", each 0 to 255\n"
 		"(alpha 0 is see-through, 255 solid)." },
+	{ "display.model_detail", _config_real, MODEL_DETAIL_DEFAULT, "HALO_MODEL_DETAIL", _environment_value, _platform_all,
+		"The models' detail: the size each model's level of detail is chosen for is\n"
+		"scaled by this (1 as the Xbox; less draws simpler models sooner, the Wii's\n"
+		"0.5 to spare its processor the skinned vertices)." },
 	{ "display.per_pixel_lighting", _config_boolean, "false", "HALO_PER_PIXEL_LIGHTING", _environment_value,
 		_platform_all,
 		"Light the models (characters, weapons, vehicles, scenery) for each\n"
