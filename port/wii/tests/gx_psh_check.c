@@ -190,6 +190,9 @@ static v4 swapped(v4 value, unsigned table)
 static v4 simulate(const struct gx_psh_program *p, const struct inputs_set *in, v4 *maps /* 9: 8 the fog ramp */)
 {
 	v4 regs[4]; memset(regs, 0, sizeof(regs));
+	/* (constants the program set in TEV registers) */
+	for (unsigned i = 0; i < p->preload_count; i++)
+		regs[p->preload_register[i]] = argb_to_v4(p->preload_color[i]);
 	for (unsigned i = 0; i < p->stage_count; i++) {
 		const struct gx_psh_stage *st = &p->stages[i];
 		v4 tex = {{0}}, ras = {{0}};
@@ -327,8 +330,15 @@ static int game_programs(void)
 			/* (the constants the menu gives the first: a channel each to pick) */
 			if (index == 0)
 			{
-				state[D3DRS_PSCONSTANT0_0] = 0x00ff0000;
-				state[D3DRS_PSCONSTANT1_0] = 0x0000ff00;
+				/* (the menu's planet: its constants, as the game sets them) */
+				static const DWORD c0[8] = { 0x00ff0000, 0x00ffffff, 0x00ffffff, 0, 0, 0, 0, 0 };
+				static const DWORD c1[8] = { 0x0000ff00, 0, 0, 0, 0, 0, 0, 0 };
+
+				for (unsigned constant = 0; constant < 8; constant++)
+				{
+					state[D3DRS_PSCONSTANT0_0 + constant] = c0[constant];
+					state[D3DRS_PSCONSTANT1_0 + constant] = c1[constant];
+				}
 				state[D3DRS_PSFINALCOMBINERCONSTANT0] = 0xffffffff;
 			}
 			state[D3DRS_PSFINALCOMBINERINPUTSABCD] = programs[index].abcd;

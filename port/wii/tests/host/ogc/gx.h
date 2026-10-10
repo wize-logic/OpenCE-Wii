@@ -113,6 +113,7 @@ typedef struct { u8 r, g, b, a; } GXColor;
 typedef float f32;
 #define GCBOOL int
 static inline void GX_SetTevKColor(u8 a, GXColor c) { (void)a; (void)c; }
+static inline void GX_SetTevColor(u8 a, GXColor c) { (void)a; (void)c; }
 static inline void GX_SetNumTevStages(u8 n) { (void)n; }
 static inline void GX_SetTevOrder(u8 a, u8 b, u8 c, u8 d) { (void)a; (void)b; (void)c; (void)d; }
 static inline void GX_SetTevSwapMode(u8 a, u8 b, u8 c) { (void)a; (void)b; (void)c; }

@@ -179,6 +179,14 @@ static struct operand folded(struct operand value)
 	return value;
 }
 
+/* something approximated, and the first thing why */
+static void approximate(struct gx_psh_program *program, const char *why)
+{
+	if (!program->approximate)
+		program->approximation = why;
+	program->approximate = TRUE;
+}
+
 static unsigned char konst_slot(struct translation *translation, DWORD color)
 {
 	struct gx_psh_program *program = translation->program;
@@ -195,7 +203,7 @@ static unsigned char konst_slot(struct translation *translation, DWORD color)
 		return (unsigned char)program->konst_count++;
 	}
 	/* (more than four constants: the last stands in) */
-	program->approximate = TRUE;
+	approximate(program, "more than four constants");
 	return 3;
 }
 
@@ -261,6 +269,186 @@ static int name_of(unsigned long reg)
 	}
 }
 
+/* ---------- constants
+
+GX has four konst registers. A program with more distinct constants keeps
+in them those it needs in every channel (dot products, through the konst
+selections) and then the rest it can, and gives the others to TEV
+registers, set before its stages run and kept for it (constants_place). */
+
+/* a constant as it is read in a portion, when that is 0 or 1 in every
+channel read: no konst register for it */
+static BOOL constant_trivial(DWORD color, int portion, BOOL alpha_channel, struct operand *out)
+{
+	unsigned r = (color >> 16) & 0xFF, g = (color >> 8) & 0xFF, b = color & 0xFF, a = color >> 24;
+	unsigned value;
+
+	if (portion == _portion_color && !alpha_channel)
+	{
+		if (r != g || g != b)
+			return FALSE;
+		value = r;
+	}
+	else if (portion == _portion_alpha && !alpha_channel)
+	{
+		value = b;
+	}
+	else
+	{
+		value = a;
+	}
+	if (value != 0 && value != 255)
+		return FALSE;
+	*out = value ? one : zero;
+	return TRUE;
+}
+
+static int preloaded_register(const struct translation *translation, DWORD color)
+{
+	unsigned index;
+
+	for (index = 0; index < translation->program->preload_count; index++)
+	{
+		if (translation->program->preload_color[index] == color)
+			return translation->program->preload_register[index];
+	}
+	return -1;
+}
+
+static void constants_place(struct translation *translation)
+{
+	const DWORD *state = translation->state;
+	struct gx_psh_program *program = translation->program;
+	DWORD values[24];
+	BOOL broadcast[24];
+	unsigned count = 0, index, konst = 0;
+	unsigned long combiner_count = state[D3DRS_PSCOMBINERCOUNT] & 0xff;
+	DWORD combiners = state[D3DRS_PSCOMBINERCOUNT];
+	unsigned long stage;
+	int portion, shift;
+
+#define CONSTANT_ADD(value, wide) \
+	do { \
+		DWORD constant_value_ = (value); \
+		unsigned constant_index_; \
+		for (constant_index_ = 0; constant_index_ < count && values[constant_index_] != constant_value_; constant_index_++); \
+		if (constant_index_ == count && count < 24) \
+		{ \
+			values[count] = constant_value_; \
+			broadcast[count++] = (wide); \
+		} \
+		else if (constant_index_ < count && (wide)) \
+			broadcast[constant_index_] = TRUE; \
+	} while (0)
+
+	if (combiner_count > 8)
+		combiner_count = 8;
+	for (stage = 0; stage < combiner_count; stage++)
+	{
+		for (portion = 0; portion < NUMBER_OF_PORTIONS; portion++)
+		{
+			DWORD inputs = state[(portion == _portion_alpha ? D3DRS_PSALPHAINPUTS0 : D3DRS_PSRGBINPUTS0) + stage];
+			unsigned flags = (unsigned)(state[(portion == _portion_alpha ? D3DRS_PSALPHAOUTPUTS0 : D3DRS_PSRGBOUTPUTS0) +
+				stage] >> 12);
+
+			for (shift = 24, index = 0; shift >= 0; shift -= 8, index++)
+			{
+				unsigned long reg = (inputs >> shift) & 0x0f;
+				BOOL wide = portion == _portion_color && ((index < 2 && (flags & 0x02)) || (index >= 2 && (flags & 0x01)));
+				BOOL alpha_channel = ((inputs >> shift) & 0x10) != 0;
+				struct operand trivial;
+
+				if ((reg == _register_c0 && constant_trivial(state[D3DRS_PSCONSTANT0_0 + ((combiners & 0x1000) ? stage : 0)],
+					portion, alpha_channel, &trivial)) ||
+					(reg == _register_c1 && constant_trivial(state[D3DRS_PSCONSTANT1_0 + ((combiners & 0x10000) ? stage : 0)],
+					portion, alpha_channel, &trivial)))
+					continue;
+				if (reg == _register_c0)
+					CONSTANT_ADD(state[D3DRS_PSCONSTANT0_0 + ((combiners & 0x1000) ? stage : 0)], wide);
+				else if (reg == _register_c1)
+					CONSTANT_ADD(state[D3DRS_PSCONSTANT1_0 + ((combiners & 0x10000) ? stage : 0)], wide);
+				else if (reg == _register_fog && portion == _portion_color && !((inputs >> shift) & 0x10))
+					CONSTANT_ADD(translation->textures->fog_color | 0xFF000000UL, FALSE);
+			}
+		}
+	}
+	for (shift = 0; shift < 32; shift += 8)
+	{
+		unsigned long input = (state[D3DRS_PSFINALCOMBINERINPUTSABCD] >> shift) & 0xff;
+		unsigned long reg = input & 0x0f;
+		struct operand trivial;
+
+		if ((reg == _register_c0 && constant_trivial(state[D3DRS_PSFINALCOMBINERCONSTANT0], _portion_color,
+			(input & 0x10) != 0, &trivial)) ||
+			(reg == _register_c1 && constant_trivial(state[D3DRS_PSFINALCOMBINERCONSTANT1], _portion_color,
+			(input & 0x10) != 0, &trivial)))
+			continue;
+		if (reg == _register_c0)
+			CONSTANT_ADD(state[D3DRS_PSFINALCOMBINERCONSTANT0], FALSE);
+		else if (reg == _register_c1)
+			CONSTANT_ADD(state[D3DRS_PSFINALCOMBINERCONSTANT1], FALSE);
+		else if (reg == _register_fog)
+			CONSTANT_ADD(translation->textures->fog_color | 0xFF000000UL, FALSE);
+	}
+	for (shift = 8; shift < 32; shift += 8)
+	{
+		unsigned long input = (state[D3DRS_PSFINALCOMBINERINPUTSEFG] >> shift) & 0xff;
+		unsigned long reg = input & 0x0f;
+		struct operand trivial;
+		/* (E and F are read as colour, G as alpha) */
+		int portion_read = shift == 8 ? _portion_alpha : _portion_color;
+
+		if ((reg == _register_c0 && constant_trivial(state[D3DRS_PSFINALCOMBINERCONSTANT0], portion_read,
+			portion_read == _portion_alpha || (input & 0x10) != 0, &trivial)) ||
+			(reg == _register_c1 && constant_trivial(state[D3DRS_PSFINALCOMBINERCONSTANT1], portion_read,
+			portion_read == _portion_alpha || (input & 0x10) != 0, &trivial)))
+			continue;
+		if (reg == _register_c0)
+			CONSTANT_ADD(state[D3DRS_PSFINALCOMBINERCONSTANT0], FALSE);
+		else if (reg == _register_c1)
+			CONSTANT_ADD(state[D3DRS_PSFINALCOMBINERCONSTANT1], FALSE);
+	}
+#undef CONSTANT_ADD
+	if (count <= 4)
+		return;
+	/* the four konst registers: those needed in every channel, then the
+	first others; the rest to REG2, REG1, REG0, kept for them */
+	for (index = 0; index < count && konst < 4; index++)
+	{
+		if (broadcast[index])
+			program->konst[konst++] = values[index];
+	}
+	for (index = 0; index < count && konst < 4; index++)
+	{
+		if (!broadcast[index])
+			program->konst[konst++] = values[index];
+	}
+	program->konst_count = konst;
+	for (index = 0; index < count; index++)
+	{
+		unsigned slot;
+		BOOL in_konst = FALSE;
+
+		for (slot = 0; slot < konst; slot++)
+			in_konst |= program->konst[slot] == values[index];
+		if (in_konst)
+			continue;
+		if (program->preload_count >= 3)
+		{
+			approximate(program, "more than seven constants");
+			continue;
+		}
+		{
+			unsigned char reg = (unsigned char)(3 - program->preload_count);
+
+			program->preload_register[program->preload_count] = reg;
+			program->preload_color[program->preload_count++] = values[index];
+			translation->holders[_portion_color][reg] = 1;
+			translation->holders[_portion_alpha][reg] = 1;
+		}
+	}
+}
+
 /* a register read in a portion (alpha_channel: its alpha in the colour
 portion, in the alpha portion its alpha rather than its blue) */
 static struct operand register_operand(struct translation *translation, unsigned long reg, BOOL alpha_channel,
@@ -285,6 +473,22 @@ static struct operand register_operand(struct translation *translation, unsigned
 
 			color = state[(reg == _register_c0 ? D3DRS_PSCONSTANT0_0 : D3DRS_PSCONSTANT1_0) + (unique ? stage : 0)];
 		}
+		{
+			int preloaded = preloaded_register(translation, color);
+			struct operand trivial;
+
+			if (constant_trivial(color, portion, alpha_channel, &trivial))
+				return trivial;
+			if (preloaded >= 0)
+			{
+				/* (a constant in a TEV register: its blue unreachable from the
+				alpha half, its alpha read instead) */
+				if (portion == _portion_alpha && !alpha_channel)
+					approximate(translation->program, "a preloaded constant's blue");
+				return operand(_kind_register, (unsigned char)preloaded,
+					portion == _portion_color && alpha_channel ? _channel_alpha : _channel_natural);
+			}
+		}
 		result = operand(_kind_konst, konst_slot(translation, color), _channel_natural);
 	}
 	else if (reg == _register_fog)
@@ -302,6 +506,12 @@ static struct operand register_operand(struct translation *translation, unsigned
 			if (portion == _portion_color)
 				result.channel = _channel_alpha;
 			return result;
+		}
+		{
+			int preloaded = preloaded_register(translation, textures->fog_color | 0xFF000000UL);
+
+			if (preloaded >= 0)
+				return operand(_kind_register, (unsigned char)preloaded, _channel_natural);
 		}
 		result = operand(_kind_konst, konst_slot(translation, textures->fog_color | 0xFF000000UL), _channel_natural);
 		return result;
@@ -776,13 +986,14 @@ static struct operand emit_dot(struct translation *translation, struct operand x
 	if (!broadcastable(&x) || !broadcastable(&y) ||
 		(translation->economical && (terms & (terms - 1))))
 	{
-		translation->program->approximate = TRUE;
+		approximate(translation->program, translation->economical ? "a dot product, economically" :
+			"a dot product of a register");
 		return one;
 	}
 	reg = register_allocate(translation, translation->portion_now);
 	if (reg < 0)
 	{
-		translation->program->approximate = TRUE;
+		approximate(translation->program, "a dot product without a register");
 		return one;
 	}
 	result = operand(_kind_register, (unsigned char)reg, _channel_natural);
@@ -845,7 +1056,7 @@ static struct operand combiner_input(struct translation *translation, unsigned l
 	{
 		/* (no register: expand negate as an inversion, half bias negate as
 		0, as they were before they had one) */
-		translation->program->approximate = TRUE;
+		approximate(translation->program, "a negated mapping");
 		if (mapping == 0xa0)
 			return zero;
 		value.invert = 1;
@@ -1248,7 +1459,7 @@ product with 1 */
 			for (index = 0; index < 4; index++)
 			{
 				if (inputs_mapped[index].negative)
-					translation->program->approximate = TRUE;
+					approximate(translation->program, "a negative product in a mux");
 			}
 
 			if (!product_operand(inputs_mapped[0], inputs_mapped[1], &ab))
@@ -1772,7 +1983,7 @@ static void final_combiner(struct translation *translation)
 /* ---------- public code */
 
 static BOOL translate_once(const DWORD *render_state, const struct gx_psh_textures *textures,
-	struct gx_psh_program *program, BOOL economical)
+	struct gx_psh_program *program, BOOL economical, BOOL preload)
 {
 	static struct translation translation;
 	unsigned long combiner_count = render_state[D3DRS_PSCOMBINERCOUNT] & 0xff;
@@ -1786,6 +1997,8 @@ static BOOL translate_once(const DWORD *render_state, const struct gx_psh_textur
 	translation.program = program;
 	translation.economical = economical;
 	names_initialize(&translation);
+	if (preload)
+		constants_place(&translation);
 	if (combiner_count > 8)
 		combiner_count = 8;
 	for (stage = 0; stage < combiner_count && !translation.failed; stage++)
@@ -1809,8 +2022,12 @@ static BOOL translate_once(const DWORD *render_state, const struct gx_psh_textur
 BOOL gx_psh_translate(const DWORD *render_state, const struct gx_psh_textures *textures,
 	struct gx_psh_program *program)
 {
-	return translate_once(render_state, textures, program, FALSE) ||
-		translate_once(render_state, textures, program, TRUE);
+	/* exact; exact with constants beyond four approximated (their registers
+	free for the program); then the same, economical */
+	return translate_once(render_state, textures, program, FALSE, TRUE) ||
+		translate_once(render_state, textures, program, FALSE, FALSE) ||
+		translate_once(render_state, textures, program, TRUE, TRUE) ||
+		translate_once(render_state, textures, program, TRUE, FALSE);
 }
 
 void gx_psh_apply(const struct gx_psh_program *program)
@@ -1823,6 +2040,13 @@ void gx_psh_apply(const struct gx_psh_program *program)
 		GXColor color = { (u8)(value >> 16), (u8)(value >> 8), (u8)value, (u8)(value >> 24) };
 
 		GX_SetTevKColor((u8)(GX_KCOLOR0 + index), color);
+	}
+	for (index = 0; index < program->preload_count; index++)
+	{
+		DWORD value = program->preload_color[index];
+		GXColor color = { (u8)(value >> 16), (u8)(value >> 8), (u8)value, (u8)(value >> 24) };
+
+		GX_SetTevColor((u8)program->preload_register[index], color);
 	}
 	GX_SetNumTevStages((u8)program->stage_count);
 	for (index = 0; index < program->stage_count; index++)

@@ -62,8 +62,15 @@ struct gx_psh_program
 	DWORD konst[4];
 	/* why it was not translated */
 	const char *reason;
-	/* more constants than GX's four: some read another's value */
+	/* constants beyond the four konst registers: TEV registers given their
+	values before the stages run (GX_SetTevColor) */
+	unsigned preload_count;
+	unsigned char preload_register[3];
+	DWORD preload_color[3];
+	/* something approximated: more constants than GX holds, a dot product
+	or mapping that did not fit */
 	BOOL approximate;
+	const char *approximation;
 };
 
 /* FALSE when the combiners need more than GX has (the program is then not

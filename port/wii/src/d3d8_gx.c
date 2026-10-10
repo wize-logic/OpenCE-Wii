@@ -1852,14 +1852,29 @@ static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct d
 		(unsigned long)D3D__RenderState[D3DRS_PSCOMBINERCOUNT], (unsigned long)D3D__RenderState[D3DRS_PSFINALCOMBINERINPUTSABCD],
 		(unsigned long)D3D__RenderState[D3DRS_PSFINALCOMBINERINPUTSEFG], (unsigned long)D3D__RenderState[D3DRS_PSTEXTUREMODES],
 		textures);
-	platform_log("  constants: c0 %08lx c1 %08lx (stage 0), final c0 %08lx c1 %08lx, fog %lu %08lx, shader %s",
-		(unsigned long)D3D__RenderState[D3DRS_PSCONSTANT0_0], (unsigned long)D3D__RenderState[D3DRS_PSCONSTANT1_0],
-		(unsigned long)D3D__RenderState[D3DRS_PSFINALCOMBINERCONSTANT0],
-		(unsigned long)D3D__RenderState[D3DRS_PSFINALCOMBINERCONSTANT1],
-		(unsigned long)D3D__RenderState[D3DRS_FOGENABLE], (unsigned long)D3D__RenderState[D3DRS_FOGCOLOR],
-		pixel_shader_last < pixel_shader_cache_count ?
-			(!pixel_shader_cache[pixel_shader_last].usable ? "beyond GX (texture times colour)" :
-				pixel_shader_cache[pixel_shader_last].program.approximate ? "approximate" : "exact") : "?");
+	{
+		const struct pixel_shader_entry *shader = pixel_shader_last < pixel_shader_cache_count ?
+			&pixel_shader_cache[pixel_shader_last] : NULL;
+		const DWORD *rs = D3D__RenderState;
+
+		platform_log("  c0 %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx, final %08lx %08lx",
+			(unsigned long)rs[D3DRS_PSCONSTANT0_0], (unsigned long)rs[D3DRS_PSCONSTANT0_0 + 1],
+			(unsigned long)rs[D3DRS_PSCONSTANT0_0 + 2], (unsigned long)rs[D3DRS_PSCONSTANT0_0 + 3],
+			(unsigned long)rs[D3DRS_PSCONSTANT0_0 + 4], (unsigned long)rs[D3DRS_PSCONSTANT0_0 + 5],
+			(unsigned long)rs[D3DRS_PSCONSTANT0_0 + 6], (unsigned long)rs[D3DRS_PSCONSTANT0_0 + 7],
+			(unsigned long)rs[D3DRS_PSFINALCOMBINERCONSTANT0], (unsigned long)rs[D3DRS_PSFINALCOMBINERCONSTANT1]);
+		platform_log("  c1 %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx, fog %lu %08lx, shader %s%s%s",
+			(unsigned long)rs[D3DRS_PSCONSTANT1_0], (unsigned long)rs[D3DRS_PSCONSTANT1_0 + 1],
+			(unsigned long)rs[D3DRS_PSCONSTANT1_0 + 2], (unsigned long)rs[D3DRS_PSCONSTANT1_0 + 3],
+			(unsigned long)rs[D3DRS_PSCONSTANT1_0 + 4], (unsigned long)rs[D3DRS_PSCONSTANT1_0 + 5],
+			(unsigned long)rs[D3DRS_PSCONSTANT1_0 + 6], (unsigned long)rs[D3DRS_PSCONSTANT1_0 + 7],
+			(unsigned long)rs[D3DRS_FOGENABLE], (unsigned long)rs[D3DRS_FOGCOLOR],
+			!shader ? "?" : !shader->usable ? "beyond GX (texture times colour)" :
+				shader->program.approximate ? "approximate: " : "exact",
+			shader && shader->usable && shader->program.approximate && shader->program.approximation ?
+				shader->program.approximation : "",
+			"");
+	}
 }
 
 /* a draw's vertices: each fetched (its inputs), run and sent */
