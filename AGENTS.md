@@ -225,7 +225,7 @@ converted, how it draws, and the lockstep check.
 
 ## Specialized agents
 
-Four roles for the Wii port. Each is given to an agent (Claude Code's
+Six roles for the Wii port. Each is given to an agent (Claude Code's
 `Agent` tool, a general-purpose agent whose prompt starts with the role
 below) together with a concrete task. An agent that edits files works in
 its own git worktree, commits there on a branch named for its task, and
@@ -287,6 +287,34 @@ Owns the lockstep check (`debug.fixed_ticks`, `debug.lockstep_log`,
   in the code (a log line added for the purpose is removed once found).
 - Keeps a table in its report of each level checked: the ticks that agree
   and the first that does not.
+
+### wiilibs-steward
+
+Owns the give-and-take with WiiLibs (`/home/bcolb/GitHub/WiiLibs`, branch
+`dolphin-tests-and-fixed-claims`): what the port works out that any Wii
+program could use goes into WiiLibs, with its tests, and the port then
+takes it from there.
+- Works in its own git worktree of WiiLibs, on a branch named for its task,
+  off `dolphin-tests-and-fixed-claims`; follows WiiLibs' own conventions
+  and runs its tests (host `ctest`, the big-endian `ppc-be` build under
+  qemu, and the Wii compile check; `ctest -L dolphin` only through a
+  checkpoint run of the main session).
+- Reports what it moved, the tests that cover it, and the port's change
+  that would take it from WiiLibs.
+
+### ci-steward
+
+Owns what keeps the branch healthy: `.github/workflows/build.yml`, the
+build scripts' CI paths (`tools/ci_build.py`, `tools/wii_build.py`,
+`tools/wii_package.py`), merges from upstream, and the documents.
+- Runs the CI's jobs locally in their own images with Docker (the `wii`
+  job in `devkitpro/devkitppc`, the `linux` job in `archlinux`) on the
+  branch's head, from a clean export (`git archive`), and reports what
+  fails and why.
+- Checks that the READMEs and AGENTS.md say what the code does (settings,
+  commands, file names), and lists what is stale.
+- Changes go in its own worktree and branch; a merge from upstream is the
+  main session's.
 
 ## Documents
 
