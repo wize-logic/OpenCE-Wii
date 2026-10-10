@@ -5,19 +5,122 @@ A host check of the vertex programs compiled ahead of time
 (port/wii/tools/nv2a_codegen.c; tools/wii_nv2a_check.py builds and runs it):
 each of the game's programs is run as its function and on the interpreter
 (port/wii/src/nv2a_cpu.c) over random constants and inputs, and the two
-must give the same outputs, bit for bit.
+must give the same outputs, bit for bit; so must its function for the
+outputs a draw reads (nv2a_cpu_run_live), in those outputs, for random sets
+of them. Then the functions' own arithmetic: nv2a_sqrtf's refinement, from
+estimates as coarse as frsqrte's, against sqrtf, and nv2a_floor_index
+against floorf.
 
 usage: nv2a_native_check microcode.inc
 */
 
 #include "nv2a_cpu_native.h"
 
+#include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 static float random_float(void)
 {
 	return (float)(rand() % 20001 - 10000) / 1000.0f;
+}
+
+/* the outputs in live the same in both */
+static int live_same(const struct nv2a_cpu_output *a, const struct nv2a_cpu_output *b, unsigned live)
+{
+	int stage;
+
+	if ((live & NV2A_CPU_LIVE_POSITION) && (memcmp(a->position, b->position, sizeof(a->position)) ||
+		memcmp(a->clip, b->clip, sizeof(a->clip)) || a->clip_captured != b->clip_captured))
+		return 0;
+	if ((live & NV2A_CPU_LIVE_D0) && memcmp(a->d0, b->d0, sizeof(a->d0)))
+		return 0;
+	if ((live & NV2A_CPU_LIVE_D1) && memcmp(a->d1, b->d1, sizeof(a->d1)))
+		return 0;
+	if ((live & NV2A_CPU_LIVE_BACK) && (memcmp(a->b0, b->b0, sizeof(a->b0)) || memcmp(a->b1, b->b1, sizeof(a->b1))))
+		return 0;
+	if ((live & NV2A_CPU_LIVE_POINT_SIZE) && memcmp(&a->point_size, &b->point_size, sizeof(a->point_size)))
+		return 0;
+	for (stage = 0; stage < 4; stage++)
+		if ((live & (NV2A_CPU_LIVE_T0 << stage)) && memcmp(a->t[stage], b->t[stage], sizeof(a->t[stage])))
+			return 0;
+	if ((live & NV2A_CPU_LIVE_FOG) && memcmp(&a->fog, &b->fog, sizeof(a->fog)))
+		return 0;
+	return 1;
+}
+
+/* an estimate of 1 / sqrt(x) to 5 bits (frsqrte's worst), and off by 1/32
+either way as which says */
+static double coarse_estimate(double x, int which)
+{
+	double exact = 1.0 / sqrt(x), scale;
+	int exponent;
+
+	scale = frexp(exact, &exponent);
+	scale = floor(scale * 32.0) / 32.0;
+	return ldexp(scale, exponent) * (which == 0 ? 1.0 : which == 1 ? 1.0 + 1.0 / 32.0 : 1.0 - 1.0 / 32.0);
+}
+
+/* nv2a_sqrtf's arithmetic for every 199th positive float (each of the
+smallest), and nv2a_floor_index around the whole numbers and sixty-fourths */
+static unsigned long arithmetic_check(void)
+{
+	static const float specials[] = { 0.0f, -0.0f, 1.0f / 0.0f, -1.0f, 3.40282347e+38f, 1.0e-45f };
+	unsigned long differ = 0, checked = 0;
+	uint32_t bits;
+	int which;
+
+	for (bits = 1; bits < 0x7F800000u; bits += bits < 0x00100000u ? 1 : 199)
+	{
+		float x, exact;
+
+		memcpy(&x, &bits, sizeof(x));
+		exact = sqrtf(x);
+		for (which = 0; which < 3; which++)
+		{
+			float refined = nv2a_sqrt_refined(x, coarse_estimate(x, which));
+
+			checked++;
+			if (memcmp(&refined, &exact, sizeof(exact)))
+			{
+				if (differ < 8)
+					printf("nv2a_sqrtf(%a): %a, sqrtf %a\n", x, refined, exact);
+				differ++;
+			}
+		}
+	}
+	for (which = 0; which < (int)(sizeof(specials) / sizeof(specials[0])); which++)
+	{
+		float root = nv2a_sqrtf(specials[which]), exact = sqrtf(specials[which]);
+
+		checked++;
+		if (memcmp(&root, &exact, sizeof(exact)) && !(root != root && exact != exact))
+		{
+			printf("nv2a_sqrtf(%a): %a, sqrtf %a\n", specials[which], root, exact);
+			differ++;
+		}
+	}
+	for (which = -70000; which <= 70000; which++)
+	{
+		float whole = (float)which / 64.0f;
+		int step;
+
+		for (step = -1; step <= 1; step++)
+		{
+			float x = step ? nextafterf(whole, step < 0 ? -1.0e30f : 1.0e30f) : whole;
+
+			checked++;
+			if (nv2a_floor_index(x) != (int)floorf(x))
+			{
+				if (differ < 8)
+					printf("nv2a_floor_index(%a): %d, floorf %d\n", x, nv2a_floor_index(x), (int)floorf(x));
+				differ++;
+			}
+		}
+	}
+	printf("%lu square roots and whole parts compared, %lu differ\n", checked, differ);
+	return differ;
 }
 
 int main(int argc, char **argv)
@@ -86,7 +189,7 @@ int main(int argc, char **argv)
 		for (trial = 0; trial < 64; trial++)
 		{
 			struct nv2a_cpu_output compiled, interpreted;
-			nv2a_cpu_native_proc run = program.native;
+			nv2a_cpu_live_proc run = program.native;
 			int row, component;
 
 			for (row = 0; row < NV2A_CPU_CONSTANT_COUNT; row++)
@@ -110,6 +213,25 @@ int main(int argc, char **argv)
 				differ++;
 				break;
 			}
+			/* its function for some of the outputs: those the same */
+			{
+				static const unsigned sets[] = { NV2A_CPU_LIVE_ALL, NV2A_CPU_LIVE_POSITION,
+					NV2A_CPU_LIVE_POSITION | NV2A_CPU_LIVE_D0, NV2A_CPU_LIVE_POSITION | NV2A_CPU_LIVE_T0,
+					NV2A_CPU_LIVE_POSITION | NV2A_CPU_LIVE_D0 | NV2A_CPU_LIVE_T0 | NV2A_CPU_LIVE_FOG };
+				struct nv2a_cpu_output live_output;
+				unsigned live = trial < 5 ? sets[trial] : (unsigned)rand() & NV2A_CPU_LIVE_ALL;
+
+				memset(&live_output, 0xA5 + trial, sizeof(live_output));
+				nv2a_cpu_run_live(&program, (const float (*)[4])constants, (const float (*)[4])inputs, 1.0f,
+					&live_output, live);
+				if (!live_same(&live_output, &interpreted, live))
+				{
+					printf("program %08lx: its function for the outputs %03x differs\n",
+						nv2a_cpu_hash(instructions, instruction_count), live);
+					differ++;
+					break;
+				}
+			}
 			/* its colour-only function: the same colours and fog */
 			{
 				struct nv2a_cpu_output colors;
@@ -128,5 +250,6 @@ int main(int argc, char **argv)
 		}
 	}
 	printf("%lu programs with functions, %lu runs compared, %lu differ\n", native, checked, differ);
+	differ += arithmetic_check();
 	return differ != 0;
 }

@@ -41,16 +41,37 @@ struct nv2a_cpu_instruction
 
 struct nv2a_cpu_output;
 
-/* a program compiled ahead of time (nv2a_cpu_native.h) */
+/* a program compiled ahead of time (nv2a_cpu_native.h), for the outputs
+in live (NV2A_CPU_LIVE_...) */
+typedef void (*nv2a_cpu_live_proc)(const float (*constants)[4], const float (*inputs)[4],
+	struct nv2a_cpu_output *output, unsigned live);
+/* ... and its colours alone */
 typedef void (*nv2a_cpu_native_proc)(const float (*constants)[4], const float (*inputs)[4],
 	struct nv2a_cpu_output *output);
+
+/* the outputs a draw reads (nv2a_cpu_run_live): the others are left as they
+were, or hold what the instructions computed on the way */
+enum
+{
+	/* (position, clip and clip_captured) */
+	NV2A_CPU_LIVE_POSITION = 1 << 0,
+	NV2A_CPU_LIVE_D0 = 1 << 1,
+	NV2A_CPU_LIVE_D1 = 1 << 2,
+	/* (b0 and b1) */
+	NV2A_CPU_LIVE_BACK = 1 << 3,
+	NV2A_CPU_LIVE_POINT_SIZE = 1 << 4,
+	/* (t[n]: NV2A_CPU_LIVE_T0 << n) */
+	NV2A_CPU_LIVE_T0 = 1 << 5,
+	NV2A_CPU_LIVE_FOG = 1 << 9,
+	NV2A_CPU_LIVE_ALL = (1 << 10) - 1,
+};
 
 struct nv2a_cpu_program
 {
 	unsigned long count;
 	/* (nv2a_cpu_hash: the generated programs' names) */
 	unsigned long hash;
-	nv2a_cpu_native_proc native;
+	nv2a_cpu_live_proc native;
 	/* (the compiled program's colours and fog alone; NULL on the
 	interpreter) */
 	nv2a_cpu_native_proc native_colors;
@@ -104,5 +125,9 @@ void nv2a_cpu_analyze_uniform(const struct nv2a_cpu_program *program, unsigned l
 void nv2a_cpu_compile(const DWORD *instructions, unsigned long instruction_count, struct nv2a_cpu_program *program);
 void nv2a_cpu_run(const struct nv2a_cpu_program *program, const float (*constants)[4], const float (*inputs)[4],
 	float point_size, struct nv2a_cpu_output *output);
+/* nv2a_cpu_run for the outputs in live alone (NV2A_CPU_LIVE_...): those are
+the same, bit for bit, the others undefined */
+void nv2a_cpu_run_live(const struct nv2a_cpu_program *program, const float (*constants)[4], const float (*inputs)[4],
+	float point_size, struct nv2a_cpu_output *output, unsigned live);
 
 #endif

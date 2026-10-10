@@ -44,7 +44,7 @@ int: libogc's is renamed while its headers are read) */
 
 #include "gx_psh.h"
 #include "port_config.h"
-#include "nv2a_cpu.h"
+#include "nv2a_cpu_native.h"
 #include "wii_memory.h"
 #include "xbox_texture_formats.h"
 #include "wl/codec/gx_tex.h"
@@ -1856,58 +1856,75 @@ static inline float normalized(long value, float maximum)
 	return result < -1.0f ? -1.0f : result;
 }
 
-static void element_fetch(const unsigned char *source, unsigned type, float out[4])
+/* how an element's data becomes its register (each sets all four
+components: what the data doesn't give is 0, and w 1). A draw's elements
+are planned once (stream_fetch_plan), each with its own small case, rather
+than a switch on the Direct3D type for each element of each vertex. */
+enum fetch_kind
 {
-	float f[4];
-	short s[4];
-	unsigned long word;
-	int component;
+	FETCH_FLOAT1, FETCH_FLOAT2, FETCH_FLOAT3, FETCH_FLOAT4, FETCH_FLOAT2H, FETCH_COLOR,
+	FETCH_SHORTS, FETCH_NORMSHORT1, FETCH_NORMSHORT2, FETCH_NORMSHORTS, FETCH_NORMPACKED3, FETCH_BYTES,
+};
 
-	out[0] = out[1] = out[2] = 0.0f;
-	out[3] = 1.0f;
+/* the conversions of a byte and of a packed normal's fields, made once by
+the same expressions (/ 255.0f, normalized): a load in place of an
+integer's conversion */
+static float byte_units[256];
+static float packed_elevens[2048], packed_tens[1024];
+static BOOL fetch_tables_made;
+
+static void fetch_tables_make(void)
+{
+	long value;
+
+	for (value = 0; value < 256; value++)
+		byte_units[value] = value / 255.0f;
+	for (value = 0; value < 2048; value++)
+		packed_elevens[value] = normalized(value < 1024 ? value : value - 2048, 1023.0f);
+	for (value = 0; value < 1024; value++)
+		packed_tens[value] = normalized(value < 512 ? value : value - 1024, 511.0f);
+	fetch_tables_made = TRUE;
+}
+
+static enum fetch_kind fetch_kind_of(unsigned type, BOOL *known)
+{
+	*known = TRUE;
 	switch (type)
 	{
-	case D3DVSDT_FLOAT1: case D3DVSDT_FLOAT2: case D3DVSDT_FLOAT3: case D3DVSDT_FLOAT4:
-		memcpy(f, source, (type >> 4) * sizeof(float));
-		for (component = 0; component < (int)(type >> 4); component++)
-			out[component] = f[component];
-		break;
-	case D3DVSDT_FLOAT2H:
-		memcpy(f, source, 3 * sizeof(float));
-		out[0] = f[0];
-		out[1] = f[1];
-		out[3] = f[2];
-		break;
-	case D3DVSDT_D3DCOLOR:
-		memcpy(&word, source, sizeof(word));
-		out[0] = ((word >> 16) & 0xff) / 255.0f;
-		out[1] = ((word >> 8) & 0xff) / 255.0f;
-		out[2] = (word & 0xff) / 255.0f;
-		out[3] = ((word >> 24) & 0xff) / 255.0f;
-		break;
-	case D3DVSDT_SHORT1: case D3DVSDT_SHORT2: case D3DVSDT_SHORT3: case D3DVSDT_SHORT4:
-		memcpy(s, source, (type >> 4) * sizeof(short));
-		for (component = 0; component < (int)(type >> 4); component++)
-			out[component] = (float)s[component];
-		break;
-	case D3DVSDT_NORMSHORT1: case D3DVSDT_NORMSHORT2: case D3DVSDT_NORMSHORT3: case D3DVSDT_NORMSHORT4:
-		memcpy(s, source, (type >> 4) * sizeof(short));
-		for (component = 0; component < (int)(type >> 4); component++)
-			out[component] = normalized(s[component], 32767.0f);
-		break;
-	case D3DVSDT_NORMPACKED3:
-		memcpy(&word, source, sizeof(word));
-		out[0] = normalized(((long)(word << 21)) >> 21, 1023.0f);
-		out[1] = normalized(((long)(word << 10)) >> 21, 1023.0f);
-		out[2] = normalized(((long)word) >> 22, 511.0f);
-		break;
-	case D3DVSDT_PBYTE1: case D3DVSDT_PBYTE2: case D3DVSDT_PBYTE3: case D3DVSDT_PBYTE4:
-		for (component = 0; component < (int)(type >> 4); component++)
-			out[component] = source[component] / 255.0f;
-		break;
+	case D3DVSDT_FLOAT1: return FETCH_FLOAT1;
+	case D3DVSDT_FLOAT2: return FETCH_FLOAT2;
+	case D3DVSDT_FLOAT3: return FETCH_FLOAT3;
+	case D3DVSDT_FLOAT4: return FETCH_FLOAT4;
+	case D3DVSDT_FLOAT2H: return FETCH_FLOAT2H;
+	case D3DVSDT_D3DCOLOR: return FETCH_COLOR;
+	case D3DVSDT_SHORT1: case D3DVSDT_SHORT2: case D3DVSDT_SHORT3: case D3DVSDT_SHORT4: return FETCH_SHORTS;
+	case D3DVSDT_NORMSHORT1: return FETCH_NORMSHORT1;
+	case D3DVSDT_NORMSHORT2: return FETCH_NORMSHORT2;
+	case D3DVSDT_NORMSHORT3: case D3DVSDT_NORMSHORT4: return FETCH_NORMSHORTS;
+	case D3DVSDT_NORMPACKED3: return FETCH_NORMPACKED3;
+	case D3DVSDT_PBYTE1: case D3DVSDT_PBYTE2: case D3DVSDT_PBYTE3: case D3DVSDT_PBYTE4: return FETCH_BYTES;
 	default:
-		break;
+		/* (any other: the register as 0, 0, 0, 1) */
+		*known = FALSE;
+		return FETCH_BYTES;
 	}
+}
+
+/* a float's bits, as the data has them */
+static inline void word_copy(float *out, const unsigned char *source)
+{
+	u32 word;
+
+	memcpy(&word, source, sizeof(word));
+	memcpy(out, &word, sizeof(word));
+}
+
+static inline short short_at(const unsigned char *source)
+{
+	short value;
+
+	memcpy(&value, source, sizeof(value));
+	return value;
 }
 
 static u8 color_byte(float value)
@@ -2006,7 +2023,19 @@ static float as_float(DWORD value)
 	return result;
 }
 
-/* the vertex's fog factor (1 no fog, 0 all fog) as its coordinate on the ramp */
+/* a fog factor (1 no fog, 0 all fog) as its coordinate on the ramp */
+static inline float fog_ramp_coordinate(float factor)
+{
+	if (!(factor >= 0.0f))
+		factor = 0.0f;
+	if (factor > 1.0f)
+		factor = 1.0f;
+	/* (a power of two: the same as the division) */
+	return (factor * 255.0f + 0.5f) * (1.0f / 256.0f);
+}
+
+/* the vertex's fog (oFog) through the table (D3DRS_FOGTABLEMODE) as its
+coordinate on the ramp */
 static float fog_coordinate(float fog)
 {
 	float factor;
@@ -2034,12 +2063,7 @@ static float fog_coordinate(float fog)
 		factor = fog;
 		break;
 	}
-	if (!(factor >= 0.0f))
-		factor = 0.0f;
-	if (factor > 1.0f)
-		factor = 1.0f;
-	/* (a power of two: the same as the division) */
-	return (factor * 255.0f + 0.5f) * (1.0f / 256.0f);
+	return fog_ramp_coordinate(factor);
 }
 
 /* a cube map's direction (s, t, r) on its sphere map: the mirror ball's
@@ -2049,7 +2073,7 @@ reads the disc's edge */
 static void sphere_coordinates(const float direction[4], float out[2])
 {
 	float x = direction[0], y = direction[1], z = direction[2];
-	float length = sqrtf(x * x + y * y + z * z), m;
+	float length = nv2a_sqrtf(x * x + y * y + z * z), m;
 
 	if (!(length > 1.0e-12f))
 	{
@@ -2059,7 +2083,7 @@ static void sphere_coordinates(const float direction[4], float out[2])
 	x /= length;
 	y /= length;
 	z /= length;
-	m = 2.0f * sqrtf(x * x + y * y + (z + 1.0f) * (z + 1.0f));
+	m = 2.0f * nv2a_sqrtf(x * x + y * y + (z + 1.0f) * (z + 1.0f));
 	if (!(m > 1.0e-6f))
 	{
 		out[0] = 0.5f;
@@ -2081,12 +2105,67 @@ struct gx_vertex
 	float fog;
 };
 
+/* what a processor's draw computes of each vertex: what vertex_emit sends
+(emit_attributes), with what is the same for the whole draw found once
+(store_plan_set, once emit_attributes is) */
+static struct
+{
+	/* the program's outputs (NV2A_CPU_LIVE_...) */
+	unsigned live;
+	/* the texture stages sent; those of them sphere maps, and those whose
+	coordinates are scaled (a linear texture's, in texels) */
+	unsigned stages, sphere, scaled;
+	/* whether the fog goes through a table (else it is oFog itself) */
+	BOOL fog_table;
+} store_plan;
+
+static void store_plan_set(void)
+{
+	unsigned stage;
+
+	store_plan.live = NV2A_CPU_LIVE_POSITION;
+	if (emit_attributes & 1)
+		store_plan.live |= NV2A_CPU_LIVE_D0;
+	if (emit_attributes & 2)
+		store_plan.live |= NV2A_CPU_LIVE_D1;
+	if (emit_attributes & 0x40)
+		store_plan.live |= NV2A_CPU_LIVE_FOG;
+	store_plan.stages = (emit_attributes >> 2) & 15;
+	store_plan.sphere = sphere_stages & store_plan.stages;
+	store_plan.scaled = 0;
+	for (stage = 0; stage < 4; stage++)
+	{
+		if (!(store_plan.stages & (1U << stage)))
+			continue;
+		store_plan.live |= NV2A_CPU_LIVE_T0 << stage;
+		/* (a scale of 1 leaves a coordinate as it is) */
+		if (!(store_plan.sphere & (1U << stage)) &&
+			(texcoord_scale[stage][0] != 1.0f || texcoord_scale[stage][1] != 1.0f))
+			store_plan.scaled |= 1U << stage;
+	}
+	switch (D3D__RenderState[D3DRS_FOGTABLEMODE])
+	{
+	case D3DFOG_LINEAR: case D3DFOG_EXP: case D3DFOG_EXP2:
+		store_plan.fog_table = TRUE;
+		break;
+	default:
+		store_plan.fog_table = FALSE;
+		break;
+	}
+}
+
+static inline void color_bytes(const float value[4], u8 out[4])
+{
+	out[0] = color_byte(value[0]);
+	out[1] = color_byte(value[1]);
+	out[2] = color_byte(value[2]);
+	out[3] = color_byte(value[3]);
+}
+
 static void vertex_store(const struct nv2a_cpu_output *out, const struct draw_projection *projection,
 	const float *raw_position, struct gx_vertex *vertex)
 {
-	/* the program's screen position (pixel centres on integers, as Direct3D
-	puts them), its depth scaled back to 0..1 */
-	float depth = out->position[2] / 16777215.0f;
+	unsigned stages = store_plan.stages;
 	int stage;
 
 	if (raw_position)
@@ -2109,6 +2188,10 @@ static void vertex_store(const struct nv2a_cpu_output *out, const struct draw_pr
 	}
 	else
 	{
+		/* the program's screen position (pixel centres on integers, as
+		Direct3D puts them), its depth scaled back to 0..1 */
+		float depth = out->position[2] / 16777215.0f;
+
 		if (!(depth >= 0.0f))
 			depth = 0.0f;
 		if (depth > 1.0f)
@@ -2117,19 +2200,37 @@ static void vertex_store(const struct nv2a_cpu_output *out, const struct draw_pr
 		vertex->position[1] = out->position[1] + 0.5f;
 		vertex->position[2] = depth - 1.0f;
 	}
-	for (stage = 0; stage < 4; stage++)
+	if (store_plan.live & NV2A_CPU_LIVE_D0)
+		color_bytes(out->d0, vertex->color0);
+	if (store_plan.live & NV2A_CPU_LIVE_D1)
+		color_bytes(out->d1, vertex->color1);
+	for (stage = 0; stages; stage++, stages >>= 1)
 	{
-		vertex->color0[stage] = color_byte(out->d0[stage]);
-		vertex->color1[stage] = color_byte(out->d1[stage]);
-		if (sphere_stages & (1U << stage))
+		if (!(stages & 1))
+			continue;
+		if (store_plan.sphere & (1U << stage))
 			sphere_coordinates(out->t[stage], vertex->texcoord[stage]);
-		else
+		else if (store_plan.scaled & (1U << stage))
 		{
 			vertex->texcoord[stage][0] = out->t[stage][0] * texcoord_scale[stage][0];
 			vertex->texcoord[stage][1] = out->t[stage][1] * texcoord_scale[stage][1];
 		}
+		else
+		{
+			vertex->texcoord[stage][0] = out->t[stage][0];
+			vertex->texcoord[stage][1] = out->t[stage][1];
+		}
 	}
-	vertex->fog = fog_coordinate(out->fog);
+	if (store_plan.live & NV2A_CPU_LIVE_FOG)
+		vertex->fog = store_plan.fog_table ? fog_coordinate(out->fog) : fog_ramp_coordinate(out->fog);
+}
+
+static inline u32 color_word(const u8 color[4])
+{
+	u32 word;
+
+	memcpy(&word, color, sizeof(word));
+	return word;
 }
 
 static inline void vertex_emit(const struct gx_vertex *vertex)
@@ -2139,19 +2240,20 @@ static inline void vertex_emit(const struct gx_vertex *vertex)
 	if (emit_matrix_index)
 		GX_MatrixIndex1x8(vertex->matrix);
 	GX_Position3f32(vertex->position[0], vertex->position[1], vertex->position[2]);
+	/* (a colour's four bytes as one word: the same bytes in the FIFO) */
 	if (emit_attributes == EMIT_ALL)
 	{
-		GX_Color4u8(vertex->color0[0], vertex->color0[1], vertex->color0[2], vertex->color0[3]);
-		GX_Color4u8(vertex->color1[0], vertex->color1[1], vertex->color1[2], vertex->color1[3]);
+		GX_Color1u32(color_word(vertex->color0));
+		GX_Color1u32(color_word(vertex->color1));
 		for (stage = 0; stage < 4; stage++)
 			GX_TexCoord2f32(vertex->texcoord[stage][0], vertex->texcoord[stage][1]);
 		GX_TexCoord1f32(vertex->fog);
 		return;
 	}
 	if (emit_attributes & 1)
-		GX_Color4u8(vertex->color0[0], vertex->color0[1], vertex->color0[2], vertex->color0[3]);
+		GX_Color1u32(color_word(vertex->color0));
 	if (emit_attributes & 2)
-		GX_Color4u8(vertex->color1[0], vertex->color1[1], vertex->color1[2], vertex->color1[3]);
+		GX_Color1u32(color_word(vertex->color1));
 	for (stage = 0; stage < 4; stage++)
 		if (emit_attributes & (4U << stage))
 			GX_TexCoord2f32(vertex->texcoord[stage][0], vertex->texcoord[stage][1]);
@@ -2174,14 +2276,6 @@ static void emit_attributes_set(void)
 			GX_SetVtxDesc(attributes[index], GX_NONE);
 	emit_attributes = wanted;
 	transform_hardware = TRUE;
-}
-
-static void vertex_send(const struct nv2a_cpu_output *out, const struct draw_projection *projection)
-{
-	struct gx_vertex vertex;
-
-	vertex_store(out, projection, NULL, &vertex);
-	vertex_emit(&vertex);
 }
 
 /* an indexed draw's vertices, each run through its program once however
@@ -2419,7 +2513,7 @@ static int position_register_of(const struct vertex_shader_object *shader,
 }
 
 /* the inputs a matrix's columns start from: none, but each element's w 1
-(as element_fetch gives it) */
+(as stream_fetch gives it) */
 static void matrix_inputs(const struct vertex_shader_object *shader, float (*inputs)[4])
 {
 	unsigned long index;
@@ -2729,6 +2823,7 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 			}
 			if (shader)
 				emit_attributes_set();
+			store_plan_set();
 
 			GX_Begin(gx_primitive(primitive_type), DEVICE_VERTEX_FORMAT, (u16)count);
 			for (vertex = 0; vertex < count; vertex++)
@@ -2741,8 +2836,8 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 
 					fetch(context, vertex, inputs);
 					t1 = PPCMftb();
-					nv2a_cpu_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
-						point_size, &out);
+					nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants,
+						(const float (*)[4])inputs, point_size, &out, store_plan.live);
 					t2 = PPCMftb();
 					vertex_store(&out, &projection, position_register >= 0 ? inputs[position_register] : NULL,
 						&vertex_memo[slot]);
@@ -2775,6 +2870,7 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 		}
 		if (shader)
 			emit_attributes_set();
+		store_plan_set();
 
 		GX_Begin(gx_primitive(primitive_type), DEVICE_VERTEX_FORMAT, (u16)count);
 		for (vertex = 0; vertex < count; vertex++)
@@ -2783,8 +2879,8 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 
 			sent.matrix = (u8)(GX_PNMTX1 + 3 * vertex_keys[vertex]);
 			fetch(context, vertex, inputs);
-			nv2a_cpu_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
-				&out);
+			nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
+				point_size, &out, store_plan.live);
 			vertex_store(&out, &projection, position_register >= 0 ? inputs[position_register] : NULL, &sent);
 			vertex_emit(&sent);
 		}
@@ -3150,30 +3246,149 @@ static BOOL draw_prepare(void)
 
 /* vertices [first, first + count) of the streams, or those the indices
 name, through the program */
+struct fetch_element
+{
+	/* (the element's data in vertex 0: past its offset, and the draw's
+	first vertex or base index) */
+	const unsigned char *base;
+	UINT stride;
+	unsigned char kind, count, reg;
+};
+
 struct stream_fetch
 {
 	const struct vertex_shader_object *shader;
 	const unsigned char *streams[MAXIMUM_STREAMS];
 	const WORD *indices;
 	UINT first;
+	/* the elements of the registers the program reads, whose stream is
+	set (stream_fetch_plan) */
+	unsigned element_count;
+	struct fetch_element elements[NV2A_CPU_INPUT_COUNT];
 };
+
+static void stream_fetch_plan(struct stream_fetch *fetch)
+{
+	const struct vertex_shader_object *shader = fetch->shader;
+	unsigned long element, read = shader->dependencies.inputs;
+	UINT first = fetch->indices ? device.base_vertex_index : fetch->first;
+
+	if (!fetch_tables_made)
+		fetch_tables_make();
+	fetch->element_count = 0;
+	for (element = 0; element < shader->element_count && element < NV2A_CPU_INPUT_COUNT; element++)
+	{
+		const struct vertex_element *source = &shader->elements[element];
+		unsigned stream = source->stream & (MAXIMUM_STREAMS - 1);
+		struct fetch_element *planned;
+		BOOL known;
+
+		/* (a register the program never reads: left as the caller has it) */
+		if (!fetch->streams[stream] || !(read & (1UL << (source->reg & 15))))
+			continue;
+		planned = &fetch->elements[fetch->element_count++];
+		planned->stride = device.streams[stream].stride;
+		planned->base = fetch->streams[stream] + first * planned->stride + source->offset;
+		planned->reg = source->reg & 15;
+		planned->kind = (unsigned char)fetch_kind_of(source->type, &known);
+		planned->count = known ? (unsigned char)(source->type >> 4) : 0;
+	}
+}
 
 static void stream_fetch(void *context, UINT vertex, float (*inputs)[4])
 {
 	const struct stream_fetch *fetch = context;
-	UINT index = fetch->indices ? fetch->indices[vertex] + device.base_vertex_index : fetch->first + vertex;
-	unsigned long element;
+	UINT index = fetch->indices ? fetch->indices[vertex] : vertex;
+	const struct fetch_element *element = fetch->elements, *end = element + fetch->element_count;
 
-	/* (each element sets its register's four components; the registers no
-	element names stay as the caller cleared them, once a draw) */
-	for (element = 0; element < fetch->shader->element_count; element++)
+	for (; element < end; element++)
 	{
-		const struct vertex_element *source = &fetch->shader->elements[element];
-		const unsigned char *stream = fetch->streams[source->stream & (MAXIMUM_STREAMS - 1)];
+		const unsigned char *source = element->base + index * element->stride;
+		float *out = inputs[element->reg];
+		int component;
 
-		if (stream)
-			element_fetch(stream + index * device.streams[source->stream & (MAXIMUM_STREAMS - 1)].stride +
-				source->offset, source->type, inputs[source->reg & 15]);
+		switch (element->kind)
+		{
+		case FETCH_FLOAT1:
+			word_copy(&out[0], source);
+			out[1] = out[2] = 0.0f;
+			out[3] = 1.0f;
+			break;
+		case FETCH_FLOAT2:
+			word_copy(&out[0], source);
+			word_copy(&out[1], source + 4);
+			out[2] = 0.0f;
+			out[3] = 1.0f;
+			break;
+		case FETCH_FLOAT3:
+			word_copy(&out[0], source);
+			word_copy(&out[1], source + 4);
+			word_copy(&out[2], source + 8);
+			out[3] = 1.0f;
+			break;
+		case FETCH_FLOAT4:
+			word_copy(&out[0], source);
+			word_copy(&out[1], source + 4);
+			word_copy(&out[2], source + 8);
+			word_copy(&out[3], source + 12);
+			break;
+		case FETCH_FLOAT2H:
+			word_copy(&out[0], source);
+			word_copy(&out[1], source + 4);
+			out[2] = 0.0f;
+			word_copy(&out[3], source + 8);
+			break;
+		case FETCH_COLOR:
+		{
+			u32 word;
+
+			memcpy(&word, source, sizeof(word));
+			out[0] = byte_units[(word >> 16) & 0xff];
+			out[1] = byte_units[(word >> 8) & 0xff];
+			out[2] = byte_units[word & 0xff];
+			out[3] = byte_units[word >> 24];
+			break;
+		}
+		case FETCH_SHORTS:
+			out[0] = out[1] = out[2] = 0.0f;
+			out[3] = 1.0f;
+			for (component = 0; component < element->count; component++)
+				out[component] = (float)short_at(source + 2 * component);
+			break;
+		case FETCH_NORMSHORT1:
+			out[0] = normalized(short_at(source), 32767.0f);
+			out[1] = out[2] = 0.0f;
+			out[3] = 1.0f;
+			break;
+		case FETCH_NORMSHORT2:
+			out[0] = normalized(short_at(source), 32767.0f);
+			out[1] = normalized(short_at(source + 2), 32767.0f);
+			out[2] = 0.0f;
+			out[3] = 1.0f;
+			break;
+		case FETCH_NORMSHORTS:
+			out[3] = 1.0f;
+			for (component = 0; component < element->count; component++)
+				out[component] = normalized(short_at(source + 2 * component), 32767.0f);
+			break;
+		case FETCH_NORMPACKED3:
+		{
+			u32 word;
+
+			memcpy(&word, source, sizeof(word));
+			out[0] = packed_elevens[word & 0x7FF];
+			out[1] = packed_elevens[(word >> 11) & 0x7FF];
+			out[2] = packed_tens[word >> 22];
+			out[3] = 1.0f;
+			break;
+		}
+		default:
+			out[0] = out[1] = out[2] = 0.0f;
+			out[3] = 1.0f;
+			for (component = 0; component < element->count; component++)
+				out[component] = byte_units[source[component]];
+			break;
+		}
 	}
 }
 
@@ -3776,6 +3991,7 @@ static void draw_streams(D3DPRIMITIVETYPE primitive_type, UINT count, const WORD
 		fetch.streams[element] = buffer && buffer->Data ? (const unsigned char *)PLATFORM_PHYSICAL_TO_VIRTUAL(buffer->Data) :
 			NULL;
 	}
+	stream_fetch_plan(&fetch);
 	{
 		uint64_t started = wl_platform_time_us();
 

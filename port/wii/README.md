@@ -209,9 +209,17 @@ and pixel shaders.
     it ran 7.9 million, and a frame takes about 160 ms in Dolphin (it took 200 to 450).
     `debug.gpu_transform = false` keeps every program on the CPU.
   - An indexed draw on the CPU runs each vertex's program once, however many indices name it.
+  - A draw on the CPU plans its vertex elements once: only the registers its program reads, each
+    type with its own case, bytes and packed normals converted by table. Each vertex then computes
+    only what the stages read: the program skips instructions that reach no output sent
+    (`nv2a_cpu_run_live`), and the texture scale, sphere map and fog table apply only where set.
   - At build time, `tools/nv2a_codegen.c` decodes the game's 67 programs with the interpreter's own
-    decoder (`src/nv2a_cpu.c`) and writes each one as a C function (88 KB of code). A program is
-    found by a hash of its words.
+    decoder (`src/nv2a_cpu.c`) and writes each one as a C function (126 KB of code). Each takes the
+    outputs a draw reads, and runs an instruction only if it reaches one of them (found backwards
+    from the end, a register's component at a time). A program is found by a hash of its words.
+  - Square roots and ARL's floor give the libraries' results without their calls
+    (`nv2a_sqrtf`: frsqrte refined in double, rounded, then corrected by the midpoints' exact
+    squares). A skinned vertex takes about 1,600 instructions where it took 3,400.
   - Any other program runs on the interpreter.
   - In the menu, the draws take 10 ms a frame compiled, against 58 ms interpreted.
 
