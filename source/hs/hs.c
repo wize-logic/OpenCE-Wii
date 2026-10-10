@@ -3270,7 +3270,9 @@ static void evaluator( \
 struct hs_object_list_get_element_arguments
 {
 	long object_list_index;
-	unsigned short element_index;
+	/* port: big-endian cells (halo_cells.h): the index at its cell's
+	low-order end, where the argument's evaluation puts it */
+	HALO_CELL_MEMBER(unsigned short, element_index);
 };
 
 union hs_real_value
