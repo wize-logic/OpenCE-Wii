@@ -259,7 +259,7 @@ static unsigned rand_input(int alpha_portion)
 	static const unsigned maps[] = { 0x00, 0x20, 0x40, 0x60, 0x80, 0xa0, 0xc0, 0xe0 };
 	unsigned reg = regs[rand() % 11];
 	unsigned alpha = (rand() % 3 == 0) ? 0x10 : 0;
-	if (alpha_portion) alpha = 0x10; /* (blue reads of registers are approximate) */
+	if (alpha_portion && rand() % 4) alpha = 0x10; /* (and blues, a quarter of the time) */ /* (blue reads of registers are approximate) */
 	return reg | alpha | maps[rand() % 8];
 }
 static unsigned rand_output(void)
@@ -273,7 +273,7 @@ static int check(const DWORD *state, unsigned present, const char *name, int ver
 	memset(&textures, 0, sizeof(textures)); textures.present = present;
 	textures.fog = (unsigned char)fog_on;
 	textures.fog_color = fog_color & 0x00FFFFFFUL;
-	if (!gx_psh_translate(state, &textures, &program) || program.approximate) { if (verbose) printf("%s: not translated (%s)\n", name, program.reason); return -1; }
+	if (!gx_psh_translate(state, &textures, &program) || program.approximate) { if (verbose && !program.approximate) printf("%s: not translated (%s)\n", name, program.reason); return -1; }
 	float worst = 0;
 	for (int trial = 0; trial < 50; trial++) {
 		struct inputs_set in; v4 maps[9];
@@ -308,13 +308,22 @@ static int game_programs(void)
 	static const DWORD b_ro[] = {0x00000089,0x000000ac,0x00000c00,0,0,0x00000c00,0x00000c00};
 	static const DWORD b_ai[] = {0x18111912,0x1a111814,0x0820a920,0x1c1c0c0c,0x00005c5c,0,0x1c201a20};
 	static const DWORD b_ao[] = {0x00000089,0x000000ac,0x00000c00,0x00024c00,0x00004d00,0x00000c00,0x00000c00};
-	struct { DWORD count, abcd, efg; const DWORD *ri, *ro, *ai, *ao; } programs[2] = {
-		{ 0x00011008, 0x340f010d, 0x0c111800, a_ri, a_ro, a_ai, a_ao },
-		{ 0x00011107, 0x0000000c, 0x00001c00, b_ri, b_ro, b_ai, b_ao },
+	/* (Blood Gulch's atmospheric fog pass, as the game sets it) */
+	static const DWORD c_ri[] = {0x11180118, 0x0108021c};
+	static const DWORD c_ro[] = {0x00000048, 0x000000cd};
+	static const DWORD c_ai[] = {0x02191209, 0x283c311c};
+	static const DWORD c_ao[] = {0x00000c00, 0x000000cd};
+	static const DWORD c_c0[8] = {0x00666666, 0x00ffe6c4};
+	static const DWORD c_c1[8] = {0, 0x00ffffff};
+	struct { DWORD count, abcd, efg; const DWORD *ri, *ro, *ai, *ao; const DWORD *c0, *c1; unsigned present; }
+		programs[3] = {
+		{ 0x00011008, 0x340f010d, 0x0c111800, a_ri, a_ro, a_ai, a_ao, NULL, NULL, 7 },
+		{ 0x00011107, 0x0000000c, 0x00001c00, b_ri, b_ro, b_ai, b_ao, NULL, NULL, 7 },
+		{ 0x00011002, 0x0c3d000f, 0x0d243c00, c_ri, c_ro, c_ai, c_ao, c_c0, c_c1, 3 },
 	};
 	int failures = 0;
 
-	for (int index = 0; index < 2; index++)
+	for (int index = 0; index < 3; index++)
 	{
 		for (unsigned separate = 0; separate < 8; separate++)
 		{
@@ -324,9 +333,14 @@ static int game_programs(void)
 
 			memset(state, 0, sizeof(state));
 			memset(&textures, 0, sizeof(textures));
-			textures.present = 7;
-			textures.separate_alpha = separate;
+			textures.present = programs[index].present;
+			textures.separate_alpha = separate & programs[index].present;
 			state[D3DRS_PSCOMBINERCOUNT] = programs[index].count;
+			for (unsigned constant = 0; constant < 8 && programs[index].c0; constant++)
+			{
+				state[D3DRS_PSCONSTANT0_0 + constant] = programs[index].c0[constant];
+				state[D3DRS_PSCONSTANT1_0 + constant] = programs[index].c1[constant];
+			}
 			/* (the constants the menu gives the first: a channel each to pick) */
 			if (index == 0)
 			{
@@ -373,8 +387,17 @@ static int game_programs(void)
 			}
 			else if (separate == 0)
 			{
-				printf("game program %d: %u stages, %s\n", index, program.stage_count,
-					program.approximate ? "approximate" : "exact");
+				char name[32];
+				int agrees;
+
+				snprintf(name, sizeof(name), "game program %d", index);
+				fog_on = 0;
+				agrees = check(state, programs[index].present, name, 1);
+				printf("game program %d: %u stages, %s%s%s\n", index, program.stage_count,
+					program.approximate ? "approximate: " : "exact",
+					program.approximate && program.approximation ? program.approximation : "",
+					program.approximate ? "" : agrees > 0 ? ", agrees with the combiners" : ", DIFFERS from the combiners");
+				failures += !program.approximate && agrees <= 0;
 			}
 		}
 	}

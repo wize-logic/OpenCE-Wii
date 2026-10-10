@@ -133,6 +133,19 @@ struct translation
 	unsigned char released[NUMBER_OF_PORTIONS][4];
 	/* the combiner stage being translated, and its portion */
 	int stage, portion_now;
+	/* how each name's colour was last made, as products the alpha half can
+	read the blue of (blue_recipe_set): the alpha half's reads of a blue the
+	colour half wrote to a register recompute it */
+	struct blue_recipe
+	{
+		BOOL valid;
+		int count;
+		struct operand x[2], y[2];
+		unsigned flags;
+		/* a dot product of x[0] and y[0] (the colour half's operands): the same
+		in every channel */
+		BOOL dot;
+	} blue[NUMBER_OF_NAMES];
 	/* the colour portion's operands of this combiner stage */
 	struct operand color_operands[4];
 	/* this combiner stage's operations, for each portion, merged at its end */
@@ -498,7 +511,7 @@ static struct operand register_operand(struct translation *translation, unsigned
 		its coordinate, the factor); 1 without fog */
 		const struct gx_psh_textures *textures = translation->textures;
 
-		if (portion == _portion_alpha || alpha_channel)
+		if ((portion == _portion_alpha && alpha_channel) || (portion == _portion_color && alpha_channel))
 		{
 			if (!textures->fog)
 				return one;
@@ -509,11 +522,20 @@ static struct operand register_operand(struct translation *translation, unsigned
 		}
 		{
 			int preloaded = preloaded_register(translation, textures->fog_color | 0xFF000000UL);
+			struct operand trivial;
 
+			/* (the alpha half reads the colour's blue) */
+			if (constant_trivial(textures->fog_color | 0xFF000000UL, portion, FALSE, &trivial))
+				return trivial;
 			if (preloaded >= 0)
+			{
+				if (portion == _portion_alpha)
+					approximate(translation->program, "a preloaded constant's blue");
 				return operand(_kind_register, (unsigned char)preloaded, _channel_natural);
+			}
 		}
-		result = operand(_kind_konst, konst_slot(translation, textures->fog_color | 0xFF000000UL), _channel_natural);
+		result = operand(_kind_konst, konst_slot(translation, textures->fog_color | 0xFF000000UL),
+			portion == _portion_alpha ? _channel_blue : _channel_natural);
 		return result;
 	}
 	else if (name >= 0)
@@ -536,7 +558,8 @@ static struct operand register_operand(struct translation *translation, unsigned
 			if (result.kind == _kind_register)
 				result = translation->names[_portion_alpha][name];
 			else if (result.kind >= _kind_texture)
-				result.channel = _channel_blue;
+				/* (a replicated alpha's blue is the alpha) */
+				result.channel = result.channel == _channel_alpha ? _channel_natural : _channel_blue;
 		}
 		return result;
 	}
@@ -632,8 +655,13 @@ static unsigned char konst_selection(const struct operand *value, int portion)
 	case _kind_one: return GX_TEV_KASEL_1;
 	case _kind_half: return GX_TEV_KASEL_1_2;
 	case _kind_konst:
-		return (unsigned char)(value->channel == _channel_blue ? GX_TEV_KASEL_K0_B + value->index :
-			GX_TEV_KASEL_K0_A + value->index);
+		switch (value->channel)
+		{
+		case _channel_red_all: return (unsigned char)(GX_TEV_KASEL_K0_R + value->index);
+		case _channel_green_all: return (unsigned char)(GX_TEV_KASEL_K0_G + value->index);
+		case _channel_blue: case _channel_blue_all: return (unsigned char)(GX_TEV_KASEL_K0_B + value->index);
+		default: return (unsigned char)(GX_TEV_KASEL_K0_A + value->index);
+		}
 	default: return NO_RESOURCE;
 	}
 }
@@ -970,7 +998,8 @@ static BOOL dot_unavailable(struct translation *translation, unsigned long input
 	return FALSE;
 }
 
-static struct operand emit_dot(struct translation *translation, struct operand x, struct operand y, int *temporary)
+static struct operand emit_dot(struct translation *translation, int portion, struct operand x, struct operand y,
+	int *temporary)
 {
 	float a[3], b[3];
 	unsigned char negative = (unsigned char)(x.negative ^ y.negative);
@@ -1014,7 +1043,7 @@ static struct operand emit_dot(struct translation *translation, struct operand x
 			"a dot product of a register");
 		return one;
 	}
-	reg = register_allocate(translation, translation->portion_now);
+	reg = register_allocate(translation, portion);
 	if (reg < 0)
 	{
 		approximate(translation->program, "a dot product without a register");
@@ -1028,8 +1057,8 @@ static struct operand emit_dot(struct translation *translation, struct operand x
 		{
 			if (!(terms & (1u << channel)))
 				continue;
-			emit_product(translation, _portion_color, broadcast(x, channel), broadcast(y, channel), first ? zero : result,
-				0, reg);
+			emit_product(translation, portion, broadcast(x, channel), broadcast(y, channel), first ? zero : result, 0,
+				reg);
 			first = FALSE;
 		}
 	}
@@ -1039,6 +1068,88 @@ static struct operand emit_dot(struct translation *translation, struct operand x
 }
 
 /* ---------- combiner inputs */
+
+/* ---------- blues for the alpha half
+
+The alpha half of a TEV stage reads alphas, and the blue of a texture, a
+rasterized colour or a constant through the swap tables and the konst
+selections, but not a register's colour. A combiner's alpha portion may read
+the blue of what its colour portion wrote: the products that made it are
+kept, when the alpha half can read their blues, and computed again there. */
+
+/* a colour-half operand as the alpha half reads its blue; FALSE when it
+cannot (a register's colour, which may change) */
+static BOOL blue_operand(struct operand value, struct operand *out)
+{
+	switch (value.kind)
+	{
+	case _kind_zero: case _kind_one: case _kind_half:
+		break;
+	case _kind_texture: case _kind_ras: case _kind_konst:
+		if (value.channel == _channel_alpha)
+			value.channel = _channel_natural;
+		else if (value.channel == _channel_natural)
+			value.channel = _channel_blue;
+		else
+			return FALSE;
+		break;
+	default:
+		return FALSE;
+	}
+	*out = value;
+	return TRUE;
+}
+
+/* a name's colour just written as x0*y0 (+ x1*y1), mapped by flags */
+static void blue_recipe_set(struct translation *translation, unsigned long reg, int count, const struct operand *x,
+	const struct operand *y, unsigned flags)
+{
+	int name = name_of(reg), index;
+	struct blue_recipe *recipe;
+
+	if (name < 0)
+		return;
+	recipe = &translation->blue[name];
+	recipe->valid = TRUE;
+	recipe->dot = FALSE;
+	recipe->count = count;
+	recipe->flags = flags;
+	for (index = 0; index < count; index++)
+	{
+		if (!blue_operand(x[index], &recipe->x[index]) || !blue_operand(y[index], &recipe->y[index]))
+			recipe->valid = FALSE;
+	}
+}
+
+/* a name's colour just written as a dot product (unmapped: its blue is the
+dot product itself, made again in the alpha half) */
+static void blue_recipe_dot(struct translation *translation, unsigned long reg, struct operand x, struct operand y,
+	unsigned flags)
+{
+	int name = name_of(reg);
+	struct blue_recipe *recipe;
+
+	if (name < 0)
+		return;
+	recipe = &translation->blue[name];
+	recipe->valid = !(flags & 0x38) && broadcastable(&x) && broadcastable(&y);
+	recipe->dot = TRUE;
+	recipe->count = 1;
+	recipe->flags = flags;
+	recipe->x[0] = x;
+	recipe->y[0] = y;
+}
+
+static void blue_recipe_forget(struct translation *translation, unsigned long reg)
+{
+	int name = name_of(reg);
+
+	if (name >= 0)
+		translation->blue[name].valid = FALSE;
+}
+
+static struct operand mapped_input(struct translation *translation, struct operand value, unsigned mapping, int portion,
+	int *temporary);
 
 /* one general combiner input, mapped: signed mappings clamped */
 static struct operand combiner_input(struct translation *translation, unsigned long input, int portion, int stage,
@@ -1050,6 +1161,33 @@ static struct operand combiner_input(struct translation *translation, unsigned l
 	int reg;
 
 	*temporary = -1;
+	/* (the blue of a name the colour half wrote to a register: made again
+	from its products, or its alpha in its place) */
+	if (portion == _portion_alpha && !(input & 0x10) && name_of(input & 0x0f) >= 0 &&
+		translation->names[_portion_color][name_of(input & 0x0f)].kind == _kind_register)
+	{
+		const struct blue_recipe *recipe = &translation->blue[name_of(input & 0x0f)];
+		int blue = recipe->valid && !recipe->dot ? register_allocate(translation, _portion_alpha) : -1;
+
+		if (recipe->valid && recipe->dot)
+		{
+			value = emit_dot(translation, _portion_alpha, recipe->x[0], recipe->y[0], temporary);
+		}
+		else if (blue >= 0)
+		{
+			emit_product(translation, _portion_alpha, recipe->x[0], recipe->y[0], zero,
+				recipe->count == 1 ? recipe->flags : 0, blue);
+			if (recipe->count == 2)
+				emit_product(translation, _portion_alpha, recipe->x[1], recipe->y[1],
+					operand(_kind_register, (unsigned char)blue, _channel_natural), recipe->flags, blue);
+			value = operand(_kind_register, (unsigned char)blue, _channel_natural);
+			*temporary = blue;
+		}
+		else
+		{
+			approximate(translation->program, "the blue of a register, read as its alpha");
+		}
+	}
 	switch (mapping)
 	{
 	case 0x00: case 0xc0:
@@ -1075,6 +1213,28 @@ static struct operand combiner_input(struct translation *translation, unsigned l
 		return mapping == 0x40 ? one : mapping == 0x80 ? operand(_kind_half, 0, 0) : zero;
 	if (value.kind == _kind_half)
 		return zero;
+	if (*temporary >= 0)
+	{
+		/* (a blue made again, now read by the mapping's own stage: its
+		register free after it) */
+		int blue = *temporary;
+		struct operand mapped;
+
+		*temporary = -1;
+		mapped = mapped_input(translation, value, mapping, portion, temporary);
+		register_free(translation, portion, blue);
+		return mapped;
+	}
+	return mapped_input(translation, value, mapping, portion, temporary);
+}
+
+/* the mappings computed into a register of their own (combiner_input) */
+static struct operand mapped_input(struct translation *translation, struct operand value, unsigned mapping, int portion,
+	int *temporary)
+{
+	struct operation operation;
+	int reg;
+
 	reg = translation->economical && (mapping == 0x60 || mapping == 0xa0) ? -1 : register_allocate(translation, portion);
 	if (reg < 0 && (mapping == 0x60 || mapping == 0xa0))
 	{
@@ -1380,6 +1540,8 @@ static void combiner_portion(struct translation *translation, int stage, int por
 	struct operand inputs_mapped[4], later[4], sum_saved[4];
 	int later_count;
 	int dot_temporaries[2] = { -1, -1 };
+	struct operand dot_operands[4];
+	BOOL dot_unlit[2] = { FALSE, FALSE };
 	int temporaries[4];
 	unsigned long ab_name = (outputs >> 4) & 0x0f, cd_name = outputs & 0x0f, sum_name = (outputs >> 8) & 0x0f;
 	int dest, index;
@@ -1416,20 +1578,54 @@ static void combiner_portion(struct translation *translation, int stage, int por
 	}
 	/* dot products: into a register of their own (emit_dot), then a
 product with 1 */
+	memcpy(dot_operands, inputs_mapped, sizeof(dot_operands));
 	if (portion == _portion_color && (flags & 0x02))
 	{
-		inputs_mapped[0] = dot_unavailable(translation, inputs >> 16, stage) ? one :
-			emit_dot(translation, inputs_mapped[0], inputs_mapped[1], &dot_temporaries[0]);
+		dot_unlit[0] = dot_unavailable(translation, inputs >> 16, stage);
+		inputs_mapped[0] = dot_unlit[0] ? one :
+			emit_dot(translation, _portion_color, inputs_mapped[0], inputs_mapped[1], &dot_temporaries[0]);
 		inputs_mapped[1] = one;
 	}
 	if (portion == _portion_color && (flags & 0x01))
 	{
-		inputs_mapped[2] = dot_unavailable(translation, inputs, stage) ? one :
-			emit_dot(translation, inputs_mapped[2], inputs_mapped[3], &dot_temporaries[1]);
+		dot_unlit[1] = dot_unavailable(translation, inputs, stage);
+		inputs_mapped[2] = dot_unlit[1] ? one :
+			emit_dot(translation, _portion_color, inputs_mapped[2], inputs_mapped[3], &dot_temporaries[1]);
 		inputs_mapped[3] = one;
 	}
 	if (portion == _portion_color)
+	{
 		memcpy(translation->color_operands, inputs_mapped, sizeof(inputs_mapped));
+		/* (what the colour half's outputs are, for the alpha half's reads of
+		their blue: a product, or a sum of two, not a mux) */
+		if (name_of(ab_name) >= 0)
+		{
+			if ((flags & 0x02) && !dot_unlit[0])
+				blue_recipe_dot(translation, ab_name, dot_operands[0], dot_operands[1], flags);
+			else
+				blue_recipe_set(translation, ab_name, 1, &inputs_mapped[0], &inputs_mapped[1], flags);
+		}
+		if (name_of(cd_name) >= 0)
+		{
+			if ((flags & 0x01) && !dot_unlit[1])
+				blue_recipe_dot(translation, cd_name, dot_operands[2], dot_operands[3], flags);
+			else
+				blue_recipe_set(translation, cd_name, 1, &inputs_mapped[2], &inputs_mapped[3], flags);
+		}
+		if (name_of(sum_name) >= 0)
+		{
+			struct operand x[2], y[2];
+
+			x[0] = inputs_mapped[0];
+			y[0] = inputs_mapped[1];
+			x[1] = inputs_mapped[2];
+			y[1] = inputs_mapped[3];
+			if (flags & 0x04)
+				blue_recipe_forget(translation, sum_name);
+			else
+				blue_recipe_set(translation, sum_name, 2, x, y, flags);
+		}
+	}
 	/* what the writes after the sum still read: A and B for A*B's own
 	output, C and D for C*D's */
 	later_count = 0;
