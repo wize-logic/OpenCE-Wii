@@ -397,6 +397,20 @@ void game_time_update(
 		every frame ran at least one tick. */
 		game_time_globals->last_local_time_elapsed = 0;
 
+		/* port: config.toml's debug.fixed_ticks: a tick each frame, whatever
+		time passed (a lockstep check's: network_test.c's lockstep log) */
+		{
+			extern int config_boolean(char const *name);
+			static int fixed_ticks = -1;
+
+			if (fixed_ticks < 0)
+				fixed_ticks = config_boolean("debug.fixed_ticks") ? 1 : 0;
+			if (fixed_ticks && ticks_per_second > 0.f)
+			{
+				game_time_globals->leftover_dt = 0.f;
+				time_delta_sec = 1.5f / ticks_per_second;
+			}
+		}
 		if (ticks_per_second > 0.f)
 		{
 			boolean discard_leftover_time;

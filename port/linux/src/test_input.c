@@ -56,12 +56,23 @@ void test_input_hold_action(int hold)
 	test_input_holding_action = hold;
 }
 
+/* the game's (source/game/game_time.c): its ticks, for debug.fixed_ticks */
+unsigned char game_in_progress(void);
+long game_time_get(void);
+
 void test_input_gamepad(XINPUT_GAMEPAD *pad, unsigned long long milliseconds)
 {
+	static int fixed_ticks = -1;
 	double t;
 
 	if (!test_input_active())
 		return;
+	/* (with debug.fixed_ticks, the game's ticks are the clock in a game: the
+	same input at the same tick on every machine, for a lockstep check) */
+	if (fixed_ticks < 0)
+		fixed_ticks = config_boolean("debug.fixed_ticks") ? 1 : 0;
+	if (fixed_ticks && game_in_progress())
+		milliseconds = (unsigned long long)game_time_get() * 1000ULL / 30ULL + 1;
 	if (test_input_holding_action)
 	{
 		/* (standing still, the button held from a second on) */

@@ -45,6 +45,7 @@ Called from the main loop every frame (main.c).
 #include "game/game_engine.h"
 #include "game/players.h"
 #include "objects/objects.h"
+#include "math/real_math.h"
 #include "units/units.h"
 #include "units/unit_definitions.h"
 #include "items/weapons.h"
@@ -92,6 +93,8 @@ static struct
 	char map_name[512];
 	real tour_seconds;
 	short tour_index;
+	/* (debug.lockstep_log) */
+	long lockstep_ticks, lockstep_logged;
 	char variant_name[64];
 	/* ... the variant of this game, of variant_name's list; and the seconds
 	the last game's scores have been shown */
@@ -201,6 +204,8 @@ static void network_test_read_settings(
 	}
 	network_test.start_delay = (real)config_real("debug.network_test_start");
 	network_test.tour_seconds = (real)config_real("debug.network_test_tour");
+	network_test.lockstep_ticks = config_integer("debug.lockstep_log");
+	network_test.lockstep_logged = -1;
 	network_test.kill_interval = (real)config_real("debug.network_test_kill");
 	network_test.shoot_interval = (real)config_real("debug.network_test_shoot");
 	network_test.vehicle_time = (real)config_real("debug.network_test_vehicle");
@@ -775,6 +780,35 @@ void network_test_update(
 	game's time starts over) */
 	if (game_in_progress() && game_time_get() < network_test.logged_time)
 		network_test.logged_time = 0;
+	/* the lockstep log (debug.lockstep_log): the game's state hashed every so
+	many ticks, the same on every machine that plays the same ticks */
+	if (game_in_progress() && !main_menu_loaded && network_test.lockstep_ticks > 0 &&
+		game_time_get() != network_test.lockstep_logged && game_time_get() % network_test.lockstep_ticks == 0)
+	{
+		struct object_iterator objects;
+		struct _object_datum *object;
+		unsigned long hash = 2166136261UL, words[14];
+		long count = 0, word;
+
+		network_test.lockstep_logged = game_time_get();
+		object_iterator_new(&objects, 0xFFFFFFFFUL, 0);
+		while ((object = object_iterator_next(&objects)) != NULL)
+		{
+			words[0] = (unsigned long)objects.index;
+			words[1] = (unsigned long)object->type;
+			memcpy(&words[2], &object->position, 3 * sizeof(unsigned long));
+			memcpy(&words[5], &object->translational_velocity, 3 * sizeof(unsigned long));
+			memcpy(&words[8], &object->forward, 3 * sizeof(unsigned long));
+			memcpy(&words[11], &object->body_vitality, sizeof(unsigned long));
+			memcpy(&words[12], &object->shield_vitality, sizeof(unsigned long));
+			words[13] = (unsigned long)object->parent_object_index;
+			for (word = 0; word < 14; word++)
+				hash = (hash ^ words[word]) * 16777619UL;
+			count++;
+		}
+		platform_log("lockstep: tick %ld objects %ld hash %08lx random %08lx", (long)game_time_get(), count, hash,
+			(unsigned long)*get_global_random_seed_address());
+	}
 	if (game_in_progress() && !main_menu_loaded && game_time_get() - network_test.logged_time >= TICKS_PER_SECOND)
 	{
 		network_test.logged_time = game_time_get();
