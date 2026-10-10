@@ -303,7 +303,7 @@ DEFINE_NETWORK_GAME_MESSAGE(message_client_add_player_request_pregame, 0x20);
 DEFINE_NETWORK_GAME_MESSAGE(message_client_remove_player_request_pregame, 0x20);
 DEFINE_NETWORK_GAME_MESSAGE(message_client_settings_request, 0x44);
 DEFINE_NETWORK_GAME_MESSAGE(message_client_player_settings_request, 0x20);
-DEFINE_NETWORK_GAME_MESSAGE(message_client_game_start_request, 0x02);
+DEFINE_NETWORK_GAME_MESSAGE(message_client_game_start_request, 0x04); /* port: was 0x02, the client's short */
 DEFINE_NETWORK_GAME_MESSAGE(message_client_graceful_game_exit_pregame, 0x04);
 DEFINE_NETWORK_GAME_MESSAGE(message_client_map_is_precached_pregame, 0x100);
 /* one 0x20-byte action per player */
