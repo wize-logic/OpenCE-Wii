@@ -269,20 +269,33 @@ checkpoint run, naming what it should show.
 ### Choosing the work
 
 Without being told, pick the most valuable work that does not need a real
-Wii. In order:
-1. **Correctness the lockstep check can show.** The first tick at which a
+Wii. The aim is a game a person can sit down and play: everything below
+serves that, and work that brings it nearer comes first. In order:
+1. **Playable from start to finish.** What stops or spoils a person
+   playing, found by playing it in Dolphin as a person would (a scripted
+   controller, `debug.test_input`, not only the bot):
+   - the menus: the title, campaign and difficulty, the pause menu,
+     settings, saving and loading a checkpoint, quitting to the menu;
+   - the controls: the Classic Controller, GameCube pad and Wiimote with
+     Nunchuk mapped as the README says, aiming, the deadzones;
+   - every level from its start to its end, cutscenes included, with no
+     halt, hang, missing script trigger or memory run out over a long
+     session (the memory report's peaks);
+   - sound: music, dialogue and effects heard (the audio report);
+   - the frame rate: the frame's time split (`a frame takes`) for each
+     level, and the largest part of it cut, counted as the log's work
+     (vertices on the processor, stages, textures uploaded), not Dolphin's
+     milliseconds alone.
+2. **Correctness the lockstep check can show.** The first tick at which a
    level's x86 and Wii logs differ, on every level (a10 to d40, then the
    multiplayer maps): find the cause and fix it. A big-endian fault breaks
    play on the console and nothing else finds it as surely.
-2. **Faults found by reading.** The endian-auditor's sweeps of code not yet
+3. **What is drawn wrong or not at all**, shown by a Dolphin screenshot or
+   A/B: text, the HUD, menus, then the README's "What is next" (bumped
+   specular, bumped reflections), and anything a checkpoint run shows broken.
+4. **Faults found by reading.** The endian-auditor's sweeps of code not yet
    covered (its reports list what was checked), and the map-converter's
-   checks of data blocks not yet verified value by value.
-3. **What is drawn wrong or not at all**, shown by a Dolphin A/B or a
-   screenshot: the README's "What is next" (bump mapping, bumped
-   reflections), and anything a checkpoint run shows broken.
-4. **Speed that can be counted without hardware**: instructions per vertex
-   (qemu or the disassembly), vertices on the processor against GX (the
-   log's counts), work skipped. Not Dolphin's milliseconds alone.
+   checks of data not yet verified value by value.
 5. **Health**: the CI's jobs, upstream merges, documents, WiiLibs taking
    what the port worked out.
 
