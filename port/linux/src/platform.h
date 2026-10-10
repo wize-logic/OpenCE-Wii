@@ -146,6 +146,14 @@ void *platform_contiguous_alloc(unsigned long size, unsigned long alignment,
 	unsigned long physical_address, DWORD protect);
 void platform_contiguous_free(void *address);
 BOOL platform_is_contiguous(const void *address);
+
+/* the files' reads so far (xbox_files.c): for seeing where loading goes */
+struct platform_file_reads
+{
+	unsigned long calls;
+	unsigned long long bytes, microseconds;
+};
+extern struct platform_file_reads platform_file_reads;
 #define PLATFORM_PHYSICAL_TO_VIRTUAL(physical) ((void *)((unsigned long)(physical) | PLATFORM_CONTIGUOUS_BASE))
 #define PLATFORM_VIRTUAL_TO_PHYSICAL(address) ((unsigned long)(address) & ~PLATFORM_CONTIGUOUS_BASE)
 

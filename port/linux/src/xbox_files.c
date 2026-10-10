@@ -403,6 +403,8 @@ static ssize_t read_some(struct platform_file *file, void *buffer, size_t count,
 		read(file->descriptor, buffer, count);
 }
 
+struct platform_file_reads platform_file_reads;
+
 static BOOL read_at(struct platform_file *file, LPVOID buffer, DWORD count, LPDWORD bytes_read,
 	BOOL positioned, unsigned long long offset)
 {
@@ -412,8 +414,14 @@ static BOOL read_at(struct platform_file *file, LPVOID buffer, DWORD count, LPDW
 	faulting. Guest memory is therefore filled through a bounce buffer: the
 	copy faults like any other write, at the moment the data really lands,
 	so a texture uploaded while the read is in flight is refreshed. */
+#ifdef HALO_WII
+	/* (the Wii protects none: straight in) */
+	BOOL bounce = FALSE;
+#else
 	BOOL bounce = platform_is_contiguous(buffer) ||
 		platform_is_contiguous((char *)buffer + (count ? count - 1 : 0));
+#endif
+	struct timeval started, ended;
 	char *staging = bounce ? malloc(count < READ_BOUNCE_SIZE ? count : READ_BOUNCE_SIZE) : NULL;
 
 	if (bounce && !staging)
@@ -421,6 +429,7 @@ static BOOL read_at(struct platform_file *file, LPVOID buffer, DWORD count, LPDW
 		SetLastError(ERROR_NOT_ENOUGH_MEMORY);
 		return FALSE;
 	}
+	gettimeofday(&started, NULL);
 	while (total < count)
 	{
 		size_t wanted = count - total;
@@ -448,6 +457,11 @@ static BOOL read_at(struct platform_file *file, LPVOID buffer, DWORD count, LPDW
 	free(staging);
 	if (bytes_read)
 		*bytes_read = total;
+	gettimeofday(&ended, NULL);
+	platform_file_reads.calls++;
+	platform_file_reads.bytes += total;
+	platform_file_reads.microseconds += (unsigned long long)(ended.tv_sec - started.tv_sec) * 1000000ULL +
+		(unsigned long long)(ended.tv_usec - started.tv_usec);
 	return TRUE;
 }
 
