@@ -27,6 +27,7 @@ function the port does not provide yet stops the game, naming it.
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "wl/platform/heap_overflow.h"
 #include "wl/platform/mem.h"
 #include "wl/platform/platform.h"
 
@@ -41,7 +42,8 @@ int __real_main(void);
 
 /* WiiLibs' heaps, all in MEM2: thread stacks, the audio output's buffers, the
 GX command FIFO, the asynchronous reads' buffers (which the port does not
-use), and the game's malloc once MEM1's is full (src/wii_malloc.c). MEM1
+use), and the game's malloc once MEM1's is full (WiiLibs' heap overflow,
+enabled in __wrap_main). MEM1
 holds the game, its game state, and libogc's malloc heap below them. Its
 own scene graph, network, asset and sample bank heaps the port has no use
 for. */
@@ -130,6 +132,10 @@ int __wrap_main(void)
 	memory.scene_stack_size = 0;
 	if (wl_mem_init(&memory) != WL_OK)
 		wii_missing_symbol("memory for WiiLibs' heaps (see the log)");
+	/* what MEM1's malloc cannot hold comes from the game's heap in MEM2
+	(the link wraps malloc and the rest: tools/wii_build.py) */
+	if (wl_heap_overflow_enable(WII_MEMORY_TAG_GAME) != WL_OK)
+		wii_missing_symbol("the game's heap in MEM2 (see the log)");
 
 	/* USB 2.0 needs IOS 58; then the SD card and a USB drive, either of
 	which may hold the game (platform_data_root) */
@@ -148,67 +154,6 @@ int __wrap_main(void)
 			wii_missing_symbol("a thread for the game's main (see the log)");
 		return (int)(intptr_t)result;
 	}
-}
-
-/* The way out, logged: exit and abort are wrapped (tools/wii_build.py), so a
-game that ends says how, and from where (the return addresses up its frame
-chain, for addr2line on build/wii/halo.elf). */
-void __real_exit(int code) __attribute__((noreturn));
-void __real_abort(void) __attribute__((noreturn));
-
-void wii_log_callers(const char *what, int code);
-
-void wii_log_callers(const char *what, int code)
-{
-	unsigned long *frame = __builtin_frame_address(0);
-	char line[240];
-	int length = snprintf(line, sizeof(line), "%s(%d) from", what, code);
-	int depth;
-
-	for (depth = 0; depth < 18 && frame && (unsigned long)frame >= 0x80000000UL &&
-		(unsigned long)frame < 0x94000000UL; depth++)
-	{
-		unsigned long *caller = (unsigned long *)frame[0];
-
-		if (!caller || (unsigned long)caller < 0x80000000UL || (unsigned long)caller >= 0x94000000UL)
-			break;
-		/* (a PowerPC frame's caller keeps its return address one word into its own frame) */
-		if (length < (int)sizeof(line) - 12)
-			length += snprintf(line + length, sizeof(line) - (size_t)length, " %08lx", caller[1]);
-		frame = caller;
-	}
-	WL_LOG_E("wii", "%s", line);
-	wl_platform_log_flush();
-}
-
-void __wrap_exit(int code)
-{
-	wii_log_callers("exit", code);
-	__real_exit(code);
-}
-
-void __real__exit(int code);
-void __wrap__exit(int code);
-s32 __real_SYS_ResetSystem(s32 reset, u32 reset_code, s32 force_menu);
-s32 __wrap_SYS_ResetSystem(s32 reset, u32 reset_code, s32 force_menu);
-
-/* (the ways out that bypass exit: who takes them) */
-void __wrap__exit(int code)
-{
-	wii_log_callers("_exit", code);
-	__real__exit(code);
-}
-
-s32 __wrap_SYS_ResetSystem(s32 reset, u32 reset_code, s32 force_menu)
-{
-	wii_log_callers("SYS_ResetSystem", reset);
-	return __real_SYS_ResetSystem(reset, reset_code, force_menu);
-}
-
-void __wrap_abort(void)
-{
-	wii_log_callers("abort", 0);
-	__real_abort();
 }
 
 void wii_missing_symbol(const char *name)

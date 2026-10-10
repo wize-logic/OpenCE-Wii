@@ -1,0 +1,1 @@
+A port of the Halo: Combat Evolved Xbox decompilation to the Wii. It needs your own Xbox maps, converted with tools/wii_convert_maps.py into apps/halo/maps on the SD card or a USB drive. In bring-up: the main menu runs, levels are not playable yet.

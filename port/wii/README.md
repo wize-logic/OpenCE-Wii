@@ -46,7 +46,10 @@ ninja wii-package                           # build/wii/halo-wii.zip for the Hom
 ```
 
 `ninja wii-package` zips `apps/halo` as the Homebrew Channel reads it: `boot.dol`, `meta.xml`
-and an icon drawn by `tools/wii_package.py`. It holds no game data. The `wii` job in
+and an icon drawn by the packager. It holds no game data. `tools/wii_package.py` is a thin
+wrapper: it calls WiiLibs' `tools/wii_package.py` (the checkout the build uses, `--wiilibs`) with
+the port's name, the version (the repository's description), the icon's lettering and the long
+description, which is in `package_description.txt` beside this file. The `wii` job in
 `.github/workflows/build.yml` runs both host checks, builds the zip in devkitPro's devkitPPC
 image (with WiiLibs checked out beside the repository) and keeps it as an artifact.
 
@@ -96,6 +99,7 @@ inflated it to, and the Wii reads it where it is.
   calls the game's `main` (`source/shell/shell_xbox.c`):
   - claims the fixed memory
   - starts WiiLibs: system buttons, log, crash report, heaps, IOS 58, SD and USB
+  - turns on the game's heap in MEM2 (the overflow of MEM1's malloc)
   - starts the network in the background
 
   Clang puts constructors in `.init_array`, which devkitPPC's start-up code never runs, so the
@@ -107,9 +111,9 @@ inflated it to, and the Wii reads it where it is.
   | File | What it does |
   | --- | --- |
   | `wii_platform.c` | log, messages and quitting |
-  | `wii_posix.c` | POSIX threads, files and time over newlib and libogc |
+  | `wii_posix.c` | where the game's folder is, `sysconf`'s memory, random bytes, thread priorities |
   | `xinput_wii.c` | XInput over the Wii Remote with Nunchuk or Classic Controller, and the GameCube controller |
-  | `posix_net_wii.c` | sockets over IOS, for system link |
+  | `posix_net_wii.c` | sockets over WiiLibs' network layer, for system link |
   | `d3d8_gx.c` | the Direct3D device |
   | `wii_extras.c` | the desktop additions the Wii goes without |
 
@@ -125,10 +129,40 @@ inflated it to, and the Wii reads it where it is.
   | MEM2 `0x90100000`–`0x92D00000` | the tag cache at its bottom (22 MB, which converted maps are linked to), then the 12 MB texture cache, the 4 MB sound cache and Direct3D's resources |
 
   WiiLibs' heaps (`src/wii_boot.c`) are in MEM2. The game's own heap is newlib's, in what MEM1
-  leaves (about 4 MB). `src/wii_malloc.c` wraps the allocators, newlib's internal ones included,
-  so that what MEM1 cannot hold comes from a 5 MB heap in MEM2. The game's pools are the Xbox's
+  leaves (about 4 MB). WiiLibs' heap overflow (`wl/platform/heap_overflow.h`, its
+  `wii/heap_wrap_wii.c`) wraps the allocators, newlib's internal ones included, so that what MEM1
+  cannot hold comes from a 5 MB heap in MEM2 (`WII_MEMORY_TAG_GAME`). The link wraps the names in
+  WiiLibs' `WL_HEAP_OVERFLOW_WRAPS` (`cmake/WiiLibs.cmake`, which `tools/wii_build.py` reads) and
+  pulls the wrappers in with `-u __wrap_malloc`; `__wrap_main` turns the overflow on with
+  `wl_heap_overflow_enable` once WiiLibs' heaps are up. Its blocks carry a 32-byte header, so
+  they are 32-byte aligned; the log says so at the first one, and "malloc(N) failed, from ..."
+  (addresses for `addr2line` on `build/wii/halo.elf`) when both heaps are full. The memory
+  report's MEM1 line (`wii_heap_usage`) and `GlobalMemoryStatus` (`sysconf` in `src/wii_posix.c`)
+  read WiiLibs' `wl_heap_overflow_usage`; the second counts MEM1's free bytes and the overflow
+  heap's free budget. The game's pools are the Xbox's
   sizes (`HALO_WII` in `port/linux/include/halo_port_capacity.h`), so the Wii can't join the
   other builds' distributed games.
+- **Ways out.** The link wraps `exit`, `_exit`, `abort` and `SYS_ResetSystem` (WiiLibs'
+  `wii/trace_wii.c`): each logs "exit(0) from 80001234 ..." (tag `exit`; the return addresses up
+  the frame chain, for `addr2line` on `build/wii/halo.elf`) before it goes on, so a game that
+  ends says how and from where. A failed assertion (`display_assert` and `cseries_assert` in
+  `source/cseries/cseries.c`, under `HALO_WII`) logs "assert from ..." the same way, through
+  `wl_platform_log_backtrace`.
+- **Network.** `src/posix_net_wii.c` is the platform layer's sockets (`posix.h`) over WiiLibs'
+  `wl/platform/net.h`; the Winsock layer above it is the Linux build's `xnet.c`, whose byte-order
+  functions are the identity on this big-endian machine. The network comes up in the background
+  (`wl_net_start` from `wii_network_start`), and every call fails with `WSAENETDOWN` until it is
+  up. WiiLibs' results become Winsock errors: `AGAIN` 10035, `INPROGRESS` 10036, `ALREADY` 10037,
+  `NOTSOCK` 10038, `MSGSIZE` 10040, `ADDRINUSE` 10048, `ADDRNOTAVAIL` 10049, `DOWN` 10050,
+  `UNREACH` 10051, `RESET` 10054, `NOMEM` 10055, `ISCONN` 10056, `NOTCONN` 10057, `TIMEDOUT`
+  10060, `REFUSED` 10061, `ACCESS` 10013, `ARG` 10022; any other is IOS's errno plus 10000.
+  `select` is `wl_net_poll` (64 sockets at most), `SO_TYPE` is `wl_net_socket_proto` and
+  `SO_ERROR` is `wl_net_connect_result`. IOS cannot say how many bytes wait (its ioctl answers
+  only `FIONBIO`), so `ioctlsocket(FIONREAD)` fails with `WSAEINVAL`, and it has no
+  `getpeername`. Options other than `SO_REUSEADDR`, `SO_BROADCAST`, `SO_SNDBUF`, `SO_RCVBUF` and
+  `TCP_NODELAY` are accepted and ignored.
+- **Positioned reads.** `pread`, `pwrite` and `pause`, which newlib declares and does not define,
+  are WiiLibs' weak definitions (`wl/platform/posix.h`, `wii/posix_wii.c`).
 - **Threads.** libogc's threads are strictly prioritised. Each of the game's threads gets the
   game's main priority (WiiLibs' `WL_THREAD_PRIO_MAIN`, LWP 64: `WII_GAME_MAIN_PRIO` in
   `src/wii_posix.c`), moved by its Win32 priority, and a 128 KB stack. The game's main runs on a
