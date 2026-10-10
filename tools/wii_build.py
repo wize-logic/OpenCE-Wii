@@ -291,6 +291,19 @@ def generate_wii_build(n: Writer, sln: Any) -> None:
     n.build(outputs=programs, rule="wii_nv2a_codegen", inputs=codegen, implicit=[microcode],
             variables={"microcode": str(microcode)})
     add_object(programs, platform_cflags)
+    # WiiLibs' Xbox texture conversions (wl/codec/xbox_tex.c) as a host library
+    # the map converter loads (tools/wii_gx_textures.py; without it, its numpy
+    # conversions make the same bytes). Left out for a WiiLibs without them
+    host_tools: List[Path] = []
+    texture_sources = [wiilibs / "wl" / "codec" / name for name in ("xbox_tex.c", "gx_tex.c")]
+    if all(source.is_file() for source in texture_sources):
+        texture_library = build_dir / "tools" / "libwl_xbox_tex.so"
+        n.rule(name="wii_host_library",
+               command=f"cc -O2 -std=gnu11 -ffp-contract=off -shared -fPIC -I{_quote(wiilibs)} -o $out $in",
+               description="WII HOST LIBRARY $out")
+        n.build(outputs=texture_library, rule="wii_host_library", inputs=texture_sources,
+                implicit=[wiilibs / "wl" / "codec" / "xbox_tex.h", wiilibs / "wl" / "codec" / "gx_tex.h"])
+        host_tools.append(texture_library)
     # the settings file's parser (port/third_party/tomlc17)
     add_object(TOML_DIR / "tomlc17.c", " ".join([abi, "-std=gnu11", "-w"]))
     # the port's zlib, and the game's sin, pow and the rest, the same on
@@ -340,7 +353,7 @@ def generate_wii_build(n: Writer, sln: Any) -> None:
            command=f"! {tools / 'powerpc-eabi-readelf'} -S $in | grep -qE 'init_array|[.]tdata|[.]tbss' && touch $out",
            description="WII CHECK no .init_array or native thread-local data in $in")
     n.build(outputs=build_dir / "no_constructors.stamp", rule="wii_no_constructors", inputs=elf)
-    n.build(outputs="wii", rule="phony", inputs=[dol, build_dir / "no_constructors.stamp"])
+    n.build(outputs="wii", rule="phony", inputs=[dol, build_dir / "no_constructors.stamp", *host_tools])
     # the Homebrew Channel's zip (apps/halo: boot.dol, meta.xml, icon.png; no game data)
     n.rule(name="wii_package", command="$python tools/wii_package.py --dol $in --output $out",
            description="WII PACKAGE $out")

@@ -21,9 +21,17 @@ GX's tiles are larger than the Xbox's smallest levels: the levels kept are the m
 bytes fit in the Xbox texture's (gx_levels, which the device computes the same way); a bitmap
 whose first level does not fit, a cube map and a 3D texture are left as they are, and the
 device decodes them.
+
+The conversions of a level are WiiLibs' (wl/codec/xbox_tex.h: wl_xbox_to_gx, wl_xbox_dxt_to_cmpr,
+wl_xbox_dxt_alpha_i4), through ctypes, from the host library `ninja wii` builds from WiiLibs'
+sources (build/wii/tools/libwl_xbox_tex.so; use_library). Without it, or for a level it does not
+take, the numpy conversions below make the same bytes. What is the port's own (the levels kept,
+cube maps as sphere maps, the padding) is here either way.
 """
 
+import ctypes
 import struct
+from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
@@ -375,6 +383,90 @@ def convert_cube(data: bytes, kind: str, size: int, levels: int) -> Optional[byt
     return body + data[len(body):]
 
 
+# ---------- WiiLibs' conversions (wl/codec/xbox_tex.h)
+
+# WlXboxFormat's order
+WL_XBOX_FORMATS = ("a8r8g8b8", "x8r8g8b8", "r5g6b5", "a1r5g5b5", "a4r4g4b4", "l8", "a8", "al8", "a8l8", "p8",
+                   "dxt1", "dxt3", "dxt5")
+# the host library tools/wii_build.py builds from WiiLibs' sources
+DEFAULT_LIBRARY = Path(__file__).resolve().parent.parent / "build" / "wii" / "tools" / "libwl_xbox_tex.so"
+
+_codec = None
+
+
+def use_library(path: Optional[Path] = DEFAULT_LIBRARY) -> Optional[str]:
+    """converts with WiiLibs' library at path (None: with numpy alone). The library is kept only
+    when it makes the numpy conversions' bytes of test textures of every format, swizzled and
+    linear; returns why it is not used, or None when it is"""
+    global _codec
+    _codec = None
+    if path is None:
+        return "numpy chosen"
+    try:
+        library = ctypes.CDLL(str(path))
+    except OSError as error:
+        return f"no library ({error})"
+    size_t, pointer, u32 = ctypes.c_size_t, ctypes.c_void_p, ctypes.c_uint32
+    library.wl_xbox_to_gx.argtypes = [ctypes.c_int, ctypes.c_int, u32, pointer, size_t, u32, u32, pointer, size_t]
+    library.wl_xbox_to_gx.restype = size_t
+    for name in ("wl_xbox_dxt_to_cmpr", "wl_xbox_dxt_alpha_i4"):
+        getattr(library, name).argtypes = [ctypes.c_int, pointer, size_t, u32, u32, pointer, size_t]
+        getattr(library, name).restype = size_t
+    state = 0x2545F491
+    for kind in WL_XBOX_FORMATS:
+        linear = 0 if kind.startswith("dxt") else (20 * XBOX_BYTES[kind] + 63) & ~63
+        for width, height, levels, pitch in ((32, 16, 6, 0), (8, 8, 1, 0), (20, 6, 1, linear)):
+            size = sum(xbox_level_bytes(kind, width, height, level, pitch) for level in range(levels))
+            data = bytearray(size)
+            for index in range(size):
+                state = (state * 1103515245 + 12345) & 0xFFFFFFFF
+                data[index] = state >> 16 & 0xFF
+            kept = gx_levels(kind, width, height, levels, pitch)
+            if _convert_codec(library, bytes(data), kind, width, height, kept, pitch) != \
+                    _convert_numpy(bytes(data), kind, width, height, kept, pitch):
+                return f"{path} does not make the numpy conversions' bytes ({kind}, {width}x{height})"
+    _codec = library
+    return None
+
+
+def _convert_codec(library, data: bytes, kind: str, width: int, height: int, kept: int,
+                   pitch: int) -> Optional[bytes]:
+    """convert's levels by WiiLibs' calls; None when a call does not take a level (a swizzled one
+    whose sides are not powers of two)"""
+    out = bytearray(len(data))
+    source = (ctypes.c_char * len(data)).from_buffer_copy(data)
+    target = (ctypes.c_char * len(out)).from_buffer(out)
+    fmt = WL_XBOX_FORMATS.index(kind)
+    read = written = 0
+    for level in range(kept):
+        w, h = level_dimension(width, level), level_dimension(height, level)
+        size = xbox_level_bytes(kind, width, height, level, pitch)
+        if kind.startswith("dxt"):
+            made = library.wl_xbox_dxt_to_cmpr(fmt, ctypes.byref(source, read), size, w, h,
+                                               ctypes.byref(target, written), len(out) - written)
+        else:
+            made = library.wl_xbox_to_gx(fmt, 0 if pitch else 1, pitch, ctypes.byref(source, read), size, w, h,
+                                         ctypes.byref(target, written), len(out) - written)
+        if not made:
+            return None
+        read += size
+        written += made
+    if kind in ("dxt3", "dxt5"):
+        # (the alpha's I4 levels, after all the colour's)
+        read = 0
+        for level in range(kept):
+            w, h = level_dimension(width, level), level_dimension(height, level)
+            size = xbox_level_bytes(kind, width, height, level)
+            made = library.wl_xbox_dxt_alpha_i4(fmt, ctypes.byref(source, read), size, w, h,
+                                                ctypes.byref(target, written), len(out) - written)
+            if not made:
+                return None
+            read += size
+            written += made
+    del target
+    return bytes(out)
+
+
 # ---------- one texture
 
 def convert(data: bytes, kind: str, width: int, height: int, levels: int, pitch: int = 0) -> Optional[bytes]:
@@ -383,6 +475,14 @@ def convert(data: bytes, kind: str, width: int, height: int, levels: int, pitch:
     kept = gx_levels(kind, width, height, levels, pitch)
     if not kept:
         return None
+    if _codec is not None:
+        converted = _convert_codec(_codec, data, kind, width, height, kept, pitch)
+        if converted is not None:
+            return converted
+    return _convert_numpy(data, kind, width, height, kept, pitch)
+
+
+def _convert_numpy(data: bytes, kind: str, width: int, height: int, kept: int, pitch: int) -> bytes:
     out = []
     alphas = []
     offset = 0
@@ -412,5 +512,5 @@ def convert(data: bytes, kind: str, width: int, height: int, levels: int, pitch:
             # (IA8: the alpha, then the intensity: the Xbox's word, big-endian)
             out.append(big_words(words16(texel), 4, 4))
     converted = b"".join(out) + b"".join(alphas)
-    assert len(converted) <= len(data), (kind, width, height, levels, len(converted), len(data))
+    assert len(converted) <= len(data), (kind, width, height, kept, len(converted), len(data))
     return converted + bytes(len(data) - len(converted))

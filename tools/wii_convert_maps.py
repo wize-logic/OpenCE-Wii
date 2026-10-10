@@ -22,7 +22,7 @@ The output is uncompressed, which the Wii reads where it is (the Xbox inflated i
 partition; source/cache/cache_files_windows.c, HALO_WII), its header big-endian with the Wii's
 version (CACHE_FILE_VERSION_WII, port/linux/game/cache_file_formats.h).
 
-usage: tools/wii_convert_maps.py [--elf build/wii/halo.elf] [--output DIR] map.map...
+usage: tools/wii_convert_maps.py [--elf build/wii/halo.elf] [--output DIR] [--numpy-textures] map.map...
 """
 
 import argparse
@@ -763,7 +763,13 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=Path("build/wii/sd/apps/halo/maps"))
     parser.add_argument("--tag-cache-address", type=lambda text: int(text, 0), default=0x90100000,
                         help="where the Wii reads the tags (HALO_PORT_TAG_CACHE_BASE_ADDRESS)")
+    parser.add_argument("--texture-library", type=Path, default=wii_gx_textures.DEFAULT_LIBRARY,
+                        help="WiiLibs' Xbox texture conversions, built by `ninja wii` (tools/wii_gx_textures.py)")
+    parser.add_argument("--numpy-textures", action="store_true",
+                        help="convert the bitmaps with numpy alone (the same bytes, more slowly)")
     args = parser.parse_args()
+    unused = wii_gx_textures.use_library(None if args.numpy_textures else args.texture_library)
+    print("textures: " + (f"numpy ({unused})" if unused else f"WiiLibs ({args.texture_library})"))
     converter = Converter(args.elf, args.tag_cache_address)
     args.output.mkdir(parents=True, exist_ok=True)
     for path in args.maps:
