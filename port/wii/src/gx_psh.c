@@ -946,6 +946,30 @@ static BOOL broadcastable(const struct operand *value)
 	return value->kind != _kind_register || value->channel == _channel_alpha;
 }
 
+/* whether a dot product's two inputs (the low two bytes of `inputs`) read a
+texture stage GX cannot sample, still unwritten: the product is then taken
+as 1 */
+static BOOL dot_unavailable(struct translation *translation, unsigned long inputs, int stage)
+{
+	int which;
+
+	(void)stage;
+	for (which = 0; which < 2; which++)
+	{
+		unsigned long reg = (inputs >> (8 * which)) & 0x0f;
+		int name = name_of(reg);
+
+		if (reg >= _register_t0 && reg <= _register_t3 &&
+			(translation->textures->unavailable & (1u << (reg - _register_t0))) &&
+			translation->names[_portion_color][name].kind == _kind_zero)
+		{
+			approximate(translation->program, "a dot product with a cube map");
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
 static struct operand emit_dot(struct translation *translation, struct operand x, struct operand y, int *temporary)
 {
 	float a[3], b[3];
@@ -1394,12 +1418,14 @@ static void combiner_portion(struct translation *translation, int stage, int por
 product with 1 */
 	if (portion == _portion_color && (flags & 0x02))
 	{
-		inputs_mapped[0] = emit_dot(translation, inputs_mapped[0], inputs_mapped[1], &dot_temporaries[0]);
+		inputs_mapped[0] = dot_unavailable(translation, inputs >> 16, stage) ? one :
+			emit_dot(translation, inputs_mapped[0], inputs_mapped[1], &dot_temporaries[0]);
 		inputs_mapped[1] = one;
 	}
 	if (portion == _portion_color && (flags & 0x01))
 	{
-		inputs_mapped[2] = emit_dot(translation, inputs_mapped[2], inputs_mapped[3], &dot_temporaries[1]);
+		inputs_mapped[2] = dot_unavailable(translation, inputs, stage) ? one :
+			emit_dot(translation, inputs_mapped[2], inputs_mapped[3], &dot_temporaries[1]);
 		inputs_mapped[3] = one;
 	}
 	if (portion == _portion_color)

@@ -1507,7 +1507,11 @@ static void tev_setup(unsigned stages)
 		/* (2D and projected lookups: the rest, cube maps, dot products and
 		bump maps, read as nothing) */
 		if (!(stages & (1U << stage)) || !bound_entries[stage] || (mode != 1 && mode != 2))
+		{
+			if (mode)
+				textures.unavailable |= 1U << stage;
 			continue;
+		}
 		textures.present |= 1U << stage;
 		if (bound_entries[stage]->alpha_texels)
 			textures.separate_alpha |= 1U << stage;
@@ -1807,7 +1811,7 @@ static u8 gx_primitive(D3DPRIMITIVETYPE type);
 
 /* one frame's draws described in the log (DRAW_LOG_FRAME; 0: none) */
 #ifndef DRAW_LOG_FRAME
-#define DRAW_LOG_FRAME 330
+#define DRAW_LOG_FRAME 0
 #endif
 
 static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct draw_projection *projection,
@@ -1841,7 +1845,7 @@ static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct d
 			length += snprintf(textures + length, sizeof(textures) - (size_t)length, " t%d %lux%lu/%u%s%s", stage,
 				entry->width, entry->height, entry->gx_format, entry->native ? "n" : "d", entry->alpha_texels ? "+a" : "");
 	}
-	platform_log("draw %lu: prim %d x%u %s screen %.0f,%.0f-%.0f,%.0f d0 %.2f %.2f %.2f %.2f | blend %lu %lu>%lu atest %lu %lu/%lu z %lu/%lu/%lu wr %lx | ps %lx fin %08lx %08lx modes %05lx |%s",
+	platform_log("draw %lu: prim %d x%u %s screen %.0f,%.0f-%.0f,%.0f d0 %.2f %.2f %.2f %.2f | blend %lu %lu>%lu atest %lu %lu/%lu z %lu/%lu/%lu wr %lx",
 		device.statistics.draws + device.statistics.immediate_draws, (int)primitive_type, count,
 		projection->perspective ? "persp" : "ortho", minimum[0], minimum[1], maximum[0], maximum[1],
 		out.d0[0], out.d0[1], out.d0[2], out.d0[3],
@@ -1849,10 +1853,24 @@ static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct d
 		(unsigned long)D3D__RenderState[D3DRS_DESTBLEND], (unsigned long)D3D__RenderState[D3DRS_ALPHATESTENABLE],
 		(unsigned long)D3D__RenderState[D3DRS_ALPHAFUNC], (unsigned long)D3D__RenderState[D3DRS_ALPHAREF],
 		(unsigned long)D3D__RenderState[D3DRS_ZENABLE], (unsigned long)D3D__RenderState[D3DRS_ZFUNC],
-		(unsigned long)D3D__RenderState[D3DRS_ZWRITEENABLE], (unsigned long)D3D__RenderState[D3DRS_COLORWRITEENABLE],
-		(unsigned long)D3D__RenderState[D3DRS_PSCOMBINERCOUNT], (unsigned long)D3D__RenderState[D3DRS_PSFINALCOMBINERINPUTSABCD],
+		(unsigned long)D3D__RenderState[D3DRS_ZWRITEENABLE], (unsigned long)D3D__RenderState[D3DRS_COLORWRITEENABLE]);
+	platform_log("  a vertex: t0 %.3f %.3f %.3f %.3f t1 %.3f %.3f t2 %.3f %.3f t3 %.3f %.3f d1 %.2f %.2f %.2f %.2f fog %.2f",
+		out.t[0][0], out.t[0][1], out.t[0][2], out.t[0][3], out.t[1][0], out.t[1][1], out.t[2][0], out.t[2][1],
+		out.t[3][0], out.t[3][1], out.d1[0], out.d1[1], out.d1[2], out.d1[3], out.fog);
+	platform_log("  ps %lx fin %08lx %08lx modes %05lx |%s", (unsigned long)D3D__RenderState[D3DRS_PSCOMBINERCOUNT],
+		(unsigned long)D3D__RenderState[D3DRS_PSFINALCOMBINERINPUTSABCD],
 		(unsigned long)D3D__RenderState[D3DRS_PSFINALCOMBINERINPUTSEFG], (unsigned long)D3D__RenderState[D3DRS_PSTEXTUREMODES],
 		textures);
+	{
+		unsigned long combiner;
+
+		for (combiner = 0; combiner < (D3D__RenderState[D3DRS_PSCOMBINERCOUNT] & 0xff) && combiner < 8; combiner++)
+			platform_log("  %lu: rgb %08lx -> %08lx, alpha %08lx -> %08lx", combiner,
+				(unsigned long)D3D__RenderState[D3DRS_PSRGBINPUTS0 + combiner],
+				(unsigned long)D3D__RenderState[D3DRS_PSRGBOUTPUTS0 + combiner],
+				(unsigned long)D3D__RenderState[D3DRS_PSALPHAINPUTS0 + combiner],
+				(unsigned long)D3D__RenderState[D3DRS_PSALPHAOUTPUTS0 + combiner]);
+	}
 	{
 		const struct pixel_shader_entry *shader = pixel_shader_last < pixel_shader_cache_count ?
 			&pixel_shader_cache[pixel_shader_last] : NULL;
@@ -1929,9 +1947,9 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 				}
 			}
 		}
-		/* (one w for all the vertices looked at: screen space is exact, as
-		for the interface's quads, whose w is 1) */
-		if (!fitted && have_first)
+		/* (a w of 1 for all the vertices looked at: screen space, as the
+		interface's quads are; any other w, the last fit's depth) */
+		if (!fitted && have_first && fabsf(first_w - 1.0f) < 1.0e-4f)
 			projection.perspective = FALSE;
 		projection.a = projection_a;
 		projection.b = projection_b;

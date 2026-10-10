@@ -37,10 +37,10 @@ image (with WiiLibs checked out beside the repository) and keeps it as an artifa
   window to `build/wii/dolphin.png`.
 - `--backtrace build/wii/halo.elf` attaches gdb through Dolphin's stub and prints every thread's
   stack when the run ends.
-- It runs Dolphin single-core on Vulkan. Dolphin's Direct3D 11 backend exits without a word on
-  the game's longer TEV programs. In dual-core mode (`--dual-core`), Dolphin exits without a word
-  in the menu about half the time once the vertices come fast. No GX FIFO overflow is counted
-  first, and the cause is still open.
+- It runs Dolphin on Vulkan, single-core by default (`--dual-core` for speed). Dolphin's
+  Direct3D 11 backend has exited without a word on the game's longer TEV programs. Earlier
+  "exits" in dual-core mode were another program's test runner killing every Dolphin; WiiLibs'
+  runner now acts only on its own (its `--name` user folder).
 - `tools/wii_dolphin.py` reports how long a frame takes in emulated time, split into draws,
   textures, pixel shaders, the end of the frame and the game, every 60 frames.
 
@@ -220,7 +220,6 @@ and pixel shaders.
 2. Speed in the levels: the compiled vertex programs carry the menu at 30 frames a second, but a
    level has far more vertices. Next are display lists for the static geometry, paired singles in
    the compiled programs, and GX's own transform for the simplest programs.
-3. Dolphin's dual-core exit, to be told apart from a fault in the GX stream on hardware.
-4. Playing a level (Blood Gulch, then a10), and the game core's endianness checked under qemu
+3. Playing a level (Blood Gulch, then a10), and the game core's endianness checked under qemu
    against the x86 build.
-5. Real hardware, from the Homebrew Channel (`ninja wii-package`).
+4. Real hardware, from the Homebrew Channel (`ninja wii-package`).

@@ -40,6 +40,10 @@ struct gx_psh_textures
 	/* the stages whose alpha is in the texture map four after (DXT3, DXT5) */
 	unsigned separate_alpha;
 	unsigned char contents[GX_PSH_TEXTURES];
+	/* the stages whose texture GX cannot sample (a cube map, a dependent or
+	dot product mode): read as 0, but a dot product with one is taken as 1
+	(a bump map against a normalization cube map, unlit) */
+	unsigned unavailable;
 	/* fog (D3DRS_FOGENABLE, its ramp bound) and its colour */
 	unsigned char fog;
 	DWORD fog_color;
