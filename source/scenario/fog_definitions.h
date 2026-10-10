@@ -28,8 +28,8 @@ enum
 
 struct fog_definition
 {
-	byte flags;
-	byte unused1[0x73];
+	word flags; /* port: the tag's word (a byte read its high half on big-endian) */
+	byte unused2[0x72];
 	real plane_distance;
 	byte unused78[0x88];
 	long background_sound_index;
