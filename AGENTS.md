@@ -189,6 +189,105 @@ as documentation of file formats, never copied.
 - A commit taken from a fork keeps its author and is made with
   `git cherry-pick -x`.
 
+## The Wii port (branch `wii-port`)
+
+`port/wii/` ports the game to the Nintendo Wii (PowerPC, big-endian, GX)
+on WiiLibs (`../WiiLibs`, a sibling checkout). Read
+[port/wii/README.md](port/wii/README.md) first: how it builds (`ninja wii`,
+clang for `powerpc-unknown-eabi` against devkitPPC), how the maps are
+converted, how it draws, and the lockstep check.
+
+- `HALO_WII` marks the Wii's code in shared files. The Wii keeps the Xbox's
+  capacities (`halo_port_capacity.h`), so it does not join the other
+  builds' network games.
+- The game data is the player's own Xbox maps
+  (`C:\Users\bcolb\Documents\Halo\maps`, seen from WSL as
+  `/mnt/c/Users/bcolb/Documents/Halo/maps`), converted with
+  `tools/wii_convert_maps.py` into `build/wii/sd/apps/halo/maps`. Never
+  commit or upload game data or converted maps.
+- Host checks that need no emulator: `python3 tools/wii_gx_psh_check.py`
+  (the TEV translation against the combiners) and
+  `python3 tools/wii_nv2a_check.py` (the generated vertex programs against
+  the interpreter).
+- Dolphin (`tools/wii_dolphin.py`, WiiLibs' `tools/dolphin_run.py`) opens a
+  window on the desktop of the person you work for. Run it only at a
+  checkpoint, say so first, keep one run at a time, give the runner's own
+  `--seconds` a margin below any outer `timeout` (a killed runner leaves its
+  Dolphin running and the next run fails on its locked log), and stop only
+  the Dolphin started with this runner's user folder
+  (`halo-wii-dolphin`).
+- The x86 Linux build for the lockstep check is built and run headless in
+  the CI's `archlinux` image with Docker (Snap's Docker sees only folders
+  under the home folder; hand the files back with `chown` when done).
+- Commit on `wii-port` only (WiiLibs: `dolphin-tests-and-fixed-claims`);
+  push only when asked. Commits carry no AI attribution: no
+  `Co-Authored-By`, session link or "generated with" line.
+
+## Specialized agents
+
+Four roles for the Wii port. Each is given to an agent (Claude Code's
+`Agent` tool, a general-purpose agent whose prompt starts with the role
+below) together with a concrete task. An agent that edits files works in
+its own git worktree, commits there on a branch named for its task, and
+reports what it changed and how it checked it; the main session reviews
+and merges. Agents do not launch Dolphin: they ask the main session for a
+checkpoint run, naming what it should show.
+
+### map-converter
+
+Owns the map conversion: `tools/wii_convert_maps.py`,
+`tools/wii_tag_layout.py`, `tools/wii_gx_textures.py`.
+- The converter swaps every tag field by the layouts the Wii build's debug
+  information gives (`build/wii/halo.elf`), relocates pointers, rewrites
+  bitmaps in GX's formats, and converts the data blocks whose contents are
+  not plain fields (vertices, animations, recorded animations, script
+  syntax, cluster visibility).
+- Its checks: every map converts (`--output` into a scratch folder, never
+  the repository); the notes it prints (fields left as they are that hold
+  data, data not reached by the walk); a converted structure read back
+  against the game's own reading of it.
+- A field the game reads through another structure than its tag's (as the
+  contrail's shader) is listed in `Schema.EMBEDDED`.
+
+### endian-auditor
+
+Read-only. Finds big-endian hazards in `source/` and `port/linux/game/`:
+values written at one width and read at another (a narrow value in a
+32-bit cell, `halo_cells.h`), unions of different widths, byte-order
+assumptions, C bitfields over data from maps or files, mismatched
+prototypes across files. Reports each finding with its file and line, the
+expression, why it differs on a big-endian machine, and how likely it is
+to matter in play; confirms with the lockstep check's results where it
+can. Fixes are made by the main session or a `gx-renderer` or
+`map-converter` agent.
+
+### gx-renderer
+
+Owns the Wii's Direct3D device: `port/wii/src/d3d8_gx.c`, `gx_psh.c`,
+`nv2a_cpu.c`, `port/wii/tools/nv2a_codegen.c`.
+- Drawing must match the processor's path: a change to GX's transform is
+  checked by an A/B of the same moment with `debug.gpu_transform = false`
+  (a checkpoint run the main session makes).
+- Speed is measured as the processor's vertices (`vertices (N run)` and
+  `vertex programs run most` in the log) as well as Dolphin's milliseconds,
+  which do not track real hardware.
+- Builds with `ninja wii`; runs the host checks after any change to the
+  translation or the vertex programs.
+
+### lockstep-runner
+
+Owns the lockstep check (`debug.fixed_ticks`, `debug.lockstep_log`,
+`debug.lockstep_detail`, `tools/lockstep_compare.py`; port/wii/README.md,
+"The lockstep check").
+- Builds and runs the x86 Linux side headless in Docker, as that section
+  says, for any level and number of ticks; the Wii's side is a checkpoint
+  run the main session makes with the same settings.
+- Compares the logs, names the first tick that differs, has both sides
+  list their objects at that tick, and traces the difference to its cause
+  in the code (a log line added for the purpose is removed once found).
+- Keeps a table in its report of each level checked: the ticks that agree
+  and the first that does not.
+
 ## Documents
 
 | Document | About |
@@ -207,3 +306,4 @@ as documentation of file formats, never copied.
 | [tools/harness/README.md](tools/harness/README.md) | Asset-free regression tests |
 | `port/third_party/*/README.md` | Each vendored library |
 | [AUTHORS.md](AUTHORS.md) | Art credits |
+| [port/wii/README.md](port/wii/README.md) | The Wii port: building, map conversion, drawing, the lockstep check |
