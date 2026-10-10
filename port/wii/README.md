@@ -345,7 +345,14 @@ and pixel shaders.
       Its sphere map of the view is drawn from the world's in the 48 rows of the EFB below the
       back buffer, 48 texels square, a 24 by 24 grid each of whose points is the world's
       sphere map at the reflection a normal there makes of the eye straight along the frame,
-      then copied out: once a frame for each cube map and rounded direction.
+      then copied out, for each cube map and rounded direction, and kept while the view turns
+      less than about a tenth of a degree. The node matrices take texture matrix rows 39 (texture
+      coordinate 3's own) and 45 to 58, eight of them, so a draw of more nodes (with its blended
+      vertices' matrix) has its reflection's coordinates from the processor. Row 60 is
+      `GX_IDENTITY`, which every draw in screen space reads its texture coordinates through: the
+      first build put the eighth and ninth nodes' matrices over it, and every such draw after came out as
+      streaks. Each frame now begins with `GX_IDENTITY` loaded again, and the display copy's
+      source, scale and filter are set again before the frame's copy.
     - `tests/gx_lighting_check.c` (run by `tools/wii_nv2a_check.py`) runs each program on the
       interpreter for random scenes (a camera, a skinned model of nodes within 40 degrees of
       each other, lights about it) and compares what GX makes of the same vertices: D0 with

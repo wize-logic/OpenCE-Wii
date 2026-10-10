@@ -794,6 +794,10 @@ static void frame_begin(D3DCOLOR clear_color)
 	guMtxIdentity(identity);
 	GX_LoadPosMtxImm(identity, GX_PNMTX0);
 	GX_SetCurrentMtx(GX_PNMTX0);
+	/* (and GX_IDENTITY, the texture matrix the draws in screen space read
+	their coordinates through, as GX_Init left it: nothing else may load it,
+	but a frame begins with it right whatever did) */
+	GX_LoadTexMtxImm(identity, GX_IDENTITY, GX_MTX3x4);
 
 	GX_SetVtxAttrFmt(DEVICE_VERTEX_FORMAT, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
 	GX_SetVtxAttrFmt(DEVICE_VERTEX_FORMAT, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
@@ -3496,6 +3500,22 @@ static void efb_quad(float x0, float y0, float x1, float y1, const GXColor *colo
 	}
 }
 
+/* what the frame's display copy (wl_gx_end_frame's) reads, as WiiLibs set
+it up: the whole EFB, its scale to the XFB and its filter, and the screen's
+viewport and scissor */
+static void display_copy_restore(void)
+{
+	GXRModeObj *mode = VIDEO_GetPreferredMode(NULL);
+
+	GX_SetViewport(0.0f, 0.0f, SCREEN_WIDTH, SCREEN_HEIGHT, 0.0f, 1.0f);
+	GX_SetScissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+	if (!mode)
+		return;
+	GX_SetDispCopySrc(0, 0, mode->fbWidth, mode->efbHeight);
+	GX_SetDispCopyDst(mode->fbWidth, (u16)GX_SetDispCopyYScale(GX_GetYScaleFactor(mode->efbHeight, mode->xfbHeight)));
+	GX_SetCopyFilter(mode->aa, mode->sample_pattern, GX_TRUE, mode->vfilter);
+}
+
 static void efb_restore(void)
 {
 	GXTexObj color, depth;
@@ -3850,16 +3870,22 @@ static BOOL node_keys(const struct vertex_shader_object *shader, const struct st
 	unsigned short seen[256 + BLEND_VALUES];
 	unsigned seen_count = 0, which;
 	struct node_values values;
-	/* (each vertex's value, from the first pass to the second; in the heap) */
+	/* (each vertex's value, from the first pass to the second; in the heap,
+	as long as the longest draw yet) */
 	static short *values_of;
+	static UINT values_room;
 
 	if (count > sizeof(vertex_keys))
 		return FALSE;
-	if (!values_of)
+	if (count > values_room)
 	{
-		values_of = malloc(sizeof(vertex_keys) * sizeof(*values_of));
-		if (!values_of)
+		UINT room = (count + 1023) & ~1023u;
+		short *grown = realloc(values_of, room * sizeof(*values_of));
+
+		if (!grown)
 			return FALSE;
+		values_of = grown;
+		values_room = room;
 	}
 	memset(indices_of, 0, sizeof(indices_of));
 	values.blend_count = values.last = 0;
@@ -4098,24 +4124,34 @@ coordinates from the normal (gx_lighting.c says how, and how close it is):
   or the planar fog's, the processor's (a world position's, by each node's
   matrix), sent as the vertex's colour;
 - texture coordinate 3 (the reflection's cube map) is made of the normal by
-  a matrix for each node (texture matrix rows LIT_SPHERE_ROW on, given with
-  each vertex as its position matrix is), into a sphere map of the view:
-  drawn from the world's in the EFB's rows below the back buffer
-  (sphere_bake), for each cube map and direction of a draw from the eye
-  (rounded to LIT_SPHERE_STEP), once a frame. */
+  a matrix for each node (lit_sphere_rows, given with each vertex as its
+  position matrix is), into a sphere map of the view: drawn from the
+  world's in the EFB's rows below the back buffer (sphere_bake), for each
+  cube map and direction of a draw from the eye (rounded to
+  LIT_SPHERE_STEP), and kept while the view turns no further. */
 
 /* (config.toml's display.gx_lighting; -1 not read yet) */
 static int gx_lighting_on = -1;
 /* the view frames' rounding (tests/gx_lighting_check.c's REFLECTION_STEP) */
 #define LIT_SPHERE_STEP (15.0f * 3.14159265f / 180.0f)
-/* the texture matrices of the normal's sphere map coordinates: a node's
-(two rows each, past the stages' TEXMTX0 to TEXMTX4), and those of the
-processor's vertices (texture coordinate 3's own) */
-#define LIT_SPHERE_ROW 45
-#define LIT_SPHERE_PROCESSOR_ROW (GX_TEXMTX0 + 3 * 3)
-/* the view's sphere maps: kept for the frame, and the most made in one */
-#define SPHERE_BAKES 16
+/* the texture matrices of the normal's sphere map coordinates, two rows
+each: the keys' in order, then the processor's vertices'. Texture
+coordinate 3's own (GX_TEXMTX3, which the draw does not use for it), then
+the free pairs past the stages' TEXMTX0 to TEXMTX4, short of GX_IDENTITY
+(row 60), the identity every draw in screen space reads its texture
+coordinates through: a matrix over it draws them all wrong. */
+static const u8 lit_sphere_rows[] = { GX_TEXMTX3, 45, 47, 49, 51, 53, 55, 57 };
+#define LIT_SPHERE_MATRICES (sizeof(lit_sphere_rows) / sizeof(lit_sphere_rows[0]))
+/* (the last pair, 57 and 58, short of GX_IDENTITY; the first past TEXMTX4's
+pair, 42 and 43) */
+typedef char lit_sphere_rows_short_of_identity[57 + 2 <= GX_IDENTITY && 45 > GX_TEXMTX4 + 1 ? 1 : -1];
+/* the view's sphere maps kept (a buffer can be drawn again in the frame:
+GX copies into it after the draws before it have read it), the most drawn
+in a frame, and how far a view's frame may turn and still keep one (in its
+rows' components: about a tenth of a degree) */
+#define SPHERE_BAKES 8
 #define SPHERE_BAKES_A_FRAME 48
+#define SPHERE_BAKE_KEPT 2.0e-3f
 /* the first row of the EFB below the back buffer, where they are drawn */
 #define SPHERE_BAKE_ROW SCREEN_HEIGHT
 
@@ -4170,14 +4206,22 @@ static BOOL sphere_bake(const struct texture_entry *world, const float frame[3][
 		sphere_bakes_frame = device.frames;
 		sphere_bakes_in_frame = 0;
 	}
-	for (which = 0; which < SPHERE_BAKES; which++)
-		if (sphere_bakes[which].buffer && sphere_bakes[which].frame_number == device.frames &&
-			sphere_bakes[which].texels == world->texels && sphere_bakes[which].scale == scale &&
-			!memcmp(sphere_bakes[which].frame, frame, sizeof(sphere_bakes[which].frame)))
+	for (which = 0; which < SPHERE_BAKES && !buffer; which++)
+	{
+		unsigned row, column;
+		BOOL near = sphere_bakes[which].buffer && sphere_bakes[which].texels == world->texels &&
+			sphere_bakes[which].scale == scale;
+
+		for (row = 0; row < 3 && near; row++)
+			for (column = 0; column < 3; column++)
+				if (fabsf(sphere_bakes[which].frame[row][column] - frame[row][column]) > SPHERE_BAKE_KEPT)
+					near = FALSE;
+		if (near)
 		{
 			buffer = sphere_bakes[which].buffer;
-			break;
+			sphere_bakes[which].frame_number = device.frames;
 		}
+	}
 	if (!buffer)
 	{
 		if (sphere_bakes_in_frame >= SPHERE_BAKES_A_FRAME)
@@ -4452,6 +4496,9 @@ static BOOL lit_prepare(const struct vertex_shader_object *shader, struct stream
 	if (lit.alpha)
 		for (key = 0; key < keys; key++)
 			lit_world_rows(lit.rows[key], lit.world[key]);
+	/* (a matrix for each key, and the processor's vertices', where they fit) */
+	if (lit.reflection && (keyed ? draw_keys.count + (draw_keys.processor ? 1u : 0u) : 1u) > LIT_SPHERE_MATRICES)
+		lit.reflection = FALSE;
 	if (lit.reflection)
 	{
 		float toward[3];
@@ -4513,7 +4560,7 @@ static void lit_state(BOOL keyed, const struct draw_projection *projection, cons
 	if (lit.reflection)
 	{
 		for (key = 0; key < keys; key++)
-			lit_sphere_matrix((const float (*)[4])lit.rows[key], LIT_SPHERE_ROW + 2 * key);
+			lit_sphere_matrix((const float (*)[4])lit.rows[key], lit_sphere_rows[key]);
 		if (draw_keys.processor)
 		{
 			float rows[3][4];
@@ -4521,11 +4568,11 @@ static void lit_state(BOOL keyed, const struct draw_projection *projection, cons
 
 			for (row = 0; row < 3; row++)
 				memcpy(rows[row], lit.space.world_to_eye[row], sizeof(rows[row]));
-			lit_sphere_matrix((const float (*)[4])rows, LIT_SPHERE_PROCESSOR_ROW);
+			lit_sphere_matrix((const float (*)[4])rows, lit_sphere_rows[keys]);
 		}
 		if (keyed)
 			GX_SetVtxDesc(GX_VA_TEX3MTXIDX, GX_DIRECT);
-		GX_SetTexCoordGen(GX_TEXCOORD3, GX_TG_MTX2x4, GX_TG_NRM, LIT_SPHERE_ROW);
+		GX_SetTexCoordGen(GX_TEXCOORD3, GX_TG_MTX2x4, GX_TG_NRM, lit_sphere_rows[0]);
 		GX_LoadTexObj(&lit.sphere, GX_TEXMAP3);
 	}
 }
@@ -4962,7 +5009,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		if (keyed)
 			GX_MatrixIndex1x8((u8)(processor ? GX_PNMTX0 : GX_PNMTX1 + 3 * vertex_keys[vertex]));
 		if (lit_on && lit.reflection && keyed)
-			GX_MatrixIndex1x8((u8)(processor ? LIT_SPHERE_PROCESSOR_ROW : LIT_SPHERE_ROW + 2 * vertex_keys[vertex]));
+			GX_MatrixIndex1x8(lit_sphere_rows[processor ? draw_keys.count : vertex_keys[vertex]]);
 		if (processor || cpu_colors || cpu_spheres)
 		{
 			/* what the processor computes of the vertex: its position (in
@@ -5303,6 +5350,9 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		}
 		/* (the device set GX behind WiiLibs' shadow) */
 		wl_gx_invalidate_shadow();
+		/* the display copy's own state, whatever the frame's copies to
+		textures and drawing below the back buffer (sphere_bake) left */
+		display_copy_restore();
 		wl_gx_end_frame();
 		device.frame_open = FALSE;
 		/* (the frame drawn: the textures evicted during it can go) */
