@@ -194,6 +194,45 @@ static void instruction_code(FILE *out, const struct nv2a_cpu_instruction *instr
 	(void)components;
 }
 
+/* one output's dependencies: its components' input registers, "!" where it
+is not affine (nv2a_cpu_analyze) */
+static void dependency_text(FILE *out, const char *name, const unsigned long *components, int count)
+{
+	unsigned long all = 0;
+	int component, input;
+
+	for (component = 0; component < count; component++)
+		all |= components[component];
+	if (!all)
+		return;
+	fprintf(out, " %s:", name);
+	for (input = 0; input < 16; input++)
+		if (all & (1UL << input))
+			fprintf(out, "v%d,", input);
+	fprintf(out, "%s", all & NV2A_CPU_NOT_AFFINE ? "!" : "");
+}
+
+static void dependencies_comment(FILE *out, const struct nv2a_cpu_program *program)
+{
+	struct nv2a_cpu_dependencies dependencies;
+	char name[8];
+	int stage;
+
+	nv2a_cpu_analyze(program, &dependencies);
+	fprintf(out, "/* depends on");
+	dependency_text(out, dependencies.clip_captured ? "clip" : "position",
+		dependencies.clip_captured ? dependencies.clip : dependencies.position, 4);
+	dependency_text(out, "d0", dependencies.d0, 4);
+	dependency_text(out, "d1", dependencies.d1, 4);
+	for (stage = 0; stage < 4; stage++)
+	{
+		snprintf(name, sizeof(name), "t%d", stage);
+		dependency_text(out, name, dependencies.t[stage], 2);
+	}
+	dependency_text(out, "fog", &dependencies.fog, 1);
+	fprintf(out, " */\n");
+}
+
 int main(int argc, char **argv)
 {
 	static DWORD words[MAXIMUM_WORDS];
@@ -285,6 +324,7 @@ int main(int argc, char **argv)
 		counts[program_count] = count;
 		program_count++;
 		nv2a_cpu_compile(instructions, count, &program);
+		dependencies_comment(out, &program);
 		fprintf(out, "static void program_%08lx(const float (*c)[4], const float (*v)[4], struct nv2a_cpu_output *o)\n"
 			"{\n\tfloat r[12][4] = { { 0.0f } };\n\tfloat p[4] = { 0.0f, 0.0f, 0.0f, 1.0f };\n"
 			"\tfloat A[4], B[4], C[4], M[4], I[4];\n\tint a0 = 0;\n\n"

@@ -48,6 +48,8 @@ typedef void (*nv2a_cpu_native_proc)(const float (*constants)[4], const float (*
 struct nv2a_cpu_program
 {
 	unsigned long count;
+	/* (nv2a_cpu_hash: the generated programs' names) */
+	unsigned long hash;
 	nv2a_cpu_native_proc native;
 	struct nv2a_cpu_instruction instructions[NV2A_CPU_MAXIMUM_INSTRUCTIONS];
 };
@@ -66,6 +68,27 @@ struct nv2a_cpu_output
 	float fog;
 	float point_size;
 };
+
+/* what a program's outputs depend on, found from its instructions alone
+(nv2a_cpu_analyze): each component's input registers (bit n: v[n]), and
+NV2A_CPU_NOT_AFFINE when it is not an affine function of them (a product of
+two inputs, a reciprocal, a minimum, a lookup by an input's index, ...).
+An affine output is A x + b for the draw's constants, which GX's matrices
+can compute (d3d8_gx.c's draws in hardware). */
+enum { NV2A_CPU_NOT_AFFINE = 1 << 16 };
+
+struct nv2a_cpu_dependencies
+{
+	unsigned long clip[4], position[4];
+	unsigned long d0[4], d1[4], b0[4], b1[4];
+	unsigned long t[4][4];
+	unsigned long fog, point_size;
+	int clip_captured;
+	/* the input registers any instruction reads */
+	unsigned long inputs;
+};
+
+void nv2a_cpu_analyze(const struct nv2a_cpu_program *program, struct nv2a_cpu_dependencies *dependencies);
 
 void nv2a_cpu_compile(const DWORD *instructions, unsigned long instruction_count, struct nv2a_cpu_program *program);
 void nv2a_cpu_run(const struct nv2a_cpu_program *program, const float (*constants)[4], const float (*inputs)[4],

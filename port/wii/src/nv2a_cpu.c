@@ -112,9 +112,10 @@ void nv2a_cpu_compile(const DWORD *instructions, unsigned long instruction_count
 			break;
 	}
 	program->native = NULL;
+	program->hash = nv2a_cpu_hash(instructions, instruction_count);
 #ifndef NV2A_CPU_NO_NATIVES
 	{
-		unsigned long hash = nv2a_cpu_hash(instructions, instruction_count);
+		unsigned long hash = program->hash;
 
 		for (index = 0; index < nv2a_cpu_native_count; index++)
 		{
@@ -178,6 +179,159 @@ static void write_masked(float destination[4], const float value[4], unsigned ma
 	if (mask & 4) destination[1] = value[1];
 	if (mask & 2) destination[2] = value[2];
 	if (mask & 1) destination[3] = value[3];
+}
+
+/* ---------- what the outputs depend on
+
+nv2a_cpu_run's walk with each value a set of input registers and whether it
+is still affine in them, in place of a number */
+
+struct dependency_registers
+{
+	unsigned long r[12][4];
+	unsigned long position[4];
+	unsigned long a0;
+};
+
+static unsigned long product(unsigned long x, unsigned long y)
+{
+	/* (a product of two inputs is not affine) */
+	return x | y | ((x & 0xFFFF) && (y & 0xFFFF) ? NV2A_CPU_NOT_AFFINE : 0);
+}
+
+static unsigned long not_affine(unsigned long x)
+{
+	return x ? x | NV2A_CPU_NOT_AFFINE : 0;
+}
+
+static void dependency_operand(const struct dependency_registers *registers,
+	const struct nv2a_cpu_instruction *instruction, const struct nv2a_cpu_operand *operand, unsigned long *inputs,
+	unsigned long out[4])
+{
+	unsigned long source[4] = { 0, 0, 0, 0 };
+	int component;
+
+	switch (operand->mux)
+	{
+	case _mux_temporary:
+		memcpy(source, operand->index == 12 ? registers->position : registers->r[operand->index < 12 ? operand->index : 0],
+			sizeof(source));
+		break;
+	case _mux_input:
+		source[0] = source[1] = source[2] = source[3] = 1UL << (instruction->input & 15);
+		*inputs |= 1UL << (instruction->input & 15);
+		break;
+	case _mux_constant:
+		/* (a constant at an index an input chose) */
+		if (instruction->relative)
+			source[0] = source[1] = source[2] = source[3] = not_affine(registers->a0);
+		break;
+	default:
+		break;
+	}
+	for (component = 0; component < 4; component++)
+		out[component] = source[operand->swizzle[component] & 3];
+}
+
+static void dependency_write(unsigned long destination[4], const unsigned long value[4], unsigned mask)
+{
+	if (mask & 8) destination[0] = value[0];
+	if (mask & 4) destination[1] = value[1];
+	if (mask & 2) destination[2] = value[2];
+	if (mask & 1) destination[3] = value[3];
+}
+
+void nv2a_cpu_analyze(const struct nv2a_cpu_program *program, struct nv2a_cpu_dependencies *dependencies)
+{
+	struct dependency_registers registers;
+	unsigned long index;
+	int component;
+
+	memset(&registers, 0, sizeof(registers));
+	memset(dependencies, 0, sizeof(*dependencies));
+	for (index = 0; index < program->count; index++)
+	{
+		const struct nv2a_cpu_instruction *instruction = &program->instructions[index];
+		unsigned long a[4], b[4], c[4], mac[4] = { 0, 0, 0, 0 }, ilu[4] = { 0, 0, 0, 0 }, sum;
+
+		dependency_operand(&registers, instruction, &instruction->operands[0], &dependencies->inputs, a);
+		dependency_operand(&registers, instruction, &instruction->operands[1], &dependencies->inputs, b);
+		dependency_operand(&registers, instruction, &instruction->operands[2], &dependencies->inputs, c);
+		switch (instruction->mac)
+		{
+		case _mac_mov: case _mac_arl: memcpy(mac, a, sizeof(mac)); break;
+		case _mac_mul: for (component = 0; component < 4; component++) mac[component] = product(a[component], b[component]); break;
+		case _mac_add: for (component = 0; component < 4; component++) mac[component] = a[component] | c[component]; break;
+		case _mac_mad:
+			for (component = 0; component < 4; component++)
+				mac[component] = product(a[component], b[component]) | c[component];
+			break;
+		case _mac_dp3: case _mac_dph: case _mac_dp4:
+			sum = product(a[0], b[0]) | product(a[1], b[1]) | product(a[2], b[2]);
+			if (instruction->mac == _mac_dph)
+				sum |= b[3];
+			else if (instruction->mac == _mac_dp4)
+				sum |= product(a[3], b[3]);
+			mac[0] = mac[1] = mac[2] = mac[3] = sum;
+			break;
+		case _mac_dst: mac[0] = 0; mac[1] = product(a[1], b[1]); mac[2] = a[2]; mac[3] = b[3]; break;
+		case _mac_min: case _mac_max: case _mac_slt: case _mac_sge:
+			for (component = 0; component < 4; component++)
+				mac[component] = not_affine(a[component] | b[component]);
+			break;
+		default: break;
+		}
+		switch (instruction->ilu)
+		{
+		case _ilu_mov: memcpy(ilu, c, sizeof(ilu)); break;
+		case _ilu_rcp: case _ilu_rcc: case _ilu_rsq: case _ilu_exp: case _ilu_log:
+			ilu[0] = ilu[1] = ilu[2] = ilu[3] = not_affine(c[0]);
+			break;
+		case _ilu_lit:
+			ilu[0] = ilu[1] = ilu[2] = ilu[3] = not_affine(c[0] | c[1] | c[3]);
+			break;
+		default: break;
+		}
+		if (instruction->captures_clip)
+		{
+			memcpy(dependencies->clip, registers.position, sizeof(dependencies->clip));
+			dependencies->clip_captured = 1;
+		}
+		if (instruction->mac == _mac_arl)
+			registers.a0 = mac[0];
+		else if (instruction->mac != _mac_nop && instruction->mac_mask)
+			dependency_write(instruction->temporary == 12 ? registers.position :
+				registers.r[instruction->temporary < 12 ? instruction->temporary : 0], mac, instruction->mac_mask);
+		if (instruction->ilu != _ilu_nop && instruction->ilu_mask)
+		{
+			unsigned temporary = instruction->mac != _mac_nop ? 1 : instruction->temporary;
+
+			dependency_write(temporary == 12 ? registers.position : registers.r[temporary < 12 ? temporary : 0], ilu,
+				instruction->ilu_mask);
+		}
+		if (instruction->output_mask && instruction->output_is_register &&
+			(instruction->output_from_ilu ? instruction->ilu : instruction->mac) != 0)
+		{
+			const unsigned long *source = instruction->output_from_ilu ? ilu : mac;
+
+			switch (instruction->output_address)
+			{
+			case _output_position: dependency_write(registers.position, source, instruction->output_mask); break;
+			case _output_d0: dependency_write(dependencies->d0, source, instruction->output_mask); break;
+			case _output_d1: dependency_write(dependencies->d1, source, instruction->output_mask); break;
+			case _output_b0: dependency_write(dependencies->b0, source, instruction->output_mask); break;
+			case _output_b1: dependency_write(dependencies->b1, source, instruction->output_mask); break;
+			case _output_fog: if (instruction->output_mask & 8) dependencies->fog = source[0]; break;
+			case _output_point_size: if (instruction->output_mask & 8) dependencies->point_size = source[0]; break;
+			default:
+				if (instruction->output_address >= _output_t0 && instruction->output_address < _output_t0 + 4)
+					dependency_write(dependencies->t[instruction->output_address - _output_t0], source,
+						instruction->output_mask);
+				break;
+			}
+		}
+	}
+	memcpy(dependencies->position, registers.position, sizeof(dependencies->position));
 }
 
 unsigned long nv2a_cpu_hash(const DWORD *instructions, unsigned long instruction_count)

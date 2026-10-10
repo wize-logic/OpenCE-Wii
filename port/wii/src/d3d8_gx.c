@@ -2092,6 +2092,57 @@ static struct frame_timing timing;
 /* (the sums when the last frame ended: a slow frame's own share) */
 static struct frame_timing last_timing;
 
+/* the vertices each program ran for, in the statistics' window: which to
+draw in hardware first */
+#define PROGRAM_STATISTICS 24
+static struct { unsigned long hash, vertices, draws; } program_statistics[PROGRAM_STATISTICS];
+
+static void program_statistics_add(const struct nv2a_cpu_program *program, unsigned long vertices)
+{
+	unsigned index, least = 0;
+
+	for (index = 0; index < PROGRAM_STATISTICS; index++)
+	{
+		if (program_statistics[index].hash == program->hash || !program_statistics[index].vertices)
+		{
+			program_statistics[index].hash = program->hash;
+			program_statistics[index].vertices += vertices;
+			program_statistics[index].draws++;
+			return;
+		}
+		if (program_statistics[index].vertices < program_statistics[least].vertices)
+			least = index;
+	}
+	program_statistics[least].hash = program->hash;
+	program_statistics[least].vertices = vertices;
+	program_statistics[least].draws = 1;
+}
+
+static void program_statistics_log(void)
+{
+	char line[400];
+	int length = 0, rank;
+
+	for (rank = 0; rank < 8; rank++)
+	{
+		unsigned index, best = PROGRAM_STATISTICS;
+
+		for (index = 0; index < PROGRAM_STATISTICS; index++)
+			if (program_statistics[index].vertices &&
+				(best == PROGRAM_STATISTICS || program_statistics[index].vertices > program_statistics[best].vertices))
+				best = index;
+		if (best == PROGRAM_STATISTICS)
+			break;
+		length += snprintf(line + length, sizeof(line) - (size_t)length, " %08lx %lu (%lu draws)",
+			program_statistics[best].hash, program_statistics[best].vertices, program_statistics[best].draws);
+		if (length >= (int)sizeof(line))
+			break;
+		program_statistics[best].vertices = 0;
+	}
+	platform_log("Direct3D: vertex programs run most:%s", line);
+	memset(program_statistics, 0, sizeof(program_statistics));
+}
+
 static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitive_type, UINT count,
 	vertex_fetch_proc fetch, void *context, const WORD *indices)
 {
@@ -2222,6 +2273,7 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 		GX_PeekARGB(DRAW_LOG_X, DRAW_LOG_Y, &pixel);
 		platform_log("  pixel (%d, %d) after: %u %u %u %u", DRAW_LOG_X, DRAW_LOG_Y, pixel.r, pixel.g, pixel.b, pixel.a);
 	}
+	program_statistics_add(program, count);
 	timing.draws += wl_platform_time_us() - started;
 }
 
@@ -2813,6 +2865,7 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			device.statistics.vertices_run, device.statistics.clears,
 			device.draws_elsewhere, device.statistics.textures_bound, device.statistics.textures_failed,
 			device.statistics.stages_without_mode, STATISTICS_FRAMES);
+		program_statistics_log();
 		platform_log("Direct3D: textures not drawn: %lu without data, %lu of a shape, %lu of a format, "
 			"%lu without memory, %lu not decoded; %lu converted bitmaps found", texture_failures[_failure_no_data],
 			texture_failures[_failure_shape],
