@@ -282,10 +282,12 @@ serves that, and work that brings it nearer comes first. In order:
      halt, hang, missing script trigger or memory run out over a long
      session (the memory report's peaks);
    - sound: music, dialogue and effects heard (the audio report);
-   - the frame rate: the frame's time split (`a frame takes`) for each
-     level, and the largest part of it cut, counted as the log's work
-     (vertices on the processor, stages, textures uploaded), not Dolphin's
-     milliseconds alone.
+   - **the frame rate: 30 frames a second (33 ms a frame) on every level**,
+     the Xbox's own rate. The frame's time split (`a frame takes`) for each
+     level shows where it goes; cut the largest part first, and count the
+     cut as the log's work (the processor's vertices, stages, textures
+     uploaded, the game's own update) as well as the milliseconds, which
+     Dolphin measures in the console's time but only approximately.
 2. **Correctness the lockstep check can show.** The first tick at which a
    level's x86 and Wii logs differ, on every level (a10 to d40, then the
    multiplayer maps): find the cause and fix it. A big-endian fault breaks

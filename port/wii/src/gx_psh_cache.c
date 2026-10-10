@@ -25,10 +25,15 @@ compared (the counts say how often they differed: a structure that differs
 is not generic from then on). A structure that is not generic is kept for
 each set of its constants, as before.
 
-What the cache keeps: the combiner render states the translation reads
-(those of the stages beyond the combiner count, and constants no combiner
-reads, left out), the textures as the translation is given them, and the
-read constants' signatures; for each entry, its constants and the program.
+Every constant counts, whether or not a combiner names it (the specular
+recipe reads some no combiner input does): one the game left from another
+shader changes the program's constants, not its structure, while its
+signature holds.
+
+What the cache keeps: the combiner render states (those of the stages beyond
+the combiner count left out), the textures as the translation is given them,
+and the constants' signatures; for each entry, its constants and the
+program.
 */
 
 #include "gx_psh_cache.h"
@@ -39,9 +44,8 @@ read constants' signatures; for each entry, its constants and the program.
 
 enum
 {
-	/* the constants a program can read: c0 and c1 of each combiner stage
-	(the first's alone unless the stages have their own), the final
-	combiner's two, and the fog's colour */
+	/* the constants a program can read: c0 and c1 of each combiner stage,
+	the final combiner's two, and the fog's colour */
 	_slot_c0 = 0,
 	_slot_c1 = 8,
 	_slot_final_c0 = 16,
@@ -60,9 +64,6 @@ enum
 	(D3DRS_PS_MAX) and the texture modes */
 	TRIAL_STATE_WORDS = D3DRS_PSTEXTUREMODES + 1,
 
-	_register_c0 = 1,
-	_register_c1 = 2,
-	_register_fog = 3,
 	_register_v0 = 4,
 	_register_v1 = 5,
 	_register_t0 = 8,
@@ -76,14 +77,14 @@ struct structure
 	DWORD state[D3DRS_PS_MAX];
 	DWORD texture_modes;
 	struct gx_psh_textures textures;
-	/* each read constant's signature (constant_signature), 0 for the rest */
+	/* each constant's signature (constant_signature) */
 	uint32_t signatures[NUMBER_OF_SLOTS];
 };
 
 struct cache_entry
 {
 	struct structure key;
-	/* the constants the program holds, 0 for those not read */
+	/* the constants the program holds */
 	DWORD constants[NUMBER_OF_SLOTS];
 	uint32_t hash;
 	/* when it was last used; 0: empty */
@@ -122,50 +123,6 @@ static uint32_t rgba(DWORD color)
 	return ((uint32_t)color << 8) | ((uint32_t)color >> 24);
 }
 
-static void input_read(unsigned long *reads, unsigned long input, long stage, DWORD combiners)
-{
-	switch (input & 0x0f)
-	{
-	case _register_c0:
-		*reads |= 1UL << (stage < 0 ? _slot_final_c0 : _slot_c0 + ((combiners & 0x1000) ? stage : 0));
-		break;
-	case _register_c1:
-		*reads |= 1UL << (stage < 0 ? _slot_final_c1 : _slot_c1 + ((combiners & 0x10000) ? stage : 0));
-		break;
-	case _register_fog:
-		/* (its alpha is the vertex's fog factor, its colour the fog's: either
-		counted) */
-		*reads |= 1UL << _slot_fog;
-		break;
-	}
-}
-
-/* the constants the combiners' inputs name (bit n: slot n) */
-static unsigned long constants_read(const DWORD *state)
-{
-	DWORD combiners = state[D3DRS_PSCOMBINERCOUNT];
-	unsigned long count = combiners & 0xff, reads = 0;
-	long stage;
-	int shift;
-
-	if (count > 8)
-		count = 8;
-	for (stage = 0; stage < (long)count; stage++)
-	{
-		for (shift = 0; shift < 32; shift += 8)
-		{
-			input_read(&reads, (state[D3DRS_PSRGBINPUTS0 + stage] >> shift) & 0xff, stage, combiners);
-			input_read(&reads, (state[D3DRS_PSALPHAINPUTS0 + stage] >> shift) & 0xff, stage, combiners);
-		}
-	}
-	for (shift = 0; shift < 32; shift += 8)
-		input_read(&reads, (state[D3DRS_PSFINALCOMBINERINPUTSABCD] >> shift) & 0xff, -1, combiners);
-	/* (E, F and G: the low byte holds the final combiner's flags) */
-	for (shift = 8; shift < 32; shift += 8)
-		input_read(&reads, (state[D3DRS_PSFINALCOMBINERINPUTSEFG] >> shift) & 0xff, -1, combiners);
-	return reads;
-}
-
 /* a constant as the translation reads it (the fog's colour opaque) */
 static DWORD slot_value(const DWORD *state, const struct gx_psh_textures *textures, int slot)
 {
@@ -196,7 +153,7 @@ static void slot_set(DWORD *state, struct gx_psh_textures *textures, int slot, D
 
 /* a constant's channels (alpha, red, green, blue): each 0, 255 or another
 value (two bits each), and which of them are equal (bits 8 to 13); bit 31
-marks a constant read */
+set */
 static uint32_t constant_signature(DWORD value)
 {
 	unsigned channels[4], i, j, bit = 8;
@@ -219,11 +176,12 @@ static uint32_t constant_signature(DWORD value)
 	return signature;
 }
 
-/* the structure of a draw's pixel shader, and the constants it reads */
+/* the structure of a draw's pixel shader, and its constants (the slots
+returned: all of them) */
 static unsigned long structure_make(struct structure *key, DWORD *constants, const DWORD *state,
 	const struct gx_psh_textures *textures)
 {
-	unsigned long count = state[D3DRS_PSCOMBINERCOUNT] & 0xff, reads = constants_read(state), stage;
+	unsigned long count = state[D3DRS_PSCOMBINERCOUNT] & 0xff, reads = (1UL << NUMBER_OF_SLOTS) - 1, stage;
 	int slot, other;
 
 	memset(key, 0, sizeof(*key));
@@ -246,17 +204,10 @@ static unsigned long structure_make(struct structure *key, DWORD *constants, con
 	}
 	key->state[D3DRS_PSFINALCOMBINERCONSTANT0] = 0;
 	key->state[D3DRS_PSFINALCOMBINERCONSTANT1] = 0;
-	/* (field by field: the padding stays 0) */
-	key->textures.present = textures->present;
-	key->textures.separate_alpha = textures->separate_alpha;
-	for (slot = 0; slot < GX_PSH_TEXTURES; slot++)
-	{
-		if (textures->present & (1U << slot))
-			key->textures.contents[slot] = textures->contents[slot];
-	}
-	key->textures.unavailable = textures->unavailable;
-	key->textures.cube = textures->cube;
-	key->textures.fog = textures->fog;
+	/* (as the caller has them, padding and all: the device clears them
+	first) */
+	memcpy(&key->textures, textures, sizeof(key->textures));
+	key->textures.fog_color = 0;
 	for (slot = 0; slot < NUMBER_OF_SLOTS; slot++)
 	{
 		if (reads & (1UL << slot))

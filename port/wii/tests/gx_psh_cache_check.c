@@ -9,6 +9,7 @@ byte.
 - Random combiner programs, each drawn with its constants as they were,
   changed within their signatures (a channel's 0s and 1s kept), and changed
   outside them.
+- The specular pass from a lightmap, its constants changed as a light's are.
 - The game's model program (the 8 combiners rasterizer_xbox_models.c sets
   up, as b30's log shows them) drawn for many objects over many frames, each
   object's fog constants changing every frame, as the game sets them from
@@ -24,6 +25,8 @@ usage: gx_psh_cache_check [programs [seed]]
 #include "gx_psh_cache.h"
 
 static unsigned long compared, differ;
+
+static void compare(const DWORD *state, const struct gx_psh_textures *textures, const char *what);
 
 static unsigned rand_input(int alpha_portion)
 {
@@ -152,6 +155,61 @@ static void program_random(DWORD *state, struct gx_psh_textures *textures)
 	for (k = 0; k < GX_PSH_TEXTURES; k++)
 		textures->contents[k] = (unsigned char)(textures->present & (1U << k) ? rand() % 3 : 0);
 	textures->fog = (unsigned char)(rand() % 2);
+	/* (now and then a bumped reflection's lookup, or a stage read as colour 1) */
+	if (rand() % 8 == 0)
+	{
+		textures->present |= 8;
+		textures->cube |= 8;
+		textures->bumped = 8;
+	}
+	if (rand() % 8 == 0)
+		textures->vertex_color = 4;
+}
+
+/* the specular pass from a lightmap (gx_psh.c's specular_lightmap_match),
+its constants changed as a light's are */
+static void specular(int draws)
+{
+	static const DWORD rgb_in[6] = { 0x484A0911, 0x48CC8A40, 0xCD4B0809, 0x2C020C01, 0x0C091C09, 0x0C150D1D };
+	static const DWORD rgb_out[6] = { 0x000030C9, 0x00010D00, 0x000020D0, 0x00000C00, 0x000110CD, 0x000010CD };
+	static const DWORD alpha_in[6] = { 0x4B204B20, 0x4A204A20, 0x2C120C11, 0x0D0D1415, 0x1D1D151C, 0x1D1D0000 };
+	static const DWORD alpha_out[6] = { 0x00020400, 0x00020500, 0x00000C00, 0x000000D5, 0x000000D5, 0x000000D0 };
+	static struct gx_psh_program fresh;
+	int draw, stage, recipes = 0;
+
+	for (draw = 0; draw < draws; draw++)
+	{
+		DWORD state[200];
+		struct gx_psh_textures textures;
+		DWORD brightness = (DWORD)(draw % 5 == 0 ? 0xFF : 0x20 + rand() % 0xC0);
+
+		memset(state, 0, sizeof(state));
+		memset(&textures, 0, sizeof(textures));
+		state[D3DRS_PSCOMBINERCOUNT] = 0x00011006;
+		state[D3DRS_PSFINALCOMBINERINPUTSABCD] = 0x0C0F0000;
+		state[D3DRS_PSFINALCOMBINERINPUTSEFG] = 0x1D110D00;
+		for (stage = 0; stage < 6; stage++)
+		{
+			state[D3DRS_PSRGBINPUTS0 + stage] = rgb_in[stage];
+			state[D3DRS_PSRGBOUTPUTS0 + stage] = rgb_out[stage];
+			state[D3DRS_PSALPHAINPUTS0 + stage] = alpha_in[stage];
+			state[D3DRS_PSALPHAOUTPUTS0 + stage] = alpha_out[stage];
+		}
+		state[D3DRS_PSFINALCOMBINERCONSTANT0] = 0x80000000UL | (DWORD)(rand() % 0x1000000);
+		state[D3DRS_PSCONSTANT0_0] = 0x800000FF;
+		/* (read by no combiner input, but by the match) */
+		state[D3DRS_PSCONSTANT0_0 + 1] = draw % 7 == 3 ? 0x00000080 : 0x000000FF;
+		state[D3DRS_PSCONSTANT0_0 + 2] = brightness << 24 | (DWORD)(rand() % 0x1000000);
+		state[D3DRS_PSCONSTANT1_0 + 2] = brightness << 24;
+		state[D3DRS_PSCONSTANT0_0 + 3] = (DWORD)rand() * 2654435761u;
+		state[D3DRS_PSCONSTANT1_0 + 3] = (DWORD)rand() * 40503u;
+		textures.present = 0xF;
+		textures.cube = 0xC;
+		compare(state, &textures, "the specular pass");
+		gx_psh_translate(state, &textures, &fresh);
+		recipes += fresh.vertices == _gx_psh_vertices_specular;
+	}
+	printf("the specular pass: %d draws, %d of them the recipe's\n", draws, recipes);
 }
 
 static void constants_random(DWORD *state, struct gx_psh_textures *textures)
@@ -365,6 +423,7 @@ int main(int argc, char **argv)
 		"constants changed; %lu tests (%lu otherwise) found %lu generic; %lu audits, %lu differ\n", compared, differ, counts.translated,
 		counts.unusable, counts.found, counts.patched, counts.tests, counts.tests_differ, counts.generic, counts.audited, counts.audits_differ);
 	models(60, 120);
+	specular(2000);
 	printf("%lu draws compared, %lu differ from a fresh translation\n", compared, differ);
 	return differ != 0;
 }

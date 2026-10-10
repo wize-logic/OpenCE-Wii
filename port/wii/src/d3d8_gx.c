@@ -1604,8 +1604,11 @@ static u8 gx_minification(DWORD stage, BOOL mipmapped)
 	return linear ? GX_LIN_MIP_LIN : GX_NEAR_MIP_LIN;
 }
 
-/* what each stage's texture is, for the pixel stage */
+/* what each stage's texture is, for the pixel stage, and its texture object
+(a bumped reflection's bump map is bound again with another TLUT:
+bump_offset_bind) */
 static struct texture_entry *bound_entries[D3DTSS_MAXSTAGES];
+static GXTexObj bound_objects[D3DTSS_MAXSTAGES];
 /* a linear texture is addressed in texels, GX's in fractions of it */
 static float texcoord_scale[D3DTSS_MAXSTAGES][2] = { { 1, 1 }, { 1, 1 }, { 1, 1 }, { 1, 1 } };
 
@@ -1679,6 +1682,7 @@ static unsigned textures_bind(void)
 			D3D__TextureState[stage][D3DTSS_MAGFILTER] == D3DTEXF_POINT ? GX_NEAR : GX_LINEAR,
 			0.0f, mipmapped ? (f32)(entry->levels - 1) : 0.0f, 0.0f, GX_FALSE, GX_FALSE, GX_ANISO_1);
 		GX_LoadTexObj(&object, (u8)(GX_TEXMAP0 + stage));
+		bound_objects[stage] = object;
 		if (entry->alpha_texels)
 		{
 			GX_InitTexObj(&object, entry->alpha_texels, (u16)entry->width, (u16)entry->height, GX_TF_I4, wrap_s, wrap_t,
@@ -1712,9 +1716,155 @@ static const struct gx_psh_program *pixel_shader_program;
 static BOOL pixel_shader_usable;
 static unsigned long pixel_shaders_logged;
 
+/* ---------- bumped lookups and a pass's own vertex terms
+
+A bumped reflection (texture modes DOTPRODUCT, DOT_RFLCT_DIFF and
+DOT_RFLCT_SPEC after the bump map) looks its cube map up at the reflection
+of the bump map's normal, carried into the world by the tangent frame of
+texture coordinates 1 to 3 (their xyz the frame's rows, their w the eye).
+GX has no such lookup; its indirect unit offsets a lookup by a texture, as
+its environment-mapped bump does (GX_SetTevIndBumpST). So the cube map's
+sphere map is read at the sphere coordinates of the flat normal's
+reflection, moved by the bump map's x and y (gx_psh.c places the stages):
+the bump map's texels again, through a TLUT of its normals' x (as alpha,
+the indirect unit's s) and y (as intensity, its t), and per vertex, how far
+the sphere coordinates move as the normal tilts along the frame's x and y
+(texture coordinates 1 and 2: a difference over a tilt of
+BUMP_OFFSET_DELTA). The two stages before a lookup take each term (GX's
+dynamic S and T matrices, by matrix 0's scale), the lookup adds its own
+coordinate. This is a linear approximation of the reflection's move, per
+vertex; the Fresnel term reads the flat normal (colour 1) where NV2A reads
+the bumped one (DOT_RFLCT_DIFF's lookup).
+
+A specular light from a lightmap takes e.l of the vertices (gx_psh.c's
+recipe): colour 0. */
+
+/* the program's vertex terms (_gx_psh_vertices_*) and the TEV stages set
+for the indirect unit */
+static unsigned char vertex_terms = _gx_psh_vertices_program;
+static unsigned indirect_stages;
+
+enum
+{
+	/* the TLUT of the bump map's normals' x and y */
+	BUMP_OFFSET_TLUT = GX_TLUT4,
+	/* matrix 0's scale: a dynamic matrix's offset is the coordinate times
+	the indirect texel less 128, over 256, times 2 to this; with the texel
+	127.5 x + 128, a term of the coordinate times x */
+	BUMP_OFFSET_SCALE = 1,
+};
+/* the tilt the terms are measured over, and their largest (in the sphere
+map's coordinates, near its rim's singularity) */
+#define BUMP_OFFSET_DELTA 0.25f
+#define BUMP_OFFSET_LIMIT 2.0f
+
+static struct
+{
+	DWORD data;
+	unsigned long hash, hashed_frame;
+	BOOL loaded;
+	u16 entries[256] __attribute__((aligned(32)));
+} bump_offset;
+
+/* the bump map (stage 0's) as the indirect unit's map, through a TLUT of
+its palette's x (alpha) and y (intensity) */
+static void bump_offset_bind(void)
+{
+	const D3DPalette *palette = device.palettes[0];
+	GXTexObj object;
+
+	if (!bound_entries[0] || bound_entries[0]->gx_format != GX_TF_CI8 || !palette || !palette->Data)
+		return;
+	if (!bump_offset.loaded || bump_offset.data != palette->Data || bump_offset.hashed_frame != device.frames)
+	{
+		const D3DCOLOR *colors = (const D3DCOLOR *)PLATFORM_PHYSICAL_TO_VIRTUAL(palette->Data);
+		unsigned long hash = palette_hash(colors), index;
+
+		if (!bump_offset.loaded || bump_offset.data != palette->Data || bump_offset.hash != hash)
+		{
+			GXTlutObj table;
+
+			for (index = 0; index < 256; index++)
+				bump_offset.entries[index] = (u16)((((colors[index] >> 16) & 0xFF) << 8) | ((colors[index] >> 8) & 0xFF));
+			DCFlushRange(bump_offset.entries, sizeof(bump_offset.entries));
+			GX_InitTlutObj(&table, bump_offset.entries, GX_TL_IA8, 256);
+			GX_LoadTlut(&table, BUMP_OFFSET_TLUT);
+			bump_offset.data = palette->Data;
+			bump_offset.hash = hash;
+			bump_offset.loaded = TRUE;
+		}
+		bump_offset.hashed_frame = device.frames;
+	}
+	object = bound_objects[0];
+	GX_InitTexObjTlut(&object, BUMP_OFFSET_TLUT);
+	GX_LoadTexObj(&object, (u8)(GX_TEXMAP0 + GX_PSH_BUMP_TEXMAP));
+}
+
+/* the indirect unit as the program's stages ask (NULL: off, for stages the
+device sets itself) */
+static void indirect_apply(const struct gx_psh_program *program)
+{
+	static f32 matrix[2][3] = { { 0.5f, 0.0f, 0.0f }, { 0.0f, 0.5f, 0.0f } };
+	unsigned used = 0, stage;
+
+	if (program)
+	{
+		for (stage = 0; stage < program->tev.stage_count; stage++)
+			if (program->indirect[stage] != _gx_psh_indirect_none)
+				used |= 1U << stage;
+	}
+	for (stage = 0; stage < GX_PSH_MAXIMUM_STAGES; stage++)
+		if (indirect_stages & ~used & (1U << stage))
+			GX_SetTevDirect((u8)stage);
+	if (!used)
+	{
+		if (indirect_stages)
+			GX_SetNumIndStages(0);
+		indirect_stages = 0;
+		return;
+	}
+	bump_offset_bind();
+	GX_SetNumIndStages(1);
+	GX_SetIndTexOrder(GX_INDTEXSTAGE0, GX_TEXCOORD0, (u8)(GX_TEXMAP0 + GX_PSH_BUMP_TEXMAP));
+	GX_SetIndTexCoordScale(GX_INDTEXSTAGE0, GX_ITS_1, GX_ITS_1);
+	GX_SetIndTexMatrix(GX_ITM_0, matrix, BUMP_OFFSET_SCALE);
+	for (stage = 0; stage < program->tev.stage_count; stage++)
+	{
+		const WlTevStage *tev = &program->tev.stages[stage];
+
+		switch (program->indirect[stage])
+		{
+		case _gx_psh_indirect_s:
+			/* (no lookup, but the lookup's map scales the coordinate) */
+			GX_SetTevOrder((u8)stage, GX_TEXCOORD0 + GX_PSH_BUMP_TEXCOORD_S,
+				(u32)program->tev.stages[stage + 2].texmap | GX_TEXMAP_DISABLE, tev->channel);
+			GX_SetTevIndirect((u8)stage, GX_INDTEXSTAGE0, GX_ITF_8, GX_ITB_ST, GX_ITM_S0, GX_ITW_0, GX_ITW_0, GX_FALSE,
+				GX_FALSE, GX_ITBA_OFF);
+			break;
+		case _gx_psh_indirect_t:
+			GX_SetTevOrder((u8)stage, GX_TEXCOORD0 + GX_PSH_BUMP_TEXCOORD_T,
+				(u32)program->tev.stages[stage + 1].texmap | GX_TEXMAP_DISABLE, tev->channel);
+			GX_SetTevIndirect((u8)stage, GX_INDTEXSTAGE0, GX_ITF_8, GX_ITB_ST, GX_ITM_T0, GX_ITW_0, GX_ITW_0, GX_TRUE,
+				GX_FALSE, GX_ITBA_OFF);
+			break;
+		case _gx_psh_indirect_lookup:
+			GX_SetTevIndirect((u8)stage, GX_INDTEXSTAGE0, GX_ITF_8, GX_ITB_NONE, GX_ITM_OFF, GX_ITW_OFF, GX_ITW_OFF,
+				GX_TRUE, GX_FALSE, GX_ITBA_OFF);
+			break;
+		case _gx_psh_indirect_repeat:
+			GX_SetTevIndRepeat((u8)stage);
+			break;
+		}
+	}
+	indirect_stages = used;
+}
+
 static void tev_fallback(unsigned stages)
 {
 	struct texture_entry *entry = bound_entries[0];
+
+	indirect_apply(NULL);
+	vertex_terms = _gx_psh_vertices_program;
 
 	if (!(stages & 1) || !entry)
 	{
@@ -1745,6 +1895,7 @@ static void tev_setup(unsigned stages)
 	const struct gx_psh_program *program;
 	BOOL usable, translated;
 	DWORD stage;
+	BOOL bumped_reflection;
 
 	/* the desktop ports' debug views (port_config.c): the diffuse colour
 	alone, or the first texture alone, opaque */
@@ -1752,6 +1903,8 @@ static void tev_setup(unsigned stages)
 		debug = config_boolean("debug.gpu_debug_flat") ? 1 : config_boolean("debug.gpu_debug_texture0") ? 2 : 0;
 	if (debug)
 	{
+		indirect_apply(NULL);
+		vertex_terms = _gx_psh_vertices_program;
 		GX_SetNumTevStages(1);
 		GX_SetTevSwapMode(GX_TEVSTAGE0, GX_TEV_SWAP0, GX_TEV_SWAP0);
 		if (debug == 2 && (stages & 1))
@@ -1772,9 +1925,29 @@ static void tev_setup(unsigned stages)
 	}
 
 	memset(&textures, 0, sizeof(textures));
+	/* a bumped reflection (after the bump map, DOTPRODUCT, DOT_RFLCT_DIFF
+	and DOT_RFLCT_SPEC): its cube map's sphere map read through the indirect
+	unit, the normal's lookup colour 1 (indirect_apply) */
+	bumped_reflection = (D3D__RenderState[D3DRS_PSTEXTUREMODES] & 0xFFFE0UL) == (0x11UL << 5 | 0x0BUL << 10 | 0x0CUL << 15) &&
+		(stages & 1) && bound_entries[0] && bound_entries[0]->gx_format == GX_TF_CI8 && (stages & 8) &&
+		bound_entries[3] && bound_entries[3]->sphere;
 	for (stage = 0; stage < GX_PSH_TEXTURES; stage++)
 	{
 		DWORD mode = (D3D__RenderState[D3DRS_PSTEXTUREMODES] >> (5 * stage)) & 0x1f;
+
+		if (bumped_reflection && stage == 2)
+		{
+			textures.vertex_color |= 1U << stage;
+			continue;
+		}
+		if (bumped_reflection && stage == 3)
+		{
+			textures.present |= 1U << stage;
+			textures.cube |= 1U << stage;
+			textures.bumped |= 1U << stage;
+			textures.contents[stage] = bound_entries[stage]->channels;
+			continue;
+		}
 
 		/* (2D, projected and sphere-mapped cube map lookups: the rest, the dot
 		product and bump map modes, read as nothing) */
@@ -1822,6 +1995,8 @@ static void tev_setup(unsigned stages)
 	if (usable)
 	{
 		gx_psh_apply(program);
+		indirect_apply(program);
+		vertex_terms = program->vertices;
 		tev_texcoords = program->texcoords;
 		tev_channels = program->channels;
 	}
@@ -2161,6 +2336,81 @@ static inline void clip_position(const float clip[4], float out[3])
 	out[2] = -w;
 }
 
+/* a reflection, as DOT_RFLCT_SPEC makes it: 2n(n.e)/(n.n) - e */
+static void reflection_of(const float n[3], const float e[3], float out[4])
+{
+	float nn = n[0] * n[0] + n[1] * n[1] + n[2] * n[2], ne = n[0] * e[0] + n[1] * e[1] + n[2] * e[2];
+	float k = nn > 1.0e-20f ? 2.0f * ne / nn : 0.0f;
+	int index;
+
+	for (index = 0; index < 3; index++)
+		out[index] = k * n[index] - e[index];
+	out[3] = 1.0f;
+}
+
+/* a bumped reflection's vertex: texture coordinate 3 the sphere coordinates
+of the flat normal's reflection, 1 and 2 how far they move as the normal
+tilts along the frame's x and y, colour 1 the flat normal */
+static void bumped_reflection_vertex(const struct nv2a_cpu_output *out, struct gx_vertex *vertex)
+{
+	const float *row0 = out->t[1], *row1 = out->t[2], *row2 = out->t[3];
+	float normal[3], eye[3], tilted[3], reflection[4], base[2], moved[2], length;
+	int axis, index;
+
+	for (index = 0; index < 3; index++)
+	{
+		const float *row = index == 0 ? row0 : index == 1 ? row1 : row2;
+
+		normal[index] = row[2];
+		eye[index] = row[3];
+	}
+	reflection_of(normal, eye, reflection);
+	sphere_coordinates(reflection, base);
+	vertex->texcoord[3][0] = base[0];
+	vertex->texcoord[3][1] = base[1];
+	for (axis = 0; axis < 2; axis++)
+	{
+		for (index = 0; index < 3; index++)
+		{
+			const float *row = index == 0 ? row0 : index == 1 ? row1 : row2;
+
+			tilted[index] = normal[index] + BUMP_OFFSET_DELTA * row[axis];
+		}
+		reflection_of(tilted, eye, reflection);
+		sphere_coordinates(reflection, moved);
+		for (index = 0; index < 2; index++)
+		{
+			float term = (moved[index] - base[index]) * (1.0f / BUMP_OFFSET_DELTA);
+
+			if (!(term > -BUMP_OFFSET_LIMIT))
+				term = -BUMP_OFFSET_LIMIT;
+			if (term > BUMP_OFFSET_LIMIT)
+				term = BUMP_OFFSET_LIMIT;
+			vertex->texcoord[GX_PSH_BUMP_TEXCOORD_S + axis][index] = term;
+		}
+	}
+	length = nv2a_sqrtf(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]);
+	for (index = 0; index < 3; index++)
+		vertex->color1[index] = color_byte(length > 1.0e-12f ? (normal[index] / length + 1.0f) * 0.5f : 0.5f);
+	vertex->color1[3] = 255;
+}
+
+/* a specular light's vertex: colour 0 (1 - e.l) / 2 of the eye's and the
+light's directions (texture coordinates 2 and 3), normalized */
+static void specular_vertex(const struct nv2a_cpu_output *out, struct gx_vertex *vertex)
+{
+	const float *e = out->t[2], *l = out->t[3];
+	float ee = e[0] * e[0] + e[1] * e[1] + e[2] * e[2], ll = l[0] * l[0] + l[1] * l[1] + l[2] * l[2];
+	float el = 0.0f;
+	u8 level;
+
+	if (ee > 1.0e-20f && ll > 1.0e-20f)
+		el = (e[0] * l[0] + e[1] * l[1] + e[2] * l[2]) / nv2a_sqrtf(ee * ll);
+	level = color_byte((1.0f - el) * 0.5f);
+	vertex->color0[0] = vertex->color0[1] = vertex->color0[2] = level;
+	vertex->color0[3] = 255;
+}
+
 static void vertex_store(const struct nv2a_cpu_output *out, const struct draw_projection *projection,
 	const float *raw_position, struct gx_vertex *vertex)
 {
@@ -2214,6 +2464,11 @@ static void vertex_store(const struct nv2a_cpu_output *out, const struct draw_pr
 	}
 	if (store_plan.live & NV2A_CPU_LIVE_FOG)
 		vertex->fog = store_plan.fog_table ? fog_coordinate(out->fog) : fog_ramp_coordinate(out->fog);
+	/* (a pass's own terms, in place of what the program made of them) */
+	if (vertex_terms == _gx_psh_vertices_bumped_reflection)
+		bumped_reflection_vertex(out, vertex);
+	else if (vertex_terms == _gx_psh_vertices_specular)
+		specular_vertex(out, vertex);
 }
 
 static inline u32 color_word(const u8 color[4])
@@ -3173,6 +3428,7 @@ static void efb_quad(float x0, float y0, float x1, float y1, const GXColor *colo
 	GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
 	GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
 	GX_SetCullMode(GX_CULL_NONE);
+	indirect_apply(NULL);
 	GX_SetNumTevStages(textured ? 2 : 1);
 	if (textured)
 	{
@@ -3844,6 +4100,8 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	dependencies = draw_dependencies(shader, program, fetch, count);
 	if (!gpu_transform || !dependencies->clip_captured || primitive_type == D3DPT_POINTLIST)
 		return hardware_rejected(program, "transform off, no clip-space position, or points");
+	if (vertex_terms != _gx_psh_vertices_program)
+		return hardware_rejected(program, "a pass's own vertex terms (a bumped reflection's, a specular light's)");
 	clip_mask = dependencies->clip[0] | dependencies->clip[1] | dependencies->clip[3];
 	position_register = single_register(clip_mask);
 	if ((clip_mask & NV2A_CPU_NOT_AFFINE) || position_register < 0)

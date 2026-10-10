@@ -38,6 +38,9 @@ static v4 rgba_to_v4(uint32_t d) { v4 v = {{ (d >> 24) / 255.0f, ((d >> 16) & 25
 
 /* ---------- the reference */
 struct inputs_set { v4 t[4]; v4 v0, v1; };
+/* the stages read as colour 1 (gx_psh_textures.vertex_color: the device's
+per-vertex stand-in for a lookup), and the bumped ones (read as any texture) */
+static unsigned check_vertex_color, check_bumped;
 /* the fog: on or not, its colour, and a pixel's factor */
 static int fog_on;
 static DWORD fog_color;
@@ -110,6 +113,7 @@ static v4 reference(const DWORD *s, const struct inputs_set *in, const unsigned 
 {
 	v4 regs[16]; memset(regs, 0, sizeof(regs));
 	for (int i = 0; i < 4; i++) if (present & (1u << i)) regs[8 + i] = in->t[i];
+	for (int i = 0; i < 4; i++) if (check_vertex_color & (1u << i)) regs[8 + i] = in->v1;
 	regs[4] = in->v0; regs[5] = in->v1;
 	regs[12].c[3] = regs[8].c[3];
 	int count = s[D3DRS_PSCOMBINERCOUNT] & 0xff;
@@ -369,6 +373,8 @@ static int check(const DWORD *state, unsigned present, const char *name, int ver
 	struct gx_psh_textures textures; struct gx_psh_program program;
 	memset(&textures, 0, sizeof(textures)); textures.present = present;
 	textures.cube = check_cube & present;
+	textures.bumped = check_bumped;
+	textures.vertex_color = check_vertex_color;
 	textures.fog = (unsigned char)fog_on;
 	textures.fog_color = fog_color & 0x00FFFFFFUL;
 	if (!gx_psh_translate(state, &textures, &program)) { if (verbose) printf("%s: not translated (%s)\n", name, program.reason); return -1; }
@@ -418,6 +424,315 @@ static void print_stages(const struct gx_psh_program *program)
 			q->color.clamp ? "" : " unclamped", q->color.dest, q->alpha.in[0], q->alpha.in[1], q->alpha.in[2],
 			q->alpha.in[3], q->alpha.bias, q->alpha.scale, q->alpha.op, q->alpha.clamp ? "" : " unclamped", q->alpha.dest);
 	}
+}
+
+/* a bumped lookup's stages as GX's indirect unit needs them: every stage
+reading a bumped map a lookup (or a repeat right after one), each lookup's
+two stages before it the offset's terms and reading no texture, and texture
+coordinates 0 to 2 asked of the vertices */
+static int bumped_structure(const struct gx_psh_program *p, unsigned bumped, const char *name)
+{
+	unsigned lookups = 0;
+
+	for (unsigned i = 0; i < p->tev.stage_count; i++)
+	{
+		const WlTevStage *st = &p->tev.stages[i];
+		int reads = st->texmap < 4 && (bumped & (1u << st->texmap));
+		unsigned char mode = p->indirect[i];
+
+		if (reads != (mode == _gx_psh_indirect_lookup || mode == _gx_psh_indirect_repeat) ||
+			(mode == _gx_psh_indirect_lookup && (i < 2 || p->indirect[i - 1] != _gx_psh_indirect_t ||
+			p->indirect[i - 2] != _gx_psh_indirect_s || p->tev.stages[i - 1].texmap != WL_TEV_NONE ||
+			p->tev.stages[i - 2].texmap != WL_TEV_NONE)) ||
+			(mode == _gx_psh_indirect_repeat && (p->indirect[i - 1] != _gx_psh_indirect_lookup &&
+			p->indirect[i - 1] != _gx_psh_indirect_repeat)))
+		{
+			printf("%s: the bumped lookup at stage %u is not set up for GX's indirect unit\n", name, i);
+			return 0;
+		}
+		lookups += mode == _gx_psh_indirect_lookup;
+	}
+	if (!lookups || (p->texcoords & 7) != 7 || p->vertices != _gx_psh_vertices_bumped_reflection)
+	{
+		printf("%s: no bumped lookup, or the offset's coordinates not asked for\n", name);
+		return 0;
+	}
+	printf("%s: %u bumped lookups through the indirect unit\n", name, lookups);
+	return 1;
+}
+
+/* ---------- NV2A's combiners, signed
+
+The combiners as NV2A runs them: registers hold -1 to 1, the input mappings
+read them signed (unsigned identity is max(0, x)), results are clamped to
+[-1, 1]; the final combiner's inputs are clamped to [0, 1]. The specular
+lights' programs (gx_psh.c's recipes) are compared against this. */
+static float nv2a_map(float x, unsigned mapping)
+{
+	float p = x < 0 ? 0 : x;
+
+	switch (mapping)
+	{
+	case 0x00: return p > 1 ? 1 : p;
+	case 0x20: return 1 - (p > 1 ? 1 : p);
+	case 0x40: return 2 * p - 1;
+	case 0x60: return 1 - 2 * p;
+	case 0x80: return p - 0.5f;
+	case 0xa0: return 0.5f - p;
+	case 0xc0: return x;
+	default: return -x;
+	}
+}
+static float clamp_signed(float x) { return x < -1 ? -1 : x > 1 ? 1 : x; }
+static v4 nv2a_eval(const DWORD *s, const struct inputs_set *in)
+{
+	v4 regs[16];
+	int count = s[D3DRS_PSCOMBINERCOUNT] & 0xff;
+
+	memset(regs, 0, sizeof(regs));
+	for (int i = 0; i < 4; i++) regs[8 + i] = in->t[i];
+	regs[4] = in->v0; regs[5] = in->v1;
+	regs[12].c[3] = in->t[0].c[3];
+	for (int st = 0; st < count; st++)
+	{
+		v4 next[16];
+
+		memcpy(next, regs, sizeof(regs));
+		for (int portion = 0; portion < 2; portion++)
+		{
+			DWORD inputs = s[(portion ? D3DRS_PSALPHAINPUTS0 : D3DRS_PSRGBINPUTS0) + st];
+			DWORD outputs = s[(portion ? D3DRS_PSALPHAOUTPUTS0 : D3DRS_PSRGBOUTPUTS0) + st];
+			unsigned flags = outputs >> 12;
+			int first = portion ? 3 : 0, last = portion ? 3 : 2;
+			float v[4][4], ab[4], cd[4], sum[4];
+
+			for (int k = 0; k < 4; k++)
+			{
+				unsigned byte = (inputs >> (24 - 8 * k)) & 0xff;
+				int reg = byte & 15;
+				v4 r = reg == 1 || reg == 2 || reg == 3 ? reg_value(s, reg, st, regs) : regs[reg];
+
+				for (int ch = first; ch <= last; ch++)
+				{
+					float x = (byte & 0x10) ? r.c[3] : portion ? r.c[2] : r.c[ch];
+
+					v[k][ch] = nv2a_map(x, byte & 0xe0);
+				}
+			}
+			for (int ch = first; ch <= last; ch++)
+			{
+				ab[ch] = v[0][ch] * v[1][ch];
+				cd[ch] = v[2][ch] * v[3][ch];
+			}
+			if (!portion && (flags & 2)) { float d = 0; for (int ch = 0; ch < 3; ch++) d += v[0][ch] * v[1][ch]; ab[0] = ab[1] = ab[2] = d; }
+			if (!portion && (flags & 1)) { float d = 0; for (int ch = 0; ch < 3; ch++) d += v[2][ch] * v[3][ch]; cd[0] = cd[1] = cd[2] = d; }
+			for (int ch = first; ch <= last; ch++)
+			{
+				sum[ch] = (flags & 4) ? (regs[12].c[3] >= 0.5f ? cd[ch] : ab[ch]) : ab[ch] + cd[ch];
+			}
+			for (int ch = first; ch <= last; ch++)
+			{
+				float values[3] = { ab[ch], cd[ch], sum[ch] };
+				int dests[3] = { (int)(outputs >> 4) & 15, (int)outputs & 15, (int)(outputs >> 8) & 15 };
+
+				for (int w = 0; w < 3; w++)
+				{
+					float x = values[w];
+
+					switch (flags & 0x38)
+					{
+					case 0x08: x -= 0.5f; break;
+					case 0x10: x *= 2; break;
+					case 0x18: x = (x - 0.5f) * 2; break;
+					case 0x20: x *= 4; break;
+					case 0x30: x *= 0.5f; break;
+					}
+					if (dests[w] >= 4 && dests[w] != 6 && dests[w] != 7)
+						next[dests[w]].c[ch] = clamp_signed(x);
+				}
+			}
+		}
+		memcpy(regs, next, sizeof(regs));
+	}
+	{
+		DWORD abcd = s[D3DRS_PSFINALCOMBINERINPUTSABCD], efg = s[D3DRS_PSFINALCOMBINERINPUTSEFG];
+		v4 result, ef;
+
+		for (int ch = 0; ch < 3; ch++)
+		{
+			float x[2];
+
+			for (int k = 0; k < 2; k++)
+			{
+				unsigned byte = (efg >> (24 - 8 * k)) & 0xff;
+				v4 r = reg_value(s, byte & 15, -1, regs);
+				float y = clamp01((byte & 0x10) ? r.c[3] : r.c[ch]);
+
+				x[k] = (byte & 0x20) ? 1 - y : y;
+			}
+			ef.c[ch] = x[0] * x[1];
+		}
+		regs[15] = ef;
+		for (int ch = 0; ch < 3; ch++)
+		{
+			float v[4];
+
+			for (int k = 0; k < 4; k++)
+			{
+				unsigned byte = (abcd >> (24 - 8 * k)) & 0xff;
+				int reg = byte & 15;
+				v4 r = reg == 15 ? regs[15] : reg_value(s, reg, -1, regs);
+				float y = clamp01((byte & 0x10) ? r.c[3] : r.c[ch]);
+
+				v[k] = (byte & 0x20) ? 1 - y : y;
+			}
+			result.c[ch] = clamp01(v[0] * v[1] + (1 - v[0]) * v[2] + v[3]);
+		}
+		result.c[3] = 1;
+		return result;
+	}
+}
+
+/* a random direction, z at least `low`, and its texel in a normalization
+cube map or bump map, (d + 1) / 2 in 8 bits */
+static void random_direction(float low, float d[3])
+{
+	for (;;)
+	{
+		float length = 0;
+
+		for (int i = 0; i < 3; i++) { d[i] = (float)(rand() % 20001) / 10000.0f - 1.0f; length += d[i] * d[i]; }
+		if (length < 1e-4f || length > 1) continue;
+		length = sqrtf(length);
+		for (int i = 0; i < 3; i++) d[i] /= length;
+		if (d[2] >= low) return;
+	}
+}
+static v4 direction_texel(const float d[3])
+{
+	v4 t;
+
+	for (int i = 0; i < 3; i++) t.c[i] = (float)lroundf((d[i] + 1) * 127.5f) / 255.0f;
+	t.c[3] = frand();
+	return t;
+}
+
+/* the environment's specular pass from its lightmaps, as
+rasterizer_xbox_environment.c sets it (bumped or with the bump map a mask,
+overbright or not, extra shiny or not), against NV2A's combiners: the
+colour's error, as the recipes approximate it (e.l from the vertices, which
+here are the pixel's own directions, so its error is not shown) */
+static int specular_programs(void)
+{
+	int failures = 0;
+
+	srand(1);
+
+	for (unsigned variant = 0; variant < 8; variant++)
+	{
+		int bumped = !(variant & 1), overbright = (variant & 2) != 0, shiny = (variant & 4) != 0;
+		DWORD state[200];
+		struct gx_psh_textures textures;
+		struct gx_psh_program program;
+		double total = 0;
+		float worst = 0;
+		unsigned samples = 0, large = 0;
+		char name[96];
+
+		memset(state, 0, sizeof(state));
+		state[D3DRS_PSCOMBINERCOUNT] = shiny ? 0x00011008 : 0x00011006;
+		state[D3DRS_PSCONSTANT0_0] = 0x800000FF;
+		state[D3DRS_PSCONSTANT0_0 + 1] = 0x000000FF;
+		state[D3DRS_PSRGBINPUTS0] = bumped ? 0x484A0911 : 0x014A0911; state[D3DRS_PSRGBOUTPUTS0] = 0x000030C9;
+		state[D3DRS_PSALPHAINPUTS0] = 0x4B204B20; state[D3DRS_PSALPHAOUTPUTS0] = 0x00020400;
+		state[D3DRS_PSRGBINPUTS0 + 1] = bumped ? 0x48CC8A40 : 0x01CC8A40; state[D3DRS_PSRGBOUTPUTS0 + 1] = 0x00010D00;
+		state[D3DRS_PSALPHAINPUTS0 + 1] = 0x4A204A20; state[D3DRS_PSALPHAOUTPUTS0 + 1] = 0x00020500;
+		state[D3DRS_PSRGBINPUTS0 + 2] = 0xCD4B0809; state[D3DRS_PSRGBOUTPUTS0 + 2] = bumped ? 0x000020D0 : 0x000020D9;
+		state[D3DRS_PSALPHAINPUTS0 + 2] = 0x2C120C11; state[D3DRS_PSALPHAOUTPUTS0 + 2] = 0x00000C00;
+		state[D3DRS_PSRGBINPUTS0 + 3] = 0x2C020C01; state[D3DRS_PSRGBOUTPUTS0 + 3] = 0x00000C00;
+		state[D3DRS_PSALPHAINPUTS0 + 3] = 0x0D0D1415; state[D3DRS_PSALPHAOUTPUTS0 + 3] = 0x000000D5;
+		state[D3DRS_PSRGBINPUTS0 + 4] = 0x0C091C09; state[D3DRS_PSRGBOUTPUTS0 + 4] = overbright ? 0x000210CD : 0x000110CD;
+		state[D3DRS_PSALPHAINPUTS0 + 4] = 0x1D1D151C; state[D3DRS_PSALPHAOUTPUTS0 + 4] = 0x000000D5;
+		state[D3DRS_PSRGBINPUTS0 + 5] = 0x0C150D1D; state[D3DRS_PSRGBOUTPUTS0 + 5] = 0x000010CD;
+		state[D3DRS_PSALPHAINPUTS0 + 5] = 0x1D1D0000; state[D3DRS_PSALPHAOUTPUTS0 + 5] = 0x000000D0;
+		if (shiny)
+			for (int i = 6; i < 8; i++) { state[D3DRS_PSALPHAINPUTS0 + i] = 0x1D1D0000; state[D3DRS_PSALPHAOUTPUTS0 + i] = 0x000000D0; }
+		state[D3DRS_PSFINALCOMBINERCONSTANT0] = 0x80000000;
+		state[D3DRS_PSFINALCOMBINERINPUTSABCD] = 0x0C0F0000;
+		state[D3DRS_PSFINALCOMBINERINPUTSEFG] = 0x1D110D00;
+		memset(&textures, 0, sizeof(textures));
+		textures.present = 0xF;
+		textures.cube = 0xC;
+		snprintf(name, sizeof(name), "specular lightmap, %s%s%s", bumped ? "bumped" : "the bump map a mask",
+			overbright ? ", overbright" : "", shiny ? ", extra shiny" : "");
+		for (int trial = 0; trial < 400; trial++)
+		{
+			struct inputs_set in;
+			float n[3], e[3], l[3], el = 0;
+			v4 maps[8], want, got;
+			DWORD brightness = (DWORD)(rand() % 256);
+
+			state[D3DRS_PSCONSTANT0_0 + 2] = brightness << 24;
+			state[D3DRS_PSCONSTANT1_0 + 2] = brightness << 24;
+			state[D3DRS_PSCONSTANT0_0 + 3] = (DWORD)rand() * 2654435761u & 0x00FFFFFFu;
+			state[D3DRS_PSCONSTANT1_0 + 3] = (DWORD)rand() * 40503u & 0x00FFFFFFu;
+			if (trial % 50 == 0 || trial == 0)
+			{
+				if (!gx_psh_translate(state, &textures, &program))
+				{
+					printf("%s: not translated (%s)\n", name, program.reason);
+					failures++;
+					break;
+				}
+				if (!validate(&program) || program.vertices != _gx_psh_vertices_specular || !(program.channels & 1))
+				{
+					printf("%s: refused by the validator, or the vertices' e.l not asked for\n", name);
+					failures++;
+					break;
+				}
+			}
+			/* (a new constant: translated again for it) */
+			gx_psh_translate(state, &textures, &program);
+			random_direction(0.5f, n);
+			random_direction(-0.2f, e);
+			random_direction(-0.2f, l);
+			for (int i = 0; i < 3; i++) el += e[i] * l[i];
+			in.t[0] = direction_texel(n);
+			in.t[1] = rand4();
+			in.t[2] = direction_texel(e);
+			in.t[3] = direction_texel(l);
+			in.v0.c[0] = in.v0.c[1] = in.v0.c[2] = (float)lroundf((1 - el) * 0.5f * 255) / 255.0f;
+			in.v0.c[3] = 1;
+			in.v1 = rand4();
+			memset(maps, 0, sizeof(maps));
+			for (int i = 0; i < 4; i++) maps[i] = in.t[i];
+			want = nv2a_eval(state, &in);
+			got = simulate(&program, &in, maps);
+			for (int ch = 0; ch < 3; ch++)
+			{
+				float d = fabsf(want.c[ch] - got.c[ch]);
+
+				total += d;
+				samples++;
+				large += d > 8.0f / 255.0f;
+				if (d > worst) worst = d;
+			}
+		}
+		if (samples)
+		{
+			printf("%s: %u stages, approximate (%s): colour against NV2A's, mean error %.2f/255, worst %.0f/255, "
+				"%.1f%% beyond 8/255\n", name, program.tev.stage_count, program.approximation ? program.approximation : "",
+				total / samples * 255.0, worst * 255.0f, 100.0 * large / samples);
+			/* (a guard against a recipe gone wrong: the approximations' error is
+			small on average, a few 255ths where n.l is the flat normal's) */
+			if (total / samples * 255.0 > (bumped && shiny ? 6.0 : 1.5))
+			{
+				printf("%s: DIFFERS from NV2A's combiners beyond its approximations\n", name);
+				failures++;
+			}
+		}
+	}
+	return failures;
 }
 
 /* the game's, which must translate: two of its main menu's, a fog pass, and
@@ -472,7 +787,7 @@ static int game_programs(void)
 	static const DWORD g_c1[8] = {0, 0, 0, 0xFFFFFFFF};
 	static const DWORD no_constants[8] = {0};
 	struct { DWORD count, abcd, efg; const DWORD *ri, *ro, *ai, *ao; const DWORD *c0, *c1; unsigned present;
-		DWORD final0; unsigned cube; const char *what; }
+		DWORD final0; unsigned cube; const char *what; unsigned bumped, vertex_color; }
 		programs[] = {
 		{ 0x00011008, 0x340f010d, 0x0c111800, a_ri, a_ro, a_ai, a_ao, NULL, NULL, 7, 0, 0, "the menu's planet" },
 		{ 0x00011107, 0x0000000c, 0x00001c00, b_ri, b_ro, b_ai, b_ao, NULL, NULL, 7, 0, 0, "the menu's" },
@@ -489,6 +804,11 @@ static int game_programs(void)
 			"a light's diffuse, bumped, its alpha r0's" },
 		{ 0x00011005, 0x0C0F0000, 0x1C200000, g_ri, g_ro, g_ai, g_ao, g_c0, g_c1, 0xF, 0, 0xE, "reflection" },
 		{ 0x00011005, 0x0C0F0000, 0x1C200000, h_ri, g_ro, g_ai, g_ao, g_c0, g_c1, 0xF, 0, 0xE, "reflection, bumped" },
+		/* (the bumped cube map's reflection, its texture modes the dependent
+		ones: t3 the cube map at the reflection of the bump map's normal, read
+		through GX's indirect unit, and t2, its normal, colour 1) */
+		{ 0x00011005, 0x0C0F0000, 0x1C200000, g_ri, g_ro, g_ai, g_ao, g_c0, g_c1, 0x9, 0, 0x8,
+			"reflection, bumped cube map", 0x8, 0x4 },
 	};
 	int failures = 0;
 
@@ -504,6 +824,8 @@ static int game_programs(void)
 			memset(&textures, 0, sizeof(textures));
 			textures.present = programs[index].present;
 			textures.cube = programs[index].cube;
+			textures.bumped = programs[index].bumped;
+			textures.vertex_color = programs[index].vertex_color;
 			textures.separate_alpha = separate & programs[index].present;
 			state[D3DRS_PSCOMBINERCOUNT] = programs[index].count;
 			state[D3DRS_PSFINALCOMBINERCONSTANT0] = programs[index].final0;
@@ -557,8 +879,12 @@ static int game_programs(void)
 				snprintf(name, sizeof(name), "game program %d", index);
 				fog_on = 0;
 				check_cube = programs[index].cube;
+				check_bumped = programs[index].bumped;
+				check_vertex_color = programs[index].vertex_color;
 				agrees = check(state, programs[index].present, name, 1);
-				check_cube = 0;
+				check_cube = check_bumped = check_vertex_color = 0;
+				if (programs[index].bumped && !bumped_structure(&program, programs[index].bumped, name))
+					failures++;
 				printf("game program %d (%s): %u stages, %s%s%s\n", index, programs[index].what, program.tev.stage_count,
 					program.approximate ? "approximate: " : "exact",
 					program.approximate && program.approximation ? program.approximation : "",
@@ -629,7 +955,7 @@ int main(int argc, char **argv)
 	printf("%lu TEV stages for the %lu translated (%.2f a program)\n", stages_made, programs_made,
 		programs_made ? (double)stages_made / (double)programs_made : 0.0);
 	{
-		int game = only < 0 ? game_programs() : 0;
+		int game = only < 0 ? game_programs() + specular_programs() : 0;
 
 		if (only < 0)
 		{
