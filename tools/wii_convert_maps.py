@@ -192,16 +192,20 @@ class Plan:
     def __init__(self, definition: Definition):
         formats = []
         self.pointers: List[int] = []
-        # (the placeholders and gaps, left as they are, by name: the report of those holding data)
-        self.byte_runs: List[Tuple[int, str]] = []
+        self.definition = definition
+        # (the placeholders and gaps, left as they are, by name and offset: the report of those
+        # holding data, and tools/wii_placeholder_check.py's of whether the game reads them)
+        self.byte_runs: List[Tuple[int, str, int, int]] = []
         position = 0
         for leaf in sorted(definition.leaves, key=lambda leaf: leaf.offset):
             if leaf.offset > position:
-                self.byte_runs.append((len(formats), f"{definition.name}+{position:#x}"))
+                self.byte_runs.append((len(formats), f"{definition.name}+{position:#x}", position,
+                                       leaf.offset - position))
                 formats.append(f"{leaf.offset - position}s")
             if leaf.kind == "bytes":
                 if leaf.size >= 2 and leaf.name.split(".")[-1].startswith(Schema.PLACEHOLDER_PREFIXES):
-                    self.byte_runs.append((len(formats), f"{definition.name}.{leaf.name.split('.', 1)[-1]}"))
+                    self.byte_runs.append((len(formats), f"{definition.name}.{leaf.name.split('.', 1)[-1]}",
+                                           leaf.offset, leaf.size))
                 formats.append(f"{leaf.size}s")
             else:
                 if leaf.kind == "pointer":
@@ -210,6 +214,8 @@ class Plan:
                                {4: "I", 8: "Q"}[leaf.size])
             position = leaf.offset + leaf.size
         if definition.size > position:
+            self.byte_runs.append((len(formats), f"{definition.name}+{position:#x}", position,
+                                   definition.size - position))
             formats.append(f"{definition.size - position}s")
         self.little = struct.Struct("<" + "".join(formats))
         self.big = struct.Struct(">" + "".join(formats))
@@ -288,6 +294,9 @@ class Converter:
         self.buffer_regions: List[Region] = []
         self.bitmaps: Dict[str, int] = {}
         self.unswapped: Dict[str, int] = {}
+        # (the bytes of each of those that hold data in some element, as an integer whose bytes
+        # are the run's, by definition and offset: tools/wii_placeholder_check.py)
+        self.unswapped_bytes: Dict[Tuple[int, int], int] = {}
         # each animation's data (its file offset, size and what the game reads it by), for
         # tools/wii_animation_check.py
         self.animations: Dict[int, dict] = {}
@@ -356,8 +365,9 @@ class Converter:
             self.notes.append(f"not converted yet: {what} ({count} bytes)")
         if self.unswapped:
             # (placeholders and gaps not zero: a field the game reads would be left little-endian;
-            # where the game's own declarations say reserved too, it reads none)
-            self.notes.append("placeholders left as they are that hold data: " + ", ".join(
+            # tools/wii_placeholder_check.py looks for the game's reads of each)
+            self.notes.append("placeholders left as they are that hold data (tools/wii_placeholder_check.py "
+                              "checks the game reads none): " + ", ".join(
                 f"{name} x{count}" for name, count in sorted(self.unswapped.items(), key=lambda item: -item[1])))
         return bytes(self.output), self.notes
 
@@ -373,9 +383,11 @@ class Converter:
             if XBOX_TAG_CACHE_ADDRESS <= pointer < XBOX_TAG_CACHE_ADDRESS + TAG_CACHE_SIZE:
                 out[index] = pointer + self.delta
         plan.big.pack_into(self.output, offset, *out)
-        for index, name in plan.byte_runs:
+        for index, name, run, _ in plan.byte_runs:
             if values[index].strip(b"\0"):
                 self.unswapped[name] = self.unswapped.get(name, 0) + 1
+                key = (id(plan.definition), run)
+                self.unswapped_bytes[key] = self.unswapped_bytes.get(key, 0) | int.from_bytes(values[index], "big")
         start = address - region.address
         region.covered[start:start + plan.little.size] = b"\x01" * plan.little.size
         return values

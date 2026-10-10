@@ -25,7 +25,7 @@ end.
 | `port/assets/` | What the builds embed or ship: high-res HUD (`hud/`), fonts, titles, menus (`menus/`), icons, network brokers |
 | `port/third_party/` | Vendored libraries, each with a README naming its upstream, version and checksum |
 | `port/tools/` | Stand-alone tools (`cache_file_report.c`) |
-| `tools/` | Build scripts (`linux_build.py`, `windows_build.py`, `android_build.py`, `ci_build.py`), generators (`ce_menus.py`, `port_settings.py`, `hud_assets.py`, `title_assets.py`, `embed_assets.py`, `xdk_headers.py`), the Wii's (`wii_build.py`, `wii_link.py`, `wii_package.py`, `wii_convert_maps.py`, `wii_tag_layout.py`, `wii_gx_textures.py`, `wii_dolphin.py`, `lockstep_compare.py`, and the host checks `wii_gx_psh_check.py`, `wii_nv2a_check.py`, and on converted maps `wii_animation_check.py`, `wii_data_check.py`) and tests |
+| `tools/` | Build scripts (`linux_build.py`, `windows_build.py`, `android_build.py`, `ci_build.py`), generators (`ce_menus.py`, `port_settings.py`, `hud_assets.py`, `title_assets.py`, `embed_assets.py`, `xdk_headers.py`), the Wii's (`wii_build.py`, `wii_link.py`, `wii_package.py`, `wii_convert_maps.py`, `wii_tag_layout.py`, `wii_gx_textures.py`, `wii_dolphin.py`, `lockstep_compare.py`, and the host checks `wii_gx_psh_check.py`, `wii_nv2a_check.py`, and on converted maps `wii_animation_check.py`, `wii_data_check.py`, `wii_placeholder_check.py`) and tests |
 | `docs/` | Longer design notes (`custom_edition_caches.md`) |
 | `pgo/` | Profile-guided optimisation profiles |
 | `assets/` | Game data for local runs (gitignored: `maps/`, `custom_maps/`) |
@@ -306,7 +306,10 @@ Owns the map conversion: `tools/wii_convert_maps.py`,
   into a scratch folder, never the repository); the notes it prints (fields left as they are that hold
   data, data not reached by the walk); a converted structure read back
   against the game's own reading of it (`tools/wii_animation_check.py`,
-  `tools/wii_data_check.py`: nothing may differ on the 24 maps).
+  `tools/wii_data_check.py`: nothing may differ on the 24 maps); and
+  `tools/wii_placeholder_check.py`: the game reads none of the bytes left
+  as they are that hold data (by its declarations and clang's AST of the
+  build; it must report nothing on the 24 maps).
 - A field the game reads through another structure than its tag's (as the
   contrail's shader) is listed in `Schema.EMBEDDED`.
 
