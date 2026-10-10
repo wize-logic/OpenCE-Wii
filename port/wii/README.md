@@ -218,10 +218,10 @@ its largest symbols are `llvm-nm -S --size-sort -r build/wii/halo.elf`.
 | Range | Holds | Before | Now |
 | --- | --- | ---: | ---: |
 | `0x80000000`–`0x80003F00` | the system's: exception vectors, the loader's and the OS's globals | 16 | 16 |
-| from `0x80003F00` | the code (`.init`, `.text`) | 3677 | 3684 |
-| then | read-only data and data: `.rodata` 380, `.eh_frame` 73 (unwind tables nothing reads), `.data` 501 | 965 | 966 |
-| then | zeroed data (`.sbss`, `.bss`): below | 12571 | 8004 |
-| to `0x813C0000` | libogc's arena: newlib's heap (the "MEM1 heap": all the game mallocs first, WiiLibs' two video framebuffers among it, 600 KB each at 480 lines and 718 at 574) and libogc's own (about 64 KB) | 2996 | 7554 |
+| from `0x80003F00` | the code (`.init`, `.text`) | 3677 | 3614 |
+| then | read-only data and data: `.rodata` 380, `.eh_frame` 73 (unwind tables nothing reads), `.data` 502 | 965 | 967 |
+| then | zeroed data (`.sbss`, `.bss`): below | 12571 | 7896 |
+| to `0x813C0000` | libogc's arena: newlib's heap (the "MEM1 heap": all the game mallocs first, WiiLibs' two video framebuffers among it, 600 KB each at 480 lines and 718 at 574) and libogc's own (about 64 KB) | 2996 | 7732 |
 | `0x813C0000`–`0x81800000` | the game state: 4 MB for the CPU's part (the Xbox's 3,165,260 bytes of pools and the port's additions), 256 KB for the GPU's | 4352 | 4352 |
 
 What changed in MEM1:
@@ -247,7 +247,7 @@ validator's walk of the menus' widgets, `tag_schema_effects.c`, sized for 65536 
 `local_lens_flare_occlusion_test_results2` 256, libogc's Bluetooth buffers
 (`memb_mem_pool_pbufs`) 200, `custom_edition_maps_globals` 200 (the Custom Edition map list,
 though the Wii runs none), libogc's main thread's stack (`s_mainStack`, which only waits once
-the game's thread starts) 128, `cache` 117 (the translated pixel shaders, `src/gx_psh_cache.c`).
+the game's thread starts) 128.
 
 **MEM2** (`0x90000000`–`0x933E0000` as IOS 58 leaves it, 53120 KB):
 
@@ -261,7 +261,7 @@ the game's thread starts) 128, `cache` 117 (the translated pixel shaders, `src/g
 | above the window | WiiLibs' heaps: the GX FIFO 1024, the game's heap (the MEM1 heap's overflow) 5120, thread stacks 256 then 64 (24 in use: the audio thread's), the audio output's buffers 256 then 64 (4 in use), asynchronous reads 256 then 64 (none in use); the rest WiiLibs' reserve | 7040 | 6528 |
 
 So the game's malloc has the MEM1 heap and the game's heap together: about 8 MB before (2.9 and
-5.1), about 12.4 MB now (7.5, of which the two framebuffers take 1.2, and 5.1 less the 64 KB of
+5.1), about 12.6 MB now (7.7, of which the two framebuffers take 1.2, and 5.1 less the 64 KB of
 the accounting's tables).
 
 **How malloc works.** The game's heap is newlib's, in what MEM1 leaves. WiiLibs' heap overflow
