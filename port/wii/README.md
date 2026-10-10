@@ -200,6 +200,18 @@ and of the converted ones as `source/models/model_animations.c` does (the frame 
 data and frames, and the compressed data's header, node headers, keyframe frame indices,
 keyframes and defaults) and compares the values element by element.
 
+`tools/wii_data_check.py --converted DIR map.map...` does the same for the other data blocks, each
+read as the game reads it: the script syntax nodes (a constant's value by its type's size from the
+cell's low-order end, a call's expression index whole), the recorded animations' streams (the
+unit control, the events with their bitfield headers), the clusters' visible sets (a long at a
+time), the BSP materials' vertices (as the processor reads them), every vertex buffer by its
+shader declaration's elements, the model parts' indices (which must name their part's vertices),
+the sounds (all of the maps' samples are Xbox ADPCM, whose decoder reads its headers a byte at a
+time; they are left as they are), and the bitmaps: each texture the device binds as GX's, decoded
+texel by texel from the Xbox's swizzled or DXT texels and from GX's tiles, and each cube map's
+sphere map against the cube map in the direction `sphere_coordinates` gives each texel. On the 24
+maps nothing differs.
+
 ## Drawing
 
 `src/d3d8_gx.c` is a Direct3D 8 device on GX. It keeps the game's own rasterizer and its vertex
