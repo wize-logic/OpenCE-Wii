@@ -3850,9 +3850,17 @@ static BOOL node_keys(const struct vertex_shader_object *shader, const struct st
 	unsigned short seen[256 + BLEND_VALUES];
 	unsigned seen_count = 0, which;
 	struct node_values values;
+	/* (each vertex's value, from the first pass to the second; in the heap) */
+	static short *values_of;
 
 	if (count > sizeof(vertex_keys))
 		return FALSE;
+	if (!values_of)
+	{
+		values_of = malloc(sizeof(vertex_keys) * sizeof(*values_of));
+		if (!values_of)
+			return FALSE;
+	}
 	memset(indices_of, 0, sizeof(indices_of));
 	values.blend_count = values.last = 0;
 	for (vertex = 0; vertex < count; vertex++)
@@ -3861,6 +3869,7 @@ static BOOL node_keys(const struct vertex_shader_object *shader, const struct st
 			fetch->first + vertex;
 		int value = vertex_value(&values, nodes + whole * node_stride, weights + whole * weight_stride, TRUE);
 
+		values_of[vertex] = (short)value;
 		if (value < 0)
 			untracked++;
 		else if (!indices_of[value]++)
@@ -3895,9 +3904,9 @@ static BOOL node_keys(const struct vertex_shader_object *shader, const struct st
 	draw_keys.processor = 0;
 	for (vertex = 0; vertex < count; vertex++)
 	{
-		unsigned long whole = fetch->indices ? (unsigned long)fetch->indices[vertex] + device.base_vertex_index :
-			fetch->first + vertex;
-		int value = vertex_value(&values, nodes + whole * node_stride, weights + whole * weight_stride, FALSE);
+		/* (as the first pass found it: a blend it could not add is untracked
+		in both) */
+		int value = values_of[vertex];
 		unsigned char key = value < 0 ? KEY_PROCESSOR : key_of[value];
 
 		vertex_keys[vertex] = key;
