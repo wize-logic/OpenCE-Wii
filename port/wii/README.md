@@ -1,8 +1,8 @@
 # Halo: Combat Evolved for the Wii
 
 This port is in bring-up. In Dolphin, the game boots from the SD card, loads its converted maps and
-runs its main menu. The menu is drawn with its textures, its 3D background and its music, at 30
-frames a second (emulated time). It hasn't been tried on a Wii yet, and no level has been played.
+runs its main menu. The menu is drawn as on the Xbox (the Pillar of Autumn passing the
+planet, the logo and the menu) with its music, at 30 frames a second (emulated time). It hasn't been tried on a Wii yet, and no level has been played.
 
 ## Building
 
@@ -114,6 +114,10 @@ inflated it to, and the Wii reads it where it is.
 - **Floating point.** `_controlfp`/`_statusfp` map the MSVC control word onto the FPSCR
   (`port/linux/src/msvc_crt.c`).
 - **Movies.** Bink movies are skipped (`source/bink/bink_playback.c`).
+- **Sound.** The shared DirectSound mixer (`port/linux/src/dsound_sdl.c`) fills WiiLibs' audio
+  stream (AESND, 32 kHz). Every 240 frames the log reports blocks mixed and played, underruns,
+  the time a block takes to mix, and the loudest sample. In the menu: no underruns, the music
+  near full scale, about 0.6 ms to mix a block.
 
 ## Map conversion
 
@@ -172,12 +176,33 @@ and pixel shaders.
 - **Pixel shaders.** The register combiners are translated to TEV stages (`src/gx_psh.c`).
   - Combiner registers are renamed as they are written, and dead values are dropped.
   - Inputs a stage can't reach (a second texture or rasterized colour, a second constant, a
-    doubly inverted product) are first computed into a free register.
+    doubly inverted product) are first computed into a free register, or into the operation's
+    own destination.
   - Colour and alpha share stages where their textures agree.
-  - GX's inputs are unsigned 8-bit, so signed mappings are clamped. Dot products (bump mapping)
-    read as 1, and fog isn't applied yet.
+  - Dot products of a texture, rasterized colour or constant with another take three stages
+    (fewer when the constant has zero channels). Swap tables put one channel in all three, as do
+    the konst selections for constants.
+  - Signed negation becomes TEV's subtraction. The other signed mappings are clamped to [0, 1],
+    as TEV's registers are.
+  - Constants read as 0 or 1 need no register. Those needed in every channel take the four konst
+    registers first, and any beyond four are set in TEV registers kept for them.
+  - The fog register reads the vertex's fog factor, sent as a fifth texture coordinate into a
+    ramp texture whose intensity is its coordinate, and `D3DRS_FOGCOLOR` as a constant.
+  - A program that doesn't fit GX's 16 stages and 4 registers is translated again with these
+    simplified, and each approximation says why. One that still doesn't fit draws its first
+    texture times its diffuse colour.
   - `tools/wii_gx_psh_check.py` simulates the TEV stages against the combiners, for random
     programs and the game's.
+- **Culling.** `D3DRS_CULLMODE` names the screen winding to discard. Both vertex paths keep the
+  screen's winding. GX's own convention is measured once at start-up: the device draws a
+  clockwise triangle with `GX_CULL_FRONT` and reads the pixel back.
+- **Render targets.** A draw into another surface takes over the EFB:
+  - The back buffer's colour and depth are parked in MEM2.
+  - The target is drawn at the EFB's origin and copied into its own memory in GX's format, where
+    its texture is bound from.
+  - The back buffer returns through a quad that writes the parked colour, and the parked depth
+    through a Z texture.
+  - A clear once the frame has begun is a quad.
 - **Textures.** A map's bitmap is bound straight from the texture cache in its GX format. Any
   other texture is decoded to RGBA8 into a 1.5 MB cache, such as the glyph cache, which is
   re-decoded when its pixels change.
@@ -189,12 +214,9 @@ and pixel shaders.
 
 ## What is next
 
-1. The rest of the drawing:
-   - render targets (EFB copies to textures) and clears in the middle of a frame
-   - culling
-   - fog
-   - cube maps
-   - the Z-buffer's precision with the fitted depth
+1. The rest of the drawing: cube maps, bump mapping (dot products of two registers), the
+   loading screen (the minute the game takes to load its menu is black), and the Z-buffer's
+   precision with the fitted depth.
 2. Speed in the levels: the compiled vertex programs carry the menu at 30 frames a second, but a
    level has far more vertices. Next are display lists for the static geometry, paired singles in
    the compiled programs, and GX's own transform for the simplest programs.
