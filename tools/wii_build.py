@@ -228,10 +228,20 @@ def generate_wii_build(n: Writer, sln: Any) -> None:
         game_defines_and_includes(linux_config),
         sdk_flags,
     ])
+    # WII_BOUNDS_CHECK=source/ai,source/physics (at configure time): those folders' units trap
+    # at an index past a sized array's end (clang's array-bounds check, in trap mode: no
+    # runtime); the crash report names the place. For finding a write into the stack
+    bounds_checked = [part for part in os.environ.get("WII_BOUNDS_CHECK", "").split(",") if part]
+
+    def checked(source: Path) -> str:
+        if any(str(source).startswith(part) for part in bounds_checked):
+            return game_cflags + " -fsanitize=array-bounds -fsanitize-trap=array-bounds"
+        return game_cflags
+
     for source in game_sources(linux_config):
-        add_object(source, game_cflags)
+        add_object(source, checked(source))
     for source in sorted(Path(linux_config["game_sources"]).glob("*.c")):
-        add_object(source, game_cflags)
+        add_object(source, checked(source))
 
     linux_platform_dir = Path(linux_config["platform_sources"])
     wii_platform_dir = Path(config["platform_sources"])
