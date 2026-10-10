@@ -131,28 +131,10 @@ inflated it to, and the Wii reads it where it is.
   `tools/wii_link.py` stubs any symbol still missing with a function that stops the game and names
   it (`build/wii/missing_symbols.txt`).
 - **Memory.** The Wii's cached memory is at virtual 0x80000000 + P, as the Xbox's is, so the
-  game's and Direct3D's physical/virtual arithmetic holds. `src/wii_memory.c` claims two fixed
-  ranges from WiiLibs (`wl_platform_mem_claim_fixed`) before anything else runs:
-
-  | Range | Holds |
-  | --- | --- |
-  | MEM1 `0x813C0000`–`0x81800000` | the game state (4 MB CPU, 256 KB GPU) |
-  | MEM2 `0x90100000`–`0x92D00000` | the tag cache at its bottom (22 MB, which converted maps are linked to), then the 12 MB texture cache, the 4 MB sound cache and Direct3D's resources |
-
-  WiiLibs' heaps (`src/wii_boot.c`) are in MEM2. The game's own heap is newlib's, in what MEM1
-  leaves (about 4 MB). WiiLibs' heap overflow (`wl/platform/heap_overflow.h`, its
-  `wii/heap_wrap_wii.c`) wraps the allocators, newlib's internal ones included, so that what MEM1
-  cannot hold comes from a 5 MB heap in MEM2 (`WII_MEMORY_TAG_GAME`). The link wraps the names in
-  WiiLibs' `WL_HEAP_OVERFLOW_WRAPS` (`cmake/WiiLibs.cmake`, which `tools/wii_build.py` reads) and
-  pulls the wrappers in with `-u __wrap_malloc`; `__wrap_main` turns the overflow on with
-  `wl_heap_overflow_enable` once WiiLibs' heaps are up. Its blocks carry a 32-byte header, so
-  they are 32-byte aligned; the log says so at the first one, and "malloc(N) failed, from ..."
-  (addresses for `addr2line` on `build/wii/halo.elf`) when both heaps are full. The memory
-  report's MEM1 line (`wii_heap_usage`) and `GlobalMemoryStatus` (`sysconf` in `src/wii_posix.c`)
-  read WiiLibs' `wl_heap_overflow_usage`; the second counts MEM1's free bytes and the overflow
-  heap's free budget. The game's pools are the Xbox's
-  sizes (`HALO_WII` in `port/linux/include/halo_port_capacity.h`), so the Wii can't join the
-  other builds' distributed games.
+  game's and Direct3D's physical/virtual arithmetic holds. Every byte of both regions, and the
+  memory report in the log, is in "Memory" below. The game's pools are the Xbox's sizes
+  (`HALO_WII` in `port/linux/include/halo_port_capacity.h`), so the Wii can't join the other
+  builds' distributed games.
 - **Ways out.** The link wraps `exit`, `_exit`, `abort` and `SYS_ResetSystem` (WiiLibs'
   `wii/trace_wii.c`): each logs "exit(0) from 80001234 ..." (tag `exit`; the return addresses up
   the frame chain, for `addr2line` on `build/wii/halo.elf`) before it goes on, so a game that
@@ -177,7 +159,7 @@ inflated it to, and the Wii reads it where it is.
 - **Threads.** libogc's threads are strictly prioritised. Each of the game's threads gets the
   game's main priority (WiiLibs' `WL_THREAD_PRIO_MAIN`, LWP 64: `WII_GAME_MAIN_PRIO` in
   `src/wii_posix.c`), moved by its Win32 priority, and a 128 KB stack. The game's main runs on a
-  thread of its own with a 1 MB stack, started by WiiLibs' `wl_platform_run_on_stack`
+  thread of its own with a 512 KB stack, started by WiiLibs' `wl_platform_run_on_stack`
   (`src/wii_boot.c`): libogc's main thread has 128 KB, below which lie its audio DSP structures,
   and a deep AI path search in b30 went past it (the game's stack reaches about 290 KB; the memory
   report says how deep, from `wl_platform_stack_used`, which measures the pattern WiiLibs fills the
@@ -217,6 +199,98 @@ inflated it to, and the Wii reads it where it is.
   stream (AESND, 32 kHz). Every 240 frames the log reports blocks mixed and played, underruns,
   the time a block takes to mix, and the loudest sample. In the menu: no underruns, the music
   near full scale, about 0.6 ms to mix a block.
+
+## Memory
+
+The Wii has 24 MB of MEM1 (fast; the program is loaded there) and 64 MB of MEM2, of which IOS 58
+keeps the top (above `0x933E0000`) and libogc a little at the bottom. `src/wii_memory.c` claims
+two fixed ranges from WiiLibs (`wl_platform_mem_claim_fixed`) before anything else runs, the game
+state's in MEM1 and the window in MEM2; WiiLibs' heaps (`src/wii_boot.c`) take what is left of
+MEM2, and newlib's malloc what is left of MEM1.
+
+The tables give every range in KB, before (the build whose b30 run ran out: MEM1's heap full
+before the first frame, the MEM2 heap's 122 failed allocations, decoded textures and the
+profiler's ring refused) and now. The executable's part is `llvm-readelf -S build/wii/halo.elf`;
+its largest symbols are `llvm-nm -S --size-sort -r build/wii/halo.elf`.
+
+**MEM1** (`0x80000000`–`0x81800000`, 24576 KB):
+
+| Range | Holds | Before | Now |
+| --- | --- | ---: | ---: |
+| `0x80000000`–`0x80003F00` | the system's: exception vectors, the loader's and the OS's globals | 16 | 16 |
+| from `0x80003F00` | the code (`.init`, `.text`) | 3677 | 3614 |
+| then | read-only data and data: `.rodata` 380, `.eh_frame` 73 (unwind tables nothing reads), `.data` 502 | 965 | 967 |
+| then | zeroed data (`.sbss`, `.bss`): below | 12571 | 7896 |
+| to `0x813C0000` | libogc's arena: newlib's heap (the "MEM1 heap": all the game mallocs first, WiiLibs' two video framebuffers among it, 600 KB each at 480 lines and 718 at 574) and libogc's own (about 64 KB) | 2996 | 7732 |
+| `0x813C0000`–`0x81800000` | the game state: 4 MB for the CPU's part (the Xbox's 3,165,260 bytes of pools and the port's additions), 256 KB for the GPU's | 4352 | 4352 |
+
+What changed in MEM1:
+
+| What | Before | Now | How |
+| --- | ---: | ---: | --- |
+| the tag validator's claims (`tag_validate_claims`, a bit a byte of the tag cache) | 2944 | 0 | They cover only the region being checked, in the tag cache's free bytes: the tags' above the tags, a bsp's between the tags and the bsp (bsps load at the tag cache's top), else malloc'd while the bsp is checked (b30's is 790 KB, a10's largest 1020: the heap's, not MEM1's for good) |
+| the game's profiler's frame history (`profile_globals`) | 1103 | 40 | 8 frames, not 256 (`source/cseries/profile.c`; the profiler is the Xbox debug build's) |
+| the game's stack (`game_stack`) | 1024 | 512 | the deepest seen is about 290 KB |
+| the window's page tables (`window_protection`, `window_blocks`) | 96 | 51 | 16 bits a page |
+| the console's framebuffer (in the MEM1 heap) | 600 | 0 | the bring-up console writes into one of WiiLibs' two |
+| the game state revert's copy (malloc'd, 4352: never had) | | | read into the game state, as the Xbox did (`source/saved games/game_state_xbox.c`) |
+| the sounds' packets, decoded (malloc'd as the game queued them: 8 to 32 KB each, up to 4 a voice) | | | read where the sound cache keeps them as they play, an ADPCM block of 64 frames at a time into the voice (`port/linux/src/dsound_sdl.c`; the same samples) |
+
+The largest zeroed data now: `render` 692 (the game's render globals), `ai_debug` 534 (the AI's
+debug state, whose layout is asserted), `update_client_globals` 513 and `update_server_globals`
+128 (`source/game/player_queues_new.c`), `late_joiner_players` 512
+(`source/networking/network_server_manager.c`), `game_stack` 512, the distributed netcode's
+damage history (`port/linux/game/network_damage.c`: `damage_trails` 384, `damage_history` 192,
+`damage_explosions` 161) and batches (`network_distributed.c`, `distributed_batches` 151),
+`reverb` 276 (the mixer's delays, `port/linux/src/dsound_sdl.c`), `widget_walk` 256 (the
+validator's walk of the menus' widgets, `tag_schema_effects.c`, sized for 65536 tags),
+`local_lens_flare_occlusion_test_results2` 256, libogc's Bluetooth buffers
+(`memb_mem_pool_pbufs`) 200, `custom_edition_maps_globals` 200 (the Custom Edition map list,
+though the Wii runs none), libogc's main thread's stack (`s_mainStack`, which only waits once
+the game's thread starts) 128.
+
+**MEM2** (`0x90000000`–`0x933E0000` as IOS 58 leaves it, 53120 KB):
+
+| Range | Holds | Before | Now |
+| --- | --- | ---: | ---: |
+| `0x90000000` to libogc's MEM2 arena | libogc's IOS buffers (the memory report's window line says where the arena began) | a few | a few |
+| from there to `0x90100000` | before, no one's; now the window's lowest pages, which only its top-down blocks reach | about 1000 | in the window |
+| `0x90100000`–`0x91700000` | the tag cache (22528 KB), at the window's bottom: a map's tags (at most 16.2 MB, b40) and the structure bsp loaded at its top (at most 8.6 MB, c20) | 22528 | 22528 |
+| top-down from the window's top | the texture cache (12288 KB, the game's own cache of the map's bitmaps, converted to GX's formats), the sound cache (4096 KB), Direct3D's resources (vertex and index buffers, textures the game makes, render targets: b30 1.4 to 3.8 MB) and what is free | 22528 | 23040 and the pages below |
+| window, in all | `0x90100000`–`0x92D00000`, now from libogc's arena to `0x92D80000` | 45056 | 45568 and about 1000 |
+| above the window | WiiLibs' heaps: the GX FIFO 1024, the game's heap (the MEM1 heap's overflow) 5120, thread stacks 256 then 64 (24 in use: the audio thread's), the audio output's buffers 256 then 64 (4 in use), asynchronous reads 256 then 64 (none in use); the rest WiiLibs' reserve | 7040 | 6528 |
+
+So the game's malloc has the MEM1 heap and the game's heap together: about 8 MB before (2.9 and
+5.1), about 12.6 MB now (7.7, of which the two framebuffers take 1.2, and 5.1 less the 64 KB of
+the accounting's tables).
+
+**How malloc works.** The game's heap is newlib's, in what MEM1 leaves. WiiLibs' heap overflow
+(`wl/platform/heap_overflow.h`, its `wii/heap_wrap_wii.c`) wraps the allocators, newlib's
+internal ones included, so that what MEM1 cannot hold comes from a 5 MB heap in MEM2
+(`WII_MEMORY_TAG_GAME`). The link wraps the names in WiiLibs' `WL_HEAP_OVERFLOW_WRAPS`
+(`cmake/WiiLibs.cmake`, which `tools/wii_build.py` reads) and pulls the wrappers in with
+`-u __wrap_malloc`; `__wrap_main` turns the overflow on with `wl_heap_overflow_enable` once
+WiiLibs' heaps are up. Its blocks carry a 32-byte header, so they are 32-byte aligned; the log
+says so at the first one, and "malloc(N) failed, from ..." (addresses for `addr2line` on
+`build/wii/halo.elf`) when both heaps are full. `GlobalMemoryStatus` (`sysconf` in
+`src/wii_posix.c`) counts MEM1's free bytes and the overflow heap's free budget.
+
+**The memory report.** Every 240 frames the log has:
+- `memory: MEM1 heap N KB used, N KB free` (newlib's `mallinfo`);
+- `memory: decoded textures N KB of 1536 in N, N given up for others (N KB)`: the textures the
+  device decodes into GX's RGBA8 in the heap (those the converter could not leave in a GX format
+  in the texture cache, and those the game makes and writes). They are kept to 1.5 MB, least
+  recently drawn going first; when the heap has no room for one, decoded textures are given up
+  (and freed at once, once GX has drawn what it was given) until it has;
+- `memory: the game's stack at most N KB deep of 512`;
+- `memory: MEM2 window ... at ADDRESS, N KB: N KB used, N KB free (N KB together)`: the largest
+  free run is what the biggest new resource can have;
+- WiiLibs' heaps, one `[mem]` line each (`game` is the overflow heap: its use, peak and failures);
+- `[heap] by call site` (WiiLibs' `heap_sites.h`, turned on in `src/wii_boot.c` with
+  `wl_heap_overflow_track_sites`): the blocks of 1 KB or more in both heaps by the two return
+  addresses above the allocator, the 16 sites holding the most (`N KiB in N blocks (peak N KiB, N
+  made) from ADDRESS ADDRESS`, for `powerpc-eabi-addr2line -f -e build/wii/halo.elf`), and the
+  smaller blocks by size.
 
 ## Map conversion
 
@@ -631,7 +705,8 @@ Dolphin runs the game, but these need the console:
   in Dolphin) and **the controllers** (the Classic Controller, the
   GameCube pad, the Wiimote and Nunchuk mappings in `xinput_wii.c`).
 - **Memory.** MEM1 and MEM2 as the console's IOS leaves them, with the
-  Homebrew Channel's loader (the memory report in the log).
+  Homebrew Channel's loader: the memory report's window line says where libogc's MEM2 began
+  (the window reaches down to it), and WiiLibs' `[mem]` lines what its heaps were given.
 - **TEV's arithmetic.** The bump mapping's signed sums rely on TEV's lerp with a bias of -1/2,
   its scale, and results kept unclamped between stages (-4 to 4); it has been checked only
   against the host check's simulation of the documented rules in 8-bit steps, not on the console
