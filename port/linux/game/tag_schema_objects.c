@@ -152,7 +152,8 @@ struct vehicle_definition
 	byte unknown324[0xc];
 	real unknown330;
 	real unknown334;
-	byte unused338[8];
+	real unknown338; /* the slide's acceleration and deceleration (vehicles.c reads 0x330-0x33c as physics_variable_speed_parameters) */
+	real unknown33c;
 	real unknown340;
 	real unknown344;
 	byte unused348[0x1c];

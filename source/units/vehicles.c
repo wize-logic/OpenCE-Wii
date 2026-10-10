@@ -211,7 +211,8 @@ struct vehicle_definition
 	byte unknown324[0xc];
 	real unknown330;
 	real unknown334;
-	byte unused338[8];
+	real unknown338; /* port: read through the cast at unknown330 (physics_variable_speed_parameters); was byte unused338[8] */
+	real unknown33c;
 	real unknown340;
 	real unknown344;
 	byte unused348[0x1c];
