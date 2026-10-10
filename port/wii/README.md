@@ -1,8 +1,13 @@
 # Halo: Combat Evolved for the Wii
 
-This port is in bring-up. In Dolphin, the game boots from the SD card, loads its converted maps and
-runs its main menu. The menu is drawn as on the Xbox (the Pillar of Autumn passing the
-planet, the logo and the menu) with its music, at 30 frames a second (emulated time). It hasn't been tried on a Wii yet, and no level has been played.
+This port is in bring-up. In Dolphin, the game boots from the SD card and loads its converted maps.
+- **The main menu** is drawn as on the Xbox (the Pillar of Autumn passing the planet, the logo, the
+  menu), with its music, at 30 frames a second (emulated time).
+- **Blood Gulch** loads and is drawn (`debug.network_test = "solo:bloodgulch"`): the canyon, its
+  terrain with lightmaps and detail maps, the sky, fog, the HUD and the first-person weapon. It
+  runs at about 21 frames a second.
+
+The port hasn't run on a Wii yet, and the levels haven't been played through.
 
 ## Building
 
@@ -126,11 +131,16 @@ the linked tag schema, `tools/wii_tag_layout.py`). The Wii build's tag structure
 exactly as the i386 build's, and none use C bitfields. A map is converted as follows:
 
 - **Tags.** Every field of every tag is byteswapped, its pointers into the tag cache moved from
-  0x803A6000 to 0x90100000. The data blocks are converted by what they hold:
+  0x803A6000 to 0x90100000. The schema's structures stand byte arrays (`reserved...`,
+  `unused...`) for fields its validator doesn't check. Where the game's own declarations of the
+  tag's structure name fields there, those are swapped too (`fill_placeholders` in
+  `tools/wii_tag_layout.py`); the sky's fog colours are an example. The data blocks are converted
+  by what they hold:
   - script syntax nodes
   - animations' frames
   - recorded animations' event streams
   - the BSPs' vertices and the vertex and index buffers
+  - the clusters' visible sets, bit vectors the game reads a long at a time
 - **Header.** The header gets the Wii's version (`CACHE_FILE_VERSION_WII`, 0x57490005), so the
   game refuses an unconverted map.
 - **Bitmaps.** Bitmaps are rewritten in place, in the same bytes, in GX's formats
@@ -220,6 +230,8 @@ and pixel shaders.
 2. Speed in the levels: the compiled vertex programs carry the menu at 30 frames a second, but a
    level has far more vertices. Next are display lists for the static geometry, paired singles in
    the compiled programs, and GX's own transform for the simplest programs.
-3. Playing a level (Blood Gulch, then a10), and the game core's endianness checked under qemu
-   against the x86 build.
+3. Playing the levels (input in Blood Gulch, then the campaign from a10), and the game core's
+   endianness checked under qemu against the x86 build. Big-endian faults so far: plain char's
+   sign (fixed with `-fsigned-char`), tag fields the schema left as placeholders, and the
+   clusters' visible sets.
 4. Real hardware, from the Homebrew Channel (`ninja wii-package`).
