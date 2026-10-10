@@ -124,12 +124,15 @@ inflated it to, and the Wii reads it where it is.
   sizes (`HALO_WII` in `port/linux/include/halo_port_capacity.h`), so the Wii can't join the
   other builds' distributed games.
 - **Threads.** libogc's threads are strictly prioritised. Each of the game's threads gets the
-  main thread's priority, moved by its Win32 priority, and a 128 KB stack. The game's main runs
-  on a thread of its own with a 1 MB stack: libogc's main thread has 128 KB, below which lie its
-  audio DSP structures, and a deep AI path search in b30 went past it (the game's stack reaches
-  about 290 KB; the memory report says how deep). devkitPPC's
-  `sched_yield` is a stub, so the link wraps it to libogc's `KThreadYield`: the game's waits spin
-  on `SwitchToThread` for its I/O thread, which otherwise never ran (the menu took 45 seconds to
+  game's main priority (WiiLibs' `WL_THREAD_PRIO_MAIN`, LWP 64: `WII_GAME_MAIN_PRIO` in
+  `src/wii_posix.c`), moved by its Win32 priority, and a 128 KB stack. The game's main runs on a
+  thread of its own with a 1 MB stack, started by WiiLibs' `wl_platform_run_on_stack`
+  (`src/wii_boot.c`): libogc's main thread has 128 KB, below which lie its audio DSP structures,
+  and a deep AI path search in b30 went past it (the game's stack reaches about 290 KB; the memory
+  report says how deep, from `wl_platform_stack_used`, which measures the pattern WiiLibs fills the
+  stack with). devkitPPC's `sched_yield` is a stub, so the link wraps it (`-Wl,--wrap=sched_yield`,
+  `tools/wii_build.py`) to WiiLibs' `__wrap_sched_yield`, libogc's yield: the game's waits spin on
+  `SwitchToThread` for its I/O thread, which otherwise never ran (the menu took 45 seconds to
   appear, a10 100 seconds to load).
 - **Big-endian fixes.** The game core is the same code as on the other ports, with a few changes
   for big-endian:

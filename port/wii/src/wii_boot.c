@@ -10,7 +10,8 @@ __wrap_main here, which then calls the game's:
 - WiiLibs: the reset and power buttons, the log, its heaps (sized for what
   the port uses it for), IOS 58 for USB 2.0, the SD card and a USB drive;
 - for the bring-up, a text console on the screen;
-- the game's main runs on a thread of its own with a 1 MB stack (libogc's
+- the game's main runs on a thread of its own with a 1 MB stack (WiiLibs'
+  wl_platform_run_on_stack; libogc's
   main thread has 128 KB, below which lie its audio DSP structures: a deep
   path search in b30 ran past it, and the audio interrupt then wrote into
   the search's frames).
@@ -22,6 +23,7 @@ function the port does not provide yet stops the game, naming it.
 #include <gccore.h>
 
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -31,7 +33,6 @@ function the port does not provide yet stops the game, naming it.
 #include "wii_memory.h"
 
 #include <string.h>
-#include <tuxedo/thread.h>
 
 void wii_missing_symbol(const char *name) __attribute__((noreturn));
 int wii_memory_claim(void);
@@ -88,29 +89,23 @@ static void wii_console_start(void)
 		VIDEO_WaitVSync();
 }
 
-/* the game's main thread: its stack, filled with a pattern so the
+/* the game's main thread: its stack, which WiiLibs fills with a pattern so the
 memory report can tell how deep it has been (wii_game_stack_used) */
 #define GAME_STACK_SIZE (1024u * 1024u)
-#define GAME_STACK_PATTERN 0xA5
 static unsigned char game_stack[GAME_STACK_SIZE] __attribute__((aligned(64)));
-static KThread game_thread;
 
-static sptr game_main(void *argument)
+static void *game_main(void *argument)
 {
 	(void)argument;
-	return (sptr)__real_main();
+	return (void *)(intptr_t)__real_main();
 }
 
 /* the deepest the game's main thread's stack has been, in bytes */
 unsigned long wii_game_stack_used(unsigned long *size)
 {
-	unsigned long untouched = 0;
-
-	while (untouched < GAME_STACK_SIZE && game_stack[untouched] == GAME_STACK_PATTERN)
-		untouched++;
 	if (size)
 		*size = GAME_STACK_SIZE;
-	return GAME_STACK_SIZE - untouched;
+	return (unsigned long)wl_platform_stack_used(game_stack, GAME_STACK_SIZE);
 }
 
 int __wrap_main(void)
@@ -146,10 +141,13 @@ int __wrap_main(void)
 	wii_report("IOS %u; SD card %s, USB drive %s\n", (unsigned)ios,
 		wl_platform_fs_mounted(WL_DEVICE_SD) ? "mounted" : "absent",
 		wl_platform_fs_mounted(WL_DEVICE_USB) ? "mounted" : "absent");
-	memset(game_stack, GAME_STACK_PATTERN, sizeof(game_stack));
-	KThreadPrepare(&game_thread, game_main, NULL, game_stack + GAME_STACK_SIZE, KTHR_MAIN_PRIO);
-	KThreadResume(&game_thread);
-	return (int)KThreadJoin(&game_thread);
+	{
+		void *result = NULL;
+
+		if (wl_platform_run_on_stack(game_main, NULL, game_stack, GAME_STACK_SIZE, &result) != WL_OK)
+			wii_missing_symbol("a thread for the game's main (see the log)");
+		return (int)(intptr_t)result;
+	}
 }
 
 /* The way out, logged: exit and abort are wrapped (tools/wii_build.py), so a

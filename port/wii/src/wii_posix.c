@@ -136,22 +136,20 @@ allocates begins with it), which the priority check below confirms. */
 
 #include <tuxedo/thread.h>
 
-/* devkitPPC's sched_yield is a stub (ENOSYS): SwitchToThread, which the
-game's waits on its worker threads spin on (the texture cache's for a read,
-xbox_texture_cache.c), gave those threads nothing, and a wait at the menu
-took most of a minute. It is libogc's yield (to the threads of the same
-priority: the game's run at the main thread's), through the link's wrap
-(tools/wii_build.py). */
-int __wrap_sched_yield(void)
-{
-	KThreadYield();
-	return 0;
-}
+/* (devkitPPC's sched_yield is a stub: SwitchToThread, which the game's waits
+on its worker threads spin on, needs libogc's yield. WiiLibs provides
+__wrap_sched_yield, which the link's --wrap=sched_yield (tools/wii_build.py)
+sends the callers to.)
+
+The game's main thread runs at WiiLibs' WL_THREAD_PRIO_MAIN, which is LWP
+priority 64 (wl/platform/wii/thread_wii.c), one above libogc's own main
+thread (KTHR_MAIN_PRIO, 63): the game's threads are placed around that. */
+#define WII_GAME_MAIN_PRIO 64
 
 int wii_thread_priority(pthread_t thread, int win32_priority)
 {
 	KThread *kernel_thread = (KThread *)thread;
-	int priority = KTHR_MAIN_PRIO - (win32_priority > 15 ? 15 : win32_priority < -15 ? -15 : win32_priority);
+	int priority = WII_GAME_MAIN_PRIO - (win32_priority > 15 ? 15 : win32_priority < -15 ? -15 : win32_priority);
 
 	if (!kernel_thread || kernel_thread->prio > KTHR_MIN_PRIO)
 		return 0;
