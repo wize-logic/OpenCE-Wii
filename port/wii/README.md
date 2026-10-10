@@ -41,6 +41,7 @@ tools/wii_gx_psh_check.py                   # the combiner translation, checked 
 tools/wii_nv2a_check.py                     # the compiled vertex programs against the interpreter
 tools/wii_animation_check.py --converted DIR XBOX/maps/*.map   # the converted maps against the Xbox's (map conversion, below)
 tools/wii_data_check.py --converted DIR XBOX/maps/*.map
+tools/wii_placeholder_check.py XBOX/maps/*.map    # the game reads none of the tag bytes left as they are
 ninja wii-package                           # build/wii/halo-wii.zip for the Homebrew Channel
 ```
 
@@ -230,6 +231,28 @@ time; they are left as they are), and the bitmaps: each texture the device binds
 texel by texel from the Xbox's swizzled or DXT texels and from GX's tiles, and each cube map's
 sphere map against the cube map in the direction `sphere_coordinates` gives each texel. On the 24
 maps nothing differs.
+
+`tools/wii_placeholder_check.py map.map...` checks that the game reads none of the tag bytes the
+converter leaves as they are (the placeholders and gaps its notes list as holding data). It
+converts the maps in memory, takes the bytes of each that hold data in any map, and looks for reads
+of them in the Wii build:
+
+- the game's declarations (the DWARF types of `halo.elf`) of every structure of the tag's names, or
+  bound to the tag by the code, in every file, where none of their fields contradicts the schema's;
+- the code: clang's AST of each of the build's files, with the build's flags (`ninja -t commands`),
+  and every value read through a pointer into a tag, at an offset the file's own declarations
+  give: a field, the address of a field cast to a wider type (vehicles.c's
+  `(struct physics_variable_speed_parameters *)&definition->unknown330`, 16 bytes), and offsets
+  added to the tag's pointer (`(byte *)unit_definition + 0x17c`). A tag's pointer is one of a
+  type of its names, what `tag_get` returns for its group (or a parent's), or a tag block's element
+  (`TAG_BLOCK_GET_ELEMENT`), whose type is then bound to the block's definition.
+
+It reports each value of two bytes or more read over bytes that hold data (a byte reads the same
+either way), and exits 1 if there is one. It finds both earlier misses when they are put back (the
+slide's acceleration at 0x338 with `75dfe227` reverted, the AI's charge values at 0x390 with
+`fill_placeholders`' tail views turned off). On the 24 maps the game reads none of the 17
+placeholders that hold data. It can't follow a tag's pointer kept as `void *` or `byte *`, or an
+index that isn't a constant. `--trace DEFINITION` lists every read it finds into one definition.
 
 ## Drawing
 

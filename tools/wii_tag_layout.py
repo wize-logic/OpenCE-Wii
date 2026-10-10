@@ -107,6 +107,9 @@ class Executable:
         # declares some differently in different files, a placeholder in one, every field in
         # another): what fills the schema's placeholders (Schema.fill_placeholders)
         self.game_structs: Dict[str, List[object]] = {}
+        # every unit's own types, by its name (source/units/vehicles.c): what a name means in that
+        # file (tools/wii_placeholder_check.py)
+        self.unit_types: Dict[str, Dict[str, object]] = {}
         self._index_types()
 
     def read(self, address: int, size: int) -> bytes:
@@ -137,7 +140,10 @@ class Executable:
     def _index_types(self):
         """complete struct, union and typedef DIEs by the names C spells them with"""
         for unit in self.dwarf.iter_CUs():
-            schema_unit = "tag_schema" in unit.get_top_DIE().get_full_path()
+            top = unit.get_top_DIE()
+            schema_unit = "tag_schema" in top.get_full_path()
+            unit_types = self.unit_types.setdefault(top.attributes["DW_AT_name"].value.decode()
+                                                    if "DW_AT_name" in top.attributes else "", {})
             for die in unit.iter_DIEs():
                 if die.tag not in ("DW_TAG_structure_type", "DW_TAG_union_type", "DW_TAG_typedef",
                                    "DW_TAG_base_type", "DW_TAG_enumeration_type"):
@@ -148,6 +154,7 @@ class Executable:
                 key = {"DW_TAG_structure_type": "struct ", "DW_TAG_union_type": "union ",
                        "DW_TAG_enumeration_type": "enum "}.get(die.tag, "") + name
                 self.types.setdefault(key, die)
+                unit_types.setdefault(key, die)
                 if schema_unit:
                     self.schema_types.setdefault(key, die)
                 elif die.tag == "DW_TAG_structure_type" and "DW_AT_byte_size" in die.attributes:
@@ -318,17 +325,20 @@ class Schema:
     # contrail's shader (struct contrail_shader) is an effect shader (render_contrails casts it)
     EMBEDDED = {"contrail": [("shader.", "shader_effect_definition")]}
 
+    @staticmethod
+    def game_names(definition: Definition) -> set:
+        """the game's names for a tag's structures: its own, ..._definition, a scenario block's
+        scenario_..., a widget's ..._reference"""
+        base = definition.name[:-len("_definition")] if definition.name.endswith("_definition") else definition.name
+        return {base, base + "_definition", "_" + base + "_definition", "scenario_" + base, base + "_reference",
+                "scenario_" + base + "_view", definition.type_name.split()[-1]}
+
     def _game_structures(self, definition: Definition) -> List[Tuple[str, List[Leaf]]]:
         """the game's structures named for a definition (sky: struct sky, struct sky_definition),
         each declaration of each (some cover only the first part of the tag, the fields their file
         reads), as leaves"""
-        base = definition.name[:-len("_definition")] if definition.name.endswith("_definition") else definition.name
-        # (the game's names for a tag's structures: its own, ..._definition, a scenario block's
-        # scenario_..., a widget's ..._reference)
-        names = {base, base + "_definition", "_" + base + "_definition", "scenario_" + base, base + "_reference",
-                 "scenario_" + base + "_view", definition.type_name.split()[-1]}
         result = []
-        for name in sorted(names):
+        for name in sorted(self.game_names(definition)):
             seen = set()
             for die in self.executable.game_structs.get(f"struct {name}", []):
                 if die.attributes["DW_AT_byte_size"].value > definition.size:
