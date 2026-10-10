@@ -231,11 +231,58 @@ converted, how it draws, and the lockstep check.
 
 Six roles for the Wii port. Each is given to an agent (Claude Code's
 `Agent` tool, a general-purpose agent whose prompt starts with the role
-below) together with a concrete task. An agent that edits files works in
+below) together with a concrete task, at the model and effort its role's
+table row gives (the tool's `model` and `effort` parameters). An agent that edits files works in
 its own git worktree, commits there on a branch named for its task, and
 reports what it changed and how it checked it; the main session reviews
 and merges. Agents do not launch Dolphin: they ask the main session for a
 checkpoint run, naming what it should show.
+
+| Role | Model | Effort | Why (from each role's first run) |
+| --- | --- | --- | --- |
+| map-converter | opus | high | Binary formats where one wrong width corrupts data silently: it found a section-sizing bug in compressed animations by reading the game's decoder, and wrote a check of every animation in 24 maps |
+| endian-auditor | opus | high | Whole-codebase reasoning about layouts and widths, cross-checked against the debug information; a missed or false finding is costly |
+| gx-renderer | opus | high | Performance work that must stay bit-identical: it halved the processor's instructions per vertex and proved the output unchanged under qemu |
+| lockstep-runner | opus | high | Mostly waiting on Docker and Dolphin, but its value is tracing a divergence to its cause across systems (identifier salts to a needle's wander and a tree's frame) |
+| wiilibs-steward | sonnet | high | Bounded library work with clear conventions (an API, tests on three targets, CMake); its scoping was good without needing more |
+| ci-steward | sonnet | high | Procedure (running the CI jobs, checking documents against code) where care, not depth, finds the faults |
+
+### Running them
+
+- Keep six agents running at once. When one finishes, the main session
+  reviews its report (and merges its branch once its checks pass, after a
+  Dolphin checkpoint if it changes what is drawn or played), records what
+  needs a checkpoint, and starts the next task at once.
+- No two running agents edit the same files; editing agents work in their
+  own worktrees.
+- The next task is chosen as "Choosing the work" says, for whichever role
+  it fits; a role may run twice at once on unrelated tasks.
+
+### Choosing the work
+
+Without being told, pick the most valuable work that does not need a real
+Wii. In order:
+1. **Correctness the lockstep check can show.** The first tick at which a
+   level's x86 and Wii logs differ, on every level (a10 to d40, then the
+   multiplayer maps): find the cause and fix it. A big-endian fault breaks
+   play on the console and nothing else finds it as surely.
+2. **Faults found by reading.** The endian-auditor's sweeps of code not yet
+   covered (its reports list what was checked), and the map-converter's
+   checks of data blocks not yet verified value by value.
+3. **What is drawn wrong or not at all**, shown by a Dolphin A/B or a
+   screenshot: the README's "What is next" (bump mapping, bumped
+   reflections), and anything a checkpoint run shows broken.
+4. **Speed that can be counted without hardware**: instructions per vertex
+   (qemu or the disassembly), vertices on the processor against GX (the
+   log's counts), work skipped. Not Dolphin's milliseconds alone.
+5. **Health**: the CI's jobs, upstream merges, documents, WiiLibs taking
+   what the port worked out.
+
+Work that needs the real console is not done by agents; it is listed for
+the person, with what to look for, in port/wii/README.md: timings, the
+processor's alignment exceptions, frsqrte's accuracy, the SD card's speed,
+the controllers. Prefer a task whose result a host check, the lockstep
+check or a Dolphin A/B can confirm; say in the report how it was confirmed.
 
 ### map-converter
 
