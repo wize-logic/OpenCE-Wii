@@ -136,11 +136,16 @@ class Plan:
     def __init__(self, definition: Definition):
         formats = []
         self.pointers: List[int] = []
+        # (the placeholders and gaps, left as they are, by name: the report of those holding data)
+        self.byte_runs: List[Tuple[int, str]] = []
         position = 0
         for leaf in sorted(definition.leaves, key=lambda leaf: leaf.offset):
             if leaf.offset > position:
+                self.byte_runs.append((len(formats), f"{definition.name}+{position:#x}"))
                 formats.append(f"{leaf.offset - position}s")
             if leaf.kind == "bytes":
+                if leaf.size >= 2 and leaf.name.split(".")[-1].startswith(Schema.PLACEHOLDER_PREFIXES):
+                    self.byte_runs.append((len(formats), f"{definition.name}.{leaf.name.split('.', 1)[-1]}"))
                 formats.append(f"{leaf.size}s")
             else:
                 if leaf.kind == "pointer":
@@ -226,6 +231,7 @@ class Converter:
         self.triangle_jobs: Dict[int, Tuple[int, int]] = {}
         self.buffer_regions: List[Region] = []
         self.bitmaps: Dict[str, int] = {}
+        self.unswapped: Dict[str, int] = {}
 
         # the header (source/cache/cache_files_windows.c's struct cache_file_header, the one
         # that names every field the game reads): its values big-endian, its version the Wii's;
@@ -289,6 +295,11 @@ class Converter:
             f"{kind} {count}" for kind, count in sorted(self.bitmaps.items())))
         for what, count in sorted(self.deferred.items()):
             self.notes.append(f"not converted yet: {what} ({count} bytes)")
+        if self.unswapped:
+            # (placeholders and gaps not zero: a field the game reads would be left little-endian;
+            # where the game's own declarations say reserved too, it reads none)
+            self.notes.append("placeholders left as they are that hold data: " + ", ".join(
+                f"{name} x{count}" for name, count in sorted(self.unswapped.items(), key=lambda item: -item[1])))
         return bytes(self.output), self.notes
 
     # ---------- the walk
@@ -303,6 +314,9 @@ class Converter:
             if XBOX_TAG_CACHE_ADDRESS <= pointer < XBOX_TAG_CACHE_ADDRESS + TAG_CACHE_SIZE:
                 out[index] = pointer + self.delta
         plan.big.pack_into(self.output, offset, *out)
+        for index, name in plan.byte_runs:
+            if values[index].strip(b"\0"):
+                self.unswapped[name] = self.unswapped.get(name, 0) + 1
         start = address - region.address
         region.covered[start:start + plan.little.size] = b"\x01" * plan.little.size
         return values

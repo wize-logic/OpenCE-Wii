@@ -642,14 +642,21 @@ static char const *recorded_animation_decode(
 
 		if (animation->version == RECORDED_ANIMATION_VERSION)
 		{
-			byte header;
+			/* (recorded_animation_playback.c's header: bitfields, whose bits
+			a big-endian compiler allocates from the top, as the Wii's
+			converted maps hold them) */
+			struct
+			{
+				byte time_delta : 2;
+				byte event_type : 6;
+			} header;
 
 			if (offset >= size)
 				return "ends inside an event";
-			header = stream[offset];
-			event_type = header >> 2;
+			csmemcpy(&header, stream + offset, 1);
+			event_type = header.event_type;
 			/* (its time since the last: none or a tick, a byte or a word) */
-			switch (header & 3)
+			switch (header.time_delta)
 			{
 			case 0:
 			case 1:

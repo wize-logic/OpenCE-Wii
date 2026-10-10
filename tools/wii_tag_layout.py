@@ -314,6 +314,9 @@ class Schema:
         return result
 
     PLACEHOLDER_PREFIXES = ("reserved", "unused", "unknown", "pad")
+    # structures a tag holds that the game declares as bytes and reads as another structure: a
+    # contrail's shader (struct contrail_shader) is an effect shader (render_contrails casts it)
+    EMBEDDED = {"contrail": [("shader.", "shader_effect_definition")]}
 
     def _game_structures(self, definition: Definition) -> List[Tuple[str, List[Leaf]]]:
         """the game's structures named for a definition (sky: struct sky, struct sky_definition),
@@ -339,6 +342,17 @@ class Schema:
                 if shape not in seen:
                     seen.add(shape)
                     result.append((f"struct {name}", leaves))
+        for prefix, name in self.EMBEDDED.get(definition.name, []):
+            inside = [leaf.offset for leaf in definition.leaves if leaf.name.split(".", 1)[-1].startswith(prefix)]
+            for die in self.executable.game_structs.get(f"struct {name}", [])[:1]:
+                if not inside or min(inside) + die.attributes["DW_AT_byte_size"].value > definition.size:
+                    continue
+                leaves = []
+                try:
+                    self.executable._flatten(die, min(inside), f"struct {name}", leaves)
+                except (ValueError, KeyError):
+                    continue
+                result.append((f"struct {name} (its {prefix[:-1]})", leaves))
         return result
 
     def fill_placeholders(self) -> Tuple[List[str], List[str]]:
