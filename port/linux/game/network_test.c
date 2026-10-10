@@ -820,9 +820,20 @@ void network_test_update(
 			/* (debug.lockstep_detail: each object's words at that tick, to find the
 			first that differs) */
 			if (network_test.lockstep_detail >= 0 && game_time_get() == network_test.lockstep_detail)
+			{
+				/* (its nodes' matrices hashed, as the game keeps them) */
+				unsigned long node_hash = 2166136261UL, node_word;
+				long node_words = object->node_matrices.size / (long)sizeof(unsigned long);
+				const unsigned long *nodes = node_words > 0 ?
+					(const unsigned long *)object_header_block_get(objects.index, &object->node_matrices) : NULL;
+
+				for (node_word = 0; nodes && node_word < (unsigned long)node_words; node_word++)
+					node_hash = (node_hash ^ nodes[node_word]) * 16777619UL;
 				platform_log("lockstep object %ld: %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx "
-					"%08lx %08lx %08lx", count, words[0], words[1], words[2], words[3], words[4], words[5], words[6],
-					words[7], words[8], words[9], words[10], words[11], words[12], words[13]);
+					"%08lx %08lx %08lx nodes %ld %08lx", count, words[0], words[1], words[2], words[3], words[4],
+					words[5], words[6], words[7], words[8], words[9], words[10], words[11], words[12], words[13],
+					node_words / (long)(sizeof(real_matrix4x3) / sizeof(unsigned long)), node_hash);
+			}
 			count++;
 		}
 		platform_log("lockstep: tick %ld objects %ld hash %08lx random %08lx", (long)game_time_get(), count, hash,
