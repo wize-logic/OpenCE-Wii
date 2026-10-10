@@ -135,6 +135,9 @@ static void render_window(
 static void render_player_frame(
 	struct render_window *window,
 	const point2d *screenshot_combined_index);
+/* port: config.toml's display.environment_reflections */
+static boolean render_environment_reflections(
+	void);
 
 void render_sky(
 	void);
@@ -386,9 +389,16 @@ static void render_window(
 
 		lights_render_specular();
 		structure_render_specular_lightmaps();
-		structure_render_reflection_lightmap_masks();
+		/* port: and the reflections only with display.environment_reflections */
+		if (render_environment_reflections())
+		{
+			structure_render_reflection_lightmap_masks();
+		}
 		structure_render_reflection_mirrors();
-		structure_render_reflections();
+		if (render_environment_reflections())
+		{
+			structure_render_reflections();
+		}
 		structure_render_transparent_geometry();
 		structure_render_fog();
 		game_engine_post_rasterize_objects();
@@ -655,3 +665,18 @@ void render_frame(
 }
 
 /* ---------- private code */
+
+/* port: config.toml's display.environment_reflections (port_config.c):
+FALSE leaves out the environment's cube map reflections and the lightmap
+masks they are drawn through, two passes over its reflective surfaces */
+static boolean render_environment_reflections(
+	void)
+{
+	extern int config_boolean(char const *name);
+	static int environment_reflections = -1;
+
+	if (environment_reflections < 0)
+		environment_reflections = config_boolean("display.environment_reflections") ? 1 : 0;
+
+	return environment_reflections != 0;
+}

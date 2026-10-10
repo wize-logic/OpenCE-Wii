@@ -18,7 +18,11 @@ This port is in bring-up. In Dolphin, the game boots from the SD card and loads 
   second). On the Wii, `display.bumped_highlights` is off by default (bumped specular and bumped
   reflections: their passes' vertices run on the processor, about two fifths of a10's frame),
   `display.object_shadows` is off by default (each object's shadow draws it again, a pass of
-  skinned vertices) and `display.model_detail` is 0.5.
+  skinned vertices), `display.model_detail` is 0.5, `display.bumped_lightmaps` is off (the
+  environment's lightmap pass drawn flat, without the cube map lookup whose direction each
+  vertex gives on the processor) and `display.environment_reflections` is off (two of the
+  environment's five passes over its shiny surfaces). "What the frame draws" below has the
+  counts.
 - **Loading**: the menu is up within a second of the game's start.
 - **Every map converts**: the 24 Xbox maps (campaign and multiplayer) go through
   `tools/wii_convert_maps.py` with nothing left unconverted.
@@ -536,6 +540,37 @@ and pixel shaders.
 - **Debugging.** The desktop ports' `debug.gpu_debug_flat` and `debug.gpu_debug_texture0` (in
   `config.toml`) show the diffuse colour, or the first texture, alone. One frame's draws are
   described in the log (`DRAW_LOG_FRAME`).
+
+### What the frame draws
+
+The game's own passes, counted in the x86 build (headless, `debug.null_renderer`, which still
+runs the game's rasterizer) with the scripted player at the same ticks as the lockstep check:
+vertices a frame (each draw's range of indices), averaged over 30 frames after tick 1300, with
+the Wii's other defaults (`display.model_detail = 0.5`, no object shadows).
+
+| Pass | a10 (cryo bay) | b30 (beach) |
+| --- | --- | --- |
+| The environment's lightmap pass (`10c30c53`, a cube map at each vertex's direction) | 33,000 | 7,000 |
+| Its texture pass, its fog pass (GX's) | 33,000 each | 7,000 each |
+| Its reflections: the lightmap mask and the cube map (GX's) | 32,000 each | 3,700 each |
+| Objects (skinned and lit) | 11,600 | 52,000 |
+| The first-person weapon and hands | (none at that tick) | 3,200 |
+| Object shadows (off on the Wii) | | 14,000 |
+| Decals, particles, contrails, lens flares, the HUD | under 1,500 | under 1,500 |
+| In all | 178,000 | 89,000 |
+
+- `display.environment_reflections = false` leaves out two of a10's five passes over its
+  environment: 178,000 vertices a frame become 113,000. `display.bumped_lightmaps = false`
+  takes the cube map's direction out of the first pass, so GX transforms it and the processor
+  computes only its colours.
+- `display.model_detail` changes almost nothing here (b30: 89,700 vertices at 1.0, 91,800 at
+  0.5, 91,200 at 0.25). The grunts, elites and jackals far away are already at their lowest
+  level of detail (about 450 vertices a grunt), and the trees, shrubs and rocks have only one.
+  b30's objects at that moment: the Pelican (10,700, its planar fog the processor's), 12 grunts
+  (5,400), about 25 trees (17,000), 4 elites (3,300).
+- None of these settings changes the game's state: with each on and off, the x86 build's
+  lockstep hashes agree at every logged tick (a10 to tick 88,500 for the lightmaps and 32,200
+  for both settings; b30 to tick 1,400 for `display.model_detail` 0.25 to 1).
 
 ## The lockstep check
 
