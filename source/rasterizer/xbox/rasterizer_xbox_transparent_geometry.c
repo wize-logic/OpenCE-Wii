@@ -498,8 +498,7 @@ struct shader_transparent_chicago
 	struct tag_reference lens_flare;
 	struct tag_block extra_layers;
 	struct tag_block maps;
-	word extra_flags;
-	word pad62;
+	unsigned long extra_flags; /* port: the tag's long (two words read its high half on big-endian) */
 };
 
 struct shader_transparent_chicago_definition
