@@ -4,8 +4,13 @@ This port is in bring-up. In Dolphin, the game boots from the SD card and loads 
 - **The main menu** is drawn as on the Xbox (the Pillar of Autumn passing the planet, the logo, the
   menu), with its music, at 30 frames a second (emulated time).
 - **Blood Gulch** loads and is drawn (`debug.network_test = "solo:bloodgulch"`): the canyon, its
-  terrain with lightmaps and detail maps, the sky, fog, the HUD and the first-person weapon. It
-  runs at about 21 frames a second.
+  terrain with lightmaps and detail maps, the sky, fog, the HUD and the first-person weapon. The
+  scripted player (`debug.test_input = "bot:1"`) moves, jumps and throws grenades in it.
+- **The campaign** starts: `debug.network_test = "solo:levels\\a10\\a10"` loads the Pillar of
+  Autumn in about 11 seconds, plays its opening (the cryo bay, the look-training prompts), and
+  survives a cinematic's skip, which reverts to the saved game. Ten minutes of it ran without a
+  fault.
+- **Loading**: the menu is up within a second of the game's start.
 
 The port hasn't run on a Wii yet, and the levels haven't been played through.
 
@@ -110,7 +115,10 @@ inflated it to, and the Wii reads it where it is.
   sizes (`HALO_WII` in `port/linux/include/halo_port_capacity.h`), so the Wii can't join the
   other builds' distributed games.
 - **Threads.** libogc's threads are strictly prioritised. Each of the game's threads gets the
-  main thread's priority, moved by its Win32 priority, and a 128 KB stack.
+  main thread's priority, moved by its Win32 priority, and a 128 KB stack. devkitPPC's
+  `sched_yield` is a stub, so the link wraps it to libogc's `KThreadYield`: the game's waits spin
+  on `SwitchToThread` for its I/O thread, which otherwise never ran (the menu took 45 seconds to
+  appear, a10 100 seconds to load).
 - **Big-endian fixes.** The game core is the same code as on the other ports, with a few changes
   for big-endian:
   - the script engine's value cells (`port/linux/include/halo_cells.h`)
@@ -169,8 +177,23 @@ The converter reports what it doesn't reach for each map.
 `src/d3d8_gx.c` is a Direct3D 8 device on GX. It keeps the game's own rasterizer and its vertex
 and pixel shaders.
 
-- **Vertex shaders.** GX has no programmable vertex stage, so the game's vertex programs run on
-  the CPU, vertex by vertex.
+- **Vertex shaders.** GX has no programmable vertex stage. A program GX's fixed transform can
+  compute goes to it; the others run on the CPU, vertex by vertex.
+  - `nv2a_cpu_analyze` walks each program with every value a set of the inputs it depends on and
+    whether it is still affine in them (the generated programs carry the result as a comment).
+  - An affine program is, for one draw's constants, a matrix. Its columns come from running it for
+    no input and for each input component alone. GX then reads the game's vertex buffers by index:
+    the position through the position matrix, each texture coordinate the TEV stages read through
+    a texture matrix (on the position, two floats or normalized shorts), the fog through a matrix
+    into its ramp, and constant colours as the channels' material colour.
+  - The others stay on the CPU: skinned models (a weight times a matrix), lit ones (a reciprocal
+    square root), and colours from the vertices (Direct3D's ARGB is a byte order GX doesn't read).
+    Even so, any draw whose position is affine goes through the same position matrix, so a
+    surface's passes on either path reach the same depths, as their equal-depth tests need.
+  - In a10, 4.0 of 6.5 million vertices a minute go to GX. The CPU runs 1.6 million programs where
+    it ran 7.9 million, and a frame takes about 160 ms in Dolphin (it took 200 to 450).
+    `debug.gpu_transform = false` keeps every program on the CPU.
+  - An indexed draw on the CPU runs each vertex's program once, however many indices name it.
   - At build time, `tools/nv2a_codegen.c` decodes the game's 67 programs with the interpreter's own
     decoder (`src/nv2a_cpu.c`) and writes each one as a C function (88 KB of code). A program is
     found by a hash of its words.
@@ -224,14 +247,23 @@ and pixel shaders.
 
 ## What is next
 
-1. The rest of the drawing: cube maps, bump mapping (dot products of two registers), the
-   loading screen (the minute the game takes to load its menu is black), and the Z-buffer's
-   precision with the fitted depth.
-2. Speed in the levels: the compiled vertex programs carry the menu at 30 frames a second, but a
-   level has far more vertices. Next are display lists for the static geometry, paired singles in
-   the compiled programs, and GX's own transform for the simplest programs.
-3. Playing the levels (input in Blood Gulch, then the campaign from a10), and the game core's
-   endianness checked under qemu against the x86 build. Big-endian faults so far: plain char's
-   sign (fixed with `-fsigned-char`), tag fields the schema left as placeholders, and the
-   clusters' visible sets.
+1. Speed. The CPU still runs skinned models (`cfc6f3a4`, two nodes a vertex: GX's matrix index
+   holds one) and the environment's lit pass (`10c30c53`, whose colour takes a reciprocal square
+   root). Next are generated colour-only programs for the second, with GX doing the rest, and
+   rigid vertices of the first through GX's matrix palette.
+2. The rest of the drawing: cube maps, bump mapping (dot products of two registers), and the
+   Z-buffer's precision with the fitted depth.
+3. Playing on. The campaign beyond a10's opening, and the game core's endianness checked under
+   qemu against the x86 build. Big-endian faults found so far:
+   - plain char's sign (fixed with `-fsigned-char`);
+   - tag fields the schema left as placeholders, one of them a contrail's shader that the game
+     reads through another structure;
+   - the clusters' visible sets;
+   - a recorded animation's event header (bitfields);
+   - the script engine's narrow values in 32-bit cells (`HALO_CELL_AT`);
+   - a material type read as a long's low word;
+   - the network message size and an AI vocalization type.
 4. Real hardware, from the Homebrew Channel (`ninja wii-package`).
+5. CI. The workflow's `wii` job passes when run locally in the devkitpro/devkitppc image. On
+   GitHub it builds against WiiLibs' `dolphin-tests-and-fixed-claims` branch, which needs this
+   port's WiiLibs changes pushed first.
