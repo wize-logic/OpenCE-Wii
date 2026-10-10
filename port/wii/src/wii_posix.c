@@ -2,52 +2,21 @@
 WII_POSIX.C
 
 The POSIX functions the shared platform layer uses that devkitPPC's newlib
-lacks: pread and pwrite (port/linux/src/xbox_files.c). They seek, read or
-write and seek back under one lock, as threads (the game's and the
-asynchronous reads') may share a descriptor. And where the game's folder is,
-which the settings file is read from before any setting can be. Built as the
-posix_*.c units are, against newlib alone.
+lacks, and the Wii's own answers to the C library's questions: where the
+game's folder is, which the settings file is read from before any setting can
+be; sysconf's memory; random bytes; and the game's thread priorities. (pread,
+pwrite and pause, which newlib declares and does not define, are WiiLibs':
+wl/platform/wii/posix_wii.c, weak definitions over wl_posix_pread and the
+rest.) Built as the posix_*.c units are, against newlib and WiiLibs' headers.
 */
 
 #include <errno.h>
 #include <pthread.h>
-#include <malloc.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
-static pthread_mutex_t positioned_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static ssize_t positioned(int descriptor, void *buffer, size_t count, off_t offset, int writing)
-{
-	off_t position;
-	ssize_t result;
-	int error;
-
-	pthread_mutex_lock(&positioned_lock);
-	position = lseek(descriptor, 0, SEEK_CUR);
-	if (position == (off_t)-1 || lseek(descriptor, offset, SEEK_SET) == (off_t)-1)
-	{
-		pthread_mutex_unlock(&positioned_lock);
-		return -1;
-	}
-	result = writing ? write(descriptor, buffer, count) : read(descriptor, buffer, count);
-	error = errno;
-	lseek(descriptor, position, SEEK_SET);
-	pthread_mutex_unlock(&positioned_lock);
-	errno = error;
-	return result;
-}
-
-ssize_t pread(int descriptor, void *buffer, size_t count, off_t offset)
-{
-	return positioned(descriptor, buffer, count, offset, 0);
-}
-
-ssize_t pwrite(int descriptor, const void *buffer, size_t count, off_t offset)
-{
-	return positioned(descriptor, (void *)buffer, count, offset, 1);
-}
+#include "wl/platform/heap_overflow.h"
 
 /* the Homebrew Channel's folder for the game: sd:/apps/halo, or
 usb:/apps/halo when only the USB drive has one with maps in it */
@@ -60,17 +29,9 @@ const char *wii_game_folder(void)
 	return "sd:/apps/halo";
 }
 
-/* waits for a signal, which the Wii never sends (port/linux/src/xbox_kernel.c,
-a thread that sleeps for ever) */
-int pause(void)
-{
-	for (;;)
-		sleep(3600);
-	return -1;
-}
-
 /* the memory the game is told the machine has (GlobalMemoryStatus): the
-Wii's 88 MB, and what newlib's heap has free */
+Wii's 88 MB, and what its malloc can still give: newlib's heap in MEM1 and
+what is left of the game's heap in MEM2 (WiiLibs' heap overflow) */
 long sysconf(int name)
 {
 	switch (name)
@@ -80,7 +41,12 @@ long sysconf(int name)
 	case _SC_PHYS_PAGES:
 		return (88L << 20) / 4096;
 	case _SC_AVPHYS_PAGES:
-		return (long)(mallinfo().fordblks / 4096);
+	{
+		WlOverflowUsage usage;
+
+		wl_heap_overflow_usage(&usage);
+		return (long)(usage.free_total / 4096);
+	}
 	case _SC_NPROCESSORS_CONF:
 	case _SC_NPROCESSORS_ONLN:
 		return 1;
@@ -116,10 +82,11 @@ void posix_random_bytes(void *buffer, unsigned long size)
 memory report, port/wii/src/d3d8_gx.c) */
 void wii_heap_usage(unsigned long *used, unsigned long *free_bytes)
 {
-	struct mallinfo heap = mallinfo();
+	WlOverflowUsage usage;
 
-	*used = (unsigned long)heap.uordblks;
-	*free_bytes = (unsigned long)heap.fordblks;
+	wl_heap_overflow_usage(&usage);
+	*used = (unsigned long)usage.primary_used;
+	*free_bytes = (unsigned long)usage.primary_free;
 }
 
 /* ---------- thread priorities

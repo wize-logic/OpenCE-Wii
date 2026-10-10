@@ -11,6 +11,7 @@ port/wii/README.md for the design.
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -127,6 +128,19 @@ def devkitpro_dir(sln: Any) -> Path:
 def wiilibs_dir(sln: Any) -> Path:
     """WiiLibs' checkout (configure.py --wiilibs, else ../WiiLibs)"""
     return Path(getattr(sln, "wiilibs", None) or "../WiiLibs")
+
+
+def heap_overflow_wraps(wiilibs: Path) -> List[str]:
+    """The names WiiLibs' heap overflow wraps (WL_HEAP_OVERFLOW_WRAPS in its cmake/WiiLibs.cmake), so that
+    the list is WiiLibs' own and cannot drift from it"""
+    try:
+        text = (wiilibs / "cmake" / "WiiLibs.cmake").read_text(encoding="utf-8")
+        match = re.search(r"set\(WL_HEAP_OVERFLOW_WRAPS\s+([^)]*)\)", text)
+        names = match.group(1).split() if match else []
+    except OSError:
+        names = []
+    return names or ["malloc", "calloc", "realloc", "free", "memalign", "aligned_alloc", "malloc_usable_size",
+                     "_malloc_r", "_calloc_r", "_realloc_r", "_free_r", "_memalign_r", "_malloc_usable_size_r"]
 
 
 def wii_configure_inputs() -> List[Path]:
@@ -264,7 +278,7 @@ def generate_wii_build(n: Writer, sln: Any) -> None:
     # newlib's structures (struct stat) have their own layout, as the Linux
     # build's posix_*.c have glibc's
     posix_cflags = " ".join([*wii_abi_flags(devkitpro), "-std=gnu11", "-D_GNU_SOURCE", "-DHALO_WII",
-                             f"-I{linux_platform_dir}", "-Wall"])
+                             f"-I{linux_platform_dir}", f"-I{wiilibs}", "-Wall"])
 
     def platform_flags(source: Path) -> str:
         return posix_cflags if source.name.startswith("posix_") or source.name == "wii_posix.c" else platform_cflags
@@ -321,11 +335,14 @@ def generate_wii_build(n: Writer, sln: Any) -> None:
     # constructor, as clang puts those in .init_array, which devkitPPC's
     # start-up code never runs. There must be none in clang's units.
     linker = tools / "powerpc-eabi-gcc"
-    ldflags = " ".join(["-mrvl", "-mcpu=750", "-meabi", "-mhard-float", "-g", "-Wl,--gc-sections", "-Wl,--wrap=main", "-Wl,--wrap=exit", "-Wl,--wrap=abort",
-                        "-Wl,--wrap=_exit", "-Wl,--wrap=SYS_ResetSystem", "-Wl,--wrap=sched_yield",
-                        # (the game's heap: port/wii/src/wii_malloc.c)
-                        *(f"-Wl,--wrap={name}" for name in ("malloc", "calloc", "realloc", "free", "memalign", "aligned_alloc",
-                                                       "_malloc_r", "_calloc_r", "_realloc_r", "_free_r", "_memalign_r")),
+    ldflags = " ".join(["-mrvl", "-mcpu=750", "-meabi", "-mhard-float", "-g", "-Wl,--gc-sections", "-Wl,--wrap=main",
+                        # (every way out logged, with who took it: WiiLibs' wii/trace_wii.c)
+                        "-Wl,--wrap=exit", "-Wl,--wrap=abort", "-Wl,--wrap=_exit", "-Wl,--wrap=SYS_ResetSystem",
+                        "-Wl,--wrap=sched_yield",
+                        # (the game's heap, MEM1's malloc with MEM2's behind it: WiiLibs' wii/heap_wrap_wii.c,
+                        # enabled in port/wii/src/wii_boot.c; -u pulls the wrappers out of the archive even when
+                        # only libc's own objects call malloc)
+                        *(f"-Wl,--wrap={name}" for name in heap_overflow_wraps(wiilibs)), "-Wl,-u,__wrap_malloc",
                         f"-Wl,-Map,{build_dir / 'halo.map'}", f"-L{devkitpro / 'libogc' / 'lib' / 'wii'}"])
     libs = " ".join([*(str(library) for library in wiilibs_outputs),
                      *(f"-l{library}" for library in config.get("libraries", []))])
@@ -355,9 +372,12 @@ def generate_wii_build(n: Writer, sln: Any) -> None:
     n.build(outputs=build_dir / "no_constructors.stamp", rule="wii_no_constructors", inputs=elf)
     n.build(outputs="wii", rule="phony", inputs=[dol, build_dir / "no_constructors.stamp", *host_tools])
     # the Homebrew Channel's zip (apps/halo: boot.dol, meta.xml, icon.png; no game data)
-    n.rule(name="wii_package", command="$python tools/wii_package.py --dol $in --output $out",
+    # (made by WiiLibs' tools/wii_package.py, which tools/wii_package.py calls)
+    n.rule(name="wii_package",
+           command=f"$python tools/wii_package.py --wiilibs {_quote(wiilibs)} --dol $in --output $out",
            description="WII PACKAGE $out")
     n.build(outputs=build_dir / "halo-wii.zip", rule="wii_package", inputs=dol,
-            implicit=[Path("tools/wii_package.py")])
+            implicit=[Path("tools/wii_package.py"), PORT_DIR / "package_description.txt",
+                      wiilibs / "tools" / "wii_package.py"])
     n.build(outputs="wii-package", rule="phony", inputs=[build_dir / "halo-wii.zip"])
     n.newline()

@@ -158,9 +158,9 @@ enum
 #ifdef HALO_RELEASE
 #define cseries_match_assert(file, line, expr) if (!(expr)) { release_assert_failed(STRINGIFY(expr), MATCH_FILE(file), MATCH_LINE(line), TRUE); }
 #elif defined(HALO_WII)
-/* port: the Wii's frame-chain walk names the callers (wii_boot.c) */
-void wii_log_callers(const char *what, int code);
-#define cseries_match_assert(file, line, expr) if (!(expr)) { stack_walk(0); wii_log_callers("assert", MATCH_LINE(line)); error(_error_silent, "EXCEPTION %s in %s,#%d: %s", "halt", MATCH_FILE(file), MATCH_LINE(line), STRINGIFY(expr)); system_exit(-1); }
+/* port: WiiLibs' frame-chain walk names the callers (wl/platform/backtrace.h) */
+void wl_platform_log_backtrace(const char *tag, const char *what, unsigned long skip);
+#define cseries_match_assert(file, line, expr) if (!(expr)) { stack_walk(0); wl_platform_log_backtrace("assert", "assert", 0); error(_error_silent, "EXCEPTION %s in %s,#%d: %s", "halt", MATCH_FILE(file), MATCH_LINE(line), STRINGIFY(expr)); system_exit(-1); }
 #else
 #define cseries_match_assert(file, line, expr) if (!(expr)) { stack_walk(0); error(_error_silent, "EXCEPTION %s in %s,#%d: %s", "halt", MATCH_FILE(file), MATCH_LINE(line), STRINGIFY(expr)); system_exit(-1); }
 #endif
@@ -450,11 +450,12 @@ void display_assert(
 		stack_walk(0);
 #ifdef HALO_WII
 		/* port: and the return addresses up the frame chain, which the
-		Wii's stack walk does not give (port/wii/src/wii_boot.c) */
+		Wii's stack walk does not give (WiiLibs' wl/platform/backtrace.h;
+		the first is in display_assert itself, so it is skipped) */
 		{
-			extern void wii_log_callers(const char *what, int code);
+			extern void wl_platform_log_backtrace(const char *tag, const char *what, unsigned long skip);
 
-			wii_log_callers("assert", (int)line);
+			wl_platform_log_backtrace("assert", "assert", 1);
 		}
 #endif
 	}
