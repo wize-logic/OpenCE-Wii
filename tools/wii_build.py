@@ -257,6 +257,24 @@ def generate_wii_build(n: Writer, sln: Any) -> None:
         add_object(linux_platform_dir / name, platform_flags(linux_platform_dir / name))
     for source in sorted(wii_platform_dir.glob("*.c")):
         add_object(source, platform_flags(source))
+    # the game's vertex programs compiled ahead of time: a host tool decodes
+    # its microcode with nv2a_cpu.c's decoder and writes each program as C
+    # (port/wii/tools/nv2a_codegen.c)
+    codegen_source = PORT_DIR / "tools" / "nv2a_codegen.c"
+    codegen = build_dir / "tools" / "nv2a_codegen"
+    microcode = Path("source/rasterizer/xbox/rasterizer_xbox_vertex_shaders_data.inc")
+    programs = build_dir / "gen" / "nv2a_programs.c"
+    n.rule(name="wii_host_cc",
+           command=f"cc -O1 -std=gnu11 -DNV2A_CPU_NO_NATIVES -I{PORT_DIR / 'tests' / 'host'} -I{wii_platform_dir} "
+                   "-o $out $in -lm",
+           description="WII HOST CC $out")
+    n.build(outputs=codegen, rule="wii_host_cc", inputs=codegen_source,
+            implicit=[wii_platform_dir / "nv2a_cpu.c", wii_platform_dir / "nv2a_cpu.h",
+                      wii_platform_dir / "nv2a_cpu_native.h", PORT_DIR / "tests" / "host" / "platform.h"])
+    n.rule(name="wii_nv2a_codegen", command="$in $microcode $out > /dev/null", description="WII NV2A PROGRAMS $out")
+    n.build(outputs=programs, rule="wii_nv2a_codegen", inputs=codegen, implicit=[microcode],
+            variables={"microcode": str(microcode)})
+    add_object(programs, platform_cflags)
     # the settings file's parser (port/third_party/tomlc17)
     add_object(TOML_DIR / "tomlc17.c", " ".join([abi, "-std=gnu11", "-w"]))
     # the port's zlib, and the game's sin, pow and the rest, the same on
@@ -275,6 +293,7 @@ def generate_wii_build(n: Writer, sln: Any) -> None:
     # start-up code never runs. There must be none in clang's units.
     linker = tools / "powerpc-eabi-gcc"
     ldflags = " ".join(["-mrvl", "-mcpu=750", "-meabi", "-mhard-float", "-g", "-Wl,--gc-sections", "-Wl,--wrap=main", "-Wl,--wrap=exit", "-Wl,--wrap=abort",
+                        "-Wl,--wrap=_exit", "-Wl,--wrap=SYS_ResetSystem",
                         # (the game's heap: port/wii/src/wii_malloc.c)
                         *(f"-Wl,--wrap={name}" for name in ("malloc", "calloc", "realloc", "free", "memalign", "aligned_alloc",
                                                        "_malloc_r", "_calloc_r", "_realloc_r", "_free_r", "_memalign_r")),

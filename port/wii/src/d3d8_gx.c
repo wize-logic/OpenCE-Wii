@@ -1937,6 +1937,16 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 	}
 	flip_count++;
 	device.frames++;
+	{
+		static u32 overflows;
+		u32 now = GX_GetOverflowCount();
+
+		if (now != overflows)
+		{
+			platform_log("Direct3D: frame %lu: %lu GX FIFO overflows so far", device.frames, (unsigned long)now);
+			overflows = now;
+		}
+	}
 	if (device.frames % STATISTICS_FRAMES == 0)
 	{
 		platform_log("Direct3D: frame %lu: %lu draws, %lu immediate, %lu vertices, %lu clears, %lu drawn elsewhere, "
@@ -1949,8 +1959,8 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			texture_failures[_failure_shape],
 			texture_failures[_failure_format], texture_failures[_failure_memory], texture_failures[_failure_decode],
 			textures_native);
-		platform_log("Direct3D: pixel shaders: %lu translated, %lu beyond GX", pixel_shaders_translated,
-			pixel_shaders_unusable);
+		platform_log("Direct3D: pixel shaders: %lu translated, %lu beyond GX; GX FIFO overflows %lu",
+			pixel_shaders_translated, pixel_shaders_unusable, (unsigned long)GX_GetOverflowCount());
 		{
 			uint64_t now = wl_platform_time_us();
 

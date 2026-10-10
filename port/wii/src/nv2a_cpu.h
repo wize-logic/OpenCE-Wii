@@ -39,9 +39,16 @@ struct nv2a_cpu_instruction
 	struct nv2a_cpu_operand operands[3];
 };
 
+struct nv2a_cpu_output;
+
+/* a program compiled ahead of time (nv2a_cpu_native.h) */
+typedef void (*nv2a_cpu_native_proc)(const float (*constants)[4], const float (*inputs)[4],
+	struct nv2a_cpu_output *output);
+
 struct nv2a_cpu_program
 {
 	unsigned long count;
+	nv2a_cpu_native_proc native;
 	struct nv2a_cpu_instruction instructions[NV2A_CPU_MAXIMUM_INSTRUCTIONS];
 };
 

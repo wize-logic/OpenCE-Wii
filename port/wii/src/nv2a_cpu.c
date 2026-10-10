@@ -8,9 +8,13 @@ same semantics as the GLSL that file writes: the MAC (vector) and ILU
 (scalar) units read their operands A, B and C, then write their results
 (the ILU's to r1 when both run), r12 is the position output read back,
 a0 indexes the constants relatively.
+
+The game's own programs are also compiled ahead of time
+(port/wii/tools/nv2a_codegen.c, which decodes them with this file): a
+program found among them (nv2a_cpu_hash) runs as its function.
 */
 
-#include "nv2a_cpu.h"
+#include "nv2a_cpu_native.h"
 
 #include <math.h>
 #include <string.h>
@@ -107,6 +111,21 @@ void nv2a_cpu_compile(const DWORD *instructions, unsigned long instruction_count
 		if (field(word, 3, 0, 1))
 			break;
 	}
+	program->native = NULL;
+#ifndef NV2A_CPU_NO_NATIVES
+	{
+		unsigned long hash = nv2a_cpu_hash(instructions, instruction_count);
+
+		for (index = 0; index < nv2a_cpu_native_count; index++)
+		{
+			if (nv2a_cpu_natives[index].hash == hash && nv2a_cpu_natives[index].count == instruction_count)
+			{
+				program->native = nv2a_cpu_natives[index].run;
+				break;
+			}
+		}
+	}
+#endif
 }
 
 struct registers
@@ -161,13 +180,59 @@ static void write_masked(float destination[4], const float value[4], unsigned ma
 	if (mask & 1) destination[3] = value[3];
 }
 
-static float reciprocal_clamped(float x)
+unsigned long nv2a_cpu_hash(const DWORD *instructions, unsigned long instruction_count)
 {
-	float r = 1.0f / x;
+	unsigned long hash = 2166136261UL, index;
 
-	if (r > 0.0f)
-		return r < 5.42101e-20f ? 5.42101e-20f : r > 1.884467e+19f ? 1.884467e+19f : r;
-	return r > -5.42101e-20f ? -5.42101e-20f : r < -1.884467e+19f ? -1.884467e+19f : r;
+	for (index = 0; index < instruction_count * 4; index++)
+		hash = ((hash ^ instructions[index]) * 16777619UL) & 0xFFFFFFFFUL;
+	return hash;
+}
+
+/* the ILU's exponent, logarithm and lighting (from C into I) */
+void nv2a_cpu_ilu(int ilu, const float c[4], float out[4])
+{
+	switch (ilu)
+	{
+	case _ilu_exp:
+		out[0] = exp2f(floorf(c[0]));
+		out[1] = c[0] - floorf(c[0]);
+		out[2] = exp2f(c[0]);
+		out[3] = 1.0f;
+		break;
+	case _ilu_log:
+	{
+		float x = fabsf(c[0]);
+
+		if (x == 0.0f)
+		{
+			out[0] = out[2] = -1.0e30f;
+			out[1] = out[3] = 1.0f;
+		}
+		else
+		{
+			float exponent = floorf(log2f(x));
+
+			out[0] = exponent;
+			out[1] = x / exp2f(exponent);
+			out[2] = log2f(x);
+			out[3] = 1.0f;
+		}
+		break;
+	}
+	case _ilu_lit:
+	{
+		float power = c[3] < -127.9961f ? -127.9961f : c[3] > 127.9961f ? 127.9961f : c[3];
+
+		out[0] = 1.0f;
+		out[1] = c[0] > 0.0f ? c[0] : 0.0f;
+		out[2] = c[0] > 0.0f ? powf(c[1] > 0.0f ? c[1] : 0.0f, power) : 0.0f;
+		out[3] = 1.0f;
+		break;
+	}
+	default:
+		break;
+	}
 }
 
 void nv2a_cpu_run(const struct nv2a_cpu_program *program, const float (*constants)[4], const float (*inputs)[4],
@@ -187,6 +252,11 @@ void nv2a_cpu_run(const struct nv2a_cpu_program *program, const float (*constant
 		output->t[component][3] = 1.0f;
 	output->fog = 1.0f;
 	output->point_size = point_size;
+	if (program->native)
+	{
+		program->native(constants, inputs, output);
+		return;
+	}
 
 	for (index = 0; index < program->count; index++)
 	{
@@ -218,42 +288,9 @@ void nv2a_cpu_run(const struct nv2a_cpu_program *program, const float (*constant
 		case _ilu_rcp: ilu[0] = ilu[1] = ilu[2] = ilu[3] = 1.0f / c[0]; break;
 		case _ilu_rcc: ilu[0] = ilu[1] = ilu[2] = ilu[3] = reciprocal_clamped(c[0]); break;
 		case _ilu_rsq: ilu[0] = ilu[1] = ilu[2] = ilu[3] = 1.0f / sqrtf(fabsf(c[0])); break;
-		case _ilu_exp:
-			ilu[0] = exp2f(floorf(c[0]));
-			ilu[1] = c[0] - floorf(c[0]);
-			ilu[2] = exp2f(c[0]);
-			ilu[3] = 1.0f;
+		case _ilu_exp: case _ilu_log: case _ilu_lit:
+			nv2a_cpu_ilu(instruction->ilu, c, ilu);
 			break;
-		case _ilu_log:
-		{
-			float x = fabsf(c[0]);
-
-			if (x == 0.0f)
-			{
-				ilu[0] = ilu[2] = -1.0e30f;
-				ilu[1] = ilu[3] = 1.0f;
-			}
-			else
-			{
-				float exponent = floorf(log2f(x));
-
-				ilu[0] = exponent;
-				ilu[1] = x / exp2f(exponent);
-				ilu[2] = log2f(x);
-				ilu[3] = 1.0f;
-			}
-			break;
-		}
-		case _ilu_lit:
-		{
-			float power = c[3] < -127.9961f ? -127.9961f : c[3] > 127.9961f ? 127.9961f : c[3];
-
-			ilu[0] = 1.0f;
-			ilu[1] = c[0] > 0.0f ? c[0] : 0.0f;
-			ilu[2] = c[0] > 0.0f ? powf(c[1] > 0.0f ? c[1] : 0.0f, power) : 0.0f;
-			ilu[3] = 1.0f;
-			break;
-		}
 		default:
 			break;
 		}

@@ -152,6 +152,24 @@ void __wrap_exit(int code)
 	__real_exit(code);
 }
 
+void __real__exit(int code);
+void __wrap__exit(int code);
+s32 __real_SYS_ResetSystem(s32 reset, u32 reset_code, s32 force_menu);
+s32 __wrap_SYS_ResetSystem(s32 reset, u32 reset_code, s32 force_menu);
+
+/* (the ways out that bypass exit: who takes them) */
+void __wrap__exit(int code)
+{
+	wii_log_callers("_exit", code);
+	__real__exit(code);
+}
+
+s32 __wrap_SYS_ResetSystem(s32 reset, u32 reset_code, s32 force_menu)
+{
+	wii_log_callers("SYS_ResetSystem", reset);
+	return __real_SYS_ResetSystem(reset, reset_code, force_menu);
+}
+
 void __wrap_abort(void)
 {
 	wii_log_callers("abort", 0);

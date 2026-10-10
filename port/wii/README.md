@@ -1,8 +1,8 @@
 # Halo: Combat Evolved for the Wii
 
 This port is in bring-up. In Dolphin, the game boots from the SD card, loads its converted maps and
-runs its main menu. The menu is drawn with its textures, its 3D background and its music, at a few
-frames a second. It hasn't been tried on a Wii yet, and no level has been played.
+runs its main menu. The menu is drawn with its textures, its 3D background and its music, at 30
+frames a second (emulated time). It hasn't been tried on a Wii yet, and no level has been played.
 
 ## Building
 
@@ -19,6 +19,7 @@ ninja wii                                   # build/wii/halo.dol and halo.elf
 tools/wii_convert_maps.py XBOX/maps/ui.map XBOX/maps/bloodgulch.map   # into build/wii/sd/apps/halo/maps
 tools/wii_dolphin.py --seconds 300 --until "frame 360:"            # run it in Dolphin from WSL
 tools/wii_gx_psh_check.py                   # the combiner translation, checked on the host
+tools/wii_nv2a_check.py                     # the compiled vertex programs against the interpreter
 ```
 
 `tools/wii_dolphin.py` runs WiiLibs' Dolphin runner (`tools/dolphin_run.py` there) on the build:
@@ -30,6 +31,12 @@ tools/wii_gx_psh_check.py                   # the combiner translation, checked 
   window to `build/wii/dolphin.png`.
 - `--backtrace build/wii/halo.elf` attaches gdb through Dolphin's stub and prints every thread's
   stack when the run ends.
+- It runs Dolphin single-core on Vulkan. Dolphin's Direct3D 11 backend exits without a word on
+  the game's longer TEV programs. In dual-core mode (`--dual-core`), Dolphin exits without a word
+  in the menu about half the time once the vertices come fast. No GX FIFO overflow is counted
+  first, and the cause is still open.
+- `tools/wii_dolphin.py` reports how long a frame takes in emulated time, split into draws,
+  textures, pixel shaders, the end of the frame and the game, every 60 frames.
 
 ## Game data
 
@@ -143,7 +150,14 @@ The converter reports what it doesn't reach for each map.
 and pixel shaders.
 
 - **Vertex shaders.** GX has no programmable vertex stage, so the game's vertex programs run on
-  the CPU (`src/nv2a_cpu.c`, an NV2A interpreter), vertex by vertex. GX then draws the results:
+  the CPU, vertex by vertex.
+  - At build time, `tools/nv2a_codegen.c` decodes the game's 67 programs with the interpreter's own
+    decoder (`src/nv2a_cpu.c`) and writes each one as a C function (88 KB of code). A program is
+    found by a hash of its words.
+  - Any other program runs on the interpreter.
+  - In the menu, the draws take 10 ms a frame compiled, against 58 ms interpreted.
+
+  GX then draws the results:
   - A program that divides by its clip-space w is sent as (x·w, y·w, −w) through a perspective
     projection. GX then clips at the eye and interpolates textures with perspective.
   - The depth is fitted per draw as a + b/w from a few of its vertices. This is exact for the
@@ -175,9 +189,10 @@ and pixel shaders.
    - fog
    - cube maps
    - the Z-buffer's precision with the fitted depth
-2. Speed: the vertex programs run on the CPU and the menu runs at a few frames a second. Next
-   are display lists for the static geometry, paired singles, and GX's own transform for the
-   simplest programs. The target is 30 frames a second.
-3. Playing a level (Blood Gulch, then a10), and the game core's endianness checked under qemu
+2. Speed in the levels: the compiled vertex programs carry the menu at 30 frames a second, but a
+   level has far more vertices. Next are display lists for the static geometry, paired singles in
+   the compiled programs, and GX's own transform for the simplest programs.
+3. Dolphin's dual-core exit, to be told apart from a fault in the GX stream on hardware.
+4. Playing a level (Blood Gulch, then a10), and the game core's endianness checked under qemu
    against the x86 build.
-4. Real hardware, then packaging for the Homebrew Channel (`meta.xml`, an icon) and a CI job.
+5. Real hardware, then packaging for the Homebrew Channel (`meta.xml`, an icon) and a CI job.
