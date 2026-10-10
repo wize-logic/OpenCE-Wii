@@ -221,6 +221,14 @@ boolean _rasterizer_environment_shadow_begin(
 		147,
 		global_d3d_device);
 
+	/* port: the radius for every window, the mirror's too, where nothing is
+	drawn but render_object_shadow_end still finds the structure's surfaces
+	in the sphere (it was left unset there: a NaN halted c40) */
+	if (shadow_volume_bounding_radius)
+	{
+		*shadow_volume_bounding_radius = object_bounding_radius;
+	}
+
 	if (global_window_parameters.rasterizer_target ==
 			_rasterizer_target_render_primary &&
 		rasterizer_debug_options.draw_environment_shadows)
