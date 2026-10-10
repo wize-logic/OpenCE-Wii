@@ -74,7 +74,7 @@ vertices, and draws simpler ones sooner) */
 #define MODEL_DETAIL_DEFAULT "0.5"
 #define OBJECT_SHADOWS_DEFAULT "false"
 #define BUMPED_HIGHLIGHTS_DEFAULT "false"
-#define GX_LIGHTING_DEFAULT "true"
+#define GX_LIGHTING_DEFAULT "false"
 #else
 #define MODEL_DETAIL_DEFAULT "1.0"
 #define OBJECT_SHADOWS_DEFAULT "true"
