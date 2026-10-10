@@ -11,14 +11,16 @@ port/wii/src/d3d8_gx.c binds straight from the texture cache:
     A1R5G5B5, X1R5G5B5, A4R4G4B4        RGB5A3
     L8, A8, AL8                         I8 (the device keeps which channels are the texel's)
     A8L8                                IA8
+    P8 (bump maps' normals)             CI8 (the same indices, in GX's tiles: the device loads
+                                        the palette as a TLUT)
     DXT1                                CMPR (the same blocks, in GX's order)
     DXT3, DXT5                          CMPR for the colour (its levels), then I4 for the alpha (its
                                         levels, as many bytes): two textures the device joins
 
 GX's tiles are larger than the Xbox's smallest levels: the levels kept are the most whose GX
 bytes fit in the Xbox texture's (gx_levels, which the device computes the same way); a bitmap
-whose first level does not fit, a cube map, a 3D texture and a palettized one are left as they
-are, and the device decodes them.
+whose first level does not fit, a cube map and a 3D texture are left as they are, and the
+device decodes them.
 """
 
 from typing import Optional, Tuple
@@ -29,18 +31,18 @@ import numpy as np
 D3D_FORMATS = {
     "a8r8g8b8": (0x06, 0x12), "x8r8g8b8": (0x07, 0x1E), "r5g6b5": (0x05, 0x11), "a1r5g5b5": (0x02, 0x10),
     "a4r4g4b4": (0x04, 0x1D), "l8": (0x00, 0x13), "a8": (0x19, 0x1F), "al8": (0x01, 0x1B), "a8l8": (0x1A, 0x20),
-    "dxt1": (0x0C, None), "dxt3": (0x0E, None), "dxt5": (0x0F, None),
+    "dxt1": (0x0C, None), "dxt3": (0x0E, None), "dxt5": (0x0F, None), "p8": (0x0B, None),
 }
 # the bitmaps' formats (source/bitmaps/bitmaps.h's order: xbox_texture_cache.c's table)
 BITMAP_FORMATS = {0: "a8", 1: "l8", 2: "al8", 3: "a8l8", 6: "r5g6b5", 8: "a1r5g5b5", 9: "a4r4g4b4",
-                  10: "x8r8g8b8", 11: "a8r8g8b8", 14: "dxt1", 15: "dxt3", 16: "dxt5"}
+                  10: "x8r8g8b8", 11: "a8r8g8b8", 14: "dxt1", 15: "dxt3", 16: "dxt5", 17: "p8"}
 # bytes per texel (per 4x4 block for DXT)
 XBOX_BYTES = {"a8r8g8b8": 4, "x8r8g8b8": 4, "r5g6b5": 2, "a1r5g5b5": 2, "a4r4g4b4": 2, "l8": 1, "a8": 1,
-              "al8": 1, "a8l8": 2, "dxt1": 8, "dxt3": 16, "dxt5": 16}
+              "al8": 1, "a8l8": 2, "dxt1": 8, "dxt3": 16, "dxt5": 16, "p8": 1}
 # GX's tiles: width, height, bytes ("dual": a CMPR level and an I4 level)
 GX_TILES = {"a8r8g8b8": (4, 4, 64), "x8r8g8b8": (4, 4, 64), "r5g6b5": (4, 4, 32), "a1r5g5b5": (4, 4, 32),
             "a4r4g4b4": (4, 4, 32), "l8": (8, 4, 32), "a8": (8, 4, 32), "al8": (8, 4, 32), "a8l8": (4, 4, 32),
-            "dxt1": (8, 8, 32), "dxt3": (8, 8, 64), "dxt5": (8, 8, 64)}
+            "dxt1": (8, 8, 32), "dxt3": (8, 8, 64), "dxt5": (8, 8, 64), "p8": (8, 4, 32)}
 GX_MAXIMUM_DIMENSION = 1024
 
 
@@ -270,7 +272,7 @@ def convert(data: bytes, kind: str, width: int, height: int, levels: int, pitch:
             out.append(big_words(words16(texel), 4, 4))
         elif kind in ("a1r5g5b5", "a4r4g4b4"):
             out.append(big_words(rgb5a3(kind, texel), 4, 4))
-        elif kind in ("l8", "a8", "al8"):
+        elif kind in ("l8", "a8", "al8", "p8"):
             out.append(tiled(texel[..., 0], 8, 4).tobytes())
         elif kind == "a8l8":
             # (IA8: the alpha, then the intensity: the Xbox's word, big-endian)

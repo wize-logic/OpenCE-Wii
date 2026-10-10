@@ -1013,6 +1013,10 @@ static BOOL gx_native_format(DWORD format, struct gx_native_format *out)
 	case 0x0E: case 0x0F:
 		*out = (struct gx_native_format){ GX_TF_CMPR, 8, 8, 64, _channels_all, TRUE };
 		return TRUE;
+	case 0x0B:
+		/* (P8: the indices; the palette is a TLUT, palette_tlut) */
+		*out = (struct gx_native_format){ GX_TF_CI8, 8, 4, 32, _channels_all, FALSE };
+		return TRUE;
 	default:
 		return FALSE;
 	}
@@ -1047,6 +1051,88 @@ static unsigned long gx_native_levels(const struct xgpu_texture_description *des
 		kept = level + 1;
 	}
 	return kept;
+}
+
+/* a palette as a GX TLUT, for a converted P8 bitmap (CI8): RGB565 when
+every entry is opaque (the game's one palette, global_vector_palette's
+normals), RGB5A3 otherwise. Kept by the palette's data and hashed once a
+frame; loaded into the stage's TLUT when it differs from what is there. */
+struct palette_tlut
+{
+	DWORD data;
+	unsigned long hash, hashed_frame;
+	u8 format;
+	u16 entries[256] __attribute__((aligned(32)));
+};
+
+static struct palette_tlut palette_tluts[4] __attribute__((aligned(32)));
+static const struct palette_tlut *loaded_tluts[D3DTSS_MAXSTAGES];
+static unsigned long loaded_tlut_hashes[D3DTSS_MAXSTAGES];
+
+static unsigned long palette_hash(const D3DCOLOR *colors)
+{
+	unsigned long hash = 2166136261UL, index;
+
+	for (index = 0; index < 256; index++)
+		hash = (hash ^ colors[index]) * 16777619UL;
+	return hash;
+}
+
+static const struct palette_tlut *palette_tlut(const D3DPalette *palette)
+{
+	const D3DCOLOR *colors;
+	struct palette_tlut *tlut = NULL;
+	unsigned long hash, index;
+	BOOL opaque = TRUE;
+
+	if (!palette || !palette->Data)
+		return NULL;
+	for (index = 0; index < sizeof(palette_tluts) / sizeof(palette_tluts[0]); index++)
+		if (palette_tluts[index].data == palette->Data)
+		{
+			tlut = &palette_tluts[index];
+			break;
+		}
+	if (tlut && tlut->hashed_frame == device.frames)
+		return tlut;
+	colors = (const D3DCOLOR *)PLATFORM_PHYSICAL_TO_VIRTUAL(palette->Data);
+	hash = palette_hash(colors);
+	if (tlut && tlut->hash == hash)
+	{
+		tlut->hashed_frame = device.frames;
+		return tlut;
+	}
+	if (!tlut)
+	{
+		/* (a new palette: the least recently hashed one goes) */
+		tlut = &palette_tluts[0];
+		for (index = 1; index < sizeof(palette_tluts) / sizeof(palette_tluts[0]); index++)
+			if (palette_tluts[index].hashed_frame < tlut->hashed_frame)
+				tlut = &palette_tluts[index];
+		for (index = 0; index < D3DTSS_MAXSTAGES; index++)
+			if (loaded_tluts[index] == tlut)
+				loaded_tluts[index] = NULL;
+	}
+	for (index = 0; index < 256; index++)
+		if ((colors[index] >> 24) != 0xFF)
+			opaque = FALSE;
+	for (index = 0; index < 256; index++)
+	{
+		unsigned long c = colors[index], a = c >> 24, r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+
+		if (opaque)
+			tlut->entries[index] = (u16)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+		else if (a >= 0xE0)
+			tlut->entries[index] = (u16)(0x8000 | ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3));
+		else
+			tlut->entries[index] = (u16)(((a >> 5) << 12) | ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4));
+	}
+	DCFlushRange(tlut->entries, sizeof(tlut->entries));
+	tlut->data = palette->Data;
+	tlut->format = opaque ? GX_TL_RGB565 : GX_TL_RGB5A3;
+	tlut->hash = hash;
+	tlut->hashed_frame = device.frames;
+	return tlut;
 }
 
 /* whether the texture's pixels are in the texture cache (a map's bitmap) */
@@ -1222,7 +1308,8 @@ static struct texture_entry *texture_get(const D3DBaseTexture *texture, const D3
 	xgpu_texture_describe(texture->Format, texture->Size, &description);
 	if (!description.cube_map && description.depth <= 1 &&
 		((texture->Format & D3DFORMAT_DIMENSION_MASK) >> D3DFORMAT_DIMENSION_SHIFT) == 2 &&
-		gx_native_format(description.format, &native) && texture_in_texture_cache(texture))
+		gx_native_format(description.format, &native) && texture_in_texture_cache(texture) &&
+		(native.gx_format != GX_TF_CI8 || (palette && palette->Data)))
 	{
 		unsigned long levels = gx_native_levels(&description, &native);
 
@@ -1413,8 +1500,30 @@ static unsigned textures_bind(void)
 		wrap_s = repeatable ? gx_wrap(D3D__TextureState[stage][D3DTSS_ADDRESSU]) : GX_CLAMP;
 		wrap_t = repeatable ? gx_wrap(D3D__TextureState[stage][D3DTSS_ADDRESSV]) : GX_CLAMP;
 		minification = gx_minification(stage, mipmapped);
-		GX_InitTexObj(&object, entry->texels, (u16)entry->width, (u16)entry->height, entry->gx_format, wrap_s, wrap_t,
-			mipmapped ? GX_TRUE : GX_FALSE);
+		if (entry->gx_format == GX_TF_CI8)
+		{
+			const struct palette_tlut *tlut = palette_tlut(device.palettes[stage]);
+
+			if (!tlut)
+			{
+				device.statistics.textures_failed++;
+				continue;
+			}
+			if (loaded_tluts[stage] != tlut || loaded_tlut_hashes[stage] != tlut->hash)
+			{
+				GXTlutObj table;
+
+				GX_InitTlutObj(&table, (void *)tlut->entries, tlut->format, 256);
+				GX_LoadTlut(&table, GX_TLUT0 + stage);
+				loaded_tluts[stage] = tlut;
+				loaded_tlut_hashes[stage] = tlut->hash;
+			}
+			GX_InitTexObjCI(&object, entry->texels, (u16)entry->width, (u16)entry->height, GX_TF_CI8, wrap_s, wrap_t,
+				mipmapped ? GX_TRUE : GX_FALSE, GX_TLUT0 + stage);
+		}
+		else
+			GX_InitTexObj(&object, entry->texels, (u16)entry->width, (u16)entry->height, entry->gx_format, wrap_s,
+				wrap_t, mipmapped ? GX_TRUE : GX_FALSE);
 		GX_InitTexObjLOD(&object, minification,
 			D3D__TextureState[stage][D3DTSS_MAGFILTER] == D3DTEXF_POINT ? GX_NEAR : GX_LINEAR,
 			0.0f, mipmapped ? (f32)(entry->levels - 1) : 0.0f, 0.0f, GX_FALSE, GX_FALSE, GX_ANISO_1);
