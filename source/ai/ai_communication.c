@@ -541,6 +541,7 @@ symbols in this file:
 
 /* ---------- headers */
 
+#include "halo_cells.h" /* port: big-endian cells */
 #include "cseries.h"
 #include "ai_communication.h"
 
@@ -3061,7 +3062,8 @@ void actor_communication_update(
 				TRUE,
 				FALSE,
 				NULL,
-				(short *)&vocalization_type,
+				/* port: the long's low-order short (halo_cells.h) */
+				&HALO_CELL_AT(short, &vocalization_type),
 				&sound_definition_index);
 			if (play_type > 0)
 			{

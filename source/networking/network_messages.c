@@ -176,6 +176,7 @@ symbols in this file:
 
 /* ---------- headers */
 
+#include "halo_cells.h" /* port: big-endian cells */
 #include "cseries.h"
 #include "cseries/errors.h"
 #include "bungie_net/common/message_header.h"
@@ -272,10 +273,11 @@ struct network_game_message_packet_definitions
 	struct data_packet_group_definition group;
 };
 
+/* port: the short at the long's low-order end, as on the Xbox (halo_cells.h) */
 union network_game_message_size
 {
 	long value;
-	short encoded;
+	HALO_CELL_MEMBER(short, encoded);
 };
 
 #define DEFINE_NETWORK_GAME_MESSAGE(name, size) typedef struct name { byte opaque[size]; } name

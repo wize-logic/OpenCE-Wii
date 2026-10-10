@@ -322,9 +322,19 @@ boolean game_state_read_from_file(
 		146,
 		xbox_game_state_globals.file_valid_for_read || recover_saved_games_hack);
 
-	/* port: read beside the game state, and taken once checked */
+	/* port: read beside the game state, and taken once checked; with no
+	room for the copy (the Wii), straight into it as the Xbox did */
 	image = malloc(xbox_game_state_globals.buffer_size);
-	if (image &&
+	if (!image &&
+		SetFilePointer(xbox_game_state_globals.handle, 0, NULL, FILE_BEGIN) !=
+			INVALID_SET_FILE_POINTER &&
+		ReadFile(xbox_game_state_globals.handle, xbox_game_state_globals.buffer,
+			xbox_game_state_globals.buffer_size, &bytes_read, NULL) &&
+		bytes_read == xbox_game_state_globals.buffer_size)
+	{
+		result = TRUE;
+	}
+	else if (image &&
 		SetFilePointer(xbox_game_state_globals.handle, 0, NULL, FILE_BEGIN) !=
 			INVALID_SET_FILE_POINTER &&
 		ReadFile(xbox_game_state_globals.handle, image,
@@ -342,7 +352,8 @@ boolean game_state_read_from_file(
 			FALSE,
 			csprintf(temporary, "couldn't read saved game file (#%d)", GetLastError()));
 	}
-	free(image);
+	if (image)
+		free(image);
 
 	return result;
 }

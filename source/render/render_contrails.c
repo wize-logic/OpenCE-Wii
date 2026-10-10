@@ -404,13 +404,13 @@ static void render_contrail(
 			first_vertex = vertices;
 			if (!(definition->flags & (1 << _contrail_first_point_unfaded_bit)))
 			{
-				((byte *)&first_vertex[0].color)[3] = 0;
-				((byte *)&first_vertex[1].color)[3] = 0;
+				first_vertex[0].color &= 0x00FFFFFF; /* port: the alpha byte, either endian */
+				first_vertex[1].color &= 0x00FFFFFF; /* port: the alpha byte, either endian */
 			}
 			if (!(definition->flags & (1 << _contrail_last_point_unfaded_bit)))
 			{
-				((byte *)&vertices[vertex_count - 1].color)[3] = 0;
-				((byte *)&vertices[vertex_count - 2].color)[3] = 0;
+				vertices[vertex_count - 1].color &= 0x00FFFFFF; /* port: the alpha byte, either endian */
+				vertices[vertex_count - 2].color &= 0x00FFFFFF; /* port: the alpha byte, either endian */
 			}
 			if (segment_count > 0)
 			{

@@ -31,4 +31,8 @@ starts in its cell. Little-endian builds are unchanged.
 #define HALO_CELL_OFFSET(size) 0
 #endif
 
+/* a narrow value in the cell at an address, where the cell keeps it (the
+script runtime's stores and loads of a boolean or short in a long) */
+#define HALO_CELL_AT(type, address) (*(type *)((char *)(address) + HALO_CELL_OFFSET(sizeof(type))))
+
 #endif /* __HALO_CELLS_H */
