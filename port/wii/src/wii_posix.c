@@ -127,7 +127,7 @@ void wii_heap_usage(unsigned long *used, unsigned long *free_bytes)
 devkitPPC's pthread_create (libsysbase) starts every thread at libogc's
 lowest priority (127) and takes none from its attributes; libogc's
 scheduler is strict, so such a thread never runs while the game's main
-thread (63) is ready, and the game's waits that yield (SwitchToThread) for
+thread (64, below) is ready, and the game's waits that yield (SwitchToThread) for
 its worker threads never end. A thread the kernel layer starts
 (port/linux/src/xbox_kernel.c) is given a Win32 priority here: normal is the
 main thread's, each step above or below one less or more (a lower number

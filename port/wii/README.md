@@ -39,6 +39,8 @@ tools/wii_convert_maps.py XBOX/maps/ui.map XBOX/maps/bloodgulch.map   # into bui
 tools/wii_dolphin.py --seconds 300 --until "frame 360:"            # run it in Dolphin from WSL
 tools/wii_gx_psh_check.py                   # the combiner translation, checked on the host
 tools/wii_nv2a_check.py                     # the compiled vertex programs against the interpreter
+tools/wii_animation_check.py --converted DIR XBOX/maps/*.map   # the converted maps against the Xbox's (map conversion, below)
+tools/wii_data_check.py --converted DIR XBOX/maps/*.map
 ninja wii-package                           # build/wii/halo-wii.zip for the Homebrew Channel
 ```
 
@@ -138,12 +140,18 @@ inflated it to, and the Wii reads it where it is.
   `SwitchToThread` for its I/O thread, which otherwise never ran (the menu took 45 seconds to
   appear, a10 100 seconds to load).
 - **Big-endian fixes.** The game core is the same code as on the other ports, with a few changes
-  for big-endian:
+  for big-endian (each marked `port:` in `source/`; the faults found so far are listed under
+  "What is next"):
   - the script engine's value cells (`port/linux/include/halo_cells.h`)
   - the halves of `LARGE_INTEGER`
   - the recorded animations' bitfield header byte (rewritten by the converter)
   - the compressed animations' floats, read a byte at a time (the 750 can trap on a misaligned
     float load)
+  - values written at one width and read at another: a profile count passed as a `word *` to a
+    function that writes a word, a chicago shader's `extra_flags` (the tag's long), the pregame
+    start request (a long on the wire, filled as a long), the server's read of the start
+    request's short, and the textures the game writes itself (the device decodes them from a copy
+    in the Xbox's byte order)
 - **Floating point.** `_controlfp`/`_statusfp` map the MSVC control word onto the FPSCR
   (`port/linux/src/msvc_crt.c`).
 - **Movies.** Bink movies are skipped (`source/bink/bink_playback.c`).
@@ -298,9 +306,11 @@ and pixel shaders.
   - A clear once the frame has begun is a quad.
 - **Textures.** A map's bitmap is bound straight from the texture cache in its GX format. Any
   other texture is decoded to RGBA8 into a 1.5 MB cache, such as the glyph cache, which is
-  re-decoded when its pixels change. A cube map is bound as its sphere map, and each vertex's
-  direction is mapped onto it (on the CPU): the normalization cube map's too, whose texel is the
-  direction a bump map's dot product takes.
+  re-decoded when its pixels change. The game writes some of those itself (the glyphs, the
+  fallback checkers), with 16- and 32-bit texels in the Wii's byte order, so the decoder, which
+  reads them as the Xbox stored them, is given a swapped copy. A cube map is bound as its sphere
+  map, and each vertex's direction is mapped onto it (on the CPU): the normalization cube map's
+  too, whose texel is the direction a bump map's dot product takes.
 - **Depth.** A program's position matrix and its depth's a + b/w come from its constants alone,
   from two points along w's gradient. Both vertex paths take them, so a surface's passes meet
   their equal-depth tests whichever path each pass took.
@@ -349,6 +359,11 @@ Dolphin runs the game, but these need the console:
   GameCube pad, the Wiimote and Nunchuk mappings in `xinput_wii.c`).
 - **Memory.** MEM1 and MEM2 as the console's IOS leaves them, with the
   Homebrew Channel's loader (the memory report in the log).
+- **TEV's arithmetic.** The bump mapping's signed sums rely on TEV's lerp with a bias of -1/2,
+  its scale, and results kept unclamped between stages (-4 to 4); it has been checked only
+  against the host check's simulation of the documented rules in 8-bit steps, not on the console
+  (and a Dolphin look at the bumped surfaces is still to make). Look at the environment's bumped
+  lighting (the lightmap's bump term, a light's diffuse) for banding or the wrong sign.
 
 ## What is next
 
@@ -359,12 +374,17 @@ Dolphin runs the game, but these need the console:
    vertices' cost on the CPU (the fetch, the program and the emission per vertex), and a profile
    on real hardware, where Dolphin's timing may not hold.
 2. The rest of the drawing. Bump mapping's dot products of textures and constants are exact
-   (the lightmap's bump term, a light's diffuse, the flat cube map's reflection). Still taken as
-   1: the bumped specular's (dot products of registers, signed sums of products), the
-   self-illuminated lightmap's (more than 16 stages), a light's alpha test's (a register's), and
-   the bumped reflections' dependent lookups (indirect texturing where it maps). Sampling the
-   cube maps put the environment's lit pass (`10c30c53`, whose cube map direction comes from the
-   tangent frame) back on the CPU: a10's frame takes about 200 ms in Dolphin (150 without them).
+   (the lightmap's bump term, a light's diffuse, the flat cube map's reflection and the bumped
+   one's, where its lookups are sampled). `tools/wii_gx_psh_check.py` holds the game's bump
+   programs and says which are exact. Approximate: the self-illuminated lightmap's (15 stages,
+   but the exact forms do not fit GX's 16 stages and four registers, so its signed dot product's
+   inputs are clamped to [0, 1]), a light's alpha test's (a dot product of a register, taken as
+   1), the bumped specular's (dot products of registers and signed sums of products, which are
+   clamped or taken as 1 likewise), and the bumped reflections' dependent lookups (texture modes
+   GX cannot sample: a dot product with one is taken as 1; indirect texturing where it maps).
+   Sampling the cube maps put the environment's lit pass (`10c30c53`, whose cube map direction
+   comes from the tangent frame) back on the CPU: a10's frame takes about 200 ms in Dolphin (150
+   without them).
 3. Playing on. The campaign beyond a10's opening, and the lockstep check over longer sessions and
    more levels. Big-endian faults found so far:
    - plain char's sign (fixed with `-fsigned-char`);
@@ -383,7 +403,16 @@ Dolphin runs the game, but these need the console:
      `device_machines.c`), and `device_group_get`'s argument (`hs.c`): a dead target read as
      alive, a corpse opening doors;
    - the compressed animations' sections, swapped by the layout the decoder reads
-     (`tools/wii_animation_check.py` compares every animation).
+     (`tools/wii_animation_check.py` compares every animation);
+   - a profile count (`playlist_profiles_enumerate_available_to_local_player_index`) written as a
+     word into a long, so the multiplayer game-type list read the other half;
+   - a chicago shader's `extra_flags`, two words in the game's structure over the tag's long;
+   - the pregame start request: the client filled a short that the packet encodes as a long, and
+     the server's decoded short sat in the long's high half (the low 16 bits on the wire are
+     unchanged, so the network version stays);
+   - textures the game writes itself, decoded as if in the Xbox's byte order (`d3d8_gx.c`);
+   - not big-endian: a shadow's bounding radius left unset in the mirror's window, which the
+     object shadow pass then read (a NaN halted c40).
 4. Real hardware, from the Homebrew Channel (`ninja wii-package`).
 5. CI. The workflow's `wii` job passes when run locally in the devkitpro/devkitppc image. On
    GitHub it builds against WiiLibs' `dolphin-tests-and-fixed-claims` branch, which needs this

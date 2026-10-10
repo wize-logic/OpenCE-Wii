@@ -1780,8 +1780,8 @@ static void tev_setup(unsigned stages)
 	{
 		DWORD mode = (D3D__RenderState[D3DRS_PSTEXTUREMODES] >> (5 * stage)) & 0x1f;
 
-		/* (2D and projected lookups: the rest, cube maps, dot products and
-		bump maps, read as nothing) */
+		/* (2D, projected and sphere-mapped cube map lookups: the rest, the dot
+		product and bump map modes, read as nothing) */
 		if (!(stages & (1U << stage)) || !bound_entries[stage] ||
 			(mode != 1 && mode != 2 && !(mode == 3 && bound_entries[stage]->sphere)))
 		{
