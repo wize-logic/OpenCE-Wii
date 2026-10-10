@@ -56,9 +56,9 @@ void test_input_hold_action(int hold)
 	test_input_holding_action = hold;
 }
 
-/* the game's (source/game/game_time.c): its ticks, for debug.fixed_ticks */
-unsigned char game_in_progress(void);
-long game_time_get(void);
+/* the game's tick in a game, else -1 (port/linux/game/network_test.c sets
+it from the main loop): for debug.fixed_ticks */
+long network_test_game_tick = -1;
 
 void test_input_gamepad(XINPUT_GAMEPAD *pad, unsigned long long milliseconds)
 {
@@ -71,8 +71,8 @@ void test_input_gamepad(XINPUT_GAMEPAD *pad, unsigned long long milliseconds)
 	same input at the same tick on every machine, for a lockstep check) */
 	if (fixed_ticks < 0)
 		fixed_ticks = config_boolean("debug.fixed_ticks") ? 1 : 0;
-	if (fixed_ticks && game_in_progress())
-		milliseconds = (unsigned long long)game_time_get() * 1000ULL / 30ULL + 1;
+	if (fixed_ticks && network_test_game_tick >= 0)
+		milliseconds = (unsigned long long)network_test_game_tick * 1000ULL / 30ULL + 1;
 	if (test_input_holding_action)
 	{
 		/* (standing still, the button held from a second on) */

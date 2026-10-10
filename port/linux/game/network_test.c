@@ -780,6 +780,12 @@ void network_test_update(
 	game's time starts over) */
 	if (game_in_progress() && game_time_get() < network_test.logged_time)
 		network_test.logged_time = 0;
+	/* (the scripted player's clock with debug.fixed_ticks: test_input.c) */
+	{
+		extern long network_test_game_tick;
+
+		network_test_game_tick = game_in_progress() && !main_menu_loaded ? (long)game_time_get() : -1;
+	}
 	/* the lockstep log (debug.lockstep_log): the game's state hashed every so
 	many ticks, the same on every machine that plays the same ticks */
 	if (game_in_progress() && !main_menu_loaded && network_test.lockstep_ticks > 0 &&
