@@ -162,6 +162,10 @@ class Converter:
         problems = self.schema.lay_out()
         if problems:
             raise SystemExit("the tag layouts have problems (tools/wii_tag_layout.py):\n  " + "\n  ".join(problems))
+        # (the schema's placeholders the game reads values in: wii_tag_layout.py's fill_placeholders)
+        filled, _ = self.schema.fill_placeholders()
+        for line in filled:
+            print(f"layouts: filled {line}")
         self.plans = {id(definition): Plan(definition) for definition in self.schema.definitions.values()}
         self.vertex_structs = {vertex_type: (struct.Struct("<" + "".join(VERTEX_STRUCT_CODES[c] for c in format)),
                                              struct.Struct(">" + "".join(VERTEX_STRUCT_CODES[c] for c in format)))

@@ -103,6 +103,10 @@ class Executable:
         # structure tags, which the port keeps: tools/linux_msvc_semantics.py); the schema's types
         # are those its own units (tag_schema*.c) see
         self.schema_types: Dict[str, object] = {}
+        # the game's own structures (outside the schema's units), every one of a name (the game
+        # declares some differently in different files, a placeholder in one, every field in
+        # another): what fills the schema's placeholders (Schema.fill_placeholders)
+        self.game_structs: Dict[str, List[object]] = {}
         self._index_types()
 
     def read(self, address: int, size: int) -> bytes:
@@ -146,6 +150,8 @@ class Executable:
                 self.types.setdefault(key, die)
                 if schema_unit:
                     self.schema_types.setdefault(key, die)
+                elif die.tag == "DW_TAG_structure_type" and "DW_AT_byte_size" in die.attributes:
+                    self.game_structs.setdefault(key, []).append(die)
 
     def struct_layout(self, type_name: str) -> List[Leaf]:
         die = self.schema_types.get(type_name.strip()) or self.types.get(type_name.strip())
@@ -306,6 +312,92 @@ class Schema:
                                              executable.string(executable.u32(fields + o["name"]))))
             fields += self.field_size
         return result
+
+    PLACEHOLDER_PREFIXES = ("reserved", "unused", "unknown", "pad")
+
+    def _game_structures(self, definition: Definition) -> List[Tuple[str, List[Leaf]]]:
+        """the game's structures named for a definition (sky: struct sky, struct sky_definition),
+        each declaration of each (some cover only the first part of the tag, the fields their file
+        reads), as leaves"""
+        base = definition.name[:-len("_definition")] if definition.name.endswith("_definition") else definition.name
+        # (the game's names for a tag's structures: its own, ..._definition, a scenario block's
+        # scenario_..., a widget's ..._reference)
+        names = {base, base + "_definition", "_" + base + "_definition", "scenario_" + base, base + "_reference",
+                 "scenario_" + base + "_view", definition.type_name.split()[-1]}
+        result = []
+        for name in sorted(names):
+            seen = set()
+            for die in self.executable.game_structs.get(f"struct {name}", []):
+                if die.attributes["DW_AT_byte_size"].value > definition.size:
+                    continue
+                leaves: List[Leaf] = []
+                try:
+                    self.executable._flatten(die, 0, f"struct {name}", leaves)
+                except (ValueError, KeyError):
+                    continue
+                shape = tuple((leaf.offset, leaf.size, leaf.kind) for leaf in leaves)
+                if shape not in seen:
+                    seen.add(shape)
+                    result.append((f"struct {name}", leaves))
+        return result
+
+    def fill_placeholders(self) -> Tuple[List[str], List[str]]:
+        """the schema's structures (tag_schema*.c) name only the fields the validator checks, and
+        stand byte arrays (reserved..., unused..., unknown..., pad...) for the rest, which a
+        byteswap would leave as they are though the game reads values there (a sky's fog
+        colours). They are filled from the game's own declarations of the definition's name (struct
+        sky, or struct sky_definition), which may cover only the tag's first part: one agrees when
+        none of its fields contradicts one the schema names (where it has bytes, it says nothing)
+        and at least one is the same. The fields within the placeholders of every declaration that
+        agrees are taken, unless two contradict each other. Returns what was filled, and the
+        placeholders left as they are and why"""
+        filled, unfilled = [], []
+        for definition in self.definitions.values():
+            placeholders = [leaf for leaf in definition.leaves if leaf.kind == "bytes" and leaf.size >= 4 and
+                            leaf.name.split(".")[-1].startswith(self.PLACEHOLDER_PREFIXES)]
+            if not placeholders:
+                continue
+            anchors = {(leaf.offset, leaf.size, leaf.kind == "pointer") for leaf in definition.leaves
+                       if leaf.kind != "bytes"}
+            ranges = [(leaf.offset, leaf.offset + leaf.size) for leaf in placeholders]
+            taken: Dict[int, Tuple[int, str, str]] = {}
+            names = set()
+            conflict = None
+            for name, leaves in self._game_structures(definition):
+                fields = {(leaf.offset, leaf.size, leaf.kind == "pointer") for leaf in leaves if leaf.kind != "bytes"}
+                # (some field the same, or, where the schema names none, a declaration of the
+                # tag's whole size)
+                whole = max((leaf.offset + leaf.size for leaf in leaves), default=0) == definition.size
+                if not (fields & anchors or (not anchors and whole)):
+                    continue
+                # (a field of its outside the placeholders that is not the schema's contradicts it)
+                if any(not any(start <= offset and offset + size <= end for start, end in ranges) and
+                       (offset, size, pointer) not in anchors for offset, size, pointer in fields):
+                    continue
+                for leaf in leaves:
+                    if leaf.kind == "bytes" or not any(start <= leaf.offset and leaf.offset + leaf.size <= end
+                                                       for start, end in ranges):
+                        continue
+                    earlier = taken.get(leaf.offset)
+                    if earlier and earlier[:2] != (leaf.size, leaf.kind):
+                        conflict = f"{name} and {earlier[2]} differ at {leaf.offset:#x}"
+                    overlapping = [offset for offset, (size, _, _) in taken.items()
+                                   if offset != leaf.offset and offset < leaf.offset + leaf.size and leaf.offset < offset + size]
+                    if overlapping:
+                        conflict = f"{name}'s fields overlap another declaration's at {leaf.offset:#x}"
+                    taken.setdefault(leaf.offset, (leaf.size, leaf.kind, name))
+                names.add(name)
+            if conflict:
+                unfilled.append(f"{definition.name}: {conflict}")
+                continue
+            if not taken:
+                unfilled.append(f"{definition.name}: no game structure of its name says more")
+                continue
+            definition.leaves = [leaf for leaf in definition.leaves if leaf not in placeholders] + \
+                [Leaf(offset, size, kind, f"{name}+{offset:#x}") for offset, (size, kind, name) in sorted(taken.items())]
+            filled.append(f"{definition.name}: {sum(size for size, _, _ in taken.values())} of "
+                          f"{sum(leaf.size for leaf in placeholders)} placeholder bytes from {', '.join(sorted(names))}")
+        return filled, unfilled
 
     def lay_out(self) -> List[str]:
         """every definition's leaves; the problems found"""

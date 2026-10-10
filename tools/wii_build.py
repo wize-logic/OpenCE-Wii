@@ -45,6 +45,8 @@ WIILIBS_LIBRARIES = ("wl/platform/libwl_platform.a", "wl/audio/libwl_audio.a", "
 #  - thread-local variables through libgcc's emulation (__emutls_get_address,
 #    over pthread keys): the PowerPC ABI addresses them from r2, which the
 #    EABI gives the small data area and libogc no thread's storage,
+#  - plain char signed, as MSVC's (PowerPC's is unsigned: a char holding
+#    NONE would read as 255),
 #  - libogc's Wii (HW_RVL) declarations.
 # -malign-double is not needed: the PowerPC EABI already aligns doubles and
 # 64-bit integers to 8 bytes, as MSVC does.
@@ -54,6 +56,7 @@ def wii_abi_flags(devkitpro: Path) -> List[str]:
         "-mcpu=750",
         "-fms-extensions",
         "-fshort-wchar",
+        "-fsigned-char",
         "-fcommon",
         "-fno-pic",
         "-fno-strict-aliasing",

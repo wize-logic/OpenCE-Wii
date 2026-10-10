@@ -80,6 +80,8 @@ enum
 	_network_test_off,
 	_network_test_host,
 	_network_test_join,
+	/* a map alone, no network: the console ports' first test of a level */
+	_network_test_solo,
 };
 
 static struct
@@ -160,6 +162,11 @@ static void network_test_read_settings(
 	else if (!strcmp(setting, "join"))
 	{
 		network_test.mode = _network_test_join;
+	}
+	else if (!strncmp(setting, "solo:", 5) && setting[5])
+	{
+		network_test.mode = _network_test_solo;
+		snprintf(network_test.map_name, sizeof(network_test.map_name), "%s", setting + 5);
 	}
 	network_test.start_delay = (real)config_real("debug.network_test_start");
 	network_test.kill_interval = (real)config_real("debug.network_test_kill");
@@ -918,6 +925,22 @@ void network_test_update(
 
 	switch (network_test.mode)
 	{
+	case _network_test_solo:
+		/* the map, once, as the menu's would load it (a level of its own
+		path, else a multiplayer map's name) */
+		if (!network_test.set_up && network_test.menu_seconds >= network_test.start_delay)
+		{
+			char path[128];
+
+			network_test.set_up = TRUE;
+			if (strchr(network_test.map_name, '\\'))
+				snprintf(path, sizeof(path), "%s", network_test.map_name);
+			else
+				snprintf(path, sizeof(path), "levels\\test\\%s\\%s", network_test.map_name, network_test.map_name);
+			platform_log("network test: %s alone", path);
+			main_set_map_name(path);
+		}
+		break;
 	case _network_test_host:
 		if (!network_test.set_up)
 		{
