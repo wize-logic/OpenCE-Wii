@@ -4018,16 +4018,16 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			if (timing.window_start)
 			{
 				platform_log("Direct3D: a frame's draws: GX's transform %lu ms (matrices %lu, vertices %lu), the "
-					"processor's %lu (an indexed draw's vertices: fetch %lu, program %lu, store %lu, emit %lu), "
-					"immediate %lu", (unsigned long)((timing.hardware_setup + timing.hardware_vertices) /
+					"processor's %lu, immediate %lu", (unsigned long)((timing.hardware_setup + timing.hardware_vertices) /
 					1000 / STATISTICS_FRAMES), (unsigned long)(timing.hardware_setup / 1000 / STATISTICS_FRAMES),
 					(unsigned long)(timing.hardware_vertices / 1000 / STATISTICS_FRAMES),
 					(unsigned long)(timing.processor / 1000 / STATISTICS_FRAMES),
+					(unsigned long)(timing.immediate / 1000 / STATISTICS_FRAMES));
+				platform_log("Direct3D: the processor's indexed vertices: fetch %lu ms, program %lu, store %lu, emit %lu",
 					(unsigned long)(timing.fetch_ticks / 60750 / STATISTICS_FRAMES),
 					(unsigned long)(timing.program_ticks / 60750 / STATISTICS_FRAMES),
 					(unsigned long)(timing.store_ticks / 60750 / STATISTICS_FRAMES),
-					(unsigned long)(timing.emit_ticks / 60750 / STATISTICS_FRAMES),
-					(unsigned long)(timing.immediate / 1000 / STATISTICS_FRAMES));
+					(unsigned long)(timing.emit_ticks / 60750 / STATISTICS_FRAMES));
 				platform_log("Direct3D: a frame takes %lu ms: draws %lu (vertex programs and GX), textures %lu, "
 					"pixel shaders %lu, the end of the frame %lu (waiting for GX), the rest (the game) %lu",
 					(unsigned long)((now - timing.window_start) / 1000 / STATISTICS_FRAMES),
