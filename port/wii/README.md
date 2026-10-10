@@ -310,7 +310,38 @@ and pixel shaders.
       alpha, then the term). Where the alpha half reads its blue (the lightmap's bump term, a
       reflection's Fresnel), it takes three in the alpha half, and the colour reads that
       register's alpha, as it does products of it.
-    - A dot product of a register's colour is still taken as 1 (no swap reaches its channels).
+    - A dot product of a register's colour is still taken as 1 (no swap reaches its channels),
+      but for the specular pass below.
+  - The environment's specular pass from its lightmaps (its eight programs: bumped or with the
+    bump map as a mask, overbright, extra shiny) is recognized and made by hand
+    (`specular_lightmap_recipe`): its r.l, a dot product of a register, is 2(n.e)(n.l) - e.l.
+    - n.e and n.l are signed dot products as above, sharing the bump map's loads (nine stages),
+      clamped to [0, 1] (NV2A keeps them signed).
+    - e.l is the vertices', of their eye and light directions normalized, in colour 0 as
+      (1 - e.l) / 2: no stages are left for a third dot product.
+    - The self-shadowing, the lightmap's intensity, the Fresnel colour and the powers are exact.
+      The Fresnel colour times the intensity is clamped after the shadows and brightness
+      multiply it (NV2A clamps it first). When extra shiny, the two more squarings leave no room
+      for n.l, which is then the flat normal's. With the bump map as a mask, only e.l is not exact.
+    - The alpha (NV2A's mask for the alpha test, 0 only where the colour is) is 1.
+    - The host check compares each with NV2A's combiners evaluated signed: a mean error of 0.03
+      to 0.1/255 with the mask, 0.5 to 1/255 bumped, 3/255 bumped and extra shiny.
+    - The specular pass of a dynamic light reads a 3D texture (the distance attenuation) GX
+      has no form of, and still draws nothing.
+  - A bumped reflection (texture modes DOTPRODUCT, DOT_RFLCT_DIFF, DOT_RFLCT_SPEC) reads its
+    cube map's sphere map through GX's indirect unit, as GX's environment-mapped bump
+    (`GX_SetTevIndBumpST`) does:
+    - The bump map is bound again as map 5 through a TLUT of its normals' x (alpha, the
+      indirect unit's s) and y (intensity, its t).
+    - Per vertex (on the processor), texture coordinate 3 is the sphere coordinates of the flat
+      normal's reflection (the tangent frame's rows in coordinates 1 to 3, the eye in their w),
+      and 1 and 2 how far they move as the normal tilts along the frame's x and y.
+    - Before each lookup, two stages that read no texture take coordinate 1 times the bump's
+      x and add coordinate 2 times its y (GX's dynamic S and T matrices); the lookup adds its own
+      coordinate (`bumped_lookups_place`, `indirect_apply`). This is the reflection's move made
+      linear per vertex.
+    - The Fresnel term's normal (DOT_RFLCT_DIFF's lookup) is the flat one, per vertex, in
+      colour 1. The combiners are then translated as the flat cube map's, exactly (14 stages).
   - (1 - x)p + xq is TEV's lerp, one stage.
   - Constants read as 0 or 1 need no register. Those needed in every channel take the four konst
     registers first, and any beyond four are set in TEV registers kept for them.
@@ -393,6 +424,11 @@ Dolphin runs the game, but these need the console:
   against the host check's simulation of the documented rules in 8-bit steps, not on the console
   (and a Dolphin look at the bumped surfaces is still to make). Look at the environment's bumped
   lighting (the lightmap's bump term, a light's diffuse) for banding or the wrong sign.
+- **The indirect unit's offsets.** A bumped reflection's offset is taken as the texture coordinate
+  times the indirect texel less 128, over 256, times 2 to matrix 0's scale (as Dolphin computes
+  GX's dynamic S and T matrices; `BUMP_OFFSET_SCALE` in `d3d8_gx.c`), and the coordinate as
+  scaled by the size of the map given with `GX_TEXMAP_DISABLE`. If the console's bumps move the
+  reflection too far or too little, that scale is what differs.
 
 ## What is next
 
@@ -409,9 +445,12 @@ Dolphin runs the game, but these need the console:
    programs and says which are exact. Approximate: the self-illuminated lightmap's (15 stages,
    but the exact forms do not fit GX's 16 stages and four registers, so its signed dot product's
    inputs are clamped to [0, 1]), a light's alpha test's (a dot product of a register, taken as
-   1), the bumped specular's (dot products of registers and signed sums of products, which are
-   clamped or taken as 1 likewise), and the bumped reflections' dependent lookups (texture modes
-   GX cannot sample: a dot product with one is taken as 1; indirect texturing where it maps).
+   1), the specular pass from the lightmaps (made by hand: e.l the vertices', n.e and n.l
+   clamped, n.l the flat normal's when extra shiny), and the bumped reflections (their cube
+   map through GX's indirect unit, the bump's move of the reflection linear per vertex, the
+   Fresnel term the flat normal's). Both are still to be seen in Dolphin against the processor's
+   path (a10's cryo bay floors, b30's metal). A dynamic light's specular pass reads a 3D
+   texture and draws nothing (its attenuation could be the vertices').
    Sampling the cube maps put the environment's lit pass (`10c30c53`, whose cube map direction
    comes from the tangent frame) back on the CPU: a10's frame takes about 200 ms in Dolphin (150
    without them).
