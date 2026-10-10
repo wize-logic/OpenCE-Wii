@@ -34,7 +34,7 @@ You need:
 
 ```sh
 python3 configure.py
-ninja wii                                   # build/wii/halo.dol and halo.elf
+ninja wii                                   # build/wii/halo.dol and halo.elf (and the converter's texture library)
 tools/wii_convert_maps.py XBOX/maps/ui.map XBOX/maps/bloodgulch.map   # into build/wii/sd/apps/halo/maps
 tools/wii_dolphin.py --seconds 300 --until "frame 360:"            # run it in Dolphin from WSL
 tools/wii_gx_psh_check.py                   # the combiner translation, checked on the host
@@ -189,6 +189,15 @@ exactly as the i386 build's, and none use C bitfields. A map is converted as fol
   Mip levels are kept while GX's tiles fit in the Xbox's bytes. A cube map's sphere map uses the
   mirror ball's mapping, sampled from the six faces' first levels; only the direction straight
   behind has no place on it. 3D textures stay as they are, and the device decodes them.
+
+  Each level is converted by WiiLibs' `wl/codec/xbox_tex.h` (`wl_xbox_to_gx`,
+  `wl_xbox_dxt_to_cmpr`, `wl_xbox_dxt_alpha_i4`). `ninja wii` builds those sources as a host
+  library, `build/wii/tools/libwl_xbox_tex.so`, which the converter loads with ctypes. Before
+  using it, the converter checks that it makes the same bytes as the converter's own numpy
+  conversions on a test texture of every format. Without the library (`--numpy-textures`, or a
+  WiiLibs without the codec), numpy converts the bitmaps itself, more slowly. Either way the
+  output is byte for byte the same on all 24 maps. The levels kept, the sphere maps and the
+  padding are the port's own and stay in `tools/wii_gx_textures.py`.
 - **Pixel offsets.** The Xbox's maps keep a stale tag-file offset in each bitmap group's pixel
   data, which the texture cache would add to every bitmap's own offset. The converter sets it to
   0.

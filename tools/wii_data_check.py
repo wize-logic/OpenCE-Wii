@@ -50,6 +50,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from wii_convert_maps import (BITMAP_GROUP_TYPE_INTERFACE, TAG_CACHE_SIZE, XBOX_TAG_CACHE_ADDRESS,  # noqa: E402
                               Converter, Region)
+import wii_gx_textures  # noqa: E402
 
 # ---------- what the game reads
 
@@ -890,6 +891,8 @@ def main() -> int:
     parser.add_argument("--only", action="append", help="the checks to run (scripts, recorded, cluster, "
                         "vertices, sounds, bitmaps)")
     args = parser.parse_args()
+    # (the bitmaps converted in memory as tools/wii_convert_maps.py converts them)
+    wii_gx_textures.use_library()
     converter = Recorder(args.elf, args.tag_cache_address)
     failed = False
     for path in args.maps:
