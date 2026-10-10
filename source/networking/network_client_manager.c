@@ -553,7 +553,7 @@ struct connect_process_input;
 
 struct message_client_game_start_request
 {
-	long request_type; /* port: the packet encodes a long (a short left its value in the high half on big-endian) */
+	short request_type;
 };
 
 struct message_client_add_player_request

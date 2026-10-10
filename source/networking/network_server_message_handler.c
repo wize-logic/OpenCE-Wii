@@ -2459,7 +2459,8 @@ static boolean network_game_server_handle_message_client_game_start_request(
 			_network_game_packet_class_client_pregame))
 		{
 			/* (a short on the wire: the rest of the long is not written) */
-			short countdown_event = (short)game_start_request.countdown_time;
+			/* port: the short is decoded into the long's first two bytes, its high half on big-endian */
+			short countdown_event = *(short *)&game_start_request.countdown_time;
 
 			/* port: the pregame screen's faster and slower, from any machine;
 			to stop the countdown or start at once (a script's), the host's own
