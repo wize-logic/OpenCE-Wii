@@ -315,6 +315,54 @@ and pixel shaders.
     instructions a vertex for `8f831b43`: its skinning and lighting are most of it); each index
     sends 7 words to the FIFO in place of 14.
   - In the menu, the draws take 10 ms a frame compiled, against 58 ms interpreted.
+  - **The models' lighting on GX's lights** (`display.gx_lighting`, on by default on the Wii;
+    `src/gx_lighting.c`). The models' lit programs (`cfc6f3a4`, `9d2757d2`, `8f831b43`: the
+    reflection, lights and planar fog permutations of a skinned model; `71f9f272`, `1d3f5b13`,
+    `e6e006c7`) light each vertex by its skinned normal, and take a cube map at the eye's
+    reflection about it: about 1,100 of a vertex's 1,200 instructions on the hybrid path above.
+    GX now makes those outputs itself:
+    - GX lights in the space its position matrices make, which the device's (x w, y w, -w) is
+      not (its x and y are pixels, its z the depth). That is K E, K upper triangular with a last
+      row of (0, 0, 1), E the eye's space, turned and moved from the world's: the position
+      matrices make E, the projection is multiplied by K, the depth's row is the same. The
+      normal matrices are E's rows of each node's matrix.
+    - The normal goes with each vertex as three floats, read from the map's 11:11:10 word as the
+      programs read it (or the processor's skinned normal for a vertex whose position is the
+      processor's).
+    - COLOR0 is D0: the ambient colour, a light far along each distant light's direction (and
+      one opposite for a translucent shader's back side), and each point light. COLOR1A1 is
+      D1, the Fresnel colour c-80 + c-81 (n.e): two lights at the eye, signed
+      (`GX_DF_SIGNED`), one for the channels where c-81 is positive and one, with a negative
+      attenuation, for those where it is negative. D0's alpha is 0, or the planar fog's, which
+      the processor computes from the world position (about 110 instructions a vertex).
+    - A point light's fall-off, max(1 - d^2/r^2, 0), is not a form GX has: its reciprocal's
+      second-order expansion about the draw's distance gives GX's k0 + k1 d + k2 d^2. Its spot,
+      clamp(cos s + o, 0, 1), is a parabola through the same cut-off, 1 on its axis.
+    - The reflection's cube map (the world's sphere map, a mirror ball looking down the world's
+      z) is read at texture coordinates GX makes of the normal through a matrix for each node
+      (given with each vertex, as its position matrix is): the normal in a frame turned toward
+      the eye along the draw's direction (rounded to 15 degrees), x / 2 + 1/2 and y / 2 + 1/2.
+      Its sphere map of the view is drawn from the world's in the 48 rows of the EFB below the
+      back buffer, 48 texels square, a 24 by 24 grid each of whose points is the world's
+      sphere map at the reflection a normal there makes of the eye straight along the frame,
+      then copied out: once a frame for each cube map and rounded direction.
+    - `tests/gx_lighting_check.c` (run by `tools/wii_nv2a_check.py`) runs each program on the
+      interpreter for random scenes (a camera, a skinned model of nodes within 40 degrees of
+      each other, lights about it) and compares what GX makes of the same vertices: D0 with
+      the distant lights 0.8 to 0.9/255 on average (the largest, 30/255, where a blend of
+      two nodes shortens the programs' normal, which GX makes unit again), with point lights
+      1.8 to 2.6/255 (their fit; largest 166/255), D1 0.6/255, the planar fog's alpha exact,
+      the position within 0.007 pixels. The reflection's direction is 7 degrees off on average
+      (25 with the eye straight ahead of every draw, 3.3 with each draw's own direction), and
+      the grid's interpolation of the world's sphere map 1.4 texels in 128 on average (the
+      largest across the mirror ball's rim, straight down).
+    - On the processor, a vertex of these draws takes 17 instructions (the normal's decode and
+      the FIFO's words), 129 with the planar fog's alpha, where the hybrid path took 920 to
+      1,200 (`qemu-ppc` counts, with GCC's code: `cfc6f3a4` 920 to 17, `9d2757d2` 1,149 to 17,
+      `8f831b43` 1,200 to 129). A vertex whose position is the processor's (a blend beyond the
+      draw's matrices) still runs the program for its position and is skinned for its normal.
+    - The log's `lit by GX` line counts the draws, their vertices, those refused (no such space,
+      more lights or colours than GX holds) and the view's sphere maps drawn.
 
   GX then draws the results:
   - A program that divides by its clip-space w is sent as (x·w, y·w, −w) through a perspective
@@ -523,6 +571,12 @@ Dolphin runs the game, but these need the console:
   GX's dynamic S and T matrices; `BUMP_OFFSET_SCALE` in `d3d8_gx.c`), and the coordinate as
   scaled by the size of the map given with `GX_TEXMAP_DISABLE`. If the console's bumps move the
   reflection too far or too little, that scale is what differs.
+
+- **GX's lighting.** The Fresnel colour (D1) takes a light with a negative attenuation (k0 of -1)
+  where the reflection is brighter at grazing angles, as Dolphin computes it; if the console
+  clamps an attenuation at 0, the models' reflections lose their grazing brightness (compare
+  `display.gx_lighting = false`). GX makes the lit normal unit length (as Dolphin does), and
+  the view's sphere maps are drawn in the EFB's rows 480 to 527, below the back buffer.
 
 ## What is next
 
