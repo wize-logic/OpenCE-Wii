@@ -377,6 +377,19 @@ void render_object_shadows(
 {
 	profile_enter(render_object_shadows_section);
 
+	/* port: config.toml's display.object_shadows (port_config.c) */
+	{
+		extern int config_boolean(char const *name);
+		static int object_shadows = -1;
+
+		if (object_shadows < 0)
+			object_shadows = config_boolean("display.object_shadows") ? 1 : 0;
+		if (!object_shadows)
+		{
+			profile_exit(render_object_shadows_section);
+			return;
+		}
+	}
 	if (render_shadows)
 	{
 		struct object_render_data data;

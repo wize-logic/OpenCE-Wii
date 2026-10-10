@@ -1999,8 +1999,29 @@ static void sound_stop(
 	long sound_index)
 {
 	struct sound_datum *sound = sound_get(sound_index);
-	struct sound_definition *definition =
-		sound_definition_get(sound->definition_index);
+	struct sound_definition *definition;
+
+	/* port: a sound of a map no longer loaded (update_channels): its channel
+	stopped and the sound deleted, its definition, which the tags no longer
+	hold, untouched */
+	if (!cache_tag_index_current(sound->definition_index))
+	{
+		if (sound->playing_channel_index != NONE)
+		{
+			struct sound_channel_datum *channel = channel_get(sound->playing_channel_index);
+
+			/* (its permutations were the old map's tags, which the sound
+			cache let go of with the map: not handed back) */
+			channel->sound_index = NONE;
+			channel->queued_permutation = NULL;
+			channel->playing_permutation = NULL;
+			sound_manager_globals.platform_definition->stop_channel(sound->playing_channel_index);
+			sound->playing_channel_index = NONE;
+		}
+		sound_delete(sound_index);
+		return;
+	}
+	definition = sound_definition_get(sound->definition_index);
 
 	if (sound->playing_channel_index != NONE)
 	{

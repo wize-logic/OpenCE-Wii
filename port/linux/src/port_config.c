@@ -72,8 +72,10 @@ struct config_setting
 vertices, and draws simpler ones sooner) */
 #ifdef HALO_WII
 #define MODEL_DETAIL_DEFAULT "0.5"
+#define OBJECT_SHADOWS_DEFAULT "false"
 #else
 #define MODEL_DETAIL_DEFAULT "1.0"
+#define OBJECT_SHADOWS_DEFAULT "true"
 #endif
 
 static const struct config_setting config_settings[] =
@@ -169,6 +171,11 @@ static const struct config_setting config_settings[] =
 		_environment_value, _platform_all,
 		"The scoreboard panel's colour: \"red, green, blue, alpha\", each 0 to 255\n"
 		"(alpha 0 is see-through, 255 solid)." },
+	{ "display.object_shadows", _config_boolean, OBJECT_SHADOWS_DEFAULT, "HALO_OBJECT_SHADOWS", _environment_value,
+		_platform_all,
+		"The objects' shadows on the ground (each object drawn again into a shadow\n"
+		"map); false draws none (the Wii's default: its processor runs the skinned\n"
+		"models' vertices, a pass of them for the shadows)." },
 	{ "display.model_detail", _config_real, MODEL_DETAIL_DEFAULT, "HALO_MODEL_DETAIL", _environment_value, _platform_all,
 		"The models' detail: the size each model's level of detail is chosen for is\n"
 		"scaled by this (1 as the Xbox; less draws simpler models sooner, the Wii's\n"
