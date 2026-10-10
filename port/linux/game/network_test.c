@@ -801,7 +801,10 @@ void network_test_update(
 		object_iterator_new(&objects, 0xFFFFFFFFUL, 0);
 		while ((object = object_iterator_next(&objects)) != NULL)
 		{
-			words[0] = (unsigned long)objects.index;
+			/* (the index, not the salt: that counts the identifiers handed out
+			since the game started, the menu's too, which ran for longer or
+			shorter on another machine) */
+			words[0] = (unsigned long)objects.index & 0xFFFF;
 			words[1] = (unsigned long)object->type;
 			memcpy(&words[2], &object->position, 3 * sizeof(unsigned long));
 			memcpy(&words[5], &object->translational_velocity, 3 * sizeof(unsigned long));
