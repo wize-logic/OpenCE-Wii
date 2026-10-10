@@ -216,11 +216,13 @@ converted, how it draws, and the lockstep check.
   `tools/wii_convert_maps.py` into `build/wii/sd/apps/halo/maps`. Never
   commit or upload game data or converted maps.
 - Host checks that need no emulator: `python3 tools/wii_gx_psh_check.py`
-  (the TEV translation against the combiners) and
+  (the TEV translation against the combiners, built with WiiLibs' TEV
+  programs: it finds WiiLibs in `WIILIBS`, `./WiiLibs` or `../WiiLibs`) and
   `python3 tools/wii_nv2a_check.py` (the generated vertex programs against
   the interpreter), both in the CI's `wii` job. `tools/wii_animation_check.py`
-  (every animation of the Xbox's maps against the converted ones) needs the
-  maps, so it is not in the CI.
+  (every animation of the Xbox's maps against the converted ones) and
+  `tools/wii_data_check.py` (the other data blocks and the bitmaps) need the
+  maps, so they are not in the CI.
 - Dolphin (`tools/wii_dolphin.py`, WiiLibs' `tools/dolphin_run.py`) opens a
   window on the desktop of the person you work for. Run it only at a
   checkpoint, say so first, keep one run at a time, give the runner's own
