@@ -126,6 +126,9 @@ struct gx_psh_program
 
 /* FALSE when the combiners need more than GX has (the program is then not
 usable) */
+/* whether the specular lights' programs are made by hand (TRUE, the
+default); FALSE translates them as any other, their bumps approximated */
+extern BOOL gx_psh_specular_recipes;
 BOOL gx_psh_translate(const DWORD *render_state, const struct gx_psh_textures *textures,
 	struct gx_psh_program *program);
 /* the stages to GX (their swap tables, konst colours and preloads too) */

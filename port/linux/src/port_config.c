@@ -73,9 +73,11 @@ vertices, and draws simpler ones sooner) */
 #ifdef HALO_WII
 #define MODEL_DETAIL_DEFAULT "0.5"
 #define OBJECT_SHADOWS_DEFAULT "false"
+#define BUMPED_HIGHLIGHTS_DEFAULT "false"
 #else
 #define MODEL_DETAIL_DEFAULT "1.0"
 #define OBJECT_SHADOWS_DEFAULT "true"
+#define BUMPED_HIGHLIGHTS_DEFAULT "true"
 #endif
 
 static const struct config_setting config_settings[] =
@@ -176,6 +178,12 @@ static const struct config_setting config_settings[] =
 		"The objects' shadows on the ground (each object drawn again into a shadow\n"
 		"map); false draws none (the Wii's default: its processor runs the skinned\n"
 		"models' vertices, a pass of them for the shadows)." },
+	{ "display.bumped_highlights", _config_boolean, BUMPED_HIGHLIGHTS_DEFAULT, "HALO_BUMPED_HIGHLIGHTS", _environment_value,
+		_platform_all,
+		"The Wii's bumped specular highlights and bumped cube-map reflections\n"
+		"(drawn by GX's indirect unit, their vertices on the processor); false\n"
+		"draws those surfaces as before, flat (the Wii's default: they cost about\n"
+		"two fifths of a10's frame). The other builds always draw them." },
 	{ "display.model_detail", _config_real, MODEL_DETAIL_DEFAULT, "HALO_MODEL_DETAIL", _environment_value, _platform_all,
 		"The models' detail: the size each model's level of detail is chosen for is\n"
 		"scaled by this (1 as the Xbox; less draws simpler models sooner, the Wii's\n"

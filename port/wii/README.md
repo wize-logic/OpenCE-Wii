@@ -15,6 +15,8 @@ This port is in bring-up. In Dolphin, the game boots from the SD card and loads 
   `debug.network_test = "solo:levels\\a30\\a30,levels\\b30\\b30"` with
   `debug.network_test_tour` seconds of game time in each). The outdoor levels run at about two
   frames a second in Dolphin: their skinned characters' vertices are the CPU's. On the Wii,
+  `display.bumped_highlights` is off by default (bumped specular and bumped reflections: their
+  passes' vertices run on the processor, about two fifths of a10's frame),
   `display.object_shadows` is off by default (each object's shadow draws it again, a pass of
   skinned vertices) and `display.model_detail` is 0.5.
 - **Loading**: the menu is up within a second of the game's start.

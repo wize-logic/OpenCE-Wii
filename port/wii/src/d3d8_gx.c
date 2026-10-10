@@ -1809,6 +1809,20 @@ static void bump_offset_bind(void)
 
 /* the indirect unit as the program's stages ask (NULL: off, for stages the
 device sets itself) */
+/* display.bumped_highlights: the bumped reflections' indirect lookups and the
+specular lights' programs made by hand (gx_psh.c), read once */
+static BOOL bumped_highlights(void)
+{
+	static int enabled = -1;
+
+	if (enabled < 0)
+	{
+		enabled = config_boolean("display.bumped_highlights") ? 1 : 0;
+		gx_psh_specular_recipes = enabled ? TRUE : FALSE;
+	}
+	return enabled ? TRUE : FALSE;
+}
+
 static void indirect_apply(const struct gx_psh_program *program)
 {
 	static f32 matrix[2][3] = { { 0.5f, 0.0f, 0.0f }, { 0.0f, 0.5f, 0.0f } };
@@ -1935,7 +1949,7 @@ static void tev_setup(unsigned stages)
 	/* a bumped reflection (after the bump map, DOTPRODUCT, DOT_RFLCT_DIFF
 	and DOT_RFLCT_SPEC): its cube map's sphere map read through the indirect
 	unit, the normal's lookup colour 1 (indirect_apply) */
-	bumped_reflection = (D3D__RenderState[D3DRS_PSTEXTUREMODES] & 0xFFFE0UL) == (0x11UL << 5 | 0x0BUL << 10 | 0x0CUL << 15) &&
+	bumped_reflection = bumped_highlights() && (D3D__RenderState[D3DRS_PSTEXTUREMODES] & 0xFFFE0UL) == (0x11UL << 5 | 0x0BUL << 10 | 0x0CUL << 15) &&
 		(stages & 1) && bound_entries[0] && bound_entries[0]->gx_format == GX_TF_CI8 && (stages & 8) &&
 		bound_entries[3] && bound_entries[3]->sphere;
 	for (stage = 0; stage < GX_PSH_TEXTURES; stage++)

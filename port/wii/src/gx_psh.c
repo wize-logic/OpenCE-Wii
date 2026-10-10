@@ -3577,6 +3577,8 @@ static BOOL translate_once(const DWORD *render_state, const struct gx_psh_textur
 	return TRUE;
 }
 
+BOOL gx_psh_specular_recipes = TRUE;
+
 BOOL gx_psh_translate(const DWORD *render_state, const struct gx_psh_textures *textures,
 	struct gx_psh_program *program)
 {
@@ -3589,7 +3591,7 @@ BOOL gx_psh_translate(const DWORD *render_state, const struct gx_psh_textures *t
 	unsigned attempt, stage;
 
 	/* (the specular lights' programs, made by hand) */
-	if (specular_lightmap_recipe(render_state, textures, program))
+	if (gx_psh_specular_recipes && specular_lightmap_recipe(render_state, textures, program))
 	{
 		program->texcoords = (unsigned char)wl_tev_texcoords_mask(&program->tev);
 		program->channels = (unsigned char)wl_tev_channels_mask(&program->tev);
