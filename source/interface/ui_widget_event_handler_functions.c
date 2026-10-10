@@ -1059,7 +1059,7 @@ boolean network_game_client_add_player(
 	short controller_index);
 void playlist_profiles_enumerate_available_to_local_player_index(
 	short local_player_index,
-	long *profile_count,
+	word *profile_count, /* port: a word, as playlist_profile.c defines it (big-endian reads the other half of a long) */
 	long *profile_indices);
 extern byte cached_variant_profile[0x144];
 static boolean new_campaign_chosen(
@@ -3348,7 +3348,7 @@ static boolean multiplayer_profiles_list_initialize(
 	profile_indices = widget->generated_list;
 	if (profile_indices)
 	{
-		long profile_count;
+		word profile_count; /* port: was long, passed as a word * */
 
 		profile_count = 100;
 		playlist_profiles_enumerate_available_to_local_player_index(0, &profile_count, profile_indices);
