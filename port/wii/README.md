@@ -163,9 +163,12 @@ exactly as the i386 build's, and none use C bitfields. A map is converted as fol
   | A1R5G5B5, A4R4G4B4 | RGB5A3 |
   | L8, A8, AL8 | I8 |
   | A8L8 | IA8 |
+  | P8 (bump maps' normals) | CI8, the palette loaded as a TLUT |
+  | a cube map (any of these) | a sphere map in RGB565 or RGB5A3, with a trailer the device finds |
 
-  Mip levels are kept while GX's tiles fit in the Xbox's bytes. Cube maps, 3D textures and
-  palettized bitmaps stay as they are, and the device decodes them.
+  Mip levels are kept while GX's tiles fit in the Xbox's bytes. A cube map's sphere map uses the
+  mirror ball's mapping, sampled from the six faces' first levels; only the direction straight
+  behind has no place on it. 3D textures stay as they are, and the device decodes them.
 - **Pixel offsets.** The Xbox's maps keep a stale tag-file offset in each bitmap group's pixel
   data, which the texture cache would add to every bitmap's own offset. The converter sets it to
   0.
@@ -238,7 +241,12 @@ and pixel shaders.
   - A clear once the frame has begun is a quad.
 - **Textures.** A map's bitmap is bound straight from the texture cache in its GX format. Any
   other texture is decoded to RGBA8 into a 1.5 MB cache, such as the glyph cache, which is
-  re-decoded when its pixels change.
+  re-decoded when its pixels change. A cube map is bound as its sphere map, and each vertex's
+  direction is mapped onto it (on the CPU). A dot product with a cube map (a bump map against a
+  normalization cube map, whose signed values TEV would clamp) is still taken as 1, unlit.
+- **Depth.** A program's position matrix and its depth's a + b/w come from its constants alone,
+  from two points along w's gradient. Both vertex paths take them, so a surface's passes meet
+  their equal-depth tests whichever path each pass took.
 - **Frame buffer.** The EFB has an alpha channel (RGBA6_Z24), because the game blends by
   destination alpha.
 - **Debugging.** The desktop ports' `debug.gpu_debug_flat` and `debug.gpu_debug_texture0` (in
@@ -251,8 +259,10 @@ and pixel shaders.
    holds one) and the environment's lit pass (`10c30c53`, whose colour takes a reciprocal square
    root). Next are generated colour-only programs for the second, with GX doing the rest, and
    rigid vertices of the first through GX's matrix palette.
-2. The rest of the drawing: cube maps, bump mapping (dot products of two registers), and the
-   Z-buffer's precision with the fitted depth.
+2. The rest of the drawing: bump mapping (dot products of two registers: indirect texturing
+   where it maps), and the bumped reflections' dependent lookups. Sampling the cube maps put
+   the environment's lit pass (`10c30c53`, whose cube map direction comes from the tangent frame)
+   back on the CPU: a10's frame takes about 200 ms in Dolphin (150 without them).
 3. Playing on. The campaign beyond a10's opening, and the game core's endianness checked under
    qemu against the x86 build. Big-endian faults found so far:
    - plain char's sign (fixed with `-fsigned-char`);
