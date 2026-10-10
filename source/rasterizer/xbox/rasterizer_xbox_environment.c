@@ -497,6 +497,9 @@ struct shader_transparent_water_definition
 
 static void rasterizer_environment_specular_spot_light_begin(
 	long light_index);
+/* port: rasterizer_lightmaps_incident_radiosity and display.bumped_lightmaps */
+static boolean lightmap_incident_radiosity(
+	void);
 
 /* ---------- globals */
 
@@ -823,7 +826,7 @@ void _rasterizer_environment_lightmap_draw(
 					? 0x00018001
 					: 0x00018401;
 			pixel_shader.rgb_inputs[0] =
-				rasterizer_debug_options.lightmap_incident_radiosity_enabled
+				lightmap_incident_radiosity() /* port: and display.bumped_lightmaps */
 					? 0x484B0A01
 					: 0x20200000;
 			pixel_shader.rgb_outputs[0] = 0x0000208C;
@@ -904,7 +907,7 @@ void _rasterizer_environment_lightmap_draw(
 			pixel_shader.alpha_inputs[1] = 0xDCDCCCCC;
 			pixel_shader.alpha_outputs[1] = 0x00024C00;
 			pixel_shader.rgb_inputs[1] =
-				rasterizer_debug_options.lightmap_incident_radiosity_enabled
+				lightmap_incident_radiosity() /* port: and display.bumped_lightmaps */
 					? 0x484B0A01
 					: 0x20200000;
 			pixel_shader.rgb_outputs[1] = 0x00002080;
@@ -1008,6 +1011,14 @@ void _rasterizer_environment_lightmap_draw(
 					FALSE,
 					"### ERROR unsupported drawing mode in environment lightmap pass");
 				break;
+		}
+		/* port: without the incident radiosity no combiner reads the fourth
+		stage's cube map (the bump's direction), so it is not sampled: the Wii
+		then needs no direction from each vertex on the processor */
+		if (rasterizer_debug_options.drawing_mode == _rasterizer_drawing_mode_normal &&
+			!lightmap_incident_radiosity())
+		{
+			pixel_shader.texture_modes &= ~(0x1FUL << 15);
 		}
 		rasterizer_set_pixel_shader(&pixel_shader);
 
@@ -3240,6 +3251,23 @@ void _rasterizer_environment_transparent_geometry_end(
 }
 
 /* ---------- private code */
+
+/* port: the lightmaps' incident radiosity (their bump: the lightmap times the
+bump map's normal along the light's direction), from the console's
+rasterizer_lightmaps_incident_radiosity and config.toml's
+display.bumped_lightmaps (port_config.c); without it the lightmap is drawn
+flat */
+static boolean lightmap_incident_radiosity(
+	void)
+{
+	extern int config_boolean(char const *name);
+	static int bumped_lightmaps = -1;
+
+	if (bumped_lightmaps < 0)
+		bumped_lightmaps = config_boolean("display.bumped_lightmaps") ? 1 : 0;
+
+	return rasterizer_debug_options.lightmap_incident_radiosity_enabled && bumped_lightmaps;
+}
 
 static void rasterizer_environment_specular_spot_light_begin(
 	long light_index)
