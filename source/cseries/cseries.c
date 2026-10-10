@@ -157,6 +157,10 @@ enum
 
 #ifdef HALO_RELEASE
 #define cseries_match_assert(file, line, expr) if (!(expr)) { release_assert_failed(STRINGIFY(expr), MATCH_FILE(file), MATCH_LINE(line), TRUE); }
+#elif defined(HALO_WII)
+/* port: the Wii's frame-chain walk names the callers (wii_boot.c) */
+void wii_log_callers(const char *what, int code);
+#define cseries_match_assert(file, line, expr) if (!(expr)) { stack_walk(0); wii_log_callers("assert", MATCH_LINE(line)); error(_error_silent, "EXCEPTION %s in %s,#%d: %s", "halt", MATCH_FILE(file), MATCH_LINE(line), STRINGIFY(expr)); system_exit(-1); }
 #else
 #define cseries_match_assert(file, line, expr) if (!(expr)) { stack_walk(0); error(_error_silent, "EXCEPTION %s in %s,#%d: %s", "halt", MATCH_FILE(file), MATCH_LINE(line), STRINGIFY(expr)); system_exit(-1); }
 #endif
