@@ -811,7 +811,8 @@ void network_test_update(
 			memcpy(&words[8], &object->forward, 3 * sizeof(unsigned long));
 			memcpy(&words[11], &object->body_vitality, sizeof(unsigned long));
 			memcpy(&words[12], &object->shield_vitality, sizeof(unsigned long));
-			words[13] = (unsigned long)object->parent_object_index;
+			words[13] = object->parent_object_index == NONE ? 0xFFFFFFFFUL :
+				(unsigned long)object->parent_object_index & 0xFFFF;
 			for (word = 0; word < 14; word++)
 				hash = (hash ^ words[word]) * 16777619UL;
 			/* (debug.lockstep_detail: each object's words at that tick, to find the
