@@ -298,6 +298,26 @@ It found `list_get`'s element index read from the wrong end of its cell, which m
 teleport player 0 to player 1's flag. With that fixed, a10's opening (the cryo bay, the cinematic and
 its skip, the scripted player) agrees at every tick of 2,600.
 
+## What only a real Wii can show
+
+Dolphin runs the game, but these need the console:
+- **Speed.** Dolphin's emulated timing does not follow this code's cost (a
+  short function can measure several times its instruction count); a
+  frame's time, and where it goes (the log's "a frame's draws" lines), on
+  the console.
+- **Alignment exceptions.** The PowerPC 750 can trap a floating-point load
+  from an address that is not a multiple of 4; Dolphin does not. The
+  compressed animations' floats are read a byte at a time for this; any
+  other crash report ("CRASH: alignment exception") names the place.
+- **The square root's estimate.** The vertex programs' square root starts
+  from `frsqrte`, checked on the host for estimates as coarse as the 750's
+  documented 1/32; Broadway's own is not documented.
+- **The SD card and USB drive's speed** (a level loads in about 11 seconds
+  in Dolphin) and **the controllers** (the Classic Controller, the
+  GameCube pad, the Wiimote and Nunchuk mappings in `xinput_wii.c`).
+- **Memory.** MEM1 and MEM2 as the console's IOS leaves them, with the
+  Homebrew Channel's loader (the memory report in the log).
+
 ## What is next
 
 1. Speed. The CPU still runs the skinned models whose vertices blend two nodes (bipeds, arms,
