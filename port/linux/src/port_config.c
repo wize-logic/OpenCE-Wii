@@ -502,6 +502,9 @@ static const struct config_setting config_settings[] =
 	{ "debug.gpu_cull", _config_boolean, "true", "HALO_GPU_CULL", _environment_set_is_true, _platform_all,
 		"Triangles facing away are culled as the game asks; false draws them all\n"
 		"(to tell a culling fault from missing geometry)." },
+	{ "debug.gpu_transform", _config_boolean, "true", "HALO_GPU_TRANSFORM", _environment_set_is_true, _platform_all,
+		"The Wii: draws whose vertex programs GX's own transform can compute go to it;\n"
+		"false runs every program on the processor." },
 	{ "debug.screenshot_directory", _config_string, "\"\"", "HALO_SCREENSHOT_DIR", _environment_value, _platform_all,
 		"A folder to save frames to (with screenshot_every); empty none." },
 	{ "debug.screenshot_every", _config_integer, "0", "HALO_SCREENSHOT_EVERY", _environment_value, _platform_all,
