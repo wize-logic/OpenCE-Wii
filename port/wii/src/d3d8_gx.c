@@ -43,6 +43,7 @@ int: libogc's is renamed while its headers are read) */
 #undef BOOL
 
 #include "gx_psh.h"
+#include "gx_psh_cache.h"
 #include "port_config.h"
 #include "nv2a_cpu_native.h"
 #include "wii_memory.h"
@@ -1701,23 +1702,15 @@ static unsigned textures_bind(void)
 /* ---------- the pixel stage
 
 The pixel shader's register combiners are translated to TEV stages
-(gx_psh.c), kept by the pixel shader render states and the textures' kinds
-they were translated for. A shader GX cannot hold takes the first stage's
+(gx_psh.c), kept by the combiners, the textures' kinds and their constants'
+signatures (gx_psh_cache.c). A shader GX cannot hold takes the first stage's
 texture, modulated by the diffuse colour. */
 
-#define PIXEL_SHADER_CACHE_ENTRIES 48
-
-struct pixel_shader_entry
-{
-	DWORD state[D3DRS_PS_MAX];
-	struct gx_psh_textures textures;
-	BOOL usable;
-	struct gx_psh_program program;
-};
-
-static struct pixel_shader_entry pixel_shader_cache[PIXEL_SHADER_CACHE_ENTRIES];
-static unsigned pixel_shader_cache_count, pixel_shader_cache_next, pixel_shader_last;
-static unsigned long pixel_shaders_translated, pixel_shaders_unusable;
+/* the last draw's program (NULL before the first), and whether it was
+usable */
+static const struct gx_psh_program *pixel_shader_program;
+static BOOL pixel_shader_usable;
+static unsigned long pixel_shaders_logged;
 
 static void tev_fallback(unsigned stages)
 {
@@ -1749,9 +1742,9 @@ static void tev_setup(unsigned stages)
 	/* (all of the vertices' values, until a translation says less) */
 	tev_texcoords = 0x1F;
 	tev_channels = 3;
-	struct pixel_shader_entry *entry = NULL;
+	const struct gx_psh_program *program;
+	BOOL usable, translated;
 	DWORD stage;
-	unsigned index;
 
 	/* the desktop ports' debug views (port_config.c): the diffuse colour
 	alone, or the first texture alone, opaque */
@@ -1807,63 +1800,30 @@ static void tev_setup(unsigned stages)
 		textures.fog = 1;
 		fog_ramp_bind();
 	}
-	if (pixel_shader_last < pixel_shader_cache_count)
+	program = gx_psh_cache_program(D3D__RenderState, &textures, &usable, &translated);
+	pixel_shader_program = program;
+	pixel_shader_usable = usable;
+	if (translated && !usable && pixel_shaders_logged++ < 8)
 	{
-		struct pixel_shader_entry *last = &pixel_shader_cache[pixel_shader_last];
+		const DWORD *state = D3D__RenderState;
+		unsigned long count = state[D3DRS_PSCOMBINERCOUNT] & 0xff, combiner;
 
-		if (!memcmp(&last->textures, &textures, sizeof(textures)) &&
-			!memcmp(last->state, D3D__RenderState, sizeof(last->state)))
-			entry = last;
-	}
-	for (index = 0; !entry && index < pixel_shader_cache_count; index++)
-	{
-		struct pixel_shader_entry *candidate = &pixel_shader_cache[index];
-
-		if (!memcmp(&candidate->textures, &textures, sizeof(textures)) &&
-			!memcmp(candidate->state, D3D__RenderState, sizeof(candidate->state)))
-		{
-			entry = candidate;
-			pixel_shader_last = index;
-		}
-	}
-	if (!entry)
-	{
-		index = pixel_shader_cache_next;
-		pixel_shader_cache_next = (pixel_shader_cache_next + 1) % PIXEL_SHADER_CACHE_ENTRIES;
-		if (pixel_shader_cache_count < PIXEL_SHADER_CACHE_ENTRIES)
-			pixel_shader_cache_count++;
-		entry = &pixel_shader_cache[index];
-		memcpy(entry->state, D3D__RenderState, sizeof(entry->state));
-		entry->textures = textures;
-		entry->usable = gx_psh_translate(D3D__RenderState, &textures, &entry->program);
-		pixel_shaders_translated++;
-		if (!entry->usable)
-		{
-			pixel_shaders_unusable++;
-			if (pixel_shaders_unusable <= 8)
-			{
-				const DWORD *state = D3D__RenderState;
-				unsigned long count = state[D3DRS_PSCOMBINERCOUNT] & 0xff, combiner;
-
-				platform_log("Direct3D: pixel shader beyond GX (%s): %lu combiners (%08lx), final %08lx %08lx, modes %08lx",
-					entry->program.reason ? entry->program.reason : "no stages", count,
-					(unsigned long)state[D3DRS_PSCOMBINERCOUNT], (unsigned long)state[D3DRS_PSFINALCOMBINERINPUTSABCD],
-					(unsigned long)state[D3DRS_PSFINALCOMBINERINPUTSEFG], (unsigned long)state[D3DRS_PSTEXTUREMODES]);
-				for (combiner = 0; combiner < count && combiner < 8; combiner++)
-					platform_log("  %lu: rgb %08lx -> %08lx, alpha %08lx -> %08lx", combiner,
-						(unsigned long)state[D3DRS_PSRGBINPUTS0 + combiner], (unsigned long)state[D3DRS_PSRGBOUTPUTS0 + combiner],
-						(unsigned long)state[D3DRS_PSALPHAINPUTS0 + combiner], (unsigned long)state[D3DRS_PSALPHAOUTPUTS0 + combiner]);
-			}
-		}
-		pixel_shader_last = index;
+		platform_log("Direct3D: pixel shader beyond GX (%s): %lu combiners (%08lx), final %08lx %08lx, modes %08lx",
+			program->reason ? program->reason : "no stages", count,
+			(unsigned long)state[D3DRS_PSCOMBINERCOUNT], (unsigned long)state[D3DRS_PSFINALCOMBINERINPUTSABCD],
+			(unsigned long)state[D3DRS_PSFINALCOMBINERINPUTSEFG], (unsigned long)state[D3DRS_PSTEXTUREMODES]);
+		for (combiner = 0; combiner < count && combiner < 8; combiner++)
+			platform_log("  %lu: rgb %08lx -> %08lx, alpha %08lx -> %08lx", combiner,
+				(unsigned long)state[D3DRS_PSRGBINPUTS0 + combiner], (unsigned long)state[D3DRS_PSRGBOUTPUTS0 + combiner],
+				(unsigned long)state[D3DRS_PSALPHAINPUTS0 + combiner], (unsigned long)state[D3DRS_PSALPHAOUTPUTS0 + combiner]);
 	}
 	tev_texcoords = 0x1F;
 	tev_channels = 3;
-	if (entry->usable)
+	if (usable)
 	{
-		gx_psh_apply(&entry->program);
-		tev_texcoords = entry->program.texcoords;
-		tev_channels = entry->program.channels;
+		gx_psh_apply(program);
+		tev_texcoords = program->texcoords;
+		tev_channels = program->channels;
 	}
 	else
 		tev_fallback(stages);
@@ -2403,8 +2363,7 @@ static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct d
 				(unsigned long)D3D__RenderState[D3DRS_PSALPHAOUTPUTS0 + combiner]);
 	}
 	{
-		const struct pixel_shader_entry *shader = pixel_shader_last < pixel_shader_cache_count ?
-			&pixel_shader_cache[pixel_shader_last] : NULL;
+		const struct gx_psh_program *shader = pixel_shader_program;
 		const DWORD *rs = D3D__RenderState;
 
 		platform_log("  c0 %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx, final %08lx %08lx",
@@ -2419,10 +2378,10 @@ static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct d
 			(unsigned long)rs[D3DRS_PSCONSTANT1_0 + 4], (unsigned long)rs[D3DRS_PSCONSTANT1_0 + 5],
 			(unsigned long)rs[D3DRS_PSCONSTANT1_0 + 6], (unsigned long)rs[D3DRS_PSCONSTANT1_0 + 7],
 			(unsigned long)rs[D3DRS_FOGENABLE], (unsigned long)rs[D3DRS_FOGCOLOR],
-			!shader ? "?" : !shader->usable ? "beyond GX (texture times colour)" :
-				shader->program.approximate ? "approximate: " : "exact",
-			shader && shader->usable && shader->program.approximate && shader->program.approximation ?
-				shader->program.approximation : "",
+			!shader ? "?" : !pixel_shader_usable ? "beyond GX (texture times colour)" :
+				shader->approximate ? "approximate: " : "exact",
+			shader && pixel_shader_usable && shader->approximate && shader->approximation ?
+				shader->approximation : "",
 			"");
 	}
 }
@@ -4536,9 +4495,22 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			texture_failures[_failure_shape],
 			texture_failures[_failure_format], texture_failures[_failure_memory], texture_failures[_failure_decode],
 			textures_native);
-		platform_log("Direct3D: pixel shaders: %lu translated, %lu beyond GX; GX FIFO overflows %lu; "
-			"render targets: %lu parks, %lu copies, %lu not copied", pixel_shaders_translated, pixel_shaders_unusable,
-			(unsigned long)GX_GetOverflowCount(), efb.parks, efb.resolves, efb.skipped);
+		{
+			static struct gx_psh_cache_counts shaders_last;
+			struct gx_psh_cache_counts shaders;
+
+			gx_psh_cache_counts(&shaders);
+			platform_log("Direct3D: pixel shaders: %lu translated, %lu beyond GX; GX FIFO overflows %lu; "
+				"render targets: %lu parks, %lu copies, %lu not copied", shaders.translated, shaders.unusable,
+				(unsigned long)GX_GetOverflowCount(), efb.parks, efb.resolves, efb.skipped);
+			platform_log("Direct3D: pixel shader programs, the last %d frames: %lu translated, %lu kept, %lu with new "
+				"constants; tests %lu (%lu otherwise, %lu generic), audits %lu (%lu differ)", STATISTICS_FRAMES,
+				shaders.translated - shaders_last.translated, shaders.found - shaders_last.found,
+				shaders.patched - shaders_last.patched, shaders.tests - shaders_last.tests,
+				shaders.tests_differ - shaders_last.tests_differ, shaders.generic - shaders_last.generic,
+				shaders.audited - shaders_last.audited, shaders.audits_differ - shaders_last.audits_differ);
+			shaders_last = shaders;
+		}
 		efb.parks = efb.resolves = efb.skipped = 0;
 		{
 			uint64_t now = wl_platform_time_us();
