@@ -1336,6 +1336,7 @@ static struct texture_entry *texture_get(const D3DBaseTexture *texture, const D3
 	unsigned long *argb;
 	unsigned char *rgba;
 	const unsigned char *source;
+	unsigned char *swapped;
 	unsigned long index, texel_count;
 
 	if (!texture || !texture->Data)
@@ -1459,15 +1460,47 @@ static struct texture_entry *texture_get(const D3DBaseTexture *texture, const D3
 		return NULL;
 	}
 	source = (const unsigned char *)PLATFORM_PHYSICAL_TO_VIRTUAL(texture->Data);
+	/* a texture the game wrote itself (the text's glyphs, the fallback checkers) holds its 16- and
+	32-bit texels in the Wii's byte order; the decoder reads them as the Xbox stored them, so it is
+	given a copy in that order */
+	swapped = NULL;
+	if (!description.compressed && !texture_in_texture_cache(texture) &&
+		(information.bytes == 2 || information.bytes == 4))
+	{
+		unsigned long bytes = xgpu_texture_level_bytes(&description, 0);
+
+		swapped = malloc(bytes);
+		if (swapped)
+		{
+			for (index = 0; index + information.bytes <= bytes; index += information.bytes)
+			{
+				if (information.bytes == 2)
+				{
+					swapped[index] = source[index + 1];
+					swapped[index + 1] = source[index];
+				}
+				else
+				{
+					swapped[index] = source[index + 3];
+					swapped[index + 1] = source[index + 2];
+					swapped[index + 2] = source[index + 1];
+					swapped[index + 3] = source[index];
+				}
+			}
+			source = swapped;
+		}
+	}
 	if (description.compressed)
 		xgpu_texture_dxt_decode_level(information.kind, source, description.width, description.height, 1, argb);
 	else if (!xgpu_texture_decode_level(&description, 0, source,
 		palette && palette->Data ? (const D3DCOLOR *)PLATFORM_PHYSICAL_TO_VIRTUAL(palette->Data) : NULL, argb))
 	{
 		texture_failures[_failure_decode]++;
+		free(swapped);
 		free(argb);
 		return NULL;
 	}
+	free(swapped);
 	/* ARGB values to RGBA bytes, in place */
 	rgba = (unsigned char *)argb;
 	for (index = 0; index < texel_count; index++)
