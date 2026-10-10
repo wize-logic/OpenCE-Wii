@@ -17,8 +17,9 @@ from -4 to 4.
 
 Every program translated is also checked by WiiLibs' validator
 (wl_tev_validate: its errors and warnings are counted; the translation
-refuses a program with errors, but for a bias with DIVIDE_2, which GX takes), and evaluated by WiiLibs' own evaluator (wl_tev_eval) on the
-same pixels as the simulation, the largest difference reported.
+refuses a program with errors), and evaluated by WiiLibs' own evaluator
+(wl_tev_eval) on the same pixels as the simulation, the largest difference
+reported.
 
 usage: gx_psh_check [programs [seed]] (SIM_TRACE=1 prints the stages)
 */

@@ -97,7 +97,6 @@ enum
 	_channel_blue_all,
 };
 
-#define NO_RESOURCE WL_TEV_NONE
 #define MAXIMUM_OPERATIONS 48
 
 /* ---------- structures */
@@ -670,28 +669,14 @@ static struct operation operation_new(int dest)
 	return result;
 }
 
-/* the resources one operand takes: what it needs of the stage's order (a
-texture and the swap tables that serve its read, a rasterized colour and
-its), and a constant selection */
-struct resources
-{
-	WlTevNeeds needs;
-	unsigned char konst;
-};
-
-static void resources_clear(struct resources *resources)
-{
-	wl_tev_needs_clear(&resources->needs);
-	resources->konst = NO_RESOURCE;
-}
-
-/* the constant selection an operand takes in a portion */
+/* the constant selection an operand takes in a portion (WL_TEV_KSEL_NONE:
+none) */
 static unsigned char konst_selection(const struct operand *value, int portion)
 {
 	if (portion == _portion_color)
 	{
 		if (value->kind != _kind_konst)
-			return NO_RESOURCE;
+			return WL_TEV_KSEL_NONE;
 		switch (value->channel)
 		{
 		case _channel_alpha: return wl_tev_kcsel(value->index, WL_TEV_K_A);
@@ -713,22 +698,20 @@ static unsigned char konst_selection(const struct operand *value, int portion)
 		case _channel_blue: case _channel_blue_all: return wl_tev_kasel(value->index, WL_TEV_K_B);
 		default: return wl_tev_kasel(value->index, WL_TEV_K_A);
 		}
-	default: return NO_RESOURCE;
+	default: return WL_TEV_KSEL_NONE;
 	}
 }
 
-/* adds what an operand takes; FALSE when it clashes with what is there */
-static BOOL resources_add(struct resources *resources, const struct operand *value, int portion)
+/* adds what an operand takes of a stage (WlTevNeeds: a texture and the swap
+tables that serve its read, a rasterized colour and its, the portion's
+constant selection); FALSE when it clashes with what is there */
+static BOOL resources_add(WlTevNeeds *needs, const struct operand *value, int portion)
 {
 	unsigned char konst = konst_selection(value, portion);
 	unsigned char swap;
 
-	if (konst != NO_RESOURCE)
-	{
-		if (resources->konst != NO_RESOURCE && resources->konst != konst)
-			return FALSE;
-		resources->konst = konst;
-	}
+	if (konst != WL_TEV_KSEL_NONE)
+		return (portion == _portion_color ? wl_tev_needs_konst_color : wl_tev_needs_konst_alpha)(needs, konst);
 	if (value->kind != _kind_texture && value->kind != _kind_ras)
 		return TRUE;
 	/* the swap tables the read can take (swap_tables_set), as a set: 0 as
@@ -743,18 +726,12 @@ static BOOL resources_add(struct resources *resources, const struct operand *val
 	default: swap = portion == _portion_color ? (1u << 0) | (1u << 3) : 1u << 0; break;
 	}
 	if (value->kind == _kind_ras)
-		return wl_tev_needs_channel(&resources->needs, value->index ? WL_TEV_CH_COLOR1A1 : WL_TEV_CH_COLOR0A0, swap);
+		return wl_tev_needs_channel(needs, value->index ? WL_TEV_CH_COLOR1A1 : WL_TEV_CH_COLOR0A0, swap);
 	/* (a texture stage's map, or four after for its separate alpha, at the
 	stage's coordinate; the fog ramp's) */
 	if (value->index == GX_PSH_FOG_MAP)
-		return wl_tev_needs_texture(&resources->needs, GX_PSH_FOG_TEXCOORD, GX_PSH_FOG_TEXMAP, swap);
-	return wl_tev_needs_texture(&resources->needs, (uint8_t)(value->index & 3), value->index, swap);
-}
-
-/* (the swaps: sets of the tables that serve, their intersection) */
-static BOOL resources_merge(struct resources *into, const struct resources *other)
-{
-	return wl_tev_needs_merge(&into->needs, &other->needs);
+		return wl_tev_needs_texture(needs, GX_PSH_FOG_TEXCOORD, GX_PSH_FOG_TEXMAP, swap);
+	return wl_tev_needs_texture(needs, (uint8_t)(value->index & 3), value->index, swap);
 }
 
 static struct operand materialized(struct translation *translation, int portion, struct operand value);
@@ -779,11 +756,11 @@ static BOOL operation_reads(const struct operation *operation, int portion, int 
 computed into registers of their own */
 static void emit(struct translation *translation, int portion, struct operation *operation)
 {
-	struct resources resources;
+	WlTevNeeds resources;
 	int temporaries[4] = { -1, -1, -1, -1 };
 	int index;
 
-	resources_clear(&resources);
+	wl_tev_needs_clear(&resources);
 	for (index = 0; index < 4; index++)
 	{
 		if (resources_add(&resources, &operation->in[index], portion))
@@ -1149,18 +1126,18 @@ static struct operand alpha_form(struct operand value)
 /* whether one TEV stage can read what these halves read */
 static BOOL stage_fits(const struct operation *color, const struct operation *alpha)
 {
-	struct resources color_resources, alpha_resources;
+	WlTevNeeds color_resources, alpha_resources;
 	int index;
 
-	resources_clear(&color_resources);
-	resources_clear(&alpha_resources);
+	wl_tev_needs_clear(&color_resources);
+	wl_tev_needs_clear(&alpha_resources);
 	for (index = 0; index < 4; index++)
 	{
 		if ((color && !resources_add(&color_resources, &color->in[index], _portion_color)) ||
 			(alpha && !resources_add(&alpha_resources, &alpha->in[index], _portion_alpha)))
 			return FALSE;
 	}
-	return resources_merge(&color_resources, &alpha_resources);
+	return wl_tev_needs_merge(&color_resources, &alpha_resources);
 }
 
 static BOOL stage_append(struct translation *translation, const struct operation *color,
@@ -2486,11 +2463,11 @@ static unsigned char input_code(const struct operand *value, int portion)
 	}
 }
 
-static void operation_resources(const struct operation *operation, int portion, struct resources *resources)
+static void operation_resources(const struct operation *operation, int portion, WlTevNeeds *resources)
 {
 	int index;
 
-	resources_clear(resources);
+	wl_tev_needs_clear(resources);
 	for (index = 0; index < 4; index++)
 		resources_add(resources, &operation->in[index], portion);
 }
@@ -2513,26 +2490,22 @@ static BOOL stage_append(struct translation *translation, const struct operation
 	const struct operation *alpha)
 {
 	WlTevStage *stage = wl_tev_add_stage(&translation->program->tev);
-	struct resources resources, other;
+	WlTevNeeds resources, other;
 
 	if (!stage)
 	{
 		fail(translation, "more than 16 stages");
 		return FALSE;
 	}
-	resources_clear(&resources);
+	wl_tev_needs_clear(&resources);
 	if (color)
 		operation_resources(color, _portion_color, &resources);
-	if (resources.konst != NO_RESOURCE)
-		stage->kcsel = resources.konst;
 	if (alpha)
 	{
 		operation_resources(alpha, _portion_alpha, &other);
-		resources_merge(&resources, &other);
-		if (other.konst != NO_RESOURCE)
-			stage->kasel = other.konst;
+		wl_tev_needs_merge(&resources, &other);
 	}
-	wl_tev_stage_set_needs(stage, &resources.needs);
+	wl_tev_stage_set_needs(stage, &resources);
 	if (color)
 		stage_half(stage, color, _portion_color);
 	if (alpha)
@@ -2561,11 +2534,11 @@ static void queues_flush(struct translation *translation)
 
 		if (color_operation && alpha_operation)
 		{
-			struct resources color_resources, alpha_resources;
+			WlTevNeeds color_resources, alpha_resources;
 
 			operation_resources(color_operation, _portion_color, &color_resources);
 			operation_resources(alpha_operation, _portion_alpha, &alpha_resources);
-			if (!resources_merge(&color_resources, &alpha_resources))
+			if (!wl_tev_needs_merge(&color_resources, &alpha_resources))
 				alpha_operation = NULL;
 		}
 		if (!stage_append(translation, color_operation, alpha_operation))
@@ -2760,31 +2733,6 @@ static void swap_tables_set(WlTevProgram *tev)
 	wl_tev_set_swap(tev, 3, WL_TEV_SWAP_R, WL_TEV_SWAP_G, WL_TEV_SWAP_B, WL_TEV_SWAP_B);
 }
 
-/* WiiLibs' validator, but for its refusal of a bias with DIVIDE_2: the
-signed dot products' (x - 1/2)(y - 1/2) terms are (lerp - 1/2) / 2 in one
-stage, which GX computes as (d + lerp + bias) / 2 (as Dolphin's TEV does) */
-static BOOL program_valid(const WlTevProgram *tev)
-{
-	WlTevReport report;
-	unsigned index;
-
-	if (wl_tev_validate(tev, &report))
-		return TRUE;
-	if (report.errors > report.count)
-		return FALSE;
-	for (index = 0; index < report.count; index++)
-	{
-		const WlTevIssue *issue = &report.issues[index];
-		const WlTevHalf *half = issue->alpha ? &tev->stages[issue->stage].alpha : &tev->stages[issue->stage].color;
-
-		if (issue->code < WL_TEV_W_KONST_UNSET &&
-			!(issue->code == WL_TEV_E_BIAS_SCALE && half->op <= WL_TEV_SUB && half->scale == WL_TEV_DIVIDE_2 &&
-				half->bias < WL_TEV_BIAS_COUNT && half->clamp <= 1))
-			return FALSE;
-	}
-	return TRUE;
-}
-
 static BOOL translate_once(const DWORD *render_state, const struct gx_psh_textures *textures,
 	struct gx_psh_program *program, BOOL economical, BOOL preload, int signed_dots)
 {
@@ -2831,29 +2779,12 @@ static BOOL translate_once(const DWORD *render_state, const struct gx_psh_textur
 	if (translation.failed || program->tev.stage_count == 0)
 		return FALSE;
 	/* (what the hardware would reject: a fault of the translation's) */
-	if (!program_valid(&program->tev))
+	if (!wl_tev_validate(&program->tev, NULL))
 	{
 		program->reason = "an invalid TEV program";
 		return FALSE;
 	}
 	return TRUE;
-}
-
-/* what the stages read of the vertices */
-static void program_reads(struct gx_psh_program *program)
-{
-	unsigned index;
-
-	program->texcoords = program->channels = 0;
-	for (index = 0; index < program->tev.stage_count; index++)
-	{
-		const WlTevStage *stage = &program->tev.stages[index];
-
-		if (stage->texcoord != WL_TEV_NONE)
-			program->texcoords |= (unsigned char)(1u << stage->texcoord);
-		if (stage->channel == WL_TEV_CH_COLOR0A0 || stage->channel == WL_TEV_CH_COLOR1A1)
-			program->channels |= (unsigned char)(1u << (stage->channel - WL_TEV_CH_COLOR0A0));
-	}
 }
 
 BOOL gx_psh_translate(const DWORD *render_state, const struct gx_psh_textures *textures,
@@ -2876,7 +2807,9 @@ BOOL gx_psh_translate(const DWORD *render_state, const struct gx_psh_textures *t
 			translate_once(render_state, textures, program, attempts[attempt].economical, FALSE,
 				attempts[attempt].signed_dots))
 		{
-			program_reads(program);
+			/* (what the stages read of the vertices) */
+			program->texcoords = (unsigned char)wl_tev_texcoords_mask(&program->tev);
+			program->channels = (unsigned char)wl_tev_channels_mask(&program->tev);
 			return TRUE;
 		}
 	}
