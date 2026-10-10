@@ -11,6 +11,7 @@ port/wii/README.md for the design.
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -39,7 +40,12 @@ WIILIBS_LIBRARIES = ("wl/platform/libwl_platform.a", "wl/audio/libwl_audio.a", "
 #    hs_runtime.c calls union-returning converters through pointers typed as
 #    returning long),
 #  - no optimisations that assume the absence of MSVC-tolerated UB,
-#  - frame pointers (the stack walker follows the frame chain),
+#  - no frame pointers, unlike the x86 builds: PowerPC's frames are chained
+#    whether or not r31 holds one (each frame's first word is the caller's,
+#    the EABI's back chain), which is what WiiLibs' backtraces and crash
+#    report follow; a frame pointer only cost every function r31 and
+#    every leaf function a frame (3% of the game's matrix and vector
+#    functions' instructions, 4% of their code),
 #  - no fused multiply-adds (PowerPC has fmadd): every port simulates the
 #    same game from the same inputs (port/include/halo_math.h),
 #  - thread-local variables through libgcc's emulation (__emutls_get_address,
@@ -63,7 +69,7 @@ def wii_abi_flags(devkitpro: Path) -> List[str]:
         "-fwrapv",
         "-fno-delete-null-pointer-checks",
         "-msvr4-struct-return",
-        "-fno-omit-frame-pointer",
+        "-fomit-frame-pointer",
         "-ffp-contract=off",
         "-femulated-tls",
         "-ffunction-sections",
@@ -90,6 +96,17 @@ def wii_abi_flags(devkitpro: Path) -> List[str]:
         )),
     ]
 
+
+# Platform files whose floating point only reaches the speakers, compiled with
+# fused multiply-adds (-ffp-contract=fast; every other unit has them off, so
+# that the Wii's game matches x86's bit for bit). The sound mixer: its low
+# pass is a multiply and an add a tap, 48 taps a voice a frame, and was most
+# of b30's processor time on the Wii (WiiLibs' profiler); fused, its
+# instructions under qemu-ppc for a scene of 24 voices fall 14%, and its
+# output moves by 3.6e-7 at most (-129 dBFS: the four-lane sum against tap by
+# tap moves it by 4.2e-7). The lockstep check's x86 side mixes nothing (SDL's
+# dummy audio), and the game never reads the mix back.
+CONTRACTED_SOURCES = {"dsound_sdl.c"}
 
 PLATFORM_FLAGS = [
     "-std=gnu11",
@@ -127,6 +144,19 @@ def devkitpro_dir(sln: Any) -> Path:
 def wiilibs_dir(sln: Any) -> Path:
     """WiiLibs' checkout (configure.py --wiilibs, else ../WiiLibs)"""
     return Path(getattr(sln, "wiilibs", None) or "../WiiLibs")
+
+
+def heap_overflow_wraps(wiilibs: Path) -> List[str]:
+    """The names WiiLibs' heap overflow wraps (WL_HEAP_OVERFLOW_WRAPS in its cmake/WiiLibs.cmake), so that
+    the list is WiiLibs' own and cannot drift from it"""
+    try:
+        text = (wiilibs / "cmake" / "WiiLibs.cmake").read_text(encoding="utf-8")
+        match = re.search(r"set\(WL_HEAP_OVERFLOW_WRAPS\s+([^)]*)\)", text)
+        names = match.group(1).split() if match else []
+    except OSError:
+        names = []
+    return names or ["malloc", "calloc", "realloc", "free", "memalign", "aligned_alloc", "malloc_usable_size",
+                     "_malloc_r", "_calloc_r", "_realloc_r", "_free_r", "_memalign_r", "_malloc_usable_size_r"]
 
 
 def wii_configure_inputs() -> List[Path]:
@@ -264,9 +294,11 @@ def generate_wii_build(n: Writer, sln: Any) -> None:
     # newlib's structures (struct stat) have their own layout, as the Linux
     # build's posix_*.c have glibc's
     posix_cflags = " ".join([*wii_abi_flags(devkitpro), "-std=gnu11", "-D_GNU_SOURCE", "-DHALO_WII",
-                             f"-I{linux_platform_dir}", "-Wall"])
+                             f"-I{linux_platform_dir}", f"-I{wiilibs}", "-Wall"])
 
     def platform_flags(source: Path) -> str:
+        if source.name in CONTRACTED_SOURCES:
+            return f"{platform_cflags} -ffp-contract=fast"
         return posix_cflags if source.name.startswith("posix_") or source.name == "wii_posix.c" else platform_cflags
 
     for name in config["shared_platform_sources"]:
@@ -321,11 +353,16 @@ def generate_wii_build(n: Writer, sln: Any) -> None:
     # constructor, as clang puts those in .init_array, which devkitPPC's
     # start-up code never runs. There must be none in clang's units.
     linker = tools / "powerpc-eabi-gcc"
-    ldflags = " ".join(["-mrvl", "-mcpu=750", "-meabi", "-mhard-float", "-g", "-Wl,--gc-sections", "-Wl,--wrap=main", "-Wl,--wrap=exit", "-Wl,--wrap=abort",
-                        "-Wl,--wrap=_exit", "-Wl,--wrap=SYS_ResetSystem", "-Wl,--wrap=sched_yield",
-                        # (the game's heap: port/wii/src/wii_malloc.c)
-                        *(f"-Wl,--wrap={name}" for name in ("malloc", "calloc", "realloc", "free", "memalign", "aligned_alloc",
-                                                       "_malloc_r", "_calloc_r", "_realloc_r", "_free_r", "_memalign_r")),
+    ldflags = " ".join(["-mrvl", "-mcpu=750", "-meabi", "-mhard-float", "-g", "-Wl,--gc-sections", "-Wl,--wrap=main",
+                        # (every way out logged, with who took it: WiiLibs' wii/trace_wii.c)
+                        "-Wl,--wrap=exit", "-Wl,--wrap=abort", "-Wl,--wrap=_exit", "-Wl,--wrap=SYS_ResetSystem",
+                        "-Wl,--wrap=sched_yield",
+                        # (sqrtf without newlib's loop of a bit a step: port/wii/src/wii_math.c)
+                        "-Wl,--wrap=sqrtf",
+                        # (the game's heap, MEM1's malloc with MEM2's behind it: WiiLibs' wii/heap_wrap_wii.c,
+                        # enabled in port/wii/src/wii_boot.c; -u pulls the wrappers out of the archive even when
+                        # only libc's own objects call malloc)
+                        *(f"-Wl,--wrap={name}" for name in heap_overflow_wraps(wiilibs)), "-Wl,-u,__wrap_malloc",
                         f"-Wl,-Map,{build_dir / 'halo.map'}", f"-L{devkitpro / 'libogc' / 'lib' / 'wii'}"])
     libs = " ".join([*(str(library) for library in wiilibs_outputs),
                      *(f"-l{library}" for library in config.get("libraries", []))])
@@ -353,11 +390,28 @@ def generate_wii_build(n: Writer, sln: Any) -> None:
            command=f"! {tools / 'powerpc-eabi-readelf'} -S $in | grep -qE 'init_array|[.]tdata|[.]tbss' && touch $out",
            description="WII CHECK no .init_array or native thread-local data in $in")
     n.build(outputs=build_dir / "no_constructors.stamp", rule="wii_no_constructors", inputs=elf)
-    n.build(outputs="wii", rule="phony", inputs=[dol, build_dir / "no_constructors.stamp", *host_tools])
+    # (no fused multiply-adds in clang's objects, whatever -ffp-contract=off
+    # was told: the lockstep check compares the Wii's game with x86's; but
+    # those of CONTRACTED_SOURCES)
+    fp_check = Path("tools/wii_fp_check.py")
+    n.rule(name="wii_fp_check",
+           command=f"$python {fp_check} --objdump {tools / 'powerpc-eabi-objdump'} --stamp $out @$out.rsp",
+           description="WII CHECK no fused multiply-adds in the game's objects",
+           rspfile="$out.rsp",
+           rspfile_content="$in_newline")
+    checked_objects = [obj for obj in objects if obj.with_suffix(".c").name not in CONTRACTED_SOURCES]
+    n.build(outputs=build_dir / "no_fused_multiply_adds.stamp", rule="wii_fp_check", inputs=checked_objects,
+            implicit=[fp_check])
+    n.build(outputs="wii", rule="phony",
+            inputs=[dol, build_dir / "no_constructors.stamp", build_dir / "no_fused_multiply_adds.stamp", *host_tools])
     # the Homebrew Channel's zip (apps/halo: boot.dol, meta.xml, icon.png; no game data)
-    n.rule(name="wii_package", command="$python tools/wii_package.py --dol $in --output $out",
+    # (made by WiiLibs' tools/wii_package.py, which tools/wii_package.py calls)
+    n.rule(name="wii_package",
+           command=f"$python tools/wii_package.py --wiilibs {_quote(wiilibs)} --dol $in --output $out",
            description="WII PACKAGE $out")
     n.build(outputs=build_dir / "halo-wii.zip", rule="wii_package", inputs=dol,
-            implicit=[Path("tools/wii_package.py")])
+            implicit=[Path("tools/wii_package.py"), PORT_DIR / "package_description.txt",
+                      wiilibs / "tools" / "wii_package.py", build_dir / "no_constructors.stamp",
+                      build_dir / "no_fused_multiply_adds.stamp"])
     n.build(outputs="wii-package", rule="phony", inputs=[build_dir / "halo-wii.zip"])
     n.newline()

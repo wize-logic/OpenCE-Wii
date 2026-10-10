@@ -6,8 +6,11 @@ stream.
 
 The game plays everything through DirectSound streams: 16-bit stereo PCM
 (music and other uncompressed sounds) and Xbox ADPCM, mono or stereo, at 22
-or 44 kHz. A packet is decoded to 16-bit PCM when the game submits it, since
-the sound cache may reuse its memory once the packet completes. The mixer
+or 44 kHz. A packet is read where the game keeps it (the sound cache, which
+does not reuse its memory until the packet completes), as it plays: an ADPCM
+packet a block of 64 frames at a time, into the voice's own block, so that
+no voice holds more than that decoded (decoding each packet whole held a
+megabyte or two of the Wii's heap with a level's sounds playing). The mixer
 runs on SDL's audio thread; for every voice it resamples to the output rate
 with a windowed sinc low pass (which is how SetFrequency changes pitch;
 resampling) and applies:
@@ -86,7 +89,9 @@ turns the reverb off; audio.enabled = false skips opening a device
 struct voice_packet
 {
 	XMEDIAPACKET packet;
-	short *samples;           /* interleaved, source channel count */
+	/* its bytes, the game's until it completes: little-endian 16-bit PCM or
+	Xbox ADPCM, interleaved, the stream's channel count */
+	const unsigned char *source;
 	unsigned long frames;
 	BOOL finished;            /* played out by the mixer, not yet completed */
 };
@@ -138,6 +143,10 @@ struct sdl_stream
 	unsigned long packet_count;
 	/* the next frame to take from the first packet not finished */
 	unsigned long cursor;
+	/* the ADPCM block the cursor is in, decoded (take_frame), and the bytes
+	it was decoded from (NULL: none) */
+	short block[XBOX_ADPCM_BLOCK_SAMPLES * 2];
+	const unsigned char *block_source;
 	/* the resampler's (resampler_reset): the last RESAMPLER_HISTORY frames
 	taken, each channel's apart and each frame twice, RESAMPLER_HISTORY apart,
 	so that the frames a low pass reaches are side by side however the ring
@@ -272,68 +281,41 @@ first, and the nibbles code the 63 after it: the 64th nibble only pads the
 block (the maps' sounds always have 0 there), and decoding it in place of the
 header's sample put a wrong sample in every 64, a buzz at 344 Hz in 22 kHz
 sounds. */
-static short *decode_adpcm(const unsigned char *source, unsigned long size, unsigned long channels,
-	unsigned long *frame_count)
+static void decode_adpcm_block(const unsigned char *data, unsigned long channels, short *output)
 {
-	unsigned long block_bytes = XBOX_ADPCM_BLOCK_BYTES * channels;
-	unsigned long blocks = size / block_bytes;
-	short *samples = malloc((blocks ? blocks : 1) * XBOX_ADPCM_BLOCK_SAMPLES * channels * sizeof(short));
-	unsigned long block, channel;
+	unsigned long channel;
 
-	if (!samples)
+	for (channel = 0; channel < channels; channel++)
 	{
-		*frame_count = 0;
-		return NULL;
-	}
-	for (block = 0; block < blocks; block++)
-	{
-		const unsigned char *data = source + block * block_bytes;
-		short *output = samples + block * XBOX_ADPCM_BLOCK_SAMPLES * channels;
+		const unsigned char *header = data + channel * 4;
+		int predictor = (short)(header[0] | (header[1] << 8));
+		int index = header[2] > 88 ? 88 : header[2];
+		unsigned long group, byte;
 
-		for (channel = 0; channel < channels; channel++)
+		output[channel] = (short)predictor;
+		for (group = 0; group < 8; group++)
 		{
-			const unsigned char *header = data + channel * 4;
-			int predictor = (short)(header[0] | (header[1] << 8));
-			int index = header[2] > 88 ? 88 : header[2];
-			unsigned long group, byte;
+			const unsigned char *nibbles = data + 4 * channels + (group * channels + channel) * 4;
 
-			output[channel] = (short)predictor;
-			for (group = 0; group < 8; group++)
+			for (byte = 0; byte < 4; byte++)
 			{
-				const unsigned char *nibbles = data + 4 * channels + (group * channels + channel) * 4;
+				/* nibble n codes sample n + 1 */
+				unsigned long sample = group * 8 + byte * 2 + 1;
 
-				for (byte = 0; byte < 4; byte++)
-				{
-					/* nibble n codes sample n + 1 */
-					unsigned long sample = group * 8 + byte * 2 + 1;
-
-					output[sample * channels + channel] = (short)ima_expand(nibbles[byte] & 0xf, &predictor, &index);
-					if (sample + 1 < XBOX_ADPCM_BLOCK_SAMPLES)
-						output[(sample + 1) * channels + channel] = (short)ima_expand(nibbles[byte] >> 4, &predictor, &index);
-				}
+				output[sample * channels + channel] = (short)ima_expand(nibbles[byte] & 0xf, &predictor, &index);
+				if (sample + 1 < XBOX_ADPCM_BLOCK_SAMPLES)
+					output[(sample + 1) * channels + channel] = (short)ima_expand(nibbles[byte] >> 4, &predictor, &index);
 			}
 		}
 	}
-	*frame_count = blocks * XBOX_ADPCM_BLOCK_SAMPLES;
-	return samples;
 }
 
-static short *decode_pcm(const unsigned char *source, unsigned long size, unsigned long channels,
-	unsigned long *frame_count)
+/* the frames in size bytes: whole ADPCM blocks, or 16-bit PCM */
+static unsigned long packet_frames(BOOL adpcm, unsigned long size, unsigned long channels)
 {
-	unsigned long frames = size / (2 * channels);
-	short *samples = malloc((frames ? frames : 1) * channels * sizeof(short));
-
-	if (samples)
-	{
-		unsigned long index;
-
-		/* little-endian samples, as the maps keep them, on any host */
-		for (index = 0; index < frames * channels; index++)
-			samples[index] = (short)(source[index * 2] | source[index * 2 + 1] << 8);
-	}
-	*frame_count = samples ? frames : 0;
-	return samples;
+	if (adpcm)
+		return size / (XBOX_ADPCM_BLOCK_BYTES * channels) * XBOX_ADPCM_BLOCK_SAMPLES;
+	return size / (2 * channels);
 }
 
 /* ---------- 3D */
@@ -643,10 +625,36 @@ static void resampler_reset(struct sdl_stream *stream)
 	stream->silence = 0;
 }
 
-static float packet_sample(const struct voice_packet *packet, unsigned long frame, unsigned long channel,
-	unsigned long channels)
+/* the packet's frame, its first and last channel (the same for a mono
+voice): ADPCM from the voice's decoded block, which is the frame's block's
+once this has run; PCM little-endian, as the maps keep it, on any host */
+static void packet_frame(struct sdl_stream *stream, const struct voice_packet *packet, unsigned long frame,
+	float *taken)
 {
-	return packet->samples[frame * channels + channel] * (1.0f / 32768.0f);
+	unsigned long channels = stream->channels;
+
+	if (stream->adpcm)
+	{
+		const unsigned char *block = packet->source +
+			frame / XBOX_ADPCM_BLOCK_SAMPLES * XBOX_ADPCM_BLOCK_BYTES * channels;
+		const short *samples = stream->block + frame % XBOX_ADPCM_BLOCK_SAMPLES * channels;
+
+		if (stream->block_source != block)
+		{
+			decode_adpcm_block(block, channels, stream->block);
+			stream->block_source = block;
+		}
+		taken[0] = samples[0] * (1.0f / 32768.0f);
+		taken[1] = samples[channels - 1] * (1.0f / 32768.0f);
+	}
+	else
+	{
+		const unsigned char *first = packet->source + frame * channels * 2;
+		const unsigned char *last = first + (channels - 1) * 2;
+
+		taken[0] = (short)(first[0] | first[1] << 8) * (1.0f / 32768.0f);
+		taken[1] = (short)(last[0] | last[1] << 8) * (1.0f / 32768.0f);
+	}
 }
 
 /* the voice's next frame, finishing the packets it passes; FALSE once they
@@ -672,8 +680,7 @@ static BOOL take_frame(struct sdl_stream *stream, float *frame)
 			return FALSE;
 		if (stream->cursor < packet->frames)
 		{
-			frame[0] = packet_sample(packet, stream->cursor, 0, stream->channels);
-			frame[1] = packet_sample(packet, stream->cursor, stream->channels - 1, stream->channels);
+			packet_frame(stream, packet, stream->cursor, frame);
 			stream->cursor++;
 			return TRUE;
 		}
@@ -1547,10 +1554,12 @@ void dsound_sdl_output_device_check(void)
 
 /* ---------- completion */
 
-static void packet_release(struct voice_packet *entry)
+static void packet_release(struct sdl_stream *stream, struct voice_packet *entry)
 {
-	free(entry->samples);
-	entry->samples = NULL;
+	/* (its bytes are the game's again: what was decoded from them is not
+	the next packet's, even at the same address) */
+	entry->source = NULL;
+	stream->block_source = NULL;
 }
 
 /* completes the head packet; called with the lock held, which the game's
@@ -1564,7 +1573,7 @@ static void stream_complete_head(struct sdl_stream *stream, DWORD status, DWORD 
 	mixer may take the next while the lock is let go below) */
 	if (!entry->finished)
 		stream->cursor = 0;
-	packet_release(entry);
+	packet_release(stream, entry);
 	entry->finished = FALSE;
 	stream->packet_head = (stream->packet_head + 1) % MAXIMUM_STREAM_PACKETS;
 	stream->packet_count--;
@@ -1668,27 +1677,20 @@ static HRESULT STDMETHODCALLTYPE stream_process(IDirectSoundStream *object, LPCX
 {
 	struct sdl_stream *stream = stream_from_interface(object);
 	struct voice_packet *entry;
-	unsigned long frames = 0;
-	short *samples;
 
 	(void)output;
 	if (!input)
 		return E_INVALIDARG;
-	/* decode outside the lock */
-	samples = stream->adpcm ?
-		decode_adpcm(input->pvBuffer, input->dwMaxSize, stream->channels, &frames) :
-		decode_pcm(input->pvBuffer, input->dwMaxSize, stream->channels, &frames);
 	pthread_mutex_lock(&mixer_lock);
 	if (stream->packet_count == MAXIMUM_STREAM_PACKETS)
 	{
 		pthread_mutex_unlock(&mixer_lock);
-		free(samples);
 		return E_OUTOFMEMORY;
 	}
 	entry = &stream->packets[(stream->packet_head + stream->packet_count) % MAXIMUM_STREAM_PACKETS];
 	entry->packet = *input;
-	entry->samples = samples;
-	entry->frames = samples ? frames : 0;
+	entry->source = input->pvBuffer;
+	entry->frames = input->pvBuffer ? packet_frames(stream->adpcm, input->dwMaxSize, stream->channels) : 0;
 	entry->finished = FALSE;
 	if (input->pdwStatus)
 		*input->pdwStatus = XMEDIAPACKET_STATUS_PENDING;

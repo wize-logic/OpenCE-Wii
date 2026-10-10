@@ -262,7 +262,7 @@ jobs:
   wii:
     # The Wii build (port/wii) in devkitPro's devkitPPC image, which has
     # libogc; clang (with its PowerPC target) compiles the game, as the port
-    # does (tools/wii_build.py). WiiLibs is checked out beside the repository.
+    # does (tools/wii_build.py). WiiLibs is checked out into WiiLibs/ of the workspace.
     # The host checks of the GX translations run first; the artifact is the
     # Homebrew Channel's zip (tools/wii_package.py: no game data). Not part of
     # the release yet: the port is in bring-up.
@@ -293,10 +293,11 @@ jobs:
         run: |
           python3 tools/wii_gx_psh_check.py
           python3 tools/wii_nv2a_check.py
+          python3 tools/wii_math_check.py
 
       - name: Build
         run: |
-          python3 configure.py --devkitpro "$DEVKITPRO" --wiilibs WiiLibs
+          python3 configure.py --devkitpro "$DEVKITPRO" --wiilibs WiiLibs --compiler-launcher ccache
           ninja wii-package
 
       - run: ccache --show-stats

@@ -74,7 +74,7 @@ vertices, and draws simpler ones sooner) */
 #define MODEL_DETAIL_DEFAULT "0.5"
 #define OBJECT_SHADOWS_DEFAULT "false"
 #define BUMPED_HIGHLIGHTS_DEFAULT "false"
-#define GX_LIGHTING_DEFAULT "true"
+#define GX_LIGHTING_DEFAULT "false"
 #else
 #define MODEL_DETAIL_DEFAULT "1.0"
 #define OBJECT_SHADOWS_DEFAULT "true"
@@ -470,8 +470,10 @@ static const struct config_setting config_settings[] =
 		"seconds in the menu; a list, comma-separated, tours them: network_test_tour);\n"
 		"empty for none." },
 	{ "debug.fixed_ticks", _config_boolean, "false", "HALO_FIXED_TICKS", _environment_set_is_true, _platform_all,
-		"A game tick each frame, whatever time passed, and the scripted player's\n"
-		"clock the game's ticks: the same session on every machine (a lockstep check)." },
+		"A game tick each frame, whatever time passed, every frame 1/30 s long to what\n"
+		"runs on the frame's time (turning, camera, menus; so a wait in seconds counts\n"
+		"frames), the scripted player's clock the game's ticks, and speaking units'\n"
+		"mouths closed: the same session on every machine (a lockstep check)." },
 	{ "debug.lockstep_log", _config_integer, "0", "HALO_LOCKSTEP_LOG", _environment_value, _platform_all,
 		"Every this many ticks of a solo network test, a hash of every object's position,\n"
 		"velocity, facing, vitality and parent and the game's random seed in the log (0: none)." },
