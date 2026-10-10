@@ -360,6 +360,8 @@ static int eval_compare(const struct gx_psh_program *p, const struct inputs_set 
 	return worst;
 }
 
+/* the TEV stages of the random programs translated */
+static unsigned long stages_made, programs_made;
 /* the stages whose cube maps are sampled as sphere maps (for the game's) */
 static unsigned check_cube;
 static int check(const DWORD *state, unsigned present, const char *name, int verbose)
@@ -371,6 +373,8 @@ static int check(const DWORD *state, unsigned present, const char *name, int ver
 	textures.fog_color = fog_color & 0x00FFFFFFUL;
 	if (!gx_psh_translate(state, &textures, &program)) { if (verbose) printf("%s: not translated (%s)\n", name, program.reason); return -1; }
 	int valid = validate(&program);
+	stages_made += program.tev.stage_count;
+	programs_made++;
 	if (program.approximate) return -2;
 	float worst = 0;
 	int unclamped = has_unclamped(&program), eval_program_worst = 0;
@@ -622,6 +626,8 @@ int main(int argc, char **argv)
 		else { untranslated++; if (getenv("LIST")) printf("UNTRANSLATED %d\n", seed); }
 	}
 	printf("%d exact and agree, %d differ, %d approximate, %d not translated\n", ok, bad, approximated, untranslated);
+	printf("%lu TEV stages for the %lu translated (%.2f a program)\n", stages_made, programs_made,
+		programs_made ? (double)stages_made / (double)programs_made : 0.0);
 	{
 		int game = only < 0 ? game_programs() : 0;
 

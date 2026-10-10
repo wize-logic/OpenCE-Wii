@@ -21,7 +21,10 @@ registers. So:
   second constant, both inputs of a product inverted, a signed mapping) is
   first computed into a free register by a stage of its own;
 - the colour and alpha halves of a combiner stage share TEV stages where
-  their textures and colours agree.
+  their textures and colours agree;
+- once the stages are made, halves whose results nothing reads are taken
+  out, and a half left alone in its stage moves into another's unused half
+  (stages_compact).
 
 GX's inputs are unsigned and clamped: the signed mappings (expand, half
 bias) come out clamped to [0, 1], and a negation as 0, except in a dot
@@ -2722,6 +2725,337 @@ static void final_combiner(struct translation *translation)
 	queues_flush(translation);
 }
 
+/* ---------- dead stages
+
+The translation leaves halves of stages whose results nothing reads (a
+value made for a portion that ends up not using it, a register written
+again before it is read) and halves that only pass a register on. Once the
+stages are made these are taken out (stages_compact): a stage with nothing
+left in it goes, and a half left alone in its stage moves into the unused
+half of another, where nothing between them reads or writes what it does
+and the two halves' textures and colours agree. Every half that stays reads
+what it read before, so PREV's colour and alpha after the last stage, the
+program's result, are as they were. */
+
+/* a register's colour (alpha 0) or alpha, as a bit of a set */
+#define REGISTER_CHANNEL(reg, alpha) (1u << ((reg) * 2 + ((alpha) ? 1 : 0)))
+#define HALF(stage, which) ((which) ? &(stage)->alpha : &(stage)->color)
+
+/* the register channel an input reads (0: none) */
+static unsigned input_channel(unsigned char code, int alpha)
+{
+	if (alpha)
+		return code <= WL_TEV_CA_A2 ? REGISTER_CHANNEL(code, 1) : 0;
+	return code <= WL_TEV_CC_A2 ? REGISTER_CHANNEL(code >> 1, code & 1) : 0;
+}
+
+static BOOL input_zero(unsigned char code, int alpha)
+{
+	return code == (alpha ? WL_TEV_CA_ZERO : WL_TEV_CC_ZERO);
+}
+
+/* the register channels a half's result depends on: d, and of the lerp
+(1 - c) * a + c * b, a unless c is 1, b unless c is 0, and c unless a and b
+are 0 (all of a compare's) */
+static unsigned half_reads(const WlTevHalf *half, int alpha)
+{
+	unsigned reads = input_channel(half->in[3], alpha);
+	BOOL lerp = half->op == WL_TEV_ADD || half->op == WL_TEV_SUB;
+
+	if (!lerp || alpha || half->in[2] != WL_TEV_CC_ONE)
+		reads |= input_channel(half->in[0], alpha);
+	if (!lerp || !input_zero(half->in[2], alpha))
+		reads |= input_channel(half->in[1], alpha);
+	if (!lerp || !input_zero(half->in[0], alpha) || !input_zero(half->in[1], alpha))
+		reads |= input_channel(half->in[2], alpha);
+	return reads;
+}
+
+static unsigned half_writes(const WlTevHalf *half, int alpha)
+{
+	return REGISTER_CHANNEL(half->dest & 3, alpha);
+}
+
+/* whether a half leaves its register as it was: d its own channel, nothing
+added to it, not scaled, and clamped only where it is in [0, 1] (in_range:
+the channels that are, before the stage) */
+static BOOL half_passes(const WlTevHalf *half, int alpha, unsigned in_range)
+{
+	unsigned char own = (unsigned char)(alpha ? half->dest : half->dest * 2);
+
+	return (half->op == WL_TEV_ADD || half->op == WL_TEV_SUB) && half->bias == WL_TEV_BIAS_ZERO &&
+		half->scale == WL_TEV_SCALE_1 && input_zero(half->in[0], alpha) && input_zero(half->in[1], alpha) &&
+		half->in[3] == own && (!half->clamp || (in_range & half_writes(half, alpha)));
+}
+
+/* the channels in [0, 1] before each stage: registers start in it (0, or a
+preloaded constant), a clamped result is in it, an unclamped one may not be */
+static void stages_in_range(const WlTevProgram *tev, unsigned in_range[WL_TEV_MAX_STAGES])
+{
+	unsigned range = 0xFF, index;
+	int alpha;
+
+	for (index = 0; index < tev->stage_count; index++)
+	{
+		unsigned next = range;
+
+		in_range[index] = range;
+		for (alpha = 0; alpha < 2; alpha++)
+		{
+			const WlTevHalf *half = HALF(&tev->stages[index], alpha);
+
+			if (half_passes(half, alpha, range))
+				continue;
+			if (half->clamp)
+				next |= half_writes(half, alpha);
+			else
+				next &= ~half_writes(half, alpha);
+		}
+		range = next;
+	}
+}
+
+/* the halves used: those that change what they write, and whose result a
+used half reads before it is written again, or that is the program's
+(PREV's colour and alpha after the last stage). (A value a used half reads
+is then always a used half's, or a register's start.) */
+static void stages_used(const WlTevProgram *tev, unsigned char used[WL_TEV_MAX_STAGES][2])
+{
+	unsigned in_range[WL_TEV_MAX_STAGES];
+	unsigned live = REGISTER_CHANNEL(WL_TEV_PREV, 0) | REGISTER_CHANNEL(WL_TEV_PREV, 1), index;
+	int alpha;
+
+	stages_in_range(tev, in_range);
+	for (index = tev->stage_count; index-- > 0;)
+	{
+		unsigned reads = 0, writes = 0;
+
+		for (alpha = 0; alpha < 2; alpha++)
+		{
+			const WlTevHalf *half = HALF(&tev->stages[index], alpha);
+
+			used[index][alpha] = (unsigned char)(!half_passes(half, alpha, in_range[index]) &&
+				(live & half_writes(half, alpha)));
+			if (used[index][alpha])
+			{
+				reads |= half_reads(half, alpha);
+				writes |= half_writes(half, alpha);
+			}
+		}
+		live = (live & ~writes) | reads;
+	}
+}
+
+/* what a half reads of its stage's order and constant selection */
+enum { _stage_texture = 1, _stage_ras = 2, _stage_konst = 4 };
+
+static unsigned half_stage_reads(const WlTevHalf *half, int alpha)
+{
+	unsigned reads = 0;
+	int index;
+
+	for (index = 0; index < 4; index++)
+	{
+		unsigned char code = half->in[index];
+
+		if (alpha)
+			reads |= code == WL_TEV_CA_TEXA ? _stage_texture : code == WL_TEV_CA_RASA ? _stage_ras :
+				code == WL_TEV_CA_KONST ? _stage_konst : 0;
+		else
+			reads |= code == WL_TEV_CC_TEXC || code == WL_TEV_CC_TEXA ? _stage_texture :
+				code == WL_TEV_CC_RASC || code == WL_TEV_CC_RASA ? _stage_ras :
+				code == WL_TEV_CC_KONST ? _stage_konst : 0;
+	}
+	return reads;
+}
+
+/* whether a half that reads and writes these register channels can move
+past a stage: none of its used halves reads what the half writes, or writes
+what it reads or writes */
+static BOOL stage_passable(const WlTevStage *stage, const unsigned char used[2], unsigned reads, unsigned writes)
+{
+	int alpha;
+
+	for (alpha = 0; alpha < 2; alpha++)
+	{
+		const WlTevHalf *half = HALF(stage, alpha);
+
+		if (used[alpha] && ((half_writes(half, alpha) & (reads | writes)) || (half_reads(half, alpha) & writes)))
+			return FALSE;
+	}
+	return TRUE;
+}
+
+/* moves a used half of stage `from` into stage `to`, whose half of its kind
+is unused, if the texture and colour its other half reads are those the
+moving half reads: FALSE when they are not */
+static BOOL half_move(WlTevProgram *tev, unsigned char used[WL_TEV_MAX_STAGES][2], unsigned from, unsigned to,
+	int alpha)
+{
+	const WlTevStage *source = &tev->stages[from];
+	WlTevStage *target = &tev->stages[to];
+	unsigned moving = half_stage_reads(HALF(source, alpha), alpha);
+	unsigned staying = used[to][!alpha] ? half_stage_reads(HALF(target, !alpha), !alpha) : 0;
+
+	if ((moving & staying & _stage_texture) && (source->texcoord != target->texcoord ||
+		source->texmap != target->texmap || source->tex_swap != target->tex_swap))
+		return FALSE;
+	if ((moving & staying & _stage_ras) && (source->channel != target->channel || source->ras_swap != target->ras_swap))
+		return FALSE;
+	if (moving & _stage_texture)
+	{
+		target->texcoord = source->texcoord;
+		target->texmap = source->texmap;
+		target->tex_swap = source->tex_swap;
+	}
+	if (moving & _stage_ras)
+	{
+		target->channel = source->channel;
+		target->ras_swap = source->ras_swap;
+	}
+	if (alpha)
+		target->kasel = source->kasel;
+	else
+		target->kcsel = source->kcsel;
+	*HALF(target, alpha) = *HALF(source, alpha);
+	used[to][alpha] = 1;
+	used[from][alpha] = 0;
+	return TRUE;
+}
+
+/* moves the half alone in stage `from` into the unused half of a later or
+earlier stage, past stages that do not see it move: FALSE when there is
+none */
+static BOOL half_merge(WlTevProgram *tev, unsigned char used[WL_TEV_MAX_STAGES][2], unsigned from)
+{
+	const WlTevHalf *half;
+	unsigned reads, writes, to;
+	int alpha;
+
+	if (used[from][0] == used[from][1])
+		return FALSE;
+	alpha = used[from][1];
+	half = HALF(&tev->stages[from], alpha);
+	reads = half_reads(half, alpha);
+	writes = half_writes(half, alpha);
+	/* (later: the stage's other half reads its inputs before the moved half
+	writes, so it must not read what that writes) */
+	for (to = from + 1; to < tev->stage_count; to++)
+	{
+		const WlTevStage *target = &tev->stages[to];
+
+		if (!used[to][alpha] && !(used[to][!alpha] && (half_reads(HALF(target, !alpha), !alpha) & writes)) &&
+			half_move(tev, used, from, to, alpha))
+			return TRUE;
+		if (!stage_passable(target, used[to], reads, writes))
+			break;
+	}
+	/* (earlier: the moved half reads its inputs before the other half
+	writes, so that must not write what it reads) */
+	for (to = from; to-- > 0;)
+	{
+		const WlTevStage *target = &tev->stages[to];
+
+		if (!used[to][alpha] && !(used[to][!alpha] && (half_writes(HALF(target, !alpha), !alpha) & reads)) &&
+			half_move(tev, used, from, to, alpha))
+			return TRUE;
+		if (!stage_passable(target, used[to], reads, writes))
+			break;
+	}
+	return FALSE;
+}
+
+static void stage_remove(WlTevProgram *tev, unsigned char used[WL_TEV_MAX_STAGES][2], unsigned index)
+{
+	memmove(&tev->stages[index], &tev->stages[index + 1], (tev->stage_count - index - 1) * sizeof(tev->stages[0]));
+	memmove(used[index], used[index + 1], (tev->stage_count - index - 1) * sizeof(used[0]));
+	tev->stage_count--;
+}
+
+/* a used half's lerp with the inputs it does not depend on 0; an unused half
+passing PREV on, exactly (clamped in stages_compact where that is the same) */
+static void half_tidy(WlTevStage *stage, int alpha, BOOL used)
+{
+	WlTevHalf *half = HALF(stage, alpha);
+	unsigned char zero_input = (unsigned char)(alpha ? WL_TEV_CA_ZERO : WL_TEV_CC_ZERO);
+
+	if (!used)
+	{
+		(alpha ? wl_tev_stage_alpha : wl_tev_stage_color)(stage, zero_input, zero_input, zero_input,
+			(unsigned char)(alpha ? WL_TEV_CA_APREV : WL_TEV_CC_CPREV), WL_TEV_ADD, WL_TEV_BIAS_ZERO, WL_TEV_SCALE_1,
+			FALSE, WL_TEV_PREV);
+		return;
+	}
+	if (half->op != WL_TEV_ADD && half->op != WL_TEV_SUB)
+		return;
+	if (!alpha && half->in[2] == WL_TEV_CC_ONE)
+		half->in[0] = zero_input;
+	if (input_zero(half->in[2], alpha))
+		half->in[1] = zero_input;
+	if (input_zero(half->in[0], alpha) && input_zero(half->in[1], alpha))
+		half->in[2] = zero_input;
+}
+
+/* takes out the halves and stages the result does not need. A half left
+unused passes PREV on, as wl_tev_add_stage leaves it (clamped where PREV is
+in [0, 1], else exactly), and a stage's order and constant selections are
+only those its halves read. */
+static void stages_compact(WlTevProgram *tev)
+{
+	unsigned char used[WL_TEV_MAX_STAGES][2];
+	unsigned in_range[WL_TEV_MAX_STAGES];
+	unsigned index;
+	int alpha;
+
+	stages_used(tev, used);
+	for (index = 0; index < tev->stage_count; index++)
+	{
+		for (alpha = 0; alpha < 2; alpha++)
+			half_tidy(&tev->stages[index], alpha, used[index][alpha]);
+	}
+	for (index = tev->stage_count; index-- > 0 && tev->stage_count > 1;)
+	{
+		if (!used[index][0] && !used[index][1])
+			stage_remove(tev, used, index);
+	}
+	for (index = 0; index < tev->stage_count;)
+	{
+		if (half_merge(tev, used, index))
+		{
+			stage_remove(tev, used, index);
+			index = 0;
+		}
+		else
+			index++;
+	}
+	stages_in_range(tev, in_range);
+	for (index = 0; index < tev->stage_count; index++)
+	{
+		WlTevStage *stage = &tev->stages[index];
+		unsigned color_reads = half_stage_reads(&stage->color, 0), alpha_reads = half_stage_reads(&stage->alpha, 1);
+
+		for (alpha = 0; alpha < 2; alpha++)
+		{
+			if (!used[index][alpha])
+				HALF(stage, alpha)->clamp = (in_range[index] & REGISTER_CHANNEL(WL_TEV_PREV, alpha)) != 0;
+		}
+		if (!((color_reads | alpha_reads) & _stage_texture))
+		{
+			stage->texcoord = stage->texmap = WL_TEV_NONE;
+			stage->tex_swap = 0;
+		}
+		if (!((color_reads | alpha_reads) & _stage_ras))
+		{
+			stage->channel = WL_TEV_NONE;
+			stage->ras_swap = 0;
+		}
+		if (!(color_reads & _stage_konst))
+			stage->kcsel = WL_TEV_KSEL_1;
+		if (!(alpha_reads & _stage_konst))
+			stage->kasel = WL_TEV_KSEL_1;
+	}
+}
+
 /* ---------- public code */
 
 /* the swap tables the stages read through (resources_add): as it is, the
@@ -2778,6 +3112,7 @@ static BOOL translate_once(const DWORD *render_state, const struct gx_psh_textur
 	program->reason = translation.failed ? translation.reason : NULL;
 	if (translation.failed || program->tev.stage_count == 0)
 		return FALSE;
+	stages_compact(&program->tev);
 	/* (what the hardware would reject: a fault of the translation's) */
 	if (!wl_tev_validate(&program->tev, NULL))
 	{
