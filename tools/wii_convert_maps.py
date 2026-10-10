@@ -54,8 +54,8 @@ SCENARIO_STRUCTURE_BSPS_OFFSET = 0x5A4
 BUFFER_SIZE = 12
 
 # What each data block holds, by the definition and field that name it: "bytes" (left as they
-# are), "utf16" (16-bit swaps), "hs_syntax" (the scripts' syntax nodes: hs_syntax below), or
-# "deferred" (not converted yet: reported).
+# are), "utf16" (16-bit swaps), "longs" (32-bit swaps), "hs_syntax" (the scripts' syntax nodes:
+# hs_syntax below), or "deferred" (not converted yet: reported).
 DATA_CONTENTS: Dict[Tuple[str, str], str] = {
     ("font", "pixels"): "bytes",
     ("hs_source_file", "source"): "bytes",
@@ -66,8 +66,9 @@ DATA_CONTENTS: Dict[Tuple[str, str], str] = {
     ("sound_permutation", "subtitle_data"): "bytes",
     ("string_list_entry", "string"): "bytes",
     ("unicode_string_list_entry", "string"): "utf16",
-    # (cluster and sound cluster data are kept in the tags but read by nothing)
-    ("structure_bsp", "cluster_data"): "bytes",
+    # (each cluster's potentially visible set: bit vectors the game reads a long at a time,
+    # structure_bsp_get_cluster_pvs; the sound clusters' is read a byte at a time)
+    ("structure_bsp", "cluster_data"): "longs",
     ("structure_bsp", "sound_cluster_data"): "bytes",
     ("animation", "data"): "animation",
     ("animation", "default_data"): "animation",
@@ -354,6 +355,8 @@ class Converter:
             offset = region.offset(data_address)
             words = struct.unpack_from(f"<{size // 2}H", self.source, offset)
             struct.pack_into(f">{size // 2}H", self.output, offset, *words)
+        elif contents == "longs":
+            self.swap_words(region.offset(data_address), size - size % 4, 4)
         elif contents == "hs_syntax":
             self.hs_syntax(region, data_address, size)
         elif contents == "recorded_animation":

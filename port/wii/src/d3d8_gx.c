@@ -904,6 +904,17 @@ static void states_apply(void)
 	}
 	/* the cull mode names the screen winding to discard (as the OpenGL
 	port reads it); the vertices keep their screen winding on both paths */
+	{
+		static int cull = -1;
+
+		if (cull < 0)
+			cull = config_boolean("debug.gpu_cull") ? 1 : 0;
+		if (!cull)
+		{
+			GX_SetCullMode(GX_CULL_NONE);
+			return;
+		}
+	}
 	switch (D3D__RenderState[D3DRS_CULLMODE])
 	{
 	case D3DCULL_CW: GX_SetCullMode(gx_cull_clockwise); break;
@@ -1661,6 +1672,8 @@ struct draw_projection
 {
 	BOOL perspective;
 	float a, b;
+	/* (for the draw log: whether this draw's vertices gave the fit) */
+	BOOL fitted;
 };
 
 static struct draw_projection projection_loaded;
@@ -1813,6 +1826,11 @@ static u8 gx_primitive(D3DPRIMITIVETYPE type);
 #ifndef DRAW_LOG_FRAME
 #define DRAW_LOG_FRAME 0
 #endif
+/* the pixel the logged frame reads back after each draw */
+#ifndef DRAW_LOG_X
+#define DRAW_LOG_X 320
+#define DRAW_LOG_Y 260
+#endif
 
 static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct draw_projection *projection,
 	void (*fetch)(void *, UINT, float (*)[4]), void *context, struct nv2a_cpu_program *program, float point_size)
@@ -1854,6 +1872,22 @@ static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct d
 		(unsigned long)D3D__RenderState[D3DRS_ALPHAFUNC], (unsigned long)D3D__RenderState[D3DRS_ALPHAREF],
 		(unsigned long)D3D__RenderState[D3DRS_ZENABLE], (unsigned long)D3D__RenderState[D3DRS_ZFUNC],
 		(unsigned long)D3D__RenderState[D3DRS_ZWRITEENABLE], (unsigned long)D3D__RenderState[D3DRS_COLORWRITEENABLE]);
+	{
+		float w_minimum = 1.0e30f, w_maximum = -1.0e30f;
+
+		for (vertex = 0; vertex < count && vertex < 64; vertex++)
+		{
+			fetch(context, vertex, inputs);
+			nv2a_cpu_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size, &out);
+			if (out.clip[3] < w_minimum)
+				w_minimum = out.clip[3];
+			if (out.clip[3] > w_maximum)
+				w_maximum = out.clip[3];
+		}
+		platform_log("  projection: %s, %s a %.6f b %.4f, w %.4f to %.4f (clip %d)",
+			projection->perspective ? "perspective" : "screen", projection->fitted ? "fitted" : "the last fit's",
+			projection->a, projection->b, w_minimum, w_maximum, out.clip_captured);
+	}
 	platform_log("  a vertex: t0 %.3f %.3f %.3f %.3f t1 %.3f %.3f t2 %.3f %.3f t3 %.3f %.3f d1 %.2f %.2f %.2f %.2f fog %.2f",
 		out.t[0][0], out.t[0][1], out.t[0][2], out.t[0][3], out.t[1][0], out.t[1][1], out.t[2][0], out.t[2][1],
 		out.t[3][0], out.t[3][1], out.d1[0], out.d1[1], out.d1[2], out.d1[3], out.fog);
@@ -1953,6 +1987,7 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 			projection.perspective = FALSE;
 		projection.a = projection_a;
 		projection.b = projection_b;
+		projection.fitted = fitted;
 	}
 	projection_load(&projection);
 	if (DRAW_LOG_FRAME && device.frames == DRAW_LOG_FRAME)
@@ -1965,6 +2000,16 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 		vertex_send(&out, &projection);
 	}
 	GX_End();
+	/* (the logged frame: a pixel read back after each draw, to see which
+	draw makes it what it is) */
+	if (DRAW_LOG_FRAME && device.frames == DRAW_LOG_FRAME && device.render_target == &device.back_buffer)
+	{
+		GXColor pixel;
+
+		GX_DrawDone();
+		GX_PeekARGB(DRAW_LOG_X, DRAW_LOG_Y, &pixel);
+		platform_log("  pixel (%d, %d) after: %u %u %u %u", DRAW_LOG_X, DRAW_LOG_Y, pixel.r, pixel.g, pixel.b, pixel.a);
+	}
 	timing.draws += wl_platform_time_us() - started;
 }
 
