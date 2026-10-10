@@ -37,7 +37,7 @@ python3 configure.py
 ninja wii                                   # build/wii/halo.dol and halo.elf
 tools/wii_convert_maps.py XBOX/maps/ui.map XBOX/maps/bloodgulch.map   # into build/wii/sd/apps/halo/maps
 tools/wii_dolphin.py --seconds 300 --until "frame 360:"            # run it in Dolphin from WSL
-tools/wii_gx_psh_check.py                   # the combiner translation, checked on the host
+tools/wii_gx_psh_check.py                   # the combiner translation, checked on the host (WIILIBS=DIR)
 tools/wii_nv2a_check.py                     # the compiled vertex programs against the interpreter
 tools/wii_animation_check.py --converted DIR XBOX/maps/*.map   # the converted maps against the Xbox's (map conversion, below)
 tools/wii_data_check.py --converted DIR XBOX/maps/*.map
@@ -262,6 +262,10 @@ and pixel shaders.
     game's projections.
   - Draws whose w doesn't vary, such as the interface's, are drawn in screen space.
 - **Pixel shaders.** The register combiners are translated to TEV stages (`src/gx_psh.c`).
+  - The stages are a WiiLibs TEV program (`wl/platform/tev.h`): its builder, register pool and
+    merging of what a stage's inputs need of its order. WiiLibs' validator checks each program
+    as it is translated (all but its refusal of a bias with `DIVIDE_2`, which GX computes), and
+    `wl_tev_apply_unchecked` sets it, with the swap tables it reads through.
   - Combiner registers are renamed as they are written, and dead values are dropped.
   - Inputs a stage can't reach (a second texture or rasterized colour, a second constant, a
     doubly inverted product) are first computed into a free register, or into the operation's
@@ -292,7 +296,9 @@ and pixel shaders.
     simplified, and each approximation says why. One that still doesn't fit draws its first
     texture times its diffuse colour.
   - `tools/wii_gx_psh_check.py` simulates the TEV stages against the combiners, for random
-    programs and the game's.
+    programs and the game's. It also counts WiiLibs' validator's findings and compares WiiLibs'
+    evaluator (`wl_tev_eval`) with its simulation. It finds WiiLibs from `WIILIBS`, else
+    `./WiiLibs` (the CI's), else `../WiiLibs`.
 - **Culling.** `D3DRS_CULLMODE` names the screen winding to discard. Both vertex paths keep the
   screen's winding. GX's own convention is measured once at start-up: the device draws a
   clockwise triangle with `GX_CULL_FRONT` and reads the pixel back.
