@@ -119,6 +119,8 @@ struct draw_statistics
 {
 	unsigned long draws;
 	unsigned long vertices;
+	/* (run through their programs: fewer, an indexed draw's kept) */
+	unsigned long vertices_run;
 	unsigned long clears;
 	unsigned long immediate_draws;
 	unsigned long textures_bound, textures_failed, stages_without_mode;
@@ -1898,7 +1900,17 @@ static float fog_coordinate(float fog)
 	return (factor * 255.0f + 0.5f) / 256.0f;
 }
 
-static void vertex_send(const struct nv2a_cpu_output *out, const struct draw_projection *projection)
+/* a vertex as GX takes it (DEVICE_VERTEX_FORMAT's attributes, in order) */
+struct gx_vertex
+{
+	float position[3];
+	u8 color0[4], color1[4];
+	float texcoord[4][2];
+	float fog;
+};
+
+static void vertex_store(const struct nv2a_cpu_output *out, const struct draw_projection *projection,
+	struct gx_vertex *vertex)
 {
 	/* the program's screen position (pixel centres on integers, as Direct3D
 	puts them), its depth scaled back to 0..1 */
@@ -1911,8 +1923,9 @@ static void vertex_send(const struct nv2a_cpu_output *out, const struct draw_pro
 		const float *offset = device.vertex_constants[VERTEX_CONSTANT_BIAS - 37];
 		float w = out->clip[3];
 
-		GX_Position3f32(out->clip[0] * scale[0] + (offset[0] + 0.5f) * w, out->clip[1] * scale[1] + (offset[1] + 0.5f) * w,
-			-w);
+		vertex->position[0] = out->clip[0] * scale[0] + (offset[0] + 0.5f) * w;
+		vertex->position[1] = out->clip[1] * scale[1] + (offset[1] + 0.5f) * w;
+		vertex->position[2] = -w;
 	}
 	else
 	{
@@ -1920,14 +1933,47 @@ static void vertex_send(const struct nv2a_cpu_output *out, const struct draw_pro
 			depth = 0.0f;
 		if (depth > 1.0f)
 			depth = 1.0f;
-		GX_Position3f32(out->position[0] + 0.5f, out->position[1] + 0.5f, depth - 1.0f);
+		vertex->position[0] = out->position[0] + 0.5f;
+		vertex->position[1] = out->position[1] + 0.5f;
+		vertex->position[2] = depth - 1.0f;
 	}
-	GX_Color4u8(color_byte(out->d0[0]), color_byte(out->d0[1]), color_byte(out->d0[2]), color_byte(out->d0[3]));
-	GX_Color4u8(color_byte(out->d1[0]), color_byte(out->d1[1]), color_byte(out->d1[2]), color_byte(out->d1[3]));
 	for (stage = 0; stage < 4; stage++)
-		GX_TexCoord2f32(out->t[stage][0] * texcoord_scale[stage][0], out->t[stage][1] * texcoord_scale[stage][1]);
-	GX_TexCoord1f32(fog_coordinate(out->fog));
+	{
+		vertex->color0[stage] = color_byte(out->d0[stage]);
+		vertex->color1[stage] = color_byte(out->d1[stage]);
+		vertex->texcoord[stage][0] = out->t[stage][0] * texcoord_scale[stage][0];
+		vertex->texcoord[stage][1] = out->t[stage][1] * texcoord_scale[stage][1];
+	}
+	vertex->fog = fog_coordinate(out->fog);
 }
+
+static inline void vertex_emit(const struct gx_vertex *vertex)
+{
+	int stage;
+
+	GX_Position3f32(vertex->position[0], vertex->position[1], vertex->position[2]);
+	GX_Color4u8(vertex->color0[0], vertex->color0[1], vertex->color0[2], vertex->color0[3]);
+	GX_Color4u8(vertex->color1[0], vertex->color1[1], vertex->color1[2], vertex->color1[3]);
+	for (stage = 0; stage < 4; stage++)
+		GX_TexCoord2f32(vertex->texcoord[stage][0], vertex->texcoord[stage][1]);
+	GX_TexCoord1f32(vertex->fog);
+}
+
+static void vertex_send(const struct nv2a_cpu_output *out, const struct draw_projection *projection)
+{
+	struct gx_vertex vertex;
+
+	vertex_store(out, projection, &vertex);
+	vertex_emit(&vertex);
+}
+
+/* an indexed draw's vertices, each run through its program once however
+many of its indices name it (a strip names most twice): kept by index less
+the draw's least, for draws whose indices span no more than this */
+#define VERTEX_MEMO_SIZE 4096
+static struct gx_vertex *vertex_memo;
+static unsigned long *vertex_memo_stamps;
+static unsigned long vertex_memo_draw;
 
 static u8 gx_primitive(D3DPRIMITIVETYPE type);
 
@@ -2043,9 +2089,11 @@ static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct d
 typedef void (*vertex_fetch_proc)(void *context, UINT vertex, float (*inputs)[4]);
 
 static struct frame_timing timing;
+/* (the sums when the last frame ended: a slow frame's own share) */
+static struct frame_timing last_timing;
 
 static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitive_type, UINT count,
-	vertex_fetch_proc fetch, void *context)
+	vertex_fetch_proc fetch, void *context, const WORD *indices)
 {
 	uint64_t started = wl_platform_time_us();
 	float inputs[NV2A_CPU_INPUT_COUNT][4];
@@ -2101,14 +2149,69 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 	projection_load(&projection);
 	if (DRAW_LOG_FRAME && device.frames == DRAW_LOG_FRAME)
 		draw_log(primitive_type, count, &projection, fetch, context, program, point_size);
-	GX_Begin(gx_primitive(primitive_type), DEVICE_VERTEX_FORMAT, (u16)count);
-	for (vertex = 0; vertex < count; vertex++)
+	if (indices && count > 3 && !vertex_memo)
 	{
-		fetch(context, vertex, inputs);
-		nv2a_cpu_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size, &out);
-		vertex_send(&out, &projection);
+		vertex_memo = malloc(VERTEX_MEMO_SIZE * sizeof(*vertex_memo));
+		vertex_memo_stamps = calloc(VERTEX_MEMO_SIZE, sizeof(*vertex_memo_stamps));
+		if (!vertex_memo || !vertex_memo_stamps)
+		{
+			free(vertex_memo);
+			free(vertex_memo_stamps);
+			vertex_memo = NULL;
+			vertex_memo_stamps = NULL;
+			indices = NULL;
+		}
 	}
-	GX_End();
+	if (indices && count > 3 && vertex_memo)
+	{
+		WORD least = 0xFFFF, most = 0;
+
+		for (vertex = 0; vertex < count; vertex++)
+		{
+			if (indices[vertex] < least)
+				least = indices[vertex];
+			if (indices[vertex] > most)
+				most = indices[vertex];
+		}
+		if ((unsigned)(most - least) >= VERTEX_MEMO_SIZE)
+			indices = NULL;
+		else
+		{
+			vertex_memo_draw++;
+			GX_Begin(gx_primitive(primitive_type), DEVICE_VERTEX_FORMAT, (u16)count);
+			for (vertex = 0; vertex < count; vertex++)
+			{
+				unsigned slot = indices[vertex] - least;
+
+				if (vertex_memo_stamps[slot] != vertex_memo_draw)
+				{
+					fetch(context, vertex, inputs);
+					nv2a_cpu_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
+						point_size, &out);
+					vertex_store(&out, &projection, &vertex_memo[slot]);
+					vertex_memo_stamps[slot] = vertex_memo_draw;
+					device.statistics.vertices_run++;
+				}
+				vertex_emit(&vertex_memo[slot]);
+			}
+			GX_End();
+		}
+	}
+	else
+		indices = NULL;
+	if (!indices)
+	{
+		GX_Begin(gx_primitive(primitive_type), DEVICE_VERTEX_FORMAT, (u16)count);
+		for (vertex = 0; vertex < count; vertex++)
+		{
+			fetch(context, vertex, inputs);
+			nv2a_cpu_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
+				&out);
+			vertex_send(&out, &projection);
+		}
+		device.statistics.vertices_run += count;
+		GX_End();
+	}
 	/* (the logged frame: a pixel read back after each draw, to see which
 	draw makes it what it is) */
 	if (DRAW_LOG_FRAME && device.frames == DRAW_LOG_FRAME && device.render_target == &device.back_buffer)
@@ -2500,7 +2603,7 @@ static void draw_streams(D3DPRIMITIVETYPE primitive_type, UINT count, const WORD
 		fetch.streams[element] = buffer && buffer->Data ? (const unsigned char *)PLATFORM_PHYSICAL_TO_VIRTUAL(buffer->Data) :
 			NULL;
 	}
-	draw_run(program, primitive_type, count, stream_fetch, &fetch);
+	draw_run(program, primitive_type, count, stream_fetch, &fetch, indices);
 }
 
 /* ---------- streams and draws */
@@ -2559,7 +2662,7 @@ void WINAPI D3DDevice_End(void)
 		device.statistics.vertices += device.immediate_vertices;
 		program = program_current();
 		if (program && device.immediate_buffer && draw_prepare())
-			draw_run(program, device.immediate_primitive, (UINT)device.immediate_vertices, immediate_fetch, NULL);
+			draw_run(program, device.immediate_primitive, (UINT)device.immediate_vertices, immediate_fetch, NULL, NULL);
 	}
 	device.immediate = FALSE;
 }
@@ -2674,11 +2777,40 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			overflows = now;
 		}
 	}
+	/* a frame of more than half a second (loading, mostly): where it went */
+	{
+		static uint64_t last_frame;
+		static unsigned slow_frames;
+		static struct platform_file_reads last_reads;
+		uint64_t now = wl_platform_time_us();
+
+		if (last_frame && now - last_frame > 500000 && slow_frames < 40)
+		{
+			slow_frames++;
+			platform_log("Direct3D: frame %lu: %lu file reads, %lu KB in %lu ms", device.frames,
+				platform_file_reads.calls - last_reads.calls,
+				(unsigned long)((platform_file_reads.bytes - last_reads.bytes) / 1024),
+				(unsigned long)((platform_file_reads.microseconds - last_reads.microseconds) / 1000));
+			platform_log("Direct3D: frame %lu took %lu ms: draws %lu, textures %lu, pixel shaders %lu, the end %lu, "
+				"the game %lu", device.frames, (unsigned long)((now - last_frame) / 1000),
+				(unsigned long)((timing.draws - last_timing.draws) / 1000),
+				(unsigned long)((timing.textures - last_timing.textures) / 1000),
+				(unsigned long)((timing.pixel_shaders - last_timing.pixel_shaders) / 1000),
+				(unsigned long)((timing.present - last_timing.present) / 1000),
+				(unsigned long)((now - last_frame - (timing.draws - last_timing.draws) -
+					(timing.textures - last_timing.textures) - (timing.pixel_shaders - last_timing.pixel_shaders) -
+					(timing.present - last_timing.present)) / 1000));
+		}
+		last_frame = now;
+		last_timing = timing;
+		last_reads = platform_file_reads;
+	}
 	if (device.frames % STATISTICS_FRAMES == 0)
 	{
-		platform_log("Direct3D: frame %lu: %lu draws, %lu immediate, %lu vertices, %lu clears, %lu drawn elsewhere, "
-			"textures %lu bound %lu failed %lu without a mode, in the last %d", device.frames, device.statistics.draws,
-			device.statistics.immediate_draws, device.statistics.vertices, device.statistics.clears,
+		platform_log("Direct3D: frame %lu: %lu draws, %lu immediate, %lu vertices (%lu run), %lu clears, %lu drawn "
+			"elsewhere, textures %lu bound %lu failed %lu without a mode, in the last %d", device.frames,
+			device.statistics.draws, device.statistics.immediate_draws, device.statistics.vertices,
+			device.statistics.vertices_run, device.statistics.clears,
 			device.draws_elsewhere, device.statistics.textures_bound, device.statistics.textures_failed,
 			device.statistics.stages_without_mode, STATISTICS_FRAMES);
 		platform_log("Direct3D: textures not drawn: %lu without data, %lu of a shape, %lu of a format, "
@@ -2707,6 +2839,7 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			}
 			memset(&timing, 0, sizeof(timing));
 			timing.window_start = now;
+			last_timing = timing;
 		}
 		memset(texture_failures, 0, sizeof(texture_failures));
 		memset(&device.statistics, 0, sizeof(device.statistics));
