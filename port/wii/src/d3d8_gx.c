@@ -104,6 +104,14 @@ struct vertex_shader_object
 	struct nv2a_cpu_program *program;
 	/* what its outputs depend on (nv2a_cpu_analyze), with the program */
 	struct nv2a_cpu_dependencies dependencies;
+	/* ... and with the inputs a draw held the same taken as constants
+	(draw_dependencies) */
+	struct
+	{
+		unsigned long uniform;
+		struct nv2a_cpu_dependencies dependencies;
+	} specialized[2];
+	unsigned specialized_count;
 };
 
 struct stream_source
@@ -2276,6 +2284,19 @@ static struct draw_projection projection_fit(struct nv2a_cpu_program *program, U
 	return projection;
 }
 
+/* the inputs a draw has the same in every vertex, as its program reads them
+(draw_dependencies): the matrices are made with these values, and kept by
+them */
+static struct
+{
+	unsigned long mask;
+	float values[NV2A_CPU_INPUT_COUNT][4];
+} draw_uniform;
+
+struct stream_fetch;
+static const struct nv2a_cpu_dependencies *draw_dependencies(struct vertex_shader_object *shader,
+	struct nv2a_cpu_program *program, struct stream_fetch *fetch, UINT count);
+
 /* ---------- the position in hardware
 
 A program whose clip-space x, y and w are affine in one register of three
@@ -2286,14 +2307,13 @@ GX computes the rest (draw_hardware) or the processor does (draw_run). A
 surface's passes, some on each path, then reach the same depths, which
 their equal depth tests need. */
 
-static int position_register_of(const struct vertex_shader_object *shader, const struct nv2a_cpu_program *program)
+static int position_register_of(const struct vertex_shader_object *shader,
+	const struct nv2a_cpu_dependencies *dependencies)
 {
-	const struct nv2a_cpu_dependencies *dependencies = &shader->dependencies;
 	unsigned long mask = dependencies->clip[0] | dependencies->clip[1] | dependencies->clip[3];
 	unsigned long index, bits = mask & 0xFFFF;
 	int reg;
 
-	(void)program;
 	if (!dependencies->clip_captured || (mask & NV2A_CPU_NOT_AFFINE) || !bits || (bits & (bits - 1)))
 		return -1;
 	for (reg = 0; !(bits & (1UL << reg)); reg++)
@@ -2313,6 +2333,9 @@ static void matrix_inputs(const struct vertex_shader_object *shader, float (*inp
 	memset(inputs, 0, NV2A_CPU_INPUT_COUNT * sizeof(*inputs));
 	for (index = 0; index < shader->element_count; index++)
 		inputs[shader->elements[index].reg & 15][3] = 1.0f;
+	for (index = 0; index < NV2A_CPU_INPUT_COUNT; index++)
+		if (draw_uniform.mask & (1UL << index))
+			memcpy(inputs[index], draw_uniform.values[index], sizeof(inputs[index]));
 }
 
 static Mtx position_matrix_rows;
@@ -2340,6 +2363,15 @@ static unsigned long long constants_key(const struct vertex_shader_object *shade
 	unsigned long row, word;
 
 	hash = (hash ^ (unsigned long)shader) * 1099511628211ULL;
+	hash = (hash ^ draw_uniform.mask) * 1099511628211ULL;
+	for (row = 0; row < NV2A_CPU_INPUT_COUNT; row++)
+		if (draw_uniform.mask & (1UL << row))
+		{
+			const unsigned long *words = (const unsigned long *)draw_uniform.values[row];
+
+			for (word = 0; word < 4; word++)
+				hash = (hash ^ words[word]) * 1099511628211ULL;
+		}
 	for (row = 0; row < NV2A_CPU_CONSTANT_COUNT; row++)
 		if (dependencies->relative || (dependencies->constants[row / 32] & (1UL << (row % 32))) ||
 			row == VERTEX_CONSTANT_BIAS - 38 || row == VERTEX_CONSTANT_BIAS - 37)
@@ -2519,7 +2551,8 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 		gpu_transform = config_boolean("debug.gpu_transform") ? 1 : 0;
 	if (shader && gpu_transform)
 	{
-		position_register = position_register_of(shader, program);
+		position_register = position_register_of(shader,
+			draw_dependencies((struct vertex_shader_object *)shader, program, (struct stream_fetch *)context, count));
 		if (position_register >= 0 && position_matrix(shader, program, position_register, point_size))
 			projection = position_projection;
 		else
@@ -3032,6 +3065,74 @@ static const struct vertex_element *element_of(const struct vertex_shader_object
 	return NULL;
 }
 
+/* what a draw's program depends on: its analysis, or, where its clip-space
+position is not affine but the inputs it is not affine in (other than a
+position of three floats) hold the same values in every vertex the draw
+names (a skinned model's part bound to one node: its node indices and
+weights), its analysis with those as constants, whose values draw_uniform
+keeps for the matrices */
+static const struct nv2a_cpu_dependencies *draw_dependencies(struct vertex_shader_object *shader,
+	struct nv2a_cpu_program *program, struct stream_fetch *fetch, UINT count)
+{
+	const struct nv2a_cpu_dependencies *general = &shader->dependencies;
+	unsigned long clip = general->clip[0] | general->clip[1] | general->clip[3], candidates = 0;
+	float inputs[NV2A_CPU_INPUT_COUNT][4];
+	unsigned index;
+	int reg;
+
+	draw_uniform.mask = 0;
+	if (!fetch || !count || !general->clip_captured || !(clip & NV2A_CPU_NOT_AFFINE))
+		return general;
+	for (reg = 0; reg < NV2A_CPU_INPUT_COUNT; reg++)
+	{
+		const struct vertex_element *element;
+
+		if (!(clip & (1UL << reg)))
+			continue;
+		element = element_of(shader, reg);
+		if (!element || !fetch->streams[element->stream & (MAXIMUM_STREAMS - 1)] || !element->bytes)
+			return general;
+		if (element->type != D3DVSDT_FLOAT3)
+			candidates |= 1UL << reg;
+	}
+	if (!candidates)
+		return general;
+	for (reg = 0; reg < NV2A_CPU_INPUT_COUNT; reg++)
+	{
+		const struct vertex_element *element;
+		const unsigned char *stream, *first;
+		UINT stride, vertex;
+
+		if (!(candidates & (1UL << reg)))
+			continue;
+		element = element_of(shader, reg);
+		stream = fetch->streams[element->stream & (MAXIMUM_STREAMS - 1)] + element->offset;
+		stride = device.streams[element->stream & (MAXIMUM_STREAMS - 1)].stride;
+		first = stream + (fetch->indices ? (unsigned long)fetch->indices[0] + device.base_vertex_index : fetch->first) *
+			stride;
+		for (vertex = 1; vertex < count; vertex++)
+		{
+			unsigned long whole = fetch->indices ? (unsigned long)fetch->indices[vertex] + device.base_vertex_index :
+				fetch->first + vertex;
+
+			if (memcmp(stream + whole * stride, first, element->bytes))
+				return general;
+		}
+	}
+	stream_fetch(fetch, 0, inputs);
+	for (reg = 0; reg < NV2A_CPU_INPUT_COUNT; reg++)
+		if (candidates & (1UL << reg))
+			memcpy(draw_uniform.values[reg], inputs[reg], sizeof(inputs[reg]));
+	draw_uniform.mask = candidates;
+	for (index = 0; index < shader->specialized_count; index++)
+		if (shader->specialized[index].uniform == candidates)
+			return &shader->specialized[index].dependencies;
+	index = shader->specialized_count < 2 ? shader->specialized_count++ : 1;
+	shader->specialized[index].uniform = candidates;
+	nv2a_cpu_analyze_uniform(program, candidates, &shader->specialized[index].dependencies);
+	return &shader->specialized[index].dependencies;
+}
+
 /* the matrices of recent draws, by what made them: the program, its
 vertex declaration, the constants it reads, the texture coordinates' scales
 and the stages that read them, the fog's table */
@@ -3071,6 +3172,10 @@ static unsigned long long hardware_key(const struct vertex_shader_object *shader
 	state[5] = D3D__RenderState[D3DRS_FOGEND];
 	hash = hash_words(hash, state, sizeof(state));
 	hash = hash_words(hash, texcoord_scale, sizeof(texcoord_scale));
+	hash = hash_words(hash, &draw_uniform.mask, sizeof(draw_uniform.mask));
+	for (row = 0; row < NV2A_CPU_INPUT_COUNT; row++)
+		if (draw_uniform.mask & (1UL << row))
+			hash = hash_words(hash, draw_uniform.values[row], sizeof(draw_uniform.values[row]));
 	for (row = 0; row < NV2A_CPU_CONSTANT_COUNT; row++)
 		if (dependencies->relative || (dependencies->constants[row / 32] & (1UL << (row % 32))) ||
 			row == VERTEX_CONSTANT_BIAS - 38 || row == VERTEX_CONSTANT_BIAS - 37)
@@ -3100,8 +3205,8 @@ static BOOL hardware_rejected(const struct nv2a_cpu_program *program, const char
 static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitive_type, UINT count,
 	const WORD *indices, UINT first, struct stream_fetch *fetch)
 {
-	const struct vertex_shader_object *shader = fetch->shader;
-	const struct nv2a_cpu_dependencies *dependencies = &shader->dependencies;
+	struct vertex_shader_object *shader = (struct vertex_shader_object *)fetch->shader;
+	const struct nv2a_cpu_dependencies *dependencies;
 	float inputs[NV2A_CPU_INPUT_COUNT][4];
 	struct nv2a_cpu_output base, column;
 	const struct vertex_element *position_element;
@@ -3119,6 +3224,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 
 	if (gpu_transform < 0)
 		gpu_transform = config_boolean("debug.gpu_transform") ? 1 : 0;
+	dependencies = draw_dependencies(shader, program, fetch, count);
 	if (!gpu_transform || !dependencies->clip_captured || primitive_type == D3DPT_POINTLIST)
 		return hardware_rejected(program, "transform off, no clip-space position, or points");
 	clip_mask = dependencies->clip[0] | dependencies->clip[1] | dependencies->clip[3];
@@ -3710,6 +3816,12 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			dsound_wii_audio_report();
 			wii_heap_usage(&used, &free_bytes);
 			platform_log("memory: MEM1 heap %lu KB used, %lu KB free", used / 1024, free_bytes / 1024);
+			{
+				extern unsigned long wii_game_stack_used(unsigned long *size);
+				unsigned long size, deepest = wii_game_stack_used(&size);
+
+				platform_log("memory: the game's stack at most %lu KB deep of %lu", deepest / 1024, size / 1024);
+			}
 			wii_memory_window_usage(&used, &free_bytes);
 			platform_log("memory: MEM2 window (tag, texture and sound caches, Direct3D) %lu KB used, %lu KB free",
 				used / 1024, free_bytes / 1024);

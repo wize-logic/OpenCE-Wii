@@ -193,6 +193,8 @@ struct dependency_registers
 	unsigned long r[12][4];
 	unsigned long position[4];
 	unsigned long a0;
+	/* the inputs taken as constants (bit n: v[n]) */
+	unsigned long uniform;
 };
 
 static unsigned long product(unsigned long x, unsigned long y)
@@ -220,7 +222,8 @@ static void dependency_operand(const struct dependency_registers *registers,
 			sizeof(source));
 		break;
 	case _mux_input:
-		source[0] = source[1] = source[2] = source[3] = 1UL << (instruction->input & 15);
+		if (!(registers->uniform & (1UL << (instruction->input & 15))))
+			source[0] = source[1] = source[2] = source[3] = 1UL << (instruction->input & 15);
 		dependencies->inputs |= 1UL << (instruction->input & 15);
 		break;
 	case _mux_constant:
@@ -250,11 +253,20 @@ static void dependency_write(unsigned long destination[4], const unsigned long v
 
 void nv2a_cpu_analyze(const struct nv2a_cpu_program *program, struct nv2a_cpu_dependencies *dependencies)
 {
+	nv2a_cpu_analyze_uniform(program, 0, dependencies);
+}
+
+/* the same with some inputs taken as constants: a draw whose vertices all
+have the same values there (a skinned model's part of one node) */
+void nv2a_cpu_analyze_uniform(const struct nv2a_cpu_program *program, unsigned long uniform,
+	struct nv2a_cpu_dependencies *dependencies)
+{
 	struct dependency_registers registers;
 	unsigned long index;
 	int component;
 
 	memset(&registers, 0, sizeof(registers));
+	registers.uniform = uniform;
 	memset(dependencies, 0, sizeof(*dependencies));
 	for (index = 0; index < program->count; index++)
 	{

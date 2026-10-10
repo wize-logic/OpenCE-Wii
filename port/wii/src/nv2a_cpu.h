@@ -98,6 +98,8 @@ struct nv2a_cpu_dependencies
 void nv2a_cpu_run_colors(const struct nv2a_cpu_program *program, const float (*constants)[4], const float (*inputs)[4],
 	struct nv2a_cpu_output *output);
 void nv2a_cpu_analyze(const struct nv2a_cpu_program *program, struct nv2a_cpu_dependencies *dependencies);
+void nv2a_cpu_analyze_uniform(const struct nv2a_cpu_program *program, unsigned long uniform,
+	struct nv2a_cpu_dependencies *dependencies);
 
 void nv2a_cpu_compile(const DWORD *instructions, unsigned long instruction_count, struct nv2a_cpu_program *program);
 void nv2a_cpu_run(const struct nv2a_cpu_program *program, const float (*constants)[4], const float (*inputs)[4],
