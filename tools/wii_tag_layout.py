@@ -362,9 +362,11 @@ class Schema:
         colours). They are filled from the game's own declarations of the definition's name (struct
         sky, or struct sky_definition), which may cover only the tag's first part: one agrees when
         none of its fields contradicts one the schema names (where it has bytes, it says nothing)
-        and at least one is the same. The fields within the placeholders of every declaration that
-        agrees are taken, unless two contradict each other. Returns what was filled, and the
-        placeholders left as they are and why"""
+        and at least one is the same, or, for a view that declares bytes up to the fields its file
+        reads (actions.c's vehicle_definition), when all its fields lie within the placeholders.
+        The fields within the placeholders of every declaration that agrees are taken, unless two
+        contradict each other. Returns what was filled, and the placeholders left as they are and
+        why"""
         filled, unfilled = [], []
         for definition in self.definitions.values():
             placeholders = [leaf for leaf in definition.leaves if leaf.kind == "bytes" and leaf.size >= 4 and
@@ -380,9 +382,15 @@ class Schema:
             for name, leaves in self._game_structures(definition):
                 fields = {(leaf.offset, leaf.size, leaf.kind == "pointer") for leaf in leaves if leaf.kind != "bytes"}
                 # (some field the same, or, where the schema names none, a declaration of the
-                # tag's whole size)
+                # tag's whole size, or a view of a later part: one that starts with bytes, over
+                # what its file does not read, and whose fields all lie within the placeholders, as
+                # actions.c's vehicle_definition, bytes up to 0x390 and the two floats it reads)
                 whole = max((leaf.offset + leaf.size for leaf in leaves), default=0) == definition.size
-                if not (fields & anchors or (not anchors and whole)):
+                first = min(leaves, key=lambda leaf: leaf.offset, default=None)
+                tail = bool(fields) and first.offset == 0 and first.kind == "bytes" and \
+                    all(any(start <= offset and offset + size <= end for start, end in ranges)
+                        for offset, size, _ in fields)
+                if not (fields & anchors or (not anchors and whole) or tail):
                     continue
                 # (a field of its outside the placeholders that is not the schema's contradicts it)
                 if any(not any(start <= offset and offset + size <= end for start, end in ranges) and
