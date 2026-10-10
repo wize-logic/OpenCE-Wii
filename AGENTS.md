@@ -201,6 +201,12 @@ on WiiLibs (`../WiiLibs`, a sibling checkout). Read
 clang for `powerpc-unknown-eabi` against devkitPPC), how the maps are
 converted, how it draws, and the lockstep check.
 
+- The port and WiiLibs give and take. What the port works out that any Wii
+  program could use (a fix, a format, a workaround for libogc) goes into
+  WiiLibs, with its tests; whatever WiiLibs already does, the port takes
+  from it rather than keeping its own copy. Before writing platform code,
+  look in WiiLibs first; after writing it, ask whether it belongs there.
+
 - `HALO_WII` marks the Wii's code in shared files. The Wii keeps the Xbox's
   capacities (`halo_port_capacity.h`), so it does not join the other
   builds' network games.
