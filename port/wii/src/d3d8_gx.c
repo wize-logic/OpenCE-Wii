@@ -51,6 +51,7 @@ int: libogc's is renamed while its headers are read) */
 #include "xbox_texture_formats.h"
 #include "wl/codec/gx_tex.h"
 
+#include "wl/platform/heap_overflow.h"
 #include "wl/platform/mem.h"
 #include "wl/platform/platform.h"
 
@@ -1032,6 +1033,9 @@ static unsigned long texture_cache_bytes;
 static unsigned long texture_failures[5];
 enum { _failure_no_data, _failure_shape, _failure_memory, _failure_decode, _failure_format };
 static unsigned long textures_native;
+/* the decoded textures given up so that another could be decoded, the heap
+being full (texture_cache_reclaim; the memory report) */
+static unsigned long textures_reclaimed, texture_reclaim_bytes;
 
 void *physical_memory_get_texture_cache_base_address(void);
 
@@ -1242,6 +1246,43 @@ static void texture_evict(struct texture_entry *entry)
 		texture_cache_bytes -= entry->bytes;
 	}
 	memset(entry, 0, sizeof(*entry));
+}
+
+/* With the heap full, decoded textures go so that the one being decoded can
+be (the least recently drawn first, keep excepted): their memory is freed
+now, once GX has drawn what it was given, not at the frame's end. TRUE if
+any memory came back. */
+static BOOL texture_cache_reclaim(unsigned long bytes, const struct texture_entry *keep)
+{
+	unsigned long freed = 0;
+	BOOL any = pending_texture_free_count != 0;
+
+	while (freed < 2 * bytes)
+	{
+		struct texture_entry *victim = NULL;
+		unsigned long index;
+
+		for (index = 0; index < TEXTURE_CACHE_ENTRIES; index++)
+		{
+			if (&texture_cache[index] != keep && texture_cache[index].texels && !texture_cache[index].native &&
+				(!victim || texture_cache[index].used_frame < victim->used_frame))
+				victim = &texture_cache[index];
+		}
+		if (!victim)
+			break;
+		freed += victim->bytes;
+		textures_reclaimed++;
+		texture_reclaim_bytes += victim->bytes;
+		texture_evict(victim);
+		any = TRUE;
+	}
+	if (any)
+	{
+		if (device.frame_open)
+			GX_DrawDone();
+		texture_frees_flush();
+	}
+	return any;
 }
 
 /* a converted bitmap's entry, bound where the texture cache read it */
@@ -1455,6 +1496,8 @@ static struct texture_entry *texture_get(const D3DBaseTexture *texture, const D3
 		return NULL;
 	}
 	argb = malloc(texel_count * sizeof(*argb));
+	if (!argb && texture_cache_reclaim(texel_count * sizeof(*argb), oldest))
+		argb = malloc(texel_count * sizeof(*argb));
 	if (!argb)
 	{
 		static unsigned reported;
@@ -1543,6 +1586,8 @@ static struct texture_entry *texture_get(const D3DBaseTexture *texture, const D3
 		if (entry->texels)
 			texture_evict(entry);
 		texels = aligned_alloc(32, (bytes + 31) & ~(size_t)31);
+		if (!texels && texture_cache_reclaim(bytes, entry))
+			texels = aligned_alloc(32, (bytes + 31) & ~(size_t)31);
 		if (!texels)
 		{
 			static unsigned reported;
@@ -5439,15 +5484,36 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			wii_heap_usage(&used, &free_bytes);
 			platform_log("memory: MEM1 heap %lu KB used, %lu KB free", used / 1024, free_bytes / 1024);
 			{
+				unsigned long index, decoded = 0;
+
+				for (index = 0; index < TEXTURE_CACHE_ENTRIES; index++)
+					decoded += texture_cache[index].texels && !texture_cache[index].native;
+				platform_log("memory: decoded textures %lu KB of %lu in %lu, %lu given up for others (%lu KB)",
+					texture_cache_bytes / 1024, TEXTURE_CACHE_BYTES / 1024, decoded, textures_reclaimed,
+					texture_reclaim_bytes / 1024);
+			}
+			{
 				extern unsigned long wii_game_stack_used(unsigned long *size);
 				unsigned long size, deepest = wii_game_stack_used(&size);
 
 				platform_log("memory: the game's stack at most %lu KB deep of %lu", deepest / 1024, size / 1024);
 			}
-			wii_memory_window_usage(&used, &free_bytes);
-			platform_log("memory: MEM2 window (tag, texture and sound caches, Direct3D) %lu KB used, %lu KB free",
-				used / 1024, free_bytes / 1024);
+			{
+				unsigned long base, size, largest;
+
+				wii_memory_window_range(&base, &size);
+				wii_memory_window_usage(&used, &free_bytes, &largest);
+				platform_log("memory: MEM2 window (tag, texture and sound caches, Direct3D) at %08lx, %lu KB: "
+					"%lu KB used, %lu KB free (%lu KB together)", base, size / 1024, used / 1024, free_bytes / 1024,
+					largest / 1024);
+			}
 			wl_mem_log_usage();
+#if defined(__has_include)
+#if __has_include("wl/platform/heap_sites.h")
+			/* who holds the heaps (port/wii/src/wii_boot.c turns it on) */
+			wl_heap_overflow_log_sites(16);
+#endif
+#endif
 		}
 	}
 }

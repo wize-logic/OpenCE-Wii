@@ -323,8 +323,13 @@ boolean game_state_read_from_file(
 		xbox_game_state_globals.file_valid_for_read || recover_saved_games_hack);
 
 	/* port: read beside the game state, and taken once checked; with no
-	room for the copy (the Wii), straight into it as the Xbox did */
+	room for the copy, straight into it as the Xbox did (the Wii always:
+	its 4.25 MB would take most of the heap) */
+#ifdef HALO_WII
+	image = NULL;
+#else
 	image = malloc(xbox_game_state_globals.buffer_size);
+#endif
 	if (!image &&
 		SetFilePointer(xbox_game_state_globals.handle, 0, NULL, FILE_BEGIN) !=
 			INVALID_SET_FILE_POINTER &&

@@ -14,7 +14,9 @@ blocks from them, as the Linux layer does from its window:
 
 - the window (PLATFORM_CONTIGUOUS_WINDOW, in MEM2): the tag cache placed at
   its bottom, which converted maps are linked to; the texture and sound
-  caches and Direct3D's resources top-down;
+  caches and Direct3D's resources top-down. It reaches down from there to
+  the start of what libogc leaves of MEM2 (about 1 MB more), which only the
+  top-down blocks reach;
 - the game state's, at the top of MEM1 (HALO_PORT_GAME_STATE_BASE_ADDRESS).
 
 Page protection is only recorded (XQueryMemoryProtect reports it).
@@ -27,6 +29,12 @@ Page protection is only recorded (XQueryMemoryProtect reports it).
 
 #include "wl/platform/platform.h"
 
+#include "wii_memory.h"
+
+/* libogc's (ogc/system.h, whose BOOL is not the port's): where what it
+leaves of MEM2 begins */
+void *SYS_GetArena2Lo(void);
+
 #define PAGE_SIZE_BYTES 0x1000UL
 
 struct contiguous_window
@@ -34,24 +42,28 @@ struct contiguous_window
 	unsigned long base;
 	unsigned long page_count;
 	WlMemRegion region;
-	/* per page: 0 free, otherwise the protection of the block (PAGE_*); the
-	first page of a block also records the block length */
-	DWORD *page_protection;
-	unsigned long *block_page_count;
+	/* per page: 0 free, otherwise the protection of the block (PAGE_*, all
+	below 0x400 once the caching flags are taken off); the first page of a
+	block also records the block length */
+	unsigned short *page_protection;
+	unsigned short *block_page_count;
 	BOOL claimed;
 };
 
-#define WINDOW_PAGES (PLATFORM_CONTIGUOUS_SIZE / PAGE_SIZE_BYTES)
+/* the window's top, and the lowest it may reach down to (MEM2's start) */
+#define WINDOW_TOP (PLATFORM_CONTIGUOUS_WINDOW + PLATFORM_CONTIGUOUS_SIZE)
+#define WINDOW_LOWEST 0x90000000UL
+#define WINDOW_PAGES ((WINDOW_TOP - WINDOW_LOWEST) / PAGE_SIZE_BYTES)
 #define GAME_STATE_PAGES ((HALO_PORT_GAME_STATE_SIZE + PAGE_SIZE_BYTES - 1) / PAGE_SIZE_BYTES)
 
-static DWORD window_protection[WINDOW_PAGES];
-static unsigned long window_blocks[WINDOW_PAGES];
-static DWORD game_state_protection[GAME_STATE_PAGES];
-static unsigned long game_state_blocks[GAME_STATE_PAGES];
+static unsigned short window_protection[WINDOW_PAGES];
+static unsigned short window_blocks[WINDOW_PAGES];
+static unsigned short game_state_protection[GAME_STATE_PAGES];
+static unsigned short game_state_blocks[GAME_STATE_PAGES];
 
 static struct contiguous_window windows[] =
 {
-	{ PLATFORM_CONTIGUOUS_WINDOW, WINDOW_PAGES, WL_MEM2, window_protection, window_blocks, FALSE },
+	{ PLATFORM_CONTIGUOUS_WINDOW, PLATFORM_CONTIGUOUS_SIZE / PAGE_SIZE_BYTES, WL_MEM2, window_protection, window_blocks, FALSE },
 	{ HALO_PORT_GAME_STATE_BASE_ADDRESS, GAME_STATE_PAGES, WL_MEM1, game_state_protection, game_state_blocks, FALSE },
 };
 #define WINDOW_COUNT (sizeof(windows) / sizeof(windows[0]))
@@ -62,7 +74,15 @@ BOOL wii_memory_claim(void)
 {
 	unsigned long index;
 	BOOL claimed = TRUE;
+	/* (the window from where libogc's MEM2 begins, if that is below the
+	tag cache: the pages between are otherwise no one's) */
+	unsigned long lowest = ((unsigned long)SYS_GetArena2Lo() + PAGE_SIZE_BYTES - 1) & ~(PAGE_SIZE_BYTES - 1);
 
+	if (lowest >= WINDOW_LOWEST && lowest < windows[0].base)
+	{
+		windows[0].base = lowest;
+		windows[0].page_count = (WINDOW_TOP - lowest) / PAGE_SIZE_BYTES;
+	}
 	for (index = 0; index < WINDOW_COUNT; index++)
 	{
 		struct contiguous_window *window = &windows[index];
@@ -170,26 +190,47 @@ void *platform_contiguous_alloc(unsigned long size, unsigned long alignment,
 
 	address = (void *)(window->base + first * PAGE_SIZE_BYTES);
 	for (page = first; page < first + count; page++)
-		window->page_protection[page] = protect;
-	window->block_page_count[first] = count;
+		window->page_protection[page] = (unsigned short)protect;
+	window->block_page_count[first] = (unsigned short)count;
 	pthread_mutex_unlock(&window_lock);
 	/* fresh pages are zeroed, as the Xbox kernel's are */
 	memset(address, 0, count * PAGE_SIZE_BYTES);
 	return address;
 }
 
-/* the main window's pages in use and free, for the log */
-void wii_memory_window_usage(unsigned long *used_bytes, unsigned long *free_bytes)
+/* the main window's pages in use and free, and the largest free run, for
+the log */
+void wii_memory_window_usage(unsigned long *used_bytes, unsigned long *free_bytes, unsigned long *largest_free)
 {
 	const struct contiguous_window *window = &windows[0];
-	unsigned long page, used = 0;
+	unsigned long page, used = 0, run = 0, largest = 0;
 
 	pthread_mutex_lock(&window_lock);
 	for (page = 0; page < window->page_count; page++)
-		used += window->page_protection[page] != 0;
+	{
+		if (window->page_protection[page])
+		{
+			used++;
+			run = 0;
+		}
+		else if (++run > largest)
+		{
+			largest = run;
+		}
+	}
 	pthread_mutex_unlock(&window_lock);
 	*used_bytes = used * PAGE_SIZE_BYTES;
 	*free_bytes = (window->page_count - used) * PAGE_SIZE_BYTES;
+	if (largest_free)
+		*largest_free = largest * PAGE_SIZE_BYTES;
+}
+
+/* the window's start and size (it reaches below PLATFORM_CONTIGUOUS_WINDOW
+when MEM2 is free there) */
+void wii_memory_window_range(unsigned long *base, unsigned long *size)
+{
+	*base = windows[0].base;
+	*size = windows[0].page_count * PAGE_SIZE_BYTES;
 }
 
 void platform_contiguous_free(void *address)
@@ -255,7 +296,7 @@ static void protection_set(unsigned long start, unsigned long end, DWORD protect
 			continue;
 		page = (address - window->base) / PAGE_SIZE_BYTES;
 		if (window->page_protection[page])
-			window->page_protection[page] = protect & ~(PAGE_WRITECOMBINE | PAGE_NOCACHE);
+			window->page_protection[page] = (unsigned short)(protect & ~(PAGE_WRITECOMBINE | PAGE_NOCACHE));
 	}
 	pthread_mutex_unlock(&window_lock);
 }
