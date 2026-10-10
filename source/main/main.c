@@ -2456,6 +2456,19 @@ static void main_update_time_unthrottled(
 	}
 
 	main_globals.frame_start_milliseconds = system_milliseconds();
+	/* port: with config.toml's debug.fixed_ticks (a tick each frame:
+	game_time.c), every frame is a tick long, whatever time it took: what
+	runs on the frame's time (the players' turning, the camera, the menus)
+	runs the same on every machine and every run (a lockstep check's) */
+	{
+		extern int config_boolean(char const *name);
+		static int fixed_ticks = -1;
+
+		if (fixed_ticks < 0)
+			fixed_ticks = config_boolean("debug.fixed_ticks") ? 1 : 0;
+		if (fixed_ticks && !main_globals.movie)
+			seconds_elapsed = 1.0f / TICKS_PER_SECOND;
+	}
 	main_globals.seconds_elapsed = seconds_elapsed;
 	profile_seconds_elapsed(seconds_elapsed);
 	main_globals.rasterizer_initial_index =
@@ -2699,6 +2712,19 @@ static void main_update_time(
 
 	main_globals.frame_start_milliseconds = end_milliseconds;
 	main_globals.rasterizer_target_index = target_index;
+	/* port: with config.toml's debug.fixed_ticks (a tick each frame:
+	game_time.c), every frame is a tick long, whatever time it took: what
+	runs on the frame's time (the players' turning, the camera, the menus)
+	runs the same on every machine and every run (a lockstep check's) */
+	{
+		extern int config_boolean(char const *name);
+		static int fixed_ticks = -1;
+
+		if (fixed_ticks < 0)
+			fixed_ticks = config_boolean("debug.fixed_ticks") ? 1 : 0;
+		if (fixed_ticks && !main_globals.movie)
+			seconds_elapsed = 1.0f / TICKS_PER_SECOND;
+	}
 	main_globals.seconds_elapsed = seconds_elapsed;
 	profile_seconds_elapsed(seconds_elapsed);
 	main_globals.rasterizer_initial_index =

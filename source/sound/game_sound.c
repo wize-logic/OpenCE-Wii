@@ -909,6 +909,20 @@ void game_sound_set_mouth_aperture(
 	long object_index,
 	real mouth_aperture)
 {
+	/* port: with config.toml's debug.fixed_ticks (a lockstep check's), a
+	speaking unit's mouth stays closed: it follows the sound as the audio
+	device plays it, in real time, and its overlay moves the unit's nodes
+	(and the markers aimed and fired from), which then differ from run to
+	run and machine to machine */
+	{
+		extern int config_boolean(char const *name);
+		static int fixed_ticks = -1;
+
+		if (fixed_ticks < 0)
+			fixed_ticks = config_boolean("debug.fixed_ticks") ? 1 : 0;
+		if (fixed_ticks)
+			return;
+	}
 	if (game_looping_sound_data->valid)
 	{
 		if (object_try_and_get_and_verify_type(object_index, _object_mask_unit))
