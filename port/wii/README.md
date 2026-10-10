@@ -10,7 +10,13 @@ This port is in bring-up. In Dolphin, the game boots from the SD card and loads 
   Autumn in about 11 seconds, plays its opening (the cryo bay, the look-training prompts), and
   survives a cinematic's skip, which reverts to the saved game. Ten minutes of it ran without a
   fault.
+- **Other levels**: a30, b30 and c10 load and play with the scripted player (a tour:
+  `debug.network_test = "solo:levels\\a30\\a30,levels\\b30\\b30"` with
+  `debug.network_test_tour` seconds of game time in each). The outdoor levels run at about one
+  frame a second in Dolphin: their skinned characters' vertices are the CPU's.
 - **Loading**: the menu is up within a second of the game's start.
+- **Every map converts**: the 24 Xbox maps (campaign and multiplayer) go through
+  `tools/wii_convert_maps.py` with nothing left unconverted.
 
 The port hasn't run on a Wii yet, and the levels haven't been played through.
 
@@ -115,7 +121,10 @@ inflated it to, and the Wii reads it where it is.
   sizes (`HALO_WII` in `port/linux/include/halo_port_capacity.h`), so the Wii can't join the
   other builds' distributed games.
 - **Threads.** libogc's threads are strictly prioritised. Each of the game's threads gets the
-  main thread's priority, moved by its Win32 priority, and a 128 KB stack. devkitPPC's
+  main thread's priority, moved by its Win32 priority, and a 128 KB stack. The game's main runs
+  on a thread of its own with a 1 MB stack: libogc's main thread has 128 KB, below which lie its
+  audio DSP structures, and a deep AI path search in b30 went past it (the game's stack reaches
+  about 290 KB; the memory report says how deep). devkitPPC's
   `sched_yield` is a stub, so the link wraps it to libogc's `KThreadYield`: the game's waits spin
   on `SwitchToThread` for its I/O thread, which otherwise never ran (the menu took 45 seconds to
   appear, a10 100 seconds to load).
@@ -255,10 +264,12 @@ and pixel shaders.
 
 ## What is next
 
-1. Speed. The CPU still runs skinned models (`cfc6f3a4`, two nodes a vertex: GX's matrix index
-   holds one) and the environment's lit pass (`10c30c53`, whose colour takes a reciprocal square
-   root). Next are generated colour-only programs for the second, with GX doing the rest, and
-   rigid vertices of the first through GX's matrix palette.
+1. Speed. The CPU still runs the skinned models whose vertices blend two nodes (bipeds, arms,
+   swaying trees: GX's matrix index picks one matrix a vertex). Models whose vertices each hang
+   off one node, of up to nine values a draw, already go to GX through its matrix palette, and
+   `display.model_detail` (0.5 on the Wii) chooses simpler models sooner. Next: the blended
+   vertices' cost on the CPU (the fetch, the program and the emission per vertex), and a profile
+   on real hardware, where Dolphin's timing may not hold.
 2. The rest of the drawing: bump mapping (dot products of two registers: indirect texturing
    where it maps), and the bumped reflections' dependent lookups. Sampling the cube maps put
    the environment's lit pass (`10c30c53`, whose cube map direction comes from the tangent frame)
