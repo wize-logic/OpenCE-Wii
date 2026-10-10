@@ -1955,7 +1955,7 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 		projection.b = projection_b;
 	}
 	projection_load(&projection);
-	if (device.frames == DRAW_LOG_FRAME)
+	if (DRAW_LOG_FRAME && device.frames == DRAW_LOG_FRAME)
 		draw_log(primitive_type, count, &projection, fetch, context, program, point_size);
 	GX_Begin(gx_primitive(primitive_type), DEVICE_VERTEX_FORMAT, (u16)count);
 	for (vertex = 0; vertex < count; vertex++)
