@@ -169,7 +169,10 @@ exactly as the i386 build's, and none use C bitfields. A map is converted as fol
   0x803A6000 to 0x90100000. The schema's structures stand byte arrays (`reserved...`,
   `unused...`) for fields its validator doesn't check. Where the game's own declarations of the
   tag's structure name fields there, those are swapped too (`fill_placeholders` in
-  `tools/wii_tag_layout.py`); the sky's fog colours are an example. The data blocks are converted
+  `tools/wii_tag_layout.py`); the sky's fog colours are an example. A declaration that stands
+  bytes for the tag's start and names only fields within the placeholders counts too
+  (`source/ai/actions.c`'s vehicle_definition: the AI's charge and strafing values at 0x390,
+  which only the banshees set). The data blocks are converted
   by what they hold:
   - script syntax nodes
   - animations' frames
@@ -394,7 +397,8 @@ Dolphin runs the game, but these need the console:
    more levels. Big-endian faults found so far:
    - plain char's sign (fixed with `-fsigned-char`);
    - tag fields the schema left as placeholders, one of them a contrail's shader that the game
-     reads through another structure;
+     reads through another structure, and a vehicle's AI charge and strafing values, which only a
+     declaration naming nothing else does;
    - the clusters' visible sets;
    - a recorded animation's event header (bitfields);
    - the script engine's narrow values in 32-bit cells (`HALO_CELL_AT`);
