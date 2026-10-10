@@ -230,6 +230,23 @@ and pixel shaders.
     square root), and colours from the vertices (Direct3D's ARGB is a byte order GX doesn't read).
     Even so, any draw whose position is affine goes through the same position matrix, so a
     surface's passes on either path reach the same depths, as their equal-depth tests need.
+  - A skinned model's draw is keyed by what its vertices' node indices and weights make
+    (`node_keys`). A vertex of weight 1 or 0 hangs off one node, whatever its other index: the
+    game's programs give it what that node alone gives (`tests/nv2a_native_check.c` checks each
+    program). A blended vertex is its two nodes and its weight. Up to nine values a draw get a
+    position matrix each, which GX picks per vertex by its matrix index. The other vertices (of a
+    value with fewer than six of the draw's indices, or past the nine) are the CPU's: their
+    position is sent in the same draw, through the identity and the same projection, and every
+    pass of the model makes the same choice, as it depends on the vertices alone.
+  - In the model parts of eleven maps (the campaign and Blood Gulch), GX now computes the position
+    of 89 to 96% of the vertices, where it computed 49 to 80% (a draw of more than nine values was
+    all the CPU's): b30 60% to 93%, c10 49% to 91%. 2 to 14% of them blend two nodes.
+  - Where GX computes the position, the CPU's program for the rest of the vertex skips it: about
+    70 instructions a vertex in the lit skinned programs, 235 in those that compute one texture
+    coordinate. A matrix's columns run the program for the position alone (440 instructions in
+    place of 670 for `cfc6f3a4`), a model's other nodes without the depth's fit, and the constants
+    a program reads are hashed once while none is set, where each node's matrix hashed them again
+    (about 10,000 instructions for a skinned program, which reads all 192).
   - In a10, 4.0 of 6.5 million vertices a minute go to GX. The CPU runs 1.6 million programs where
     it ran 7.9 million, and a frame takes about 160 ms in Dolphin (it took 200 to 450).
     `debug.gpu_transform = false` keeps every program on the CPU.
@@ -352,12 +369,13 @@ Dolphin runs the game, but these need the console:
 
 ## What is next
 
-1. Speed. The CPU still runs the skinned models whose vertices blend two nodes (bipeds, arms,
-   swaying trees: GX's matrix index picks one matrix a vertex). Models whose vertices each hang
-   off one node, of up to nine values a draw, already go to GX through its matrix palette, and
-   `display.model_detail` (0.5 on the Wii) chooses simpler models sooner. Next: the blended
-   vertices' cost on the CPU (the fetch, the program and the emission per vertex), and a profile
-   on real hardware, where Dolphin's timing may not hold.
+1. Speed. A skinned model's vertices go to GX through its matrix palette by node, or by blend
+   where a blend has enough vertices; the CPU computes the position of the rest (the blended
+   ones, 2 to 14%), and `display.model_detail` (0.5 on the Wii) chooses simpler models sooner.
+   A pass whose stages read a cube map's direction or a texture coordinate from the nodes is
+   still the CPU's, vertex by vertex, less the position. Next: those passes' cost (the fetch, the
+   program, the sphere map and the emission per vertex), and a profile on real hardware, where
+   Dolphin's timing may not hold.
 2. The rest of the drawing. Bump mapping's dot products of textures and constants are exact
    (the lightmap's bump term, a light's diffuse, the flat cube map's reflection). Still taken as
    1: the bumped specular's (dot products of registers, signed sums of products), the
