@@ -237,9 +237,23 @@ static void lock_level(const DWORD *resource, unsigned long face, unsigned long 
 	locked->pBits = bits;
 }
 
+/* the Wii's device keeps a mark of the pixels it has seen in a texture's
+Lock, D3D's own field (port/wii/src/d3d8_gx.c, texture_get): a lock, before
+the game writes the pixels, takes it away */
+static void lock_unmark(void *resource)
+{
+#if defined(HALO_WII)
+	if (resource)
+		((DWORD *)resource)[2] = 0;
+#else
+	(void)resource;
+#endif
+}
+
 void WINAPI D3DTexture_LockRect(D3DTexture *texture, UINT level, D3DLOCKED_RECT *locked, CONST RECT *rectangle, DWORD flags)
 {
 	(void)flags;
+	lock_unmark(texture);
 	lock_level((const DWORD *)texture, 0, level, locked, rectangle);
 }
 
@@ -247,6 +261,7 @@ void WINAPI D3DCubeTexture_LockRect(D3DCubeTexture *texture, D3DCUBEMAP_FACES fa
 	D3DLOCKED_RECT *locked, CONST RECT *rectangle, DWORD flags)
 {
 	(void)flags;
+	lock_unmark(texture);
 	lock_level((const DWORD *)texture, (unsigned long)face, level, locked, rectangle);
 }
 
@@ -259,6 +274,7 @@ void WINAPI D3DVolumeTexture_LockBox(D3DVolumeTexture *texture, UINT level, D3DL
 	char *bits;
 
 	(void)flags;
+	lock_unmark(texture);
 	xgpu_texture_describe(resource[3], resource[4], &description);
 	row_pitch = xgpu_texture_level_pitch(&description, level);
 	slice = row_pitch * level_dimension(description.height, level);
@@ -326,6 +342,8 @@ void WINAPI D3DSurface_GetDesc(D3DSurface *surface, D3DSURFACE_DESC *description
 void WINAPI D3DSurface_LockRect(D3DSurface *surface, D3DLOCKED_RECT *locked, CONST RECT *rectangle, DWORD flags)
 {
 	(void)flags;
+	/* (a texture's level: the texture's pixels) */
+	lock_unmark(surface->Parent);
 	lock_level((const DWORD *)surface, 0, 0, locked, rectangle);
 }
 

@@ -71,9 +71,11 @@ image (with WiiLibs checked out into `./WiiLibs`) and keeps it as an artifact.
   runner now acts only on its own (its `--name` user folder).
 - The game's log (`src/d3d8_gx.c`, not the runner) reports how long a frame takes in emulated time
   every 60 frames, split into draws, textures, pixel shaders, the end of the frame and the game,
-  with the draws' split (GX's transform, the processor's, immediate) and the processor's
-  vertices (fetch, program, store, emit). A frame of more than half a second (loading, mostly)
-  gets a split of its own.
+  with the draws' split (GX's transform, the processor's, immediate), the processor's
+  vertices (fetch, program, store, emit), the end of the frame's (GX finishing the frame's
+  draws; the copy to the display and the wait for its retrace) and the textures' counts (found
+  by their mark or looked up, made, hashed, decoded, flushed, TMEM emptied). A frame of more than
+  half a second (loading, mostly) gets a split of its own.
 
 ## Game data
 
@@ -599,7 +601,14 @@ and pixel shaders.
   other texture is decoded to RGBA8 into a 1.5 MB cache, such as the glyph cache, which is
   re-decoded when its pixels change. The game writes some of those itself (the glyphs, the
   fallback checkers), with 16- and 32-bit texels in the Wii's byte order, so the decoder, which
-  reads them as the Xbox stored them, is given a swapped copy. A cube map is bound as its sphere
+  reads them as the Xbox stored them, is given a swapped copy. The device marks a texture's
+  header once it has seen its pixels (D3D's `Lock` field: the entry it found them in), and a
+  marked texture is bound without being looked up, hashed or flushed again. The game clears the
+  field when it loads a bitmap into the texture cache, and `d3d8_resources.c`'s lock functions
+  clear it before the game writes a texture (the glyph cache's new glyphs); a texture outside the
+  texture cache is hashed once a frame as well. GX's texture cache (TMEM) is emptied only when
+  texture memory has changed (a decode, a bitmap loaded, a copy out of the EFB) and at each
+  frame's start, not before every draw. A cube map is bound as its sphere
   map, and each vertex's direction is mapped onto it (on the CPU): the normalization cube map's
   too, whose texel is the direction a bump map's dot product takes.
 - **Depth.** A program's position matrix and its depth's a + b/w come from its constants alone,
