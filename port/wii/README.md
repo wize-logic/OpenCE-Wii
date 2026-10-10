@@ -305,6 +305,13 @@ and pixel shaders.
     (`nv2a_sqrtf`: frsqrte refined in double, rounded, then corrected by the midpoints' exact
     squares). A skinned vertex takes about 1,600 instructions where it took 3,400.
   - Any other program runs on the interpreter.
+  - A cube map sampled as a sphere map at a direction the vertices give (a model's reflection)
+    no longer keeps its draw on the CPU: GX reads the position and the other coordinates by
+    index, and the CPU computes only the sphere map's coordinates (and the colours, where they are
+    its), sent with each vertex. In b30 these programs (`8f831b43`, `9d2757d2`, `cfc6f3a4`,
+    `10c30c53`) were nearly all the CPU's vertices. The program itself saves little (1110 to 1108
+    instructions a vertex for `8f831b43`: its skinning and lighting are most of it); each index
+    sends 7 words to the FIFO in place of 14.
   - In the menu, the draws take 10 ms a frame compiled, against 58 ms interpreted.
 
   GX then draws the results:
@@ -322,6 +329,16 @@ and pixel shaders.
     stage's free half where nothing between depends on it, and each stage's order is reduced to
     what it reads (`stages_compact`): about half the stages of the random set, three of the menu
     planet's twelve, and fewer texture coordinates and colours asked of the vertices.
+  - A program is translated once for its structure (`src/gx_psh_cache.c`): its combiners, its
+    textures, and each constant's signature (which channels are 0 or 1, which are equal, which
+    constants are equal). Where the translation's result changes with the constants only in the
+    konst and preloaded values that hold them (two more translations with other constants of the
+    same signatures show it), a draw with other constants rewrites those values in place. The
+    game sets a model's fog constants from its distance, so a cache by the whole of the render
+    states translated b30's model programs for nearly every draw (about 215 a frame, often all
+    ten of a refusal's attempts). `tests/gx_psh_cache_check.c` compares every program the cache
+    gives with a fresh translation; the log's `pixel shader programs` line counts the
+    translations, the programs kept and changed, and the changes translated again to check them.
   - Combiner registers are renamed as they are written, and dead values are dropped.
   - Inputs a stage can't reach (a second texture or rasterized colour, a second constant, a
     doubly inverted product) are first computed into a free register, or into the operation's
