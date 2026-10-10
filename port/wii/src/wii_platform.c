@@ -16,17 +16,24 @@ builds, and a file on the SD card once one is mounted.
 
 #include "wl/platform/platform.h"
 
-/* ---------- the log */
+/* ---------- the log
+
+Each line carries the seconds since the first one, for seeing where the
+time goes while nothing is drawn (loading). */
 
 void platform_log(const char *format, ...)
 {
+	static uint64_t first_us;
 	char line[512];
 	va_list arguments;
+	uint64_t now = wl_platform_time_us();
 
+	if (!first_us)
+		first_us = now;
 	va_start(arguments, format);
 	vsnprintf(line, sizeof(line), format, arguments);
 	va_end(arguments);
-	WL_LOG_I("halo", "%s", line);
+	WL_LOG_I("halo", "%7.2f %s", (double)(now - first_us) / 1e6, line);
 }
 
 /* ---------- messages and quitting */
