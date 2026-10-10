@@ -24,9 +24,10 @@ registers. So:
   their textures and colours agree.
 
 GX's inputs are unsigned and clamped: the signed mappings (expand, half
-bias) come out clamped to [0, 1], a negation as 0, and a dot product as 1
-(the bump mapping it serves is not drawn). The fog register is no fog (the
-fog colour black, its factor 1).
+bias) come out clamped to [0, 1], and a negation as 0, except in a dot
+product, whose signed terms TEV's lerp, bias and scale make exactly (the
+bump mapping it serves: signed dot products). A dot product of a register
+is taken as 1.
 */
 
 #include "gx_psh.h"
@@ -112,6 +113,8 @@ struct operation
 {
 	struct operand in[4];
 	unsigned char subtract, bias, scale, dest;
+	/* (its result kept signed, for a later operation's d) */
+	unsigned char unclamped;
 };
 
 struct translation
@@ -125,7 +128,13 @@ struct translation
 	mappings that would take a register of their own, and the dot
 	products that would take three stages, approximated */
 	BOOL economical;
-	/* where each name is, for each portion */
+	/* the signed dot products (emit_signed_dot): 2 in the alpha half where
+	the alpha half reads the result's blue, else in the colour half; 1 in
+	the colour half; 0 taken as 1; -1 as before they were made, their
+	inputs clamped */
+	int signed_dots;
+	/* where each name is, for each portion (a colour's may be a register's
+	alpha: a value the same in every channel) */
 	struct operand names[NUMBER_OF_PORTIONS][NUMBER_OF_NAMES];
 	/* what holds each TEV register, for each portion (names and temporaries) */
 	unsigned char holders[NUMBER_OF_PORTIONS][4];
@@ -146,6 +155,11 @@ struct translation
 		in every channel */
 		BOOL dot;
 	} blue[NUMBER_OF_NAMES];
+	/* the colour's names and their recipes as this combiner stage began: the
+	alpha portion reads blues of those (NV2A reads every input before it
+	writes any) */
+	struct operand color_before[NUMBER_OF_NAMES];
+	struct blue_recipe blue_before[NUMBER_OF_NAMES];
 	/* the colour portion's operands of this combiner stage */
 	struct operand color_operands[4];
 	/* this combiner stage's operations, for each portion, merged at its end */
@@ -462,6 +476,25 @@ static void constants_place(struct translation *translation)
 	}
 }
 
+/* the colour of a name whose blue the alpha portion reads, and how it was
+made: as the combiner stage began (NV2A reads every input before it writes
+any), unless that is a register's colour whose products are not known: then
+as the colour portion left it */
+static const struct operand *blue_location(const struct translation *translation, int name,
+	const struct blue_recipe **recipe)
+{
+	const struct operand *before = &translation->color_before[name];
+
+	if (before->kind != _kind_register || before->channel == _channel_alpha ||
+		translation->blue_before[name].valid)
+	{
+		*recipe = &translation->blue_before[name];
+		return before;
+	}
+	*recipe = &translation->blue[name];
+	return &translation->names[_portion_color][name];
+}
+
 /* a register read in a portion (alpha_channel: its alpha in the colour
 portion, in the alpha portion its alpha rather than its blue) */
 static struct operand register_operand(struct translation *translation, unsigned long reg, BOOL alpha_channel,
@@ -554,8 +587,13 @@ static struct operand register_operand(struct translation *translation, unsigned
 		{
 			/* the blue: a texture's, a colour's or a constant's through the
 			swap tables; a register's alpha stands in for its blue */
-			result = translation->names[_portion_color][name];
-			if (result.kind == _kind_register)
+			const struct blue_recipe *recipe;
+
+			result = *blue_location(translation, name, &recipe);
+			if (result.kind == _kind_register && result.channel == _channel_alpha)
+				/* (a colour that is a register's alpha: its blue too) */
+				result.channel = _channel_natural;
+			else if (result.kind == _kind_register)
 				result = translation->names[_portion_alpha][name];
 			else if (result.kind >= _kind_texture)
 				/* (a replicated alpha's blue is the alpha) */
@@ -598,6 +636,14 @@ static void register_free(struct translation *translation, int portion, int reg)
 {
 	if (reg >= 0 && translation->holders[portion][reg])
 		translation->holders[portion][reg]--;
+}
+
+/* the pool a portion's name in a register is held in: a colour's name may
+stand for a register's alpha (the same in every channel), held in the
+alpha's */
+static int location_pool(int portion, const struct operand *location)
+{
+	return portion == _portion_color && location->channel == _channel_alpha ? _portion_alpha : portion;
 }
 
 /* ---------- operations */
@@ -975,8 +1021,9 @@ static BOOL broadcastable(const struct operand *value)
 }
 
 /* whether a dot product's two inputs (the low two bytes of `inputs`) read a
-texture stage GX cannot sample, still unwritten: the product is then taken
-as 1 */
+texture stage GX cannot sample, still unwritten (a dependent lookup's): the
+product is then taken as 1. (A cube map sampled as a sphere map is read as
+any texture.) */
 static BOOL dot_unavailable(struct translation *translation, unsigned long inputs, int stage)
 {
 	int which;
@@ -988,12 +1035,10 @@ static BOOL dot_unavailable(struct translation *translation, unsigned long input
 		int name = name_of(reg);
 
 		if (reg >= _register_t0 && reg <= _register_t3 &&
-			(((translation->textures->unavailable & (1u << (reg - _register_t0))) &&
-				translation->names[_portion_color][name].kind == _kind_zero) ||
-			((translation->textures->cube & (1u << (reg - _register_t0))) &&
-				translation->names[_portion_color][name].kind == _kind_texture)))
+			(translation->textures->unavailable & (1u << (reg - _register_t0))) &&
+			translation->names[_portion_color][name].kind == _kind_zero)
 		{
-			approximate(translation->program, "a dot product with a cube map");
+			approximate(translation->program, "a dot product with a texture GX cannot sample");
 			return TRUE;
 		}
 	}
@@ -1067,6 +1112,309 @@ static struct operand emit_dot(struct translation *translation, int portion, str
 	*temporary = reg;
 	result.negative = negative;
 	return result;
+}
+
+/* ---------- signed dot products
+
+A dot product whose inputs are mapped to signed values (expand, 2v - 1;
+half bias, v - 1/2; and their negations: each k(v - 1/2)), of values a swap
+table or a constant's selection puts one channel of in all three (the bump
+map against a normalization cube map's direction, or a constant). TEV's
+inputs are unsigned, but its lerp, d + (1 - c)a + cb, with its bias of -1/2
+and its scale, makes each term exactly:
+
+	(x - 1/2)(y - 1/2) = (lerp(1 - x, x, y) - 1/2) / 2
+	(x - 1/2) y        = lerp(1/2, x, y) - 1/2
+	(x - 1/2)(1 - y)   = lerp(x, 1/2, y) - 1/2
+
+A channel at a time, x (and 1 - x) go to registers, then the term is read
+with c = y and added to the sum so far, as d. The sum stays signed (TEV keeps
+-4 to 4 unclamped, for a d) until the last term, which scales it and clamps
+it to [0, 1]: a dot product below 0 is 0, as any register below 0 is here.
+
+In the colour half, 1 - x and x are one stage's colour and alpha: two stages
+a channel. Where the alpha half reads the result's blue later, the sum is
+made in the alpha half instead, three stages a channel (x, 1 - x, the term),
+and the colour reads it as that register's alpha. */
+
+/* a signed mapping as k(v - 1/2) */
+static BOOL mapping_signed(unsigned mapping, int *k)
+{
+	switch (mapping)
+	{
+	case 0x40: *k = 2; return TRUE;
+	case 0x60: *k = -2; return TRUE;
+	case 0x80: *k = 1; return TRUE;
+	case 0xa0: *k = -1; return TRUE;
+	default: return FALSE;
+	}
+}
+
+/* a value in [0, 1] under a combiner input's mapping, as NV2A's (signed) */
+static float mapped_value(float v, unsigned mapping)
+{
+	switch (mapping)
+	{
+	case 0x20: return 1.0f - v;
+	case 0x40: return 2.0f * v - 1.0f;
+	case 0x60: return 1.0f - 2.0f * v;
+	case 0x80: return v - 0.5f;
+	case 0xa0: return 0.5f - v;
+	case 0xe0: return -v;
+	default: return v;
+	}
+}
+
+/* a colour-half operand (one channel in all three, or a value the same in
+every channel) as the alpha half reads it */
+static struct operand alpha_form(struct operand value)
+{
+	if (value.kind == _kind_register || value.channel == _channel_alpha)
+		value.channel = _channel_natural;
+	return value;
+}
+
+/* whether one TEV stage can read what these halves read */
+static BOOL stage_fits(const struct operation *color, const struct operation *alpha)
+{
+	struct resources color_resources, alpha_resources;
+	int index;
+
+	resources_clear(&color_resources);
+	resources_clear(&alpha_resources);
+	for (index = 0; index < 4; index++)
+	{
+		if ((color && !resources_add(&color_resources, &color->in[index], _portion_color)) ||
+			(alpha && !resources_add(&alpha_resources, &alpha->in[index], _portion_alpha)))
+			return FALSE;
+	}
+	return resources_merge(&color_resources, &alpha_resources);
+}
+
+static BOOL stage_append(struct translation *translation, const struct operation *color,
+	const struct operation *alpha);
+
+enum { MAXIMUM_SIGNED_DOT_STAGES = 9 };
+
+/* a signed dot product's TEV stages, for x and y in this order (x signed),
+of the terms (channels) not 0: FALSE when a stage cannot read what it must */
+static BOOL signed_dot_stages(struct operand x, struct operand y, BOOL both_signed, int sign, BOOL invert_y,
+	int scale, BOOL in_alpha, unsigned terms, int sum, int low, int high, struct operation *color,
+	struct operation *alpha, BOOL *has_color, BOOL *has_alpha, int *count)
+{
+	static const unsigned char scales[] = { GX_CS_DIVIDE_2, GX_CS_SCALE_1, GX_CS_SCALE_2, 0, GX_CS_SCALE_4 };
+	int channel;
+	BOOL first_term = TRUE;
+
+	*count = 0;
+	for (channel = 0; channel < 3; channel++)
+	{
+		struct operand bx = broadcast(x, channel), by = broadcast(y, channel);
+		struct operation *term;
+		struct operand a, b;
+		int first = *count;
+
+		if (!(terms & (1u << channel)))
+			continue;
+		/* x, and 1 - x: (1 - c) * 1 */
+		if (!in_alpha)
+		{
+			color[*count] = operation_new(both_signed ? low : high);
+			if (both_signed)
+			{
+				color[*count].in[0] = one;
+				color[*count].in[2] = bx;
+				alpha[*count] = operation_new(high);
+				alpha[*count].in[3] = alpha_form(bx);
+			}
+			else
+			{
+				color[*count].in[3] = bx;
+			}
+			has_color[*count] = TRUE;
+			has_alpha[*count] = both_signed;
+			++*count;
+		}
+		else
+		{
+			alpha[*count] = operation_new(high);
+			alpha[*count].in[3] = alpha_form(bx);
+			has_color[*count] = FALSE;
+			has_alpha[*count] = TRUE;
+			++*count;
+			if (both_signed)
+			{
+				alpha[*count] = operation_new(low);
+				alpha[*count].in[0] = one;
+				alpha[*count].in[2] = alpha_form(bx);
+				has_color[*count] = FALSE;
+				has_alpha[*count] = TRUE;
+				++*count;
+			}
+		}
+		/* the term, added to the sum so far */
+		term = in_alpha ? &alpha[*count] : &color[*count];
+		*term = operation_new(sum);
+		if (both_signed)
+		{
+			struct operand x_low = operand(_kind_register, (unsigned char)low, _channel_natural);
+			struct operand x_high = operand(_kind_register, (unsigned char)high,
+				in_alpha ? _channel_natural : _channel_alpha);
+
+			/* (a negative product: lerp(x, 1 - x, y), its negation) */
+			a = sign > 0 ? x_low : x_high;
+			b = sign > 0 ? x_high : x_low;
+			term->bias = GX_TB_SUBHALF;
+		}
+		else
+		{
+			struct operand x_high = operand(_kind_register, (unsigned char)high, _channel_natural);
+
+			a = invert_y ? x_high : operand(_kind_half, 0, 0);
+			b = invert_y ? operand(_kind_half, 0, 0) : x_high;
+			/* (a negative product subtracted: d - lerp + 1/2) */
+			term->subtract = (unsigned char)(sign < 0);
+			term->bias = sign < 0 ? GX_TB_ADDHALF : GX_TB_SUBHALF;
+		}
+		term->in[0] = a;
+		term->in[1] = b;
+		term->in[2] = in_alpha ? alpha_form(by) : by;
+		term->in[3] = first_term ? zero : operand(_kind_register, (unsigned char)sum, _channel_natural);
+		first_term = FALSE;
+		/* (the last term scales the sum and clamps it) */
+		if (terms >> (channel + 1))
+			term->unclamped = 1;
+		else
+			term->scale = scales[scale];
+		has_color[*count] = !in_alpha;
+		has_alpha[*count] = in_alpha;
+		++*count;
+		for (; first < *count; first++)
+		{
+			if (!stage_fits(has_color[first] ? &color[first] : NULL, has_alpha[first] ? &alpha[first] : NULL))
+				return FALSE;
+		}
+	}
+	return TRUE;
+}
+
+/* dot(x, y) under their mappings (one of them signed), x and y read through
+a swap or a selection: into a register of its own (*temporary), the
+colour's, or (in_alpha) the alpha's, read by the colour as its alpha. FALSE
+when it cannot be made so (nothing made) */
+static BOOL emit_signed_dot(struct translation *translation, struct operand x, unsigned x_mapping, struct operand y,
+	unsigned y_mapping, BOOL in_alpha, struct operand *result, int *temporary)
+{
+	struct operation color[MAXIMUM_SIGNED_DOT_STAGES], alpha[MAXIMUM_SIGNED_DOT_STAGES];
+	BOOL has_color[MAXIMUM_SIGNED_DOT_STAGES], has_alpha[MAXIMUM_SIGNED_DOT_STAGES];
+	float a[3], b[3];
+	int kx = 0, ky = 0, sign, scale, count = 0, attempt, index;
+	int pool = in_alpha ? _portion_alpha : _portion_color;
+	int sum, low = -1, high, low_pool = in_alpha ? _portion_alpha : _portion_color;
+	int high_pool = _portion_alpha;
+	BOOL x_signed = mapping_signed(x_mapping, &kx), y_signed = mapping_signed(y_mapping, &ky), both_signed;
+	BOOL invert_y, made = FALSE;
+	BOOL x_constant, y_constant;
+	unsigned terms = 0;
+	int channel;
+
+	*temporary = -1;
+	/* (any queued operation of this combiner stage would come after the
+	stages made here: there must be none) */
+	if ((!x_signed && !y_signed) || translation->queue_count[_portion_color] ||
+		translation->queue_count[_portion_alpha])
+		return FALSE;
+	if (!x_signed)
+	{
+		struct operand swap = x;
+		unsigned swap_mapping = x_mapping;
+
+		x = y;
+		y = swap;
+		x_mapping = y_mapping;
+		y_mapping = swap_mapping;
+		kx = ky;
+		y_signed = FALSE;
+	}
+	both_signed = y_signed;
+	/* (of two constants, a constant: 0 and 1 without a konst register) */
+	x_constant = constant_value(translation, &x, a);
+	y_constant = constant_value(translation, &y, b);
+	if (x_constant && y_constant)
+	{
+		float dot = 0.0f;
+		DWORD level;
+
+		for (channel = 0; channel < 3; channel++)
+			dot += mapped_value(a[channel], x_mapping) * mapped_value(b[channel], y_mapping);
+		dot = dot < 0.0f ? 0.0f : dot > 1.0f ? 1.0f : dot;
+		level = (DWORD)(dot * 255.0f + 0.5f);
+		*result = level == 0 ? zero : level == 255 ? one :
+			operand(_kind_konst, konst_slot(translation, (level << 24) | (level << 16) | (level << 8) | level),
+				_channel_natural);
+		return TRUE;
+	}
+	/* (the terms whose constant maps to 0 are left out) */
+	for (channel = 0; channel < 3; channel++)
+	{
+		if (!(x_constant && mapped_value(a[channel], x_mapping) == 0.0f) &&
+			!(y_constant && mapped_value(b[channel], y_mapping) == 0.0f))
+			terms |= 1u << channel;
+	}
+	if (!terms)
+	{
+		*result = zero;
+		return TRUE;
+	}
+	/* the product's sign and its scale: k(x - 1/2) k'(y - 1/2) is
+	kk'/2 (lerp(...) - 1/2); k(x - 1/2) y is k (lerp(...) - 1/2) */
+	invert_y = !both_signed && y_mapping == 0x20;
+	if (both_signed)
+	{
+		sign = kx * ky > 0 ? 1 : -1;
+		scale = (kx * ky > 0 ? kx * ky : -kx * ky) / 2;
+	}
+	else
+	{
+		sign = (kx > 0 ? 1 : -1) * (y_mapping == 0xe0 ? -1 : 1);
+		scale = kx > 0 ? kx : -kx;
+	}
+	/* (the colour half's x is 1 - x, of x in the alpha's: x for a product
+	with an unsigned value) */
+	if (!in_alpha && !both_signed)
+		high_pool = _portion_color;
+	sum = register_allocate(translation, pool);
+	high = register_allocate(translation, high_pool);
+	if (both_signed)
+		low = register_allocate(translation, low_pool);
+	if (sum >= 0 && high >= 0 && (!both_signed || low >= 0))
+	{
+		/* (either way round, for two signed values: the one a constant
+		selection reaches is better read as c) */
+		for (attempt = 0; attempt < (both_signed ? 2 : 1) && !made; attempt++)
+		{
+			made = attempt ?
+				signed_dot_stages(y, x, both_signed, sign, invert_y, scale, in_alpha, terms, sum, low, high, color, alpha,
+					has_color, has_alpha, &count) :
+				signed_dot_stages(x, y, both_signed, sign, invert_y, scale, in_alpha, terms, sum, low, high, color, alpha,
+					has_color, has_alpha, &count);
+		}
+	}
+	for (index = 0; made && index < count; index++)
+	{
+		if (!stage_append(translation, has_color[index] ? &color[index] : NULL, has_alpha[index] ? &alpha[index] : NULL))
+			break;
+	}
+	register_free(translation, low_pool, low);
+	register_free(translation, high_pool, high);
+	if (!made)
+	{
+		register_free(translation, pool, sum);
+		return FALSE;
+	}
+	*temporary = sum;
+	*result = operand(_kind_register, (unsigned char)sum, in_alpha ? _channel_alpha : _channel_natural);
+	return TRUE;
 }
 
 /* ---------- combiner inputs */
@@ -1159,16 +1507,15 @@ static struct operand combiner_input(struct translation *translation, unsigned l
 {
 	struct operand value = register_operand(translation, input & 0x0f, (input & 0x10) != 0, portion, stage);
 	unsigned mapping = input & 0xe0;
-	struct operation operation;
-	int reg;
+	const struct blue_recipe *recipe = NULL;
+	const struct operand *location = portion == _portion_alpha && !(input & 0x10) && name_of(input & 0x0f) >= 0 ?
+		blue_location(translation, name_of(input & 0x0f), &recipe) : NULL;
 
 	*temporary = -1;
 	/* (the blue of a name the colour half wrote to a register: made again
 	from its products, or its alpha in its place) */
-	if (portion == _portion_alpha && !(input & 0x10) && name_of(input & 0x0f) >= 0 &&
-		translation->names[_portion_color][name_of(input & 0x0f)].kind == _kind_register)
+	if (location && location->kind == _kind_register && location->channel != _channel_alpha)
 	{
-		const struct blue_recipe *recipe = &translation->blue[name_of(input & 0x0f)];
 		int blue = recipe->valid && !recipe->dot ? register_allocate(translation, _portion_alpha) : -1;
 
 		if (recipe->valid && recipe->dot)
@@ -1346,6 +1693,90 @@ static BOOL name_read_later(const struct translation *translation, int after_sta
 	return FALSE;
 }
 
+/* a value the same in every channel */
+static BOOL uniform(const struct operand *value)
+{
+	return value->kind <= _kind_half || value->channel == _channel_alpha;
+}
+
+/* whether a combiner stage's alpha portion reads a name's blue */
+static BOOL blue_read_now(const struct translation *translation, int stage, int name)
+{
+	DWORD inputs = translation->state[D3DRS_PSALPHAINPUTS0 + stage];
+	int shift;
+
+	for (shift = 0; shift < 32; shift += 8)
+	{
+		unsigned long input = (inputs >> shift) & 0xff;
+
+		if (name_of(input & 0x0f) == name && !(input & 0x10))
+			return TRUE;
+	}
+	return FALSE;
+}
+
+/* whether a combiner stage's colour output (4 bits a name, at shift) is a
+product of the name it writes, read as its colour, and alphas or 0: a
+value the same in every channel where the name's was (made in the alpha
+half where that was, as combiner_portion makes it) */
+static BOOL uniform_product(const struct translation *translation, int stage, int shift, int name)
+{
+	DWORD inputs = translation->state[D3DRS_PSRGBINPUTS0 + stage];
+	DWORD outputs = translation->state[D3DRS_PSRGBOUTPUTS0 + stage];
+	int which = shift == 4 ? 0 : 1, index;
+
+	if (shift == 8 || (outputs & (which ? 0x1000u : 0x2000u)))
+		return FALSE;
+	for (index = 0; index < 2; index++)
+	{
+		unsigned long input = (inputs >> (24 - 16 * which - 8 * index)) & 0xff;
+
+		if (!(input & 0x10) && (input & 0x0f) && name_of(input & 0x0f) != name)
+			return FALSE;
+		if ((input & 0xe0) != 0x00 && (input & 0xe0) != 0x20 && (input & 0xe0) != 0xc0 && (input & 0xe0) != 0xe0)
+			return FALSE;
+	}
+	return TRUE;
+}
+
+/* whether the alpha half reads a name's blue after a combiner stage, before
+the colour half writes it again other than as a uniform_product (the alpha
+portions' inputs, the final combiner's G) */
+static BOOL blue_read_later(const struct translation *translation, int after_stage, int name)
+{
+	const DWORD *state = translation->state;
+	unsigned long count = state[D3DRS_PSCOMBINERCOUNT] & 0xff;
+	DWORD efg = state[D3DRS_PSFINALCOMBINERINPUTSEFG];
+	unsigned long stage, g;
+	int shift;
+
+	if (count > 8)
+		count = 8;
+	for (stage = (unsigned long)(after_stage + 1); stage < count; stage++)
+	{
+		DWORD inputs = state[D3DRS_PSALPHAINPUTS0 + stage];
+		DWORD outputs = state[D3DRS_PSRGBOUTPUTS0 + stage];
+
+		for (shift = 0; shift < 32; shift += 8)
+		{
+			unsigned long input = (inputs >> shift) & 0xff;
+
+			if (name_of(input & 0x0f) == name && !(input & 0x10))
+				return TRUE;
+		}
+		for (shift = 0; shift <= 8; shift += 4)
+		{
+			if (name_of((outputs >> shift) & 0x0f) == name &&
+				!uniform_product(translation, (int)stage, shift, name))
+				return FALSE;
+		}
+	}
+	if (!state[D3DRS_PSFINALCOMBINERINPUTSABCD] && !efg)
+		return FALSE;
+	g = (efg >> 8) & 0xff;
+	return name_of(g & 0x0f) == name && !(g & 0x10);
+}
+
 /* after a combiner stage: the registers of names nothing reads again are free */
 static void names_retire(struct translation *translation, int stage)
 {
@@ -1359,7 +1790,7 @@ static void names_retire(struct translation *translation, int stage)
 
 			if (location->kind == _kind_register && !name_read_later(translation, stage, name, portion))
 			{
-				register_free(translation, portion, location->index);
+				register_free(translation, location_pool(portion, location), location->index);
 				*location = zero;
 			}
 		}
@@ -1418,6 +1849,34 @@ static BOOL half_pair(const struct operand *inputs, struct operand *x, struct op
 	return FALSE;
 }
 
+/* A*B + C*D as (1 - x) p + x q: one of each pair x, inverted in one of them
+only, the others plain (not inverted or negative) */
+static BOOL lerp_pair(const struct operand *inputs, struct operand *p, struct operand *q, struct operand *x)
+{
+	int first, second;
+
+	for (first = 0; first < 2; first++)
+	{
+		for (second = 2; second < 4; second++)
+		{
+			struct operand a = inputs[first], c = inputs[second];
+			const struct operand *b = &inputs[1 - first], *d = &inputs[5 - second];
+
+			if (a.negative || c.negative || b->invert || b->negative || d->invert || d->negative ||
+				a.invert == c.invert || a.kind < _kind_register)
+				continue;
+			a.invert = c.invert = 0;
+			if (memcmp(&a, &c, sizeof(a)))
+				continue;
+			*x = a;
+			*p = inputs[first].invert ? *b : *d;
+			*q = inputs[first].invert ? *d : *b;
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
 static BOOL operand_reads(const struct operand *value, int reading_portion, int reg, int pool)
 {
 	int read_pool = reading_portion == _portion_color && value->channel != _channel_alpha ? _portion_color :
@@ -1431,7 +1890,10 @@ after reads that (later: the operands still to be used in this portion,
 and for the alpha the colour portion's reads of alpha), else a free one */
 static BOOL aliasable(const struct operand *value, int portion)
 {
-	return value->kind != _kind_register || portion == _portion_alpha || value->channel == _channel_natural;
+	/* (a register's alpha, for the colour, the same in every channel: held
+	in the alpha's pool, location_pool) */
+	return value->kind != _kind_register || portion == _portion_alpha || value->channel == _channel_natural ||
+		value->channel == _channel_alpha;
 }
 
 /* a name now standing for an operand (a register's shared) */
@@ -1440,9 +1902,9 @@ static void name_alias(struct translation *translation, int portion, unsigned lo
 	struct operand *location = &translation->names[portion][name_of(reg)];
 
 	if (location->kind == _kind_register)
-		translation->released[portion][location->index]++;
+		translation->released[location_pool(portion, location)][location->index]++;
 	if (value.kind == _kind_register)
-		translation->holders[portion][value.index]++;
+		translation->holders[location_pool(portion, &value)][value.index]++;
 	*location = value;
 }
 
@@ -1469,7 +1931,8 @@ static BOOL in_place(const struct translation *translation, int portion, unsigne
 	if (name < 0)
 		return FALSE;
 	location = &translation->names[portion][name];
-	if (location->kind != _kind_register || translation->holders[portion][location->index] != 1)
+	if (location->kind != _kind_register || location_pool(portion, location) != portion ||
+		translation->holders[portion][location->index] != 1)
 		return FALSE;
 	for (index = 0; index < later_count; index++)
 	{
@@ -1510,7 +1973,7 @@ static int output_register(struct translation *translation, int portion, unsigne
 		{
 			struct operand *victim = &translation->names[portion][other];
 
-			if (other != name && victim->kind == _kind_register &&
+			if (other != name && victim->kind == _kind_register && location_pool(portion, victim) == portion &&
 				!name_read_later(translation, translation->stage, other, portion) &&
 				in_place(translation, portion, (unsigned long)register_of_name(other), later, later_count))
 			{
@@ -1519,7 +1982,7 @@ static int output_register(struct translation *translation, int portion, unsigne
 				translation->holders[portion][dest]--;
 				translation->holders[portion][dest]++;
 				if (location->kind == _kind_register)
-					translation->released[portion][location->index]++;
+					translation->released[location_pool(portion, location)][location->index]++;
 				*location = operand(_kind_register, (unsigned char)dest, _channel_natural);
 				return dest;
 			}
@@ -1528,7 +1991,7 @@ static int output_register(struct translation *translation, int portion, unsigne
 		return -1;
 	}
 	if (location->kind == _kind_register)
-		translation->released[portion][location->index]++;
+		translation->released[location_pool(portion, location)][location->index]++;
 	*location = operand(_kind_register, (unsigned char)dest, _channel_natural);
 	return dest;
 }
@@ -1544,6 +2007,9 @@ static void combiner_portion(struct translation *translation, int stage, int por
 	int dot_temporaries[2] = { -1, -1 };
 	struct operand dot_operands[4];
 	BOOL dot_unlit[2] = { FALSE, FALSE };
+	BOOL signed_dot[2] = { FALSE, FALSE };
+	struct operand signed_results[2];
+	int signed_temporaries[2] = { -1, -1 };
 	int temporaries[4];
 	unsigned long ab_name = (outputs >> 4) & 0x0f, cd_name = outputs & 0x0f, sum_name = (outputs >> 8) & 0x0f;
 	int dest, index;
@@ -1557,15 +2023,78 @@ static void combiner_portion(struct translation *translation, int stage, int por
 		sum_name = 0;
 	if (name_of(ab_name) < 0 && name_of(cd_name) < 0 && name_of(sum_name) < 0)
 		return;
+	/* signed dot products, of values a swap or selection reaches: first, as
+	their stages come before any this combiner stage queues */
+	for (index = 0; portion == _portion_color && index < 2; index++)
+	{
+		unsigned long x_input = (inputs >> (24 - 16 * index)) & 0xff, y_input = (inputs >> (16 - 16 * index)) & 0xff;
+		unsigned long own = index ? cd_name : ab_name;
+		struct operand x, y;
+		int k;
+		BOOL in_alpha;
+
+		if (!(flags & (index ? 0x01u : 0x02u)) ||
+			(!mapping_signed((unsigned)(x_input & 0xe0), &k) && !mapping_signed((unsigned)(y_input & 0xe0), &k)) ||
+			dot_unavailable(translation, (x_input << 8) | y_input, stage))
+			continue;
+		/* (the last attempts: as the translation was before it had them, its
+		inputs mapped as anywhere else) */
+		if (translation->signed_dots < 0)
+		{
+			approximate(translation->program, "a signed dot product, its inputs clamped");
+			continue;
+		}
+		x = register_operand(translation, x_input & 0x0f, (x_input & 0x10) != 0, portion, stage);
+		y = register_operand(translation, y_input & 0x0f, (y_input & 0x10) != 0, portion, stage);
+		/* (a register's colour: as before, a dot product of a register, its
+		signed inputs clamped) */
+		if (!broadcastable(&x) || !broadcastable(&y))
+		{
+			approximate(translation->program, "a signed dot product of a register");
+			continue;
+		}
+		if (name_of(own) < 0 && name_of(sum_name) < 0)
+		{
+			signed_dot[index] = TRUE;
+			signed_results[index] = zero;
+			continue;
+		}
+		in_alpha = translation->signed_dots == 2 && name_of(own) >= 0 && !(flags & 0x38) &&
+			blue_read_later(translation, stage, name_of(own));
+		signed_dot[index] = translation->signed_dots && !translation->economical &&
+			(emit_signed_dot(translation, x, (unsigned)(x_input & 0xe0), y, (unsigned)(y_input & 0xe0), in_alpha,
+				&signed_results[index], &signed_temporaries[index]) ||
+			(in_alpha && emit_signed_dot(translation, x, (unsigned)(x_input & 0xe0), y, (unsigned)(y_input & 0xe0),
+				FALSE, &signed_results[index], &signed_temporaries[index])));
+		/* (else as before: of 0, 1/2 or 1, its signed inputs clamped to [0, 1],
+		as a register's are; of anything else 1, as a dot product of the
+		register a mapping would take) */
+		if (!signed_dot[index] && (translation->economical || x.kind > _kind_half || y.kind > _kind_half))
+		{
+			signed_dot[index] = TRUE;
+			signed_results[index] = one;
+			approximate(translation->program, "a signed dot product");
+		}
+		else if (!signed_dot[index])
+		{
+			approximate(translation->program, "a signed dot product, its inputs clamped");
+		}
+	}
 	for (index = 0; index < 4; index++)
 	{
 		unsigned long input = (inputs >> (24 - 8 * index)) & 0xff;
 		int earlier;
 
+		if (signed_dot[index / 2])
+		{
+			inputs_mapped[index] = index & 1 ? one : signed_results[index / 2];
+			temporaries[index] = -1;
+			continue;
+		}
 		/* (an input given twice is mapped once) */
 		for (earlier = 0; earlier < index; earlier++)
 		{
-			if (((inputs >> (24 - 8 * earlier)) & 0xff) == input)
+			if (!signed_dot[earlier / 2] && ((inputs >> (24 - 8 * earlier)) & 0xff) == input)
 				break;
 		}
 		if (earlier < index)
@@ -1581,14 +2110,27 @@ static void combiner_portion(struct translation *translation, int stage, int por
 	/* dot products: into a register of their own (emit_dot), then a
 product with 1 */
 	memcpy(dot_operands, inputs_mapped, sizeof(dot_operands));
-	if (portion == _portion_color && (flags & 0x02))
+	/* (one nothing reads, neither its own output nor the sum: 0) */
+	if (portion == _portion_color && (flags & 0x02) && !signed_dot[0] && name_of(ab_name) < 0 &&
+		name_of(sum_name) < 0)
+	{
+		inputs_mapped[0] = zero;
+		inputs_mapped[1] = one;
+	}
+	else if (portion == _portion_color && (flags & 0x02) && !signed_dot[0])
 	{
 		dot_unlit[0] = dot_unavailable(translation, inputs >> 16, stage);
 		inputs_mapped[0] = dot_unlit[0] ? one :
 			emit_dot(translation, _portion_color, inputs_mapped[0], inputs_mapped[1], &dot_temporaries[0]);
 		inputs_mapped[1] = one;
 	}
-	if (portion == _portion_color && (flags & 0x01))
+	if (portion == _portion_color && (flags & 0x01) && !signed_dot[1] && name_of(cd_name) < 0 &&
+		name_of(sum_name) < 0)
+	{
+		inputs_mapped[2] = zero;
+		inputs_mapped[3] = one;
+	}
+	else if (portion == _portion_color && (flags & 0x01) && !signed_dot[1])
 	{
 		dot_unlit[1] = dot_unavailable(translation, inputs, stage);
 		inputs_mapped[2] = dot_unlit[1] ? one :
@@ -1602,14 +2144,14 @@ product with 1 */
 		their blue: a product, or a sum of two, not a mux) */
 		if (name_of(ab_name) >= 0)
 		{
-			if ((flags & 0x02) && !dot_unlit[0])
+			if ((flags & 0x02) && !dot_unlit[0] && !signed_dot[0])
 				blue_recipe_dot(translation, ab_name, dot_operands[0], dot_operands[1], flags);
 			else
 				blue_recipe_set(translation, ab_name, 1, &inputs_mapped[0], &inputs_mapped[1], flags);
 		}
 		if (name_of(cd_name) >= 0)
 		{
-			if ((flags & 0x01) && !dot_unlit[1])
+			if ((flags & 0x01) && !dot_unlit[1] && !signed_dot[1])
 				blue_recipe_dot(translation, cd_name, dot_operands[2], dot_operands[3], flags);
 			else
 				blue_recipe_set(translation, cd_name, 1, &inputs_mapped[2], &inputs_mapped[3], flags);
@@ -1757,7 +2299,7 @@ product with 1 */
 				memcpy(inputs_mapped + 2, swap, sizeof(swap));
 			}
 
-			struct operand half_x, half_y;
+			struct operand half_x, half_y, lerp_c;
 
 			if (half_pair(inputs_mapped, &half_x, &half_y))
 			{
@@ -1771,6 +2313,22 @@ product with 1 */
 					operation.in[0] = half_x;
 					operation.in[1] = half_y;
 					operation.in[2] = operand(_kind_half, 0, 0);
+					output_mapping(&operation, flags);
+					emit(translation, portion, &operation);
+				}
+			}
+			else if (lerp_pair(inputs_mapped, &half_x, &half_y, &lerp_c))
+			{
+				/* ((1 - x) p + x q: TEV's own lerp) */
+				struct operation operation;
+
+				dest = output_register(translation, portion, sum_name, later, later_count);
+				if (dest >= 0)
+				{
+					operation = operation_new(dest);
+					operation.in[0] = half_x;
+					operation.in[1] = half_y;
+					operation.in[2] = lerp_c;
 					output_mapping(&operation, flags);
 					emit(translation, portion, &operation);
 				}
@@ -1828,8 +2386,35 @@ product with 1 */
 		}
 	}
 	memcpy(inputs_mapped, sum_saved, sizeof(sum_saved));
+	/* a product of values the same in every channel, one of them a
+	register's alpha (a signed dot product made there, for the alpha half's
+	reads of its blue): made in the alpha half, the colour standing for that
+	register's alpha, unless this combiner stage's alpha portion reads the
+	blue it had */
+	for (index = 0; portion == _portion_color && translation->signed_dots == 2 && index < 2; index++)
+	{
+		unsigned long *name = index ? &cd_name : &ab_name;
+		struct operand x = inputs_mapped[2 * index], y = inputs_mapped[2 * index + 1];
+		struct operand *location;
+		int reg;
+
+		if (name_of(*name) < 0 || (flags & (index ? 0x01u : 0x02u)) || !uniform(&x) || !uniform(&y) ||
+			!((x.kind == _kind_register && x.channel == _channel_alpha) ||
+				(y.kind == _kind_register && y.channel == _channel_alpha)) ||
+			blue_read_now(translation, stage, name_of(*name)) ||
+			(reg = register_allocate(translation, _portion_alpha)) < 0)
+			continue;
+		emit_product(translation, _portion_alpha, alpha_form(x), alpha_form(y), zero, flags, reg);
+		location = &translation->names[_portion_color][name_of(*name)];
+		if (location->kind == _kind_register)
+			translation->released[location_pool(_portion_color, location)][location->index]++;
+		*location = operand(_kind_register, (unsigned char)reg, _channel_alpha);
+		blue_recipe_forget(translation, *name);
+		*name = 0;
+	}
 	/* a product that is an operand as it is, unmapped, is that operand: the
-	name stands for it, no stage made (not a register of the other pool) */
+	name stands for it, no stage made (a register's alpha too, for the
+	colour: held in the alpha's pool) */
 	if (!(flags & 0x38))
 	{
 		struct operand value;
@@ -1882,6 +2467,17 @@ product with 1 */
 		register_free(translation, portion, temporaries[index]);
 	register_free(translation, portion, dot_temporaries[0]);
 	register_free(translation, portion, dot_temporaries[1]);
+	/* (a signed dot product in an alpha, which the colour's queued
+	operations may still read: free once they are TEV stages) */
+	for (index = 0; index < 2; index++)
+	{
+		if (signed_temporaries[index] < 0)
+			continue;
+		if (signed_results[index].channel == _channel_alpha)
+			translation->released[_portion_alpha][signed_temporaries[index]]++;
+		else
+			register_free(translation, _portion_color, signed_temporaries[index]);
+	}
 }
 
 /* ---------- stages */
@@ -1941,6 +2537,7 @@ static void stage_half(struct gx_psh_stage *stage, const struct operation *opera
 		stage->color_bias = operation->bias;
 		stage->color_scale = operation->scale;
 		stage->color_dest = operation->dest;
+		stage->color_unclamped = operation->unclamped;
 	}
 	else
 	{
@@ -1948,6 +2545,7 @@ static void stage_half(struct gx_psh_stage *stage, const struct operation *opera
 		stage->alpha_bias = operation->bias;
 		stage->alpha_scale = operation->scale;
 		stage->alpha_dest = operation->dest;
+		stage->alpha_unclamped = operation->unclamped;
 	}
 }
 
@@ -2116,8 +2714,17 @@ static void final_combiner(struct translation *translation)
 		{
 			struct operand e = final_input(translation, (efg >> 24) & 0xff, _portion_color);
 			struct operand f = final_input(translation, (efg >> 16) & 0xff, _portion_color);
-			int reg = register_allocate(translation, _portion_color);
+			struct operand value;
+			int reg;
 
+			/* (a register as it is: read where it is) */
+			if (product_operand(e, f, &value) && value.kind == _kind_register)
+			{
+				abcd = (abcd & ~(0xffUL << shift)) | ((unsigned long)(0x80 | value.index |
+					(value.channel == _channel_alpha ? 0x10 : 0)) << shift) | (((abcd >> shift) & 0x30UL) << shift);
+				continue;
+			}
+			reg = register_allocate(translation, _portion_color);
 			if (reg < 0)
 			{
 				fail(translation, "no free register");
@@ -2188,7 +2795,19 @@ static void final_combiner(struct translation *translation)
 	color.in[3] = d;
 	emit(translation, _portion_color, &color);
 
-	g = final_input(translation, (efg >> 8) & 0xff, _portion_alpha);
+	{
+		/* (a register's blue as a combiner stage's alpha portion reads it:
+		made again from its products, or its alpha, approximated) */
+		unsigned long input = (efg >> 8) & 0xff;
+		int temporary;
+
+		g = combiner_input(translation, input & 0x1f, _portion_alpha, -1, &temporary);
+		if (input & 0x20)
+		{
+			g.invert = 1;
+			g = folded(g);
+		}
+	}
 	alpha = operation_new(0);
 	if (g.invert)
 	{
@@ -2207,7 +2826,7 @@ static void final_combiner(struct translation *translation)
 /* ---------- public code */
 
 static BOOL translate_once(const DWORD *render_state, const struct gx_psh_textures *textures,
-	struct gx_psh_program *program, BOOL economical, BOOL preload)
+	struct gx_psh_program *program, BOOL economical, BOOL preload, int signed_dots)
 {
 	static struct translation translation;
 	unsigned long combiner_count = render_state[D3DRS_PSCOMBINERCOUNT] & 0xff;
@@ -2220,6 +2839,7 @@ static BOOL translate_once(const DWORD *render_state, const struct gx_psh_textur
 	translation.textures = textures;
 	translation.program = program;
 	translation.economical = economical;
+	translation.signed_dots = signed_dots;
 	names_initialize(&translation);
 	if (preload)
 		constants_place(&translation);
@@ -2228,6 +2848,8 @@ static BOOL translate_once(const DWORD *render_state, const struct gx_psh_textur
 	for (stage = 0; stage < combiner_count && !translation.failed; stage++)
 	{
 		memset(translation.color_operands, 0, sizeof(translation.color_operands));
+		memcpy(translation.color_before, translation.names[_portion_color], sizeof(translation.color_before));
+		memcpy(translation.blue_before, translation.blue, sizeof(translation.blue_before));
 		translation.stage = (int)stage;
 		for (portion = 0; portion < NUMBER_OF_PORTIONS; portion++)
 		{
@@ -2237,6 +2859,8 @@ static BOOL translate_once(const DWORD *render_state, const struct gx_psh_textur
 		queues_flush(&translation);
 		names_retire(&translation, (int)stage);
 	}
+	memcpy(translation.color_before, translation.names[_portion_color], sizeof(translation.color_before));
+	memcpy(translation.blue_before, translation.blue, sizeof(translation.blue_before));
 	if (!translation.failed)
 		final_combiner(&translation);
 	program->reason = translation.failed ? translation.reason : NULL;
@@ -2246,12 +2870,25 @@ static BOOL translate_once(const DWORD *render_state, const struct gx_psh_textur
 BOOL gx_psh_translate(const DWORD *render_state, const struct gx_psh_textures *textures,
 	struct gx_psh_program *program)
 {
-	/* exact; exact with constants beyond four approximated (their registers
-	free for the program); then the same, economical */
-	return translate_once(render_state, textures, program, FALSE, TRUE) ||
-		translate_once(render_state, textures, program, FALSE, FALSE) ||
-		translate_once(render_state, textures, program, TRUE, TRUE) ||
-		translate_once(render_state, textures, program, TRUE, FALSE);
+	/* the signed dot products: where the alpha half reads them, then in the
+	colour half only (the alpha half's blue of one approximated), then as the
+	translation was before it made them, their inputs clamped; economically,
+	1, then as before */
+	static const struct { BOOL economical; signed char signed_dots; } attempts[] =
+		{ { FALSE, 2 }, { FALSE, 1 }, { FALSE, -1 }, { TRUE, 0 }, { TRUE, -1 } };
+	unsigned attempt;
+
+	/* each exact, then with constants beyond four approximated (their
+	registers free for the program) */
+	for (attempt = 0; attempt < sizeof(attempts) / sizeof(attempts[0]); attempt++)
+	{
+		if (translate_once(render_state, textures, program, attempts[attempt].economical, TRUE,
+				attempts[attempt].signed_dots) ||
+			translate_once(render_state, textures, program, attempts[attempt].economical, FALSE,
+				attempts[attempt].signed_dots))
+			return TRUE;
+	}
+	return FALSE;
 }
 
 void gx_psh_apply(const struct gx_psh_program *program)
@@ -2288,9 +2925,11 @@ void gx_psh_apply(const struct gx_psh_program *program)
 		GX_SetTevKColorSel(tev, stage->konst_color);
 		GX_SetTevKAlphaSel(tev, stage->konst_alpha);
 		GX_SetTevColorIn(tev, stage->color_in[0], stage->color_in[1], stage->color_in[2], stage->color_in[3]);
-		GX_SetTevColorOp(tev, stage->color_op, stage->color_bias, stage->color_scale, GX_TRUE, stage->color_dest);
+		GX_SetTevColorOp(tev, stage->color_op, stage->color_bias, stage->color_scale,
+			stage->color_unclamped ? GX_FALSE : GX_TRUE, stage->color_dest);
 		GX_SetTevAlphaIn(tev, stage->alpha_in[0], stage->alpha_in[1], stage->alpha_in[2], stage->alpha_in[3]);
-		GX_SetTevAlphaOp(tev, stage->alpha_op, stage->alpha_bias, stage->alpha_scale, GX_TRUE, stage->alpha_dest);
+		GX_SetTevAlphaOp(tev, stage->alpha_op, stage->alpha_bias, stage->alpha_scale,
+			stage->alpha_unclamped ? GX_FALSE : GX_TRUE, stage->alpha_dest);
 	}
 }
 

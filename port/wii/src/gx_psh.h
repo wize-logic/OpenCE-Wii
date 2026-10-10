@@ -42,11 +42,11 @@ struct gx_psh_textures
 	unsigned char contents[GX_PSH_TEXTURES];
 	/* the stages whose texture GX cannot sample (a cube map, a dependent or
 	dot product mode): read as 0, but a dot product with one is taken as 1
-	(a bump map against a normalization cube map, unlit) */
+	(a bumped reflection's lookups, unlit) */
 	unsigned unavailable;
-	/* the stages whose cube map is sampled as a sphere map: a lookup reads
-	it, but a dot product with it (a bump map against a normalization cube
-	map, whose signed values TEV clamps) is still taken as 1 */
+	/* the stages whose cube map is sampled as a sphere map, as any other
+	texture (a normalization cube map's direction, for a dot product with a
+	bump map, among them) */
 	unsigned cube;
 	/* fog (D3DRS_FOGENABLE, its ramp bound) and its colour */
 	unsigned char fog;
@@ -60,6 +60,9 @@ struct gx_psh_stage
 	unsigned char konst_color, konst_alpha;
 	unsigned char color_in[4], color_op, color_bias, color_scale, color_dest;
 	unsigned char alpha_in[4], alpha_op, alpha_bias, alpha_scale, alpha_dest;
+	/* a result not clamped to [0, 1]: a signed sum TEV keeps (-4 to 4) for
+	a later stage's d */
+	unsigned char color_unclamped, alpha_unclamped;
 };
 
 struct gx_psh_program
