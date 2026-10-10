@@ -17,4 +17,7 @@ enum
 	WII_MEMORY_TAG_COUNT
 };
 
+/* the contiguous window's pages in use and free (the log's memory report) */
+void wii_memory_window_usage(unsigned long *used_bytes, unsigned long *free_bytes);
+
 #endif /* __WII_MEMORY_H */

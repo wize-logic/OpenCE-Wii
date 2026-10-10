@@ -44,6 +44,7 @@ int: libogc's is renamed while its headers are read) */
 #include "gx_psh.h"
 #include "port_config.h"
 #include "nv2a_cpu.h"
+#include "wii_memory.h"
 #include "xbox_texture_formats.h"
 #include "wl/codec/gx_tex.h"
 
@@ -2043,8 +2044,18 @@ static void efb_park(void)
 {
 	if (!efb.parked_color)
 	{
-		efb.parked_color = aligned_alloc(32, efb_buffer_bytes());
-		efb.parked_depth = aligned_alloc(32, efb_buffer_bytes());
+		/* (in the contiguous window, where there is room; else the heap) */
+		efb.parked_color = platform_contiguous_alloc(efb_buffer_bytes(), 32, PLATFORM_ANY_PHYSICAL_ADDRESS, 0);
+		efb.parked_depth = platform_contiguous_alloc(efb_buffer_bytes(), 32, PLATFORM_ANY_PHYSICAL_ADDRESS, 0);
+		if (!efb.parked_color || !efb.parked_depth)
+		{
+			if (efb.parked_color)
+				platform_contiguous_free(efb.parked_color);
+			if (efb.parked_depth)
+				platform_contiguous_free(efb.parked_depth);
+			efb.parked_color = aligned_alloc(32, efb_buffer_bytes());
+			efb.parked_depth = aligned_alloc(32, efb_buffer_bytes());
+		}
 		if (!efb.parked_color || !efb.parked_depth)
 		{
 			free(efb.parked_color);
@@ -2538,6 +2549,9 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			dsound_wii_audio_report();
 			wii_heap_usage(&used, &free_bytes);
 			platform_log("memory: MEM1 heap %lu KB used, %lu KB free", used / 1024, free_bytes / 1024);
+			wii_memory_window_usage(&used, &free_bytes);
+			platform_log("memory: MEM2 window (tag, texture and sound caches, Direct3D) %lu KB used, %lu KB free",
+				used / 1024, free_bytes / 1024);
 			wl_mem_log_usage();
 		}
 	}

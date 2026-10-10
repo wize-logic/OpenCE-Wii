@@ -178,6 +178,20 @@ void *platform_contiguous_alloc(unsigned long size, unsigned long alignment,
 	return address;
 }
 
+/* the main window's pages in use and free, for the log */
+void wii_memory_window_usage(unsigned long *used_bytes, unsigned long *free_bytes)
+{
+	const struct contiguous_window *window = &windows[0];
+	unsigned long page, used = 0;
+
+	pthread_mutex_lock(&window_lock);
+	for (page = 0; page < window->page_count; page++)
+		used += window->page_protection[page] != 0;
+	pthread_mutex_unlock(&window_lock);
+	*used_bytes = used * PAGE_SIZE_BYTES;
+	*free_bytes = (window->page_count - used) * PAGE_SIZE_BYTES;
+}
+
 void platform_contiguous_free(void *address)
 {
 	struct contiguous_window *window = window_of((unsigned long)address);
