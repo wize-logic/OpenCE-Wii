@@ -94,7 +94,7 @@ static struct
 	real tour_seconds;
 	short tour_index;
 	/* (debug.lockstep_log) */
-	long lockstep_ticks, lockstep_logged;
+	long lockstep_ticks, lockstep_logged, lockstep_detail;
 	char variant_name[64];
 	/* ... the variant of this game, of variant_name's list; and the seconds
 	the last game's scores have been shown */
@@ -206,6 +206,7 @@ static void network_test_read_settings(
 	network_test.tour_seconds = (real)config_real("debug.network_test_tour");
 	network_test.lockstep_ticks = config_integer("debug.lockstep_log");
 	network_test.lockstep_logged = -1;
+	network_test.lockstep_detail = config_integer("debug.lockstep_detail");
 	network_test.kill_interval = (real)config_real("debug.network_test_kill");
 	network_test.shoot_interval = (real)config_real("debug.network_test_shoot");
 	network_test.vehicle_time = (real)config_real("debug.network_test_vehicle");
@@ -810,6 +811,12 @@ void network_test_update(
 			words[13] = (unsigned long)object->parent_object_index;
 			for (word = 0; word < 14; word++)
 				hash = (hash ^ words[word]) * 16777619UL;
+			/* (debug.lockstep_detail: each object's words at that tick, to find the
+			first that differs) */
+			if (network_test.lockstep_detail >= 0 && game_time_get() == network_test.lockstep_detail)
+				platform_log("lockstep object %ld: %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx "
+					"%08lx %08lx %08lx", count, words[0], words[1], words[2], words[3], words[4], words[5], words[6],
+					words[7], words[8], words[9], words[10], words[11], words[12], words[13]);
 			count++;
 		}
 		platform_log("lockstep: tick %ld objects %ld hash %08lx random %08lx", (long)game_time_get(), count, hash,

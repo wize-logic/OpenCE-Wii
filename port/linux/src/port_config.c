@@ -459,6 +459,8 @@ static const struct config_setting config_settings[] =
 	{ "debug.lockstep_log", _config_integer, "0", "HALO_LOCKSTEP_LOG", _environment_value, _platform_all,
 		"Every this many ticks of a solo network test, a hash of every object's position,\n"
 		"velocity and vitality and the game's random seed in the log (0: none)." },
+	{ "debug.lockstep_detail", _config_integer, "-1", "HALO_LOCKSTEP_DETAIL", _environment_value, _platform_all,
+		"The tick at which the lockstep log lists each object's values (-1: none)." },
 	{ "debug.network_test_tour", _config_real, "0.0", "HALO_NETWORK_TEST_TOUR", _environment_value, _platform_all,
 		"Seconds of game time a solo test spends in each map of its list before the next\n"
 		"(0: the first map only)." },
