@@ -51,6 +51,9 @@ struct nv2a_cpu_program
 	/* (nv2a_cpu_hash: the generated programs' names) */
 	unsigned long hash;
 	nv2a_cpu_native_proc native;
+	/* (the compiled program's colours and fog alone; NULL on the
+	interpreter) */
+	nv2a_cpu_native_proc native_colors;
 	struct nv2a_cpu_instruction instructions[NV2A_CPU_MAXIMUM_INSTRUCTIONS];
 };
 
@@ -86,8 +89,14 @@ struct nv2a_cpu_dependencies
 	int clip_captured;
 	/* the input registers any instruction reads */
 	unsigned long inputs;
+	/* the constant registers it reads (bit n of word n / 32: c[n - 96]),
+	all of them when it reads one by a0 */
+	unsigned long constants[NV2A_CPU_CONSTANT_COUNT / 32];
+	int relative;
 };
 
+void nv2a_cpu_run_colors(const struct nv2a_cpu_program *program, const float (*constants)[4], const float (*inputs)[4],
+	struct nv2a_cpu_output *output);
 void nv2a_cpu_analyze(const struct nv2a_cpu_program *program, struct nv2a_cpu_dependencies *dependencies);
 
 void nv2a_cpu_compile(const DWORD *instructions, unsigned long instruction_count, struct nv2a_cpu_program *program);

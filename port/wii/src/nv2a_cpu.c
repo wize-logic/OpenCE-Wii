@@ -112,6 +112,7 @@ void nv2a_cpu_compile(const DWORD *instructions, unsigned long instruction_count
 			break;
 	}
 	program->native = NULL;
+	program->native_colors = NULL;
 	program->hash = nv2a_cpu_hash(instructions, instruction_count);
 #ifndef NV2A_CPU_NO_NATIVES
 	{
@@ -122,6 +123,7 @@ void nv2a_cpu_compile(const DWORD *instructions, unsigned long instruction_count
 			if (nv2a_cpu_natives[index].hash == hash && nv2a_cpu_natives[index].count == instruction_count)
 			{
 				program->native = nv2a_cpu_natives[index].run;
+				program->native_colors = nv2a_cpu_natives[index].colors;
 				break;
 			}
 		}
@@ -205,8 +207,8 @@ static unsigned long not_affine(unsigned long x)
 }
 
 static void dependency_operand(const struct dependency_registers *registers,
-	const struct nv2a_cpu_instruction *instruction, const struct nv2a_cpu_operand *operand, unsigned long *inputs,
-	unsigned long out[4])
+	const struct nv2a_cpu_instruction *instruction, const struct nv2a_cpu_operand *operand,
+	struct nv2a_cpu_dependencies *dependencies, unsigned long out[4])
 {
 	unsigned long source[4] = { 0, 0, 0, 0 };
 	int component;
@@ -219,12 +221,17 @@ static void dependency_operand(const struct dependency_registers *registers,
 		break;
 	case _mux_input:
 		source[0] = source[1] = source[2] = source[3] = 1UL << (instruction->input & 15);
-		*inputs |= 1UL << (instruction->input & 15);
+		dependencies->inputs |= 1UL << (instruction->input & 15);
 		break;
 	case _mux_constant:
 		/* (a constant at an index an input chose) */
 		if (instruction->relative)
+		{
 			source[0] = source[1] = source[2] = source[3] = not_affine(registers->a0);
+			dependencies->relative = 1;
+		}
+		else if (instruction->constant < NV2A_CPU_CONSTANT_COUNT)
+			dependencies->constants[instruction->constant / 32] |= 1UL << (instruction->constant % 32);
 		break;
 	default:
 		break;
@@ -254,9 +261,9 @@ void nv2a_cpu_analyze(const struct nv2a_cpu_program *program, struct nv2a_cpu_de
 		const struct nv2a_cpu_instruction *instruction = &program->instructions[index];
 		unsigned long a[4], b[4], c[4], mac[4] = { 0, 0, 0, 0 }, ilu[4] = { 0, 0, 0, 0 }, sum;
 
-		dependency_operand(&registers, instruction, &instruction->operands[0], &dependencies->inputs, a);
-		dependency_operand(&registers, instruction, &instruction->operands[1], &dependencies->inputs, b);
-		dependency_operand(&registers, instruction, &instruction->operands[2], &dependencies->inputs, c);
+		dependency_operand(&registers, instruction, &instruction->operands[0], dependencies, a);
+		dependency_operand(&registers, instruction, &instruction->operands[1], dependencies, b);
+		dependency_operand(&registers, instruction, &instruction->operands[2], dependencies, c);
 		switch (instruction->mac)
 		{
 		case _mac_mov: case _mac_arl: memcpy(mac, a, sizeof(mac)); break;
@@ -387,6 +394,23 @@ void nv2a_cpu_ilu(int ilu, const float c[4], float out[4])
 	default:
 		break;
 	}
+}
+
+/* a vertex's colours (d0, d1) and fog alone: the program's colour-only
+function where it has one, else all of it */
+void nv2a_cpu_run_colors(const struct nv2a_cpu_program *program, const float (*constants)[4], const float (*inputs)[4],
+	struct nv2a_cpu_output *output)
+{
+	if (!program->native_colors)
+	{
+		nv2a_cpu_run(program, constants, inputs, 1.0f, output);
+		return;
+	}
+	output->d0[0] = output->d0[1] = output->d0[2] = 0.0f;
+	output->d1[0] = output->d1[1] = output->d1[2] = 0.0f;
+	output->d0[3] = output->d1[3] = 1.0f;
+	output->fog = 1.0f;
+	program->native_colors(constants, inputs, output);
 }
 
 void nv2a_cpu_run(const struct nv2a_cpu_program *program, const float (*constants)[4], const float (*inputs)[4],

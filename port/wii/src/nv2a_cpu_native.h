@@ -18,6 +18,8 @@ struct nv2a_cpu_native
 {
 	unsigned long hash, count;
 	nv2a_cpu_native_proc run;
+	/* its colours (d0, d1) and fog alone */
+	nv2a_cpu_native_proc colors;
 };
 
 extern const struct nv2a_cpu_native nv2a_cpu_natives[];

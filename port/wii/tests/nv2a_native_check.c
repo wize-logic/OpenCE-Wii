@@ -110,6 +110,21 @@ int main(int argc, char **argv)
 				differ++;
 				break;
 			}
+			/* its colour-only function: the same colours and fog */
+			{
+				struct nv2a_cpu_output colors;
+
+				memset(&colors, 0, sizeof(colors));
+				nv2a_cpu_run_colors(&program, (const float (*)[4])constants, (const float (*)[4])inputs, &colors);
+				if (memcmp(colors.d0, compiled.d0, sizeof(colors.d0)) || memcmp(colors.d1, compiled.d1, sizeof(colors.d1)) ||
+					memcmp(&colors.fog, &compiled.fog, sizeof(colors.fog)))
+				{
+					printf("program %08lx: its colour-only function's colours differ\n",
+						nv2a_cpu_hash(instructions, instruction_count));
+					differ++;
+					break;
+				}
+			}
 		}
 	}
 	printf("%lu programs with functions, %lu runs compared, %lu differ\n", native, checked, differ);

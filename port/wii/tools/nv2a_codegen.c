@@ -84,6 +84,12 @@ static const char *temporary_name(unsigned temporary, char *text, size_t size)
 	return text;
 }
 
+/* writing a program's colour-only function: its texture coordinates, back
+colours, point size and clip-space position are left out, and the compiler
+drops what only they needed (d3d8_gx.c's draws whose colours alone are
+the processor's) */
+static int colors_only;
+
 static void instruction_code(FILE *out, const struct nv2a_cpu_instruction *instruction, unsigned long index)
 {
 	char text[32];
@@ -149,7 +155,7 @@ static void instruction_code(FILE *out, const struct nv2a_cpu_instruction *instr
 		fprintf(out, "\t\tI[0] = I[1] = I[2] = I[3] = 0.0f;\n");
 		break;
 	}
-	if (instruction->captures_clip)
+	if (instruction->captures_clip && !colors_only)
 		fprintf(out, "\t\tmemcpy(o->clip, p, sizeof(o->clip));\n\t\to->clip_captured = 1;\n");
 	if (instruction->mac == _mac_arl)
 		fprintf(out, "\t\ta0 = (int)floorf(M[0] + 0.001f);\n");
@@ -171,18 +177,19 @@ static void instruction_code(FILE *out, const struct nv2a_cpu_instruction *instr
 		case _output_position: masked(out, "p", value, instruction->output_mask); break;
 		case _output_d0: masked(out, "o->d0", value, instruction->output_mask); break;
 		case _output_d1: masked(out, "o->d1", value, instruction->output_mask); break;
-		case _output_b0: masked(out, "o->b0", value, instruction->output_mask); break;
-		case _output_b1: masked(out, "o->b1", value, instruction->output_mask); break;
+		case _output_b0: if (!colors_only) masked(out, "o->b0", value, instruction->output_mask); break;
+		case _output_b1: if (!colors_only) masked(out, "o->b1", value, instruction->output_mask); break;
 		case _output_fog:
 			if (instruction->output_mask & 8)
 				fprintf(out, "\t\to->fog = %s[0];\n", value);
 			break;
 		case _output_point_size:
-			if (instruction->output_mask & 8)
+			if ((instruction->output_mask & 8) && !colors_only)
 				fprintf(out, "\t\to->point_size = %s[0];\n", value);
 			break;
 		default:
-			if (instruction->output_address >= _output_t0 && instruction->output_address < _output_t0 + 4)
+			if (instruction->output_address >= _output_t0 && instruction->output_address < _output_t0 + 4 &&
+				!colors_only)
 			{
 				snprintf(text, sizeof(text), "o->t[%d]", instruction->output_address - _output_t0);
 				masked(out, text, value, instruction->output_mask);
@@ -332,10 +339,21 @@ int main(int argc, char **argv)
 		for (index = 0; index < program.count; index++)
 			instruction_code(out, &program.instructions[index], index);
 		fprintf(out, "\tmemcpy(o->position, p, sizeof(o->position));\n}\n\n");
+		/* (its colours and fog alone) */
+		fprintf(out, "static void program_%08lx_colors(const float (*c)[4], const float (*v)[4], struct nv2a_cpu_output *o)\n"
+			"{\n\tfloat r[12][4] = { { 0.0f } };\n\tfloat p[4] = { 0.0f, 0.0f, 0.0f, 1.0f };\n"
+			"\tfloat A[4], B[4], C[4], M[4], I[4];\n\tint a0 = 0;\n\n"
+			"\t(void)c;\n\t(void)v;\n\t(void)a0;\n\t(void)A;\n\t(void)B;\n\t(void)C;\n\t(void)r;\n\t(void)p;\n", hash);
+		colors_only = 1;
+		for (index = 0; index < program.count; index++)
+			instruction_code(out, &program.instructions[index], index);
+		colors_only = 0;
+		fprintf(out, "}\n\n");
 	}
 	fprintf(out, "const struct nv2a_cpu_native nv2a_cpu_natives[] =\n{\n");
 	for (index = 0; index < program_count; index++)
-		fprintf(out, "\t{ 0x%08lxUL, %lu, program_%08lx },\n", hashes[index], counts[index], hashes[index]);
+		fprintf(out, "\t{ 0x%08lxUL, %lu, program_%08lx, program_%08lx_colors },\n", hashes[index], counts[index],
+			hashes[index], hashes[index]);
 	fprintf(out, "};\n\nconst unsigned long nv2a_cpu_native_count = %lu;\n", program_count);
 	fclose(out);
 	printf("nv2a_codegen: %lu programs from %lu words\n", program_count, word_count);
