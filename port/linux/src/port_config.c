@@ -412,7 +412,11 @@ static const struct config_setting config_settings[] =
 		"Automated system link sessions for testing (port/linux/game/network_test.c):\n"
 		"\"host:<map>\" hosts a game on that map, \"join\" joins the first game found,\n"
 		"\"solo:<map>\" plays the map alone with no network (after network_test_start\n"
-		"seconds in the menu); empty for none." },
+		"seconds in the menu; a list, comma-separated, tours them: network_test_tour);\n"
+		"empty for none." },
+	{ "debug.network_test_tour", _config_real, "0.0", "HALO_NETWORK_TEST_TOUR", _environment_value, _platform_all,
+		"Seconds of game time a solo test spends in each map of its list before the next\n"
+		"(0: the first map only)." },
 	{ "debug.network_test_start", _config_real, "15.0", "HALO_NETWORK_TEST_START", _environment_value, _platform_all,
 		"Seconds after hosting that an automated test game starts." },
 	{ "debug.network_test_kill", _config_real, "0.0", "HALO_NETWORK_TEST_KILL", _environment_value, _platform_all,

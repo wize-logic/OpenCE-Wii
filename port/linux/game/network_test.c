@@ -88,7 +88,10 @@ static struct
 {
 	boolean checked;
 	short mode;
-	char map_name[64];
+	/* (solo: a list, each map in turn for tour_seconds of game time) */
+	char map_name[512];
+	real tour_seconds;
+	short tour_index;
 	char variant_name[64];
 	/* ... the variant of this game, of variant_name's list; and the seconds
 	the last game's scores have been shown */
@@ -113,6 +116,34 @@ static struct
 	long score_to_win;
 	long logged_time;
 } network_test;
+
+/* a solo map's path, of the list at the index: a level of its own path,
+else a multiplayer map's name; FALSE past the list's end */
+static boolean network_test_solo_path(
+	short index,
+	char *path,
+	size_t size)
+{
+	char const *map = network_test.map_name;
+	char name[128];
+	size_t length;
+
+	for (; index > 0 && map; index--)
+	{
+		map = strchr(map, ',');
+		if (map)
+			map++;
+	}
+	if (!map || !*map)
+		return FALSE;
+	length = strcspn(map, ",");
+	snprintf(name, sizeof(name), "%.*s", (int)length, map);
+	if (strchr(name, '\\'))
+		snprintf(path, size, "%s", name);
+	else
+		snprintf(path, size, "levels\\test\\%s\\%s", name, name);
+	return TRUE;
+}
 
 /* the variant at the index of the list (copied to name), FALSE past its end */
 static boolean network_test_variant(
@@ -169,6 +200,7 @@ static void network_test_read_settings(
 		snprintf(network_test.map_name, sizeof(network_test.map_name), "%s", setting + 5);
 	}
 	network_test.start_delay = (real)config_real("debug.network_test_start");
+	network_test.tour_seconds = (real)config_real("debug.network_test_tour");
 	network_test.kill_interval = (real)config_real("debug.network_test_kill");
 	network_test.shoot_interval = (real)config_real("debug.network_test_shoot");
 	network_test.vehicle_time = (real)config_real("debug.network_test_vehicle");
@@ -747,6 +779,21 @@ void network_test_update(
 	{
 		network_test.logged_time = game_time_get();
 		network_test_log_players();
+		/* a tour: the next map of the list once this one has had its time
+		(each map's game time starts over) */
+		if (network_test.mode == _network_test_solo && network_test.tour_seconds > 0.0f &&
+			game_time_get() >= (long)(network_test.tour_seconds * TICKS_PER_SECOND))
+		{
+			char path[128];
+
+			if (network_test_solo_path((short)(network_test.tour_index + 1), path, sizeof(path)))
+			{
+				network_test.tour_index++;
+				network_test.logged_time = 0;
+				platform_log("network test: the tour's next map, %s", path);
+				main_set_map_name(path);
+			}
+		}
 		if (network_test.shoot_interval > 0.0f &&
 			game_time_get() % MAX(1, (long)(network_test.shoot_interval * TICKS_PER_SECOND)) < TICKS_PER_SECOND)
 		{
@@ -933,12 +980,11 @@ void network_test_update(
 			char path[128];
 
 			network_test.set_up = TRUE;
-			if (strchr(network_test.map_name, '\\'))
-				snprintf(path, sizeof(path), "%s", network_test.map_name);
-			else
-				snprintf(path, sizeof(path), "levels\\test\\%s\\%s", network_test.map_name, network_test.map_name);
-			platform_log("network test: %s alone", path);
-			main_set_map_name(path);
+			if (network_test_solo_path(0, path, sizeof(path)))
+			{
+				platform_log("network test: %s alone", path);
+				main_set_map_name(path);
+			}
 		}
 		break;
 	case _network_test_host:
