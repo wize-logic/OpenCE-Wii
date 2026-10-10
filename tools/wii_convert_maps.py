@@ -112,6 +112,61 @@ EVENTS = {0: [], 1: [], 2: [(1, 1)], 3: [(1, 1)], 4: [(2, 1)], 5: [(2, 1)], 6: [
           **{event: [(1, 2)] for event in range(7, 15)}, **{event: [(2, 2)] for event in range(15, 23)}}
 RECORDED_ANIMATION_END = 1
 
+# A node header of an animation's compressed data: its first keyframe above, its keyframe count in
+# the low 12 bits (COMPRESSED_ANIMATION_NODE_HEADER_KEYFRAME_COUNT_BITS, model_animations.c)
+KEYFRAME_COUNT_BITS = 12
+
+
+def keyframe_count(data: bytes, offset: int, end: int, endian: str, node_count: int) -> int:
+    """how many keyframes the node headers at offset reach: the largest first keyframe plus count"""
+    total = 0
+    for node in range(node_count):
+        if offset + 4 * node + 4 > end:
+            break
+        header = struct.unpack_from(endian + "I", data, offset + 4 * node)[0]
+        count = header & ((1 << KEYFRAME_COUNT_BITS) - 1)
+        if count:
+            total = max(total, (header >> KEYFRAME_COUNT_BITS) + count)
+    return total
+
+
+def compressed_animation_sections(data: bytes, block: int, size: int, endian: str, node_count: int,
+                                  rotating: int, translating: int, scaling: int) -> List[Tuple[str, int, int, int]]:
+    """the sections of an animation's compressed data at block, as model_animations.c reads them
+    (struct compressed_animation_header; animation_get_keyframe_rotation, _translation, _scale and
+    animation_get_node_orientations): each (name, offset from block, element width, element
+    count). The header's eleven offsets are followed by one node header (a long) per rotating
+    node; a rotation is a compressed_quaternion_6byte, three words; a keyframe's frame index a
+    word; a translation a real_point3d; a scale a real. The default rotations and translations
+    are one per node (by node index), the default scales one per scaling node (by its adjusted
+    index), the keyframes as many as the node headers reach"""
+    end = block + size
+    (rotation_indices, default_rotations, rotation_keyframes, translation_headers, translation_indices,
+     default_translations, translation_keyframes, scale_headers, scale_indices, default_scales,
+     scale_keyframes) = struct.unpack_from(endian + "11i", data, block)
+
+    def reach(offset: int, count: int) -> int:
+        return keyframe_count(data, block + offset, end, endian, count) if 0 <= offset else 0
+
+    rotations = reach(0x2C, rotating)
+    translations = reach(translation_headers, translating)
+    scales = reach(scale_headers, scaling)
+    return [
+        ("header", 0, 4, 11),
+        ("rotation node headers", 0x2C, 4, rotating),
+        ("rotation keyframe frame indices", rotation_indices, 2, rotations),
+        ("default rotations", default_rotations, 2, 3 * node_count),
+        ("rotation keyframes", rotation_keyframes, 2, 3 * rotations),
+        ("translation node headers", translation_headers, 4, translating),
+        ("translation keyframe frame indices", translation_indices, 2, translations),
+        ("default translations", default_translations, 4, 3 * node_count),
+        ("translation keyframes", translation_keyframes, 4, 3 * translations),
+        ("scale node headers", scale_headers, 4, scaling),
+        ("scale keyframe frame indices", scale_indices, 2, scales),
+        ("default scales", default_scales, 4, scaling),
+        ("scale keyframes", scale_keyframes, 4, scales),
+    ]
+
 
 class Region:
     """bytes the game reads to one address: the tags, or a structure bsp"""
@@ -233,6 +288,9 @@ class Converter:
         self.buffer_regions: List[Region] = []
         self.bitmaps: Dict[str, int] = {}
         self.unswapped: Dict[str, int] = {}
+        # each animation's data (its file offset, size and what the game reads it by), for
+        # tools/wii_animation_check.py
+        self.animations: Dict[int, dict] = {}
 
         # the header (source/cache/cache_files_windows.c's struct cache_file_header, the one
         # that names every field the game reads): its values big-endian, its version the Wii's;
@@ -410,25 +468,28 @@ class Converter:
             offset += node.size
 
     def animation(self, definition: Definition, field, region: Region, element: int, address: int, size: int):
-        """an animation's frames (source/models/model_animations.c): its frame info all floats; its
-        default data and uncompressed frames, node by node, a rotation four shorts, a translation
-        three floats, a scale a float (frames for the nodes the flags say move, the default for
-        the others); and its compressed data, a header of section offsets and the sections,
-        swapped by their elements' widths (32-bit node headers, 16-bit frame indices, rotations of
-        three 16-bit words, translations and scales of floats)"""
+        """an animation's frames (source/models/model_animations.c): its frame info all floats
+        (dx dy, dx dy dyaw or dx dy dz dyaw); its default data and uncompressed frames, node by
+        node, a rotation four shorts (compressed_quaternion_8byte), a translation three floats, a
+        scale a float (frames for the nodes the flags say move, the default for the others); and
+        its compressed data, by the sections compressed_animation_sections names"""
         leaves = {leaf.name.split(".", 1)[1]: leaf.offset for leaf in definition.leaves}
 
         def value(name, code="<h"):
             return struct.unpack_from(code, self.source, region.offset(element + leaves[name]))[0]
 
         offset = region.offset(address)
-        if field.name == "frame_info":
-            self.swap_words(offset, size, 4)
-            return
         node_count, frame_count, frame_size = value("node_count"), value("frame_count"), value("frame_size")
         flags = value("flags", "<H")
         moving = {kind: (value(f"nodes_with_{kind}_flags[0]", "<I") | value(f"nodes_with_{kind}_flags[1]", "<I") << 32)
                   for kind in ("rotation", "translation", "scale")}
+        record = self.animations.setdefault(region.offset(element), {
+            "node_count": node_count, "frame_count": frame_count, "frame_size": frame_size, "flags": flags,
+            "moving": moving, "compressed_offset": value("compressed_data_offset", "<i")})
+        record[field.name] = (offset, size)
+        if field.name == "frame_info":
+            self.swap_words(offset, size - size % 4, 4)
+            return
         widths = {"rotation": (2, 4), "translation": (4, 3), "scale": (4, 1)}
 
         def nodes(position: int, animated: bool) -> int:
@@ -445,7 +506,7 @@ class Converter:
             if end - offset != size:
                 self.notes.append(f"an animation's default data is {size} bytes, not {end - offset}")
             return
-        compressed_offset = value("compressed_data_offset", "<i")
+        compressed_offset = record["compressed_offset"]
         compressed = flags & 1
         uncompressed = frame_count * frame_size if (not compressed or compressed_offset) else 0
         position = offset
@@ -455,15 +516,28 @@ class Converter:
                 self.notes.append(f"an animation's frame is {frame_size} bytes, not {end - position}")
                 break
             position = end
-        if compressed:
-            block = offset + compressed_offset
-            header = struct.unpack_from("<11i", self.source, block)
-            struct.pack_into(">11i", self.output, block, *header)
-            sections = [(0x2C, 4)] + list(zip(header, (2, 2, 2, 4, 2, 4, 4, 4, 2, 4, 4)))
-            sections.sort()
-            for (start, width), (next_start, _) in zip(sections, sections[1:] + [(size - compressed_offset, 0)]):
-                if 0 <= start < next_start <= size - compressed_offset:
-                    self.swap_words(block + start, (next_start - start) // width * width, width)
+        if not compressed:
+            return
+        block, block_size = offset + compressed_offset, size - compressed_offset
+        if not 0 <= compressed_offset <= size - 0x2C:
+            self.notes.append(f"an animation's compressed data is outside it ({compressed_offset} of {size} bytes)")
+            return
+        counts = [bin(moving[kind] & ((1 << node_count) - 1)).count("1") for kind in ("rotation", "translation", "scale")]
+        covered = bytearray(block_size)
+        for name, start, width, count in compressed_animation_sections(self.source, block, block_size, "<",
+                                                                       node_count, *counts):
+            if count == 0:
+                continue
+            if not 0 <= start <= start + width * count <= block_size:
+                self.notes.append(f"an animation's compressed {name} are outside its data")
+                continue
+            if any(covered[start:start + width * count]):
+                self.notes.append(f"an animation's compressed {name} overlap another section")
+            covered[start:start + width * count] = b"\x01" * (width * count)
+            self.swap_words(block + start, width * count, width)
+        left = block_size - sum(covered)
+        if left:
+            self.notes.append(f"an animation's compressed data has {left} of {block_size} bytes in no section")
 
     def recorded_animation(self, definition: Definition, region: Region, element: int, address: int, size: int):
         """a recorded animation's event stream: its unit control (the fields of each version up to
