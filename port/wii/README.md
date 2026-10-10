@@ -265,6 +265,26 @@ and pixel shaders.
   `config.toml`) show the diffuse colour, or the first texture, alone. One frame's draws are
   described in the log (`DRAW_LOG_FRAME`).
 
+## The lockstep check
+
+The same session, played by the x86 Linux build and by the Wii in Dolphin, compared tick by tick:
+the big-endian game core against the little-endian one, with the maps the Wii's converter wrote.
+
+- Both builds run a solo network test with `debug.fixed_ticks = true` (a game tick each frame, and
+  the scripted player's clock the game's ticks, so both see the same input at the same tick) and
+  `debug.lockstep_log = 10`. Every 10 ticks they log a hash of every object's position, velocity,
+  facing, vitality and parent, and the game's random seed (`port/linux/game/network_test.c`).
+- The Linux build runs headless (`debug.null_renderer`, SDL's dummy video and audio drivers) in the
+  CI's Arch Linux image, with the Xbox maps. Both builds use musl's maths functions, so the floats
+  agree to the bit.
+- `tools/lockstep_compare.py linux.log wii.log` names the first tick that differs. With
+  `debug.lockstep_detail = <tick>` both list every object's values (and its nodes' matrices,
+  hashed) at that tick, and the tool names the objects that differ.
+
+It found `list_get`'s element index read from the wrong end of its cell, which made a10's opening
+teleport player 0 to player 1's flag. With that fixed, a10's opening (the cryo bay, the cinematic and
+its skip, the scripted player) agrees at every tick of 2,600.
+
 ## What is next
 
 1. Speed. The CPU still runs the skinned models whose vertices blend two nodes (bipeds, arms,
@@ -277,8 +297,8 @@ and pixel shaders.
    where it maps), and the bumped reflections' dependent lookups. Sampling the cube maps put
    the environment's lit pass (`10c30c53`, whose cube map direction comes from the tangent frame)
    back on the CPU: a10's frame takes about 200 ms in Dolphin (150 without them).
-3. Playing on. The campaign beyond a10's opening, and the game core's endianness checked under
-   qemu against the x86 build. Big-endian faults found so far:
+3. Playing on. The campaign beyond a10's opening, and the lockstep check over longer sessions and
+   more levels. Big-endian faults found so far:
    - plain char's sign (fixed with `-fsigned-char`);
    - tag fields the schema left as placeholders, one of them a contrail's shader that the game
      reads through another structure;
@@ -286,7 +306,8 @@ and pixel shaders.
    - a recorded animation's event header (bitfields);
    - the script engine's narrow values in 32-bit cells (`HALO_CELL_AT`);
    - a material type read as a long's low word;
-   - the network message size and an AI vocalization type.
+   - the network message size and an AI vocalization type;
+   - `list_get`'s element index (the lockstep check found it).
 4. Real hardware, from the Homebrew Channel (`ninja wii-package`).
 5. CI. The workflow's `wii` job passes when run locally in the devkitpro/devkitppc image. On
    GitHub it builds against WiiLibs' `dolphin-tests-and-fixed-claims` branch, which needs this
