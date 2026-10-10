@@ -1307,11 +1307,14 @@ static void mix(float *output, unsigned long frames)
 
 #ifdef HALO_WII
 static BOOL audio_started = FALSE;
+/* the loudest sample since the last report (dsound_wii_audio_report) */
+static volatile int audio_peak;
 
 /* WiiLibs' audio thread asks for frames: mixed, and made 16-bit */
 static void audio_fill(void *user, int16_t *stereo, uint32_t frames)
 {
 	float buffer[MIX_CHUNK_FRAMES * OUTPUT_CHANNELS];
+	int peak = audio_peak;
 
 	(void)user;
 	while (frames)
@@ -1325,10 +1328,29 @@ static void audio_fill(void *user, int16_t *stereo, uint32_t frames)
 			float sample = buffer[index] * 32767.0f;
 
 			stereo[index] = (int16_t)(sample > 32767.0f ? 32767 : sample < -32768.0f ? -32768 : (int)sample);
+			if (stereo[index] > peak || -stereo[index] > peak)
+				peak = stereo[index] < 0 ? -stereo[index] : stereo[index];
 		}
 		stereo += chunk * OUTPUT_CHANNELS;
 		frames -= chunk;
 	}
+	audio_peak = peak;
+}
+
+/* the output's health in the log: blocks mixed and played, underruns, the
+time a block takes to mix, the loudest sample since the last report */
+void dsound_wii_audio_report(void)
+{
+	WlPlatformAudioStats stats;
+
+	if (!audio_started)
+		return;
+	wl_platform_audio_stats(&stats);
+	platform_log("audio: %lu blocks mixed, %lu played, %lu underruns, mixing %lu us a block (at most %lu), "
+		"peak %d of 32767", (unsigned long)stats.blocks_filled, (unsigned long)stats.blocks_played,
+		(unsigned long)stats.underruns, (unsigned long)(stats.blocks_filled ? stats.fill_us_total / stats.blocks_filled : 0),
+		(unsigned long)stats.fill_us_max, audio_peak);
+	audio_peak = 0;
 }
 
 /* without output, drain voices in real time */

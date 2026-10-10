@@ -26,6 +26,10 @@ static v4 argb_to_v4(DWORD d) { v4 v = {{ ((d >> 16) & 255) / 255.0f, ((d >> 8) 
 
 /* ---------- the reference */
 struct inputs_set { v4 t[4]; v4 v0, v1; };
+/* the fog: on or not, its colour, and a pixel's factor */
+static int fog_on;
+static DWORD fog_color;
+static float fog_factor;
 static v4 reg_value(const DWORD *s, int reg, int stage, v4 *regs /* indexed by reg number */)
 {
 	v4 z = {{0}};
@@ -34,7 +38,7 @@ static v4 reg_value(const DWORD *s, int reg, int stage, v4 *regs /* indexed by r
 		return argb_to_v4(stage < 0 ? s[D3DRS_PSFINALCOMBINERCONSTANT0] : s[D3DRS_PSCONSTANT0_0 + (u ? stage : 0)]); }
 	case 2: { DWORD cnt = s[D3DRS_PSCOMBINERCOUNT]; int u = (cnt & 0x10000) != 0;
 		return argb_to_v4(stage < 0 ? s[D3DRS_PSFINALCOMBINERCONSTANT1] : s[D3DRS_PSCONSTANT1_0 + (u ? stage : 0)]); }
-	case 3: { v4 f = {{0, 0, 0, 1}}; return f; }
+	case 3: { v4 f = argb_to_v4(fog_color); f.c[3] = fog_on ? fog_factor : 1.0f; return f; }
 	case 4: case 5: case 8: case 9: case 10: case 11: case 12: case 13: return regs[reg];
 	default: return z;
 	}
@@ -43,10 +47,12 @@ static float map_input(float x, unsigned mapping)
 {
 	switch (mapping) {
 	case 0x00: case 0xc0: return clamp01(x);
-	case 0x20: case 0x60: return 1 - clamp01(x);
+	case 0x20: return 1 - clamp01(x);
 	case 0x40: return clamp01(2 * x - 1);
+	case 0x60: return clamp01(1 - 2 * clamp01(x));
 	case 0x80: return clamp01(x - 0.5f);
-	default: return 0;
+	case 0xa0: return clamp01(0.5f - clamp01(x));
+	default: return -clamp01(x);
 	}
 }
 static float out_map(float x, unsigned flags)
@@ -74,20 +80,33 @@ static v4 reference(const DWORD *s, const struct inputs_set *in, const unsigned 
 			DWORD outputs = s[(portion ? D3DRS_PSALPHAOUTPUTS0 : D3DRS_PSRGBOUTPUTS0) + st];
 			unsigned flags = outputs >> 12;
 			int channels = portion ? 1 : 3, first = portion ? 3 : 0;
-			float ab[4], cd[4], sum[4];
+			float ab[4], cd[4], sum[4], mapped[4][4];
+			/* the inputs, mapped, in every channel the portion has */
 			for (int ch = first; ch < first + channels; ch++) {
-				float v[4];
 				for (int k = 0; k < 4; k++) {
 					unsigned byte = (inputs >> (24 - 8 * k)) & 0xff;
 					v4 r = reg_value(s, byte & 15, st, regs);
 					float x;
 					if (portion) x = (byte & 0x10) ? r.c[3] : r.c[2];
 					else x = (byte & 0x10) ? r.c[3] : r.c[ch];
-					v[k] = map_input(x, byte & 0xe0);
+					mapped[k][ch] = map_input(x, byte & 0xe0);
 				}
-				if (!portion && (flags & 2)) v[0] = v[1] = 1;
-				if (!portion && (flags & 1)) v[2] = v[3] = 1;
+			}
+			for (int ch = first; ch < first + channels; ch++) {
+				float v[4];
+				for (int k = 0; k < 4; k++)
+					v[k] = mapped[k][ch];
 				ab[ch] = v[0] * v[1]; cd[ch] = v[2] * v[3];
+				/* (dot products: over red, green and blue; saturating at 1,
+				as the TEV's sum of the three terms does) */
+				if (!portion && (flags & 2)) {
+					float dot = mapped[0][0] * mapped[1][0] + mapped[0][1] * mapped[1][1] + mapped[0][2] * mapped[1][2];
+					ab[ch] = dot > 1 ? 1 : dot < -1 ? -1 : dot;
+				}
+				if (!portion && (flags & 1)) {
+					float dot = mapped[2][0] * mapped[3][0] + mapped[2][1] * mapped[3][1] + mapped[2][2] * mapped[3][2];
+					cd[ch] = dot > 1 ? 1 : dot < -1 ? -1 : dot;
+				}
 				if (flags & 4) { float m = regs[12].c[3]; sum[ch] = (1 - m) * ab[ch] + m * cd[ch]; }
 				else sum[ch] = ab[ch] + cd[ch];
 			}
@@ -155,16 +174,29 @@ static float konst_sel(const struct gx_psh_program *p, unsigned sel, int ch, int
 	if (sel >= 0x10) { int which = (sel - 0x10) / 4, slot = (sel - 0x10) % 4; v4 k = argb_to_v4(p->konst[slot]); return k.c[which]; }
 	return 0;
 }
-static v4 simulate(const struct gx_psh_program *p, const struct inputs_set *in, v4 *maps /* 8 */)
+/* gx_psh_initialize's swap tables: as it is, red, green, the blue in the alpha */
+static v4 swapped(v4 value, unsigned table)
+{
+	v4 out = value;
+	switch (table) {
+	case 1: out.c[0] = out.c[1] = out.c[2] = out.c[3] = value.c[0]; break;
+	case 2: out.c[0] = out.c[1] = out.c[2] = out.c[3] = value.c[1]; break;
+	case 3: out.c[3] = value.c[2]; break;
+	default: break;
+	}
+	return out;
+}
+
+static v4 simulate(const struct gx_psh_program *p, const struct inputs_set *in, v4 *maps /* 9: 8 the fog ramp */)
 {
 	v4 regs[4]; memset(regs, 0, sizeof(regs));
 	for (unsigned i = 0; i < p->stage_count; i++) {
 		const struct gx_psh_stage *st = &p->stages[i];
 		v4 tex = {{0}}, ras = {{0}};
 		if (st->texture_map != 0xFF) tex = maps[st->texture_map];
-		if (st->texture_swap == 1) tex.c[3] = tex.c[2];
+		tex = swapped(tex, st->texture_swap);
 		if (st->ras_channel != 0xFF) ras = st->ras_channel ? in->v1 : in->v0;
-		if (st->ras_swap == 1) ras.c[3] = ras.c[2];
+		ras = swapped(ras, st->ras_swap);
 		v4 out = regs[0]; v4 nregs[4]; memcpy(nregs, regs, sizeof(regs));
 		for (int ch = 0; ch < 3; ch++) {
 			float v[4];
@@ -220,12 +252,12 @@ static v4 simulate(const struct gx_psh_program *p, const struct inputs_set *in, 
 /* ---------- programs */
 static unsigned rand_input(int alpha_portion)
 {
-	static const unsigned regs[] = { 0, 1, 2, 4, 5, 8, 9, 10, 12, 13 };
-	static const unsigned maps[] = { 0x00, 0x20, 0x40, 0x80, 0xc0 };
-	unsigned reg = regs[rand() % 10];
+	static const unsigned regs[] = { 0, 1, 2, 3, 4, 5, 8, 9, 10, 12, 13 };
+	static const unsigned maps[] = { 0x00, 0x20, 0x40, 0x60, 0x80, 0xa0, 0xc0, 0xe0 };
+	unsigned reg = regs[rand() % 11];
 	unsigned alpha = (rand() % 3 == 0) ? 0x10 : 0;
 	if (alpha_portion) alpha = 0x10; /* (blue reads of registers are approximate) */
-	return reg | alpha | maps[rand() % 5];
+	return reg | alpha | maps[rand() % 8];
 }
 static unsigned rand_output(void)
 {
@@ -236,14 +268,18 @@ static int check(const DWORD *state, unsigned present, const char *name, int ver
 {
 	struct gx_psh_textures textures; struct gx_psh_program program;
 	memset(&textures, 0, sizeof(textures)); textures.present = present;
+	textures.fog = (unsigned char)fog_on;
+	textures.fog_color = fog_color & 0x00FFFFFFUL;
 	if (!gx_psh_translate(state, &textures, &program) || program.approximate) { if (verbose) printf("%s: not translated (%s)\n", name, program.reason); return -1; }
 	float worst = 0;
 	for (int trial = 0; trial < 50; trial++) {
-		struct inputs_set in; v4 maps[8];
+		struct inputs_set in; v4 maps[9];
 		for (int i = 0; i < 4; i++) in.t[i] = rand4();
 		in.t[0].c[3] = rand() % 2; /* (r0.a starts as t0.a: binary, for the mux) */
 		in.v0 = rand4(); in.v1 = rand4();
 		memset(maps, 0, sizeof(maps));
+		fog_factor = frand();
+		for (int ch = 0; ch < 4; ch++) maps[8].c[ch] = fog_factor;
 		for (int i = 0; i < 4; i++) maps[i] = in.t[i];
 		v4 want = reference(state, &in, present), got = simulate(&program, &in, maps);
 		for (int ch = 0; ch < 4; ch++) { float d = fabsf(want.c[ch] - got.c[ch]); if (d > worst) worst = d; }
@@ -297,6 +333,22 @@ static int game_programs(void)
 				state[D3DRS_PSALPHAINPUTS0 + stage] = programs[index].ai[stage];
 				state[D3DRS_PSALPHAOUTPUTS0 + stage] = programs[index].ao[stage];
 			}
+			if (getenv("DUMP_GAME") && atoi(getenv("DUMP_GAME")) == index * 8 + (int)separate)
+			{
+				gx_psh_translate(state, &textures, &program);
+				printf("  %u stages (%s)\n", program.stage_count, program.reason ? program.reason : "ok");
+				for (unsigned i = 0; i < program.stage_count; i++)
+				{
+					const struct gx_psh_stage *q = &program.stages[i];
+
+					printf("  tev %2u: map %2d ras %2d sw %d/%d kc %02x ka %02x | C %2d %2d %2d %2d b%d s%d op%d -> %d | A %d %d %d %d b%d s%d op%d -> %d\n",
+						i, q->texture_map == 255 ? -1 : q->texture_map, q->ras_channel == 255 ? -1 : q->ras_channel,
+						q->texture_swap, q->ras_swap, q->konst_color, q->konst_alpha, q->color_in[0], q->color_in[1],
+						q->color_in[2], q->color_in[3], q->color_bias, q->color_scale, q->color_op, q->color_dest,
+						q->alpha_in[0], q->alpha_in[1], q->alpha_in[2], q->alpha_in[3], q->alpha_bias, q->alpha_scale,
+						q->alpha_op, q->alpha_dest);
+				}
+			}
 			if (!gx_psh_translate(state, &textures, &program))
 			{
 				printf("game program %d (separate alphas %x): not translated (%s)\n", index, separate, program.reason);
@@ -315,6 +367,8 @@ int main(int argc, char **argv)
 	for (int seed = 0; seed < seed_count; seed++) {
 		DWORD state[200]; memset(state, 0, sizeof(state));
 		srand(seed);
+		fog_on = rand() % 2;
+		fog_color = (DWORD)rand() * 2654435761u;
 		int count = 1 + rand() % 4;
 		state[D3DRS_PSCOMBINERCOUNT] = count | (rand() % 2 ? 0x1000 : 0) | (rand() % 2 ? 0x10000 : 0);
 		for (int i = 0; i < 8; i++) { state[D3DRS_PSCONSTANT0_0 + i] = (DWORD)rand() * 2654435761u; state[D3DRS_PSCONSTANT1_0 + i] = (DWORD)rand() * 40503u * 65537u; }
@@ -328,7 +382,8 @@ int main(int argc, char **argv)
 				if (ab && ab == cd) cd = 0;
 				if (sum && (sum == ab || sum == cd)) sum = 0;
 				static const unsigned mapflags[] = { 0, 0, 0x08, 0x10, 0x18, 0x20, 0x30 };
-				unsigned flags = mapflags[rand() % 7] | (sum && rand() % 4 == 0 ? 0x04 : 0);
+				unsigned flags = mapflags[rand() % 7] | (sum && rand() % 4 == 0 ? 0x04 : 0) |
+					(!portion && rand() % 5 == 0 ? 0x02 : 0) | (!portion && rand() % 5 == 0 ? 0x01 : 0);
 				DWORD out = (flags << 12) | (sum << 8) | (ab << 4) | cd;
 				state[(portion ? D3DRS_PSALPHAINPUTS0 : D3DRS_PSRGBINPUTS0) + st] = in;
 				state[(portion ? D3DRS_PSALPHAOUTPUTS0 : D3DRS_PSRGBOUTPUTS0) + st] = out;
@@ -336,7 +391,7 @@ int main(int argc, char **argv)
 		}
 		if (rand() % 3) {
 			DWORD abcd = 0;
-			for (int k = 0; k < 4; k++) { static const unsigned r[] = { 0, 1, 2, 4, 5, 8, 9, 12, 13, 14, 15 }; abcd = (abcd << 8) | r[rand() % 11] | (rand() % 3 == 0 ? 0x10 : 0) | (rand() % 3 == 0 ? 0x20 : 0); }
+			for (int k = 0; k < 4; k++) { static const unsigned r[] = { 0, 1, 2, 3, 4, 5, 8, 9, 12, 13, 14, 15 }; abcd = (abcd << 8) | r[rand() % 12] | (rand() % 3 == 0 ? 0x10 : 0) | (rand() % 3 == 0 ? 0x20 : 0); }
 			unsigned e = (unsigned[]){ 0, 1, 4, 8, 12 }[rand() % 5], f = (unsigned[]){ 0, 2, 5, 9, 13 }[rand() % 5];
 			unsigned g = (unsigned[]){ 0x1c, 0x18, 0x14, 0x1d, 0x11 }[rand() % 5] | (rand() % 3 == 0 ? 0x20 : 0);
 			state[D3DRS_PSFINALCOMBINERINPUTSABCD] = abcd;

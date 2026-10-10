@@ -706,6 +706,8 @@ the colours as the vertices give them. */
 
 static BOOL projection_valid;
 static void efb_frame_begun(void);
+static void fog_ramp_bind(void);
+static void cull_measure(void);
 
 static void frame_begin(D3DCOLOR clear_color)
 {
@@ -733,6 +735,7 @@ static void frame_begin(D3DCOLOR clear_color)
 	GX_SetVtxDesc(GX_VA_TEX1, GX_DIRECT);
 	GX_SetVtxDesc(GX_VA_TEX2, GX_DIRECT);
 	GX_SetVtxDesc(GX_VA_TEX3, GX_DIRECT);
+	GX_SetVtxDesc(GX_VA_TEX4, GX_DIRECT);
 	GX_SetVtxAttrFmt(DEVICE_VERTEX_FORMAT, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
 	GX_SetVtxAttrFmt(DEVICE_VERTEX_FORMAT, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
 	GX_SetVtxAttrFmt(DEVICE_VERTEX_FORMAT, GX_VA_CLR1, GX_CLR_RGBA, GX_RGBA8, 0);
@@ -740,20 +743,90 @@ static void frame_begin(D3DCOLOR clear_color)
 	GX_SetVtxAttrFmt(DEVICE_VERTEX_FORMAT, GX_VA_TEX1, GX_TEX_ST, GX_F32, 0);
 	GX_SetVtxAttrFmt(DEVICE_VERTEX_FORMAT, GX_VA_TEX2, GX_TEX_ST, GX_F32, 0);
 	GX_SetVtxAttrFmt(DEVICE_VERTEX_FORMAT, GX_VA_TEX3, GX_TEX_ST, GX_F32, 0);
+	/* (the fog factor, on the fog ramp: fog_coordinate) */
+	GX_SetVtxAttrFmt(DEVICE_VERTEX_FORMAT, GX_VA_TEX4, GX_TEX_S, GX_F32, 0);
 	gx_psh_initialize();
 	GX_SetNumChans(2);
 	GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
 	GX_SetChanCtrl(GX_COLOR1A1, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
-	GX_SetNumTexGens(4);
+	GX_SetNumTexGens(5);
 	GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
 	GX_SetTexCoordGen(GX_TEXCOORD1, GX_TG_MTX2x4, GX_TG_TEX1, GX_IDENTITY);
 	GX_SetTexCoordGen(GX_TEXCOORD2, GX_TG_MTX2x4, GX_TG_TEX2, GX_IDENTITY);
 	GX_SetTexCoordGen(GX_TEXCOORD3, GX_TG_MTX2x4, GX_TG_TEX3, GX_IDENTITY);
+	GX_SetTexCoordGen(GX_TEXCOORD4, GX_TG_MTX2x4, GX_TG_TEX4, GX_IDENTITY);
 	GX_SetViewport(0.0f, 0.0f, SCREEN_WIDTH, SCREEN_HEIGHT, 0.0f, 1.0f);
 	GX_SetScissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+	{
+		static BOOL cull_measured;
+
+		if (!cull_measured)
+		{
+			cull_measured = TRUE;
+			cull_measure();
+		}
+	}
 }
 
 /* ---------- render states to GX */
+
+/* GX's cull mode that discards what is clockwise on the screen: measured
+once (cull_measure), as GX's names for its windings are not the screen's */
+static u8 gx_cull_clockwise = GX_CULL_FRONT;
+
+/* a small clockwise triangle drawn at the EFB's corner with GX_CULL_FRONT,
+and the pixel read back: drawn, then GX_CULL_FRONT keeps clockwise and
+discards counterclockwise */
+static void cull_measure(void)
+{
+	static const float corner[3][2] = { { 0.0f, 0.0f }, { 16.0f, 0.0f }, { 0.0f, 16.0f } };
+	Mtx44 matrix;
+	GXColor read = { 0, 0, 0, 0 };
+	int pass, vertex, stage;
+
+	memset(matrix, 0, sizeof(matrix));
+	matrix[0][0] = 2.0f / SCREEN_WIDTH;
+	matrix[0][3] = -1.0f;
+	matrix[1][1] = -2.0f / SCREEN_HEIGHT;
+	matrix[1][3] = 1.0f;
+	matrix[2][2] = 1.0f;
+	matrix[3][3] = 1.0f;
+	GX_LoadProjectionMtx(matrix, GX_ORTHOGRAPHIC);
+	GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+	GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
+	GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+	GX_SetColorUpdate(GX_TRUE);
+	GX_SetAlphaUpdate(GX_TRUE);
+	GX_SetNumTevStages(1);
+	GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+	GX_SetTevSwapMode(GX_TEVSTAGE0, GX_TEV_SWAP0, GX_TEV_SWAP0);
+	GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+	/* black, unculled; then white, clockwise, with GX_CULL_FRONT */
+	for (pass = 0; pass < 2; pass++)
+	{
+		GX_SetCullMode(pass ? GX_CULL_FRONT : GX_CULL_NONE);
+		GX_Begin(GX_TRIANGLES, DEVICE_VERTEX_FORMAT, 3);
+		for (vertex = 0; vertex < 3; vertex++)
+		{
+			u8 value = pass ? 255 : 0;
+
+			GX_Position3f32(corner[vertex][0], corner[vertex][1], -0.5f);
+			GX_Color4u8(value, value, value, 255);
+			GX_Color4u8(value, value, value, 255);
+			for (stage = 0; stage < 4; stage++)
+				GX_TexCoord2f32(0.0f, 0.0f);
+			GX_TexCoord1f32(1.0f);
+		}
+		GX_End();
+	}
+	GX_SetCullMode(GX_CULL_NONE);
+	GX_DrawDone();
+	GX_PeekARGB(2, 2, &read);
+	gx_cull_clockwise = read.r > 128 ? GX_CULL_BACK : GX_CULL_FRONT;
+	platform_log("Direct3D: GX_CULL_FRONT %s clockwise triangles (read back %u): clockwise is culled by %s",
+		read.r > 128 ? "keeps" : "discards", read.r, read.r > 128 ? "GX_CULL_BACK" : "GX_CULL_FRONT");
+	projection_valid = FALSE;
+}
 
 static u8 gx_compare(DWORD function)
 {
@@ -828,9 +901,14 @@ static void states_apply(void)
 		GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
 		GX_SetZCompLoc(GX_TRUE);
 	}
-	/* (the device draws the vertices as the program leaves them, in screen
-	space; their winding is not kept yet: nothing is culled) */
-	GX_SetCullMode(GX_CULL_NONE);
+	/* the cull mode names the screen winding to discard (as the OpenGL
+	port reads it); the vertices keep their screen winding on both paths */
+	switch (D3D__RenderState[D3DRS_CULLMODE])
+	{
+	case D3DCULL_CW: GX_SetCullMode(gx_cull_clockwise); break;
+	case D3DCULL_CCW: GX_SetCullMode(gx_cull_clockwise == GX_CULL_FRONT ? GX_CULL_BACK : GX_CULL_FRONT); break;
+	default: GX_SetCullMode(GX_CULL_NONE); break;
+	}
 }
 
 /* ---------- textures
@@ -1434,6 +1512,14 @@ static void tev_setup(unsigned stages)
 			textures.separate_alpha |= 1U << stage;
 		textures.contents[stage] = bound_entries[stage]->channels;
 	}
+	/* (the fog ramp is map 7, which a fourth stage's DXT3/5 alpha would
+	take: no fog then) */
+	textures.fog_color = D3D__RenderState[D3DRS_FOGCOLOR] & 0x00FFFFFFUL;
+	if (D3D__RenderState[D3DRS_FOGENABLE] && !(textures.separate_alpha & 8))
+	{
+		textures.fog = 1;
+		fog_ramp_bind();
+	}
 	if (pixel_shader_last < pixel_shader_cache_count)
 	{
 		struct pixel_shader_entry *last = &pixel_shader_cache[pixel_shader_last];
@@ -1610,6 +1696,81 @@ static void projection_load(const struct draw_projection *projection)
 	projection_valid = TRUE;
 }
 
+/* ---------- fog
+
+The pixel shaders read the fog register: its colour is D3DRS_FOGCOLOR, its
+alpha the vertex's fog factor, from the program's oFog through the fog
+table (D3DRS_FOGTABLEMODE; Halo's own programs compute the factor, table
+none). GX has no such value, so it is sent as a fifth texture coordinate,
+which reads the fog ramp (texture map 7): an intensity texture whose value
+is its coordinate. The translation (gx_psh.c) reads its alpha. */
+
+static unsigned char fog_ramp[256 * 4] __attribute__((aligned(32)));
+static BOOL fog_ramp_made;
+
+static void fog_ramp_bind(void)
+{
+	GXTexObj ramp;
+
+	if (!fog_ramp_made)
+	{
+		unsigned x, y;
+
+		/* (I8 in 8x4 tiles: a 256x4 texture, each row the same) */
+		for (y = 0; y < 4; y++)
+			for (x = 0; x < 256; x++)
+				fog_ramp[(x / 8) * 32 + y * 8 + (x % 8)] = (unsigned char)x;
+		DCFlushRange(fog_ramp, sizeof(fog_ramp));
+		fog_ramp_made = TRUE;
+	}
+	GX_InitTexObj(&ramp, fog_ramp, 256, 4, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObjFilterMode(&ramp, GX_NEAR, GX_NEAR);
+	GX_LoadTexObj(&ramp, GX_TEXMAP7);
+}
+
+static float as_float(DWORD value)
+{
+	float result;
+
+	memcpy(&result, &value, sizeof(result));
+	return result;
+}
+
+/* the vertex's fog factor (1 no fog, 0 all fog) as its coordinate on the ramp */
+static float fog_coordinate(float fog)
+{
+	float factor;
+
+	switch (D3D__RenderState[D3DRS_FOGTABLEMODE])
+	{
+	case D3DFOG_LINEAR:
+	{
+		float start = as_float(D3D__RenderState[D3DRS_FOGSTART]), end = as_float(D3D__RenderState[D3DRS_FOGEND]);
+
+		factor = end != start ? (end - fog) / (end - start) : 1.0f;
+		break;
+	}
+	case D3DFOG_EXP:
+		factor = expf(-as_float(D3D__RenderState[D3DRS_FOGDENSITY]) * fog);
+		break;
+	case D3DFOG_EXP2:
+	{
+		float density = as_float(D3D__RenderState[D3DRS_FOGDENSITY]) * fog;
+
+		factor = expf(-density * density);
+		break;
+	}
+	default:
+		factor = fog;
+		break;
+	}
+	if (!(factor >= 0.0f))
+		factor = 0.0f;
+	if (factor > 1.0f)
+		factor = 1.0f;
+	return (factor * 255.0f + 0.5f) / 256.0f;
+}
+
 static void vertex_send(const struct nv2a_cpu_output *out, const struct draw_projection *projection)
 {
 	/* the program's screen position (pixel centres on integers, as Direct3D
@@ -1638,6 +1799,7 @@ static void vertex_send(const struct nv2a_cpu_output *out, const struct draw_pro
 	GX_Color4u8(color_byte(out->d1[0]), color_byte(out->d1[1]), color_byte(out->d1[2]), color_byte(out->d1[3]));
 	for (stage = 0; stage < 4; stage++)
 		GX_TexCoord2f32(out->t[stage][0] * texcoord_scale[stage][0], out->t[stage][1] * texcoord_scale[stage][1]);
+	GX_TexCoord1f32(fog_coordinate(out->fog));
 }
 
 static u8 gx_primitive(D3DPRIMITIVETYPE type);
@@ -1974,6 +2136,7 @@ static void efb_quad(float x0, float y0, float x1, float y1, const GXColor *colo
 		GX_Color4u8(255, 255, 255, 255);
 		for (stage = 0; stage < 4; stage++)
 			GX_TexCoord2f32(corners[corner][0], corners[corner][1]);
+		GX_TexCoord1f32(1.0f);
 	}
 	GX_End();
 	if (textured)
@@ -2347,6 +2510,9 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			/* the heaps: MEM1's (newlib's), and WiiLibs' in MEM2 */
 			unsigned long used, free_bytes;
 
+			extern void dsound_wii_audio_report(void);
+
+			dsound_wii_audio_report();
 			wii_heap_usage(&used, &free_bytes);
 			platform_log("memory: MEM1 heap %lu KB used, %lu KB free", used / 1024, free_bytes / 1024);
 			wl_mem_log_usage();

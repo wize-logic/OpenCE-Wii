@@ -88,6 +88,12 @@ enum
 	_channel_alpha,
 	/* the blue, read in the alpha half */
 	_channel_blue,
+	/* the red, green or blue in all three of the colour half's channels
+	(a dot product's terms, through the swap tables or the constant's
+	selection) */
+	_channel_red_all,
+	_channel_green_all,
+	_channel_blue_all,
 };
 
 #define NO_RESOURCE 0xFF
@@ -98,6 +104,8 @@ enum
 struct operand
 {
 	unsigned char kind, index, channel, invert;
+	/* signed negation: a product with it is subtracted (TEV's SUB) */
+	unsigned char negative;
 };
 
 struct operation
@@ -113,14 +121,18 @@ struct translation
 	struct gx_psh_program *program;
 	BOOL failed;
 	const char *reason;
+	/* the second attempt, for a program the exact one does not fit: the
+	mappings that would take a register of their own, and the dot
+	products that would take three stages, approximated */
+	BOOL economical;
 	/* where each name is, for each portion */
 	struct operand names[NUMBER_OF_PORTIONS][NUMBER_OF_NAMES];
 	/* what holds each TEV register, for each portion (names and temporaries) */
 	unsigned char holders[NUMBER_OF_PORTIONS][4];
 	/* registers whose names moved this combiner stage, freed at its end */
 	unsigned char released[NUMBER_OF_PORTIONS][4];
-	/* the combiner stage being translated */
-	int stage;
+	/* the combiner stage being translated, and its portion */
+	int stage, portion_now;
 	/* the colour portion's operands of this combiner stage */
 	struct operand color_operands[4];
 	/* this combiner stage's operations, for each portion, merged at its end */
@@ -145,11 +157,12 @@ static struct operand operand(unsigned char kind, unsigned char index, unsigned 
 	result.index = index;
 	result.channel = channel;
 	result.invert = 0;
+	result.negative = 0;
 	return result;
 }
 
-static const struct operand zero = { _kind_zero, 0, 0, 0 };
-static const struct operand one = { _kind_one, 0, 0, 0 };
+static const struct operand zero = { _kind_zero, 0, 0, 0, 0 };
+static const struct operand one = { _kind_one, 0, 0, 0, 0 };
 
 /* an operand with its inversion folded where it can be (constants) */
 static struct operand folded(struct operand value)
@@ -276,8 +289,21 @@ static struct operand register_operand(struct translation *translation, unsigned
 	}
 	else if (reg == _register_fog)
 	{
-		/* (no fog: its colour black, its factor 1) */
-		result = (portion == _portion_alpha || alpha_channel) ? one : zero;
+		/* the fog register: its colour the fog's, its alpha the vertex's fog
+		factor, read from the fog ramp (GX_PSH_FOG_MAP: an intensity equal to
+		its coordinate, the factor); 1 without fog */
+		const struct gx_psh_textures *textures = translation->textures;
+
+		if (portion == _portion_alpha || alpha_channel)
+		{
+			if (!textures->fog)
+				return one;
+			result = operand(_kind_texture, GX_PSH_FOG_MAP, _channel_natural);
+			if (portion == _portion_color)
+				result.channel = _channel_alpha;
+			return result;
+		}
+		result = operand(_kind_konst, konst_slot(translation, textures->fog_color | 0xFF000000UL), _channel_natural);
 		return result;
 	}
 	else if (name >= 0)
@@ -382,8 +408,14 @@ static unsigned char konst_selection(const struct operand *value, int portion)
 	{
 		if (value->kind != _kind_konst)
 			return NO_RESOURCE;
-		return (unsigned char)(value->channel == _channel_alpha ? GX_TEV_KCSEL_K0_A + value->index :
-			GX_TEV_KCSEL_K0 + value->index);
+		switch (value->channel)
+		{
+		case _channel_alpha: return (unsigned char)(GX_TEV_KCSEL_K0_A + value->index);
+		case _channel_red_all: return (unsigned char)(GX_TEV_KCSEL_K0_R + value->index);
+		case _channel_green_all: return (unsigned char)(GX_TEV_KCSEL_K0_G + value->index);
+		case _channel_blue_all: return (unsigned char)(GX_TEV_KCSEL_K0_B + value->index);
+		default: return (unsigned char)(GX_TEV_KCSEL_K0 + value->index);
+		}
 	}
 	switch (value->kind)
 	{
@@ -410,29 +442,34 @@ static BOOL resources_add(struct resources *resources, const struct operand *val
 	}
 	if (value->kind != _kind_texture && value->kind != _kind_ras)
 		return TRUE;
-	/* the swap the read needs: 1 (alpha from blue) for a blue, 0 for the
-	alpha in the colour half, either for the colour */
-	swap = value->channel == _channel_blue ? 1 : value->channel == _channel_alpha ? 0 :
-		portion == _portion_alpha ? 0 : NO_RESOURCE;
+	/* the swap tables the read can take (gx_psh_initialize), as a set: 0
+	as it is (RGBA), 1 the red everywhere, 2 the green, 3 the blue in the
+	alpha (RGBB, the colour as it is) */
+	switch (value->channel)
+	{
+	case _channel_red_all: swap = 1u << 1; break;
+	case _channel_green_all: swap = 1u << 2; break;
+	case _channel_blue_all: case _channel_blue: swap = 1u << 3; break;
+	case _channel_alpha: swap = 1u << 0; break;
+	default: swap = portion == _portion_color ? (1u << 0) | (1u << 3) : 1u << 0; break;
+	}
 	if (value->kind == _kind_texture)
 	{
 		if (resources->texture_map != NO_RESOURCE && resources->texture_map != value->index)
 			return FALSE;
-		if (swap != NO_RESOURCE && resources->texture_swap != NO_RESOURCE && resources->texture_swap != swap)
+		if (!(resources->texture_swap & swap))
 			return FALSE;
 		resources->texture_map = value->index;
-		if (swap != NO_RESOURCE)
-			resources->texture_swap = swap;
+		resources->texture_swap &= swap;
 	}
 	else
 	{
 		if (resources->ras != NO_RESOURCE && resources->ras != value->index)
 			return FALSE;
-		if (swap != NO_RESOURCE && resources->ras_swap != NO_RESOURCE && resources->ras_swap != swap)
+		if (!(resources->ras_swap & swap))
 			return FALSE;
 		resources->ras = value->index;
-		if (swap != NO_RESOURCE)
-			resources->ras_swap = swap;
+		resources->ras_swap &= swap;
 	}
 	return TRUE;
 }
@@ -447,29 +484,40 @@ static BOOL resources_merge(struct resources *into, const struct resources *othe
 			return FALSE;
 		merged.texture_map = other->texture_map;
 	}
-	if (other->texture_swap != NO_RESOURCE)
-	{
-		if (merged.texture_swap != NO_RESOURCE && merged.texture_swap != other->texture_swap)
-			return FALSE;
-		merged.texture_swap = other->texture_swap;
-	}
+	/* (swaps are sets of the tables that serve: their intersection) */
+	merged.texture_swap &= other->texture_swap;
+	if (!merged.texture_swap)
+		return FALSE;
 	if (other->ras != NO_RESOURCE)
 	{
 		if (merged.ras != NO_RESOURCE && merged.ras != other->ras)
 			return FALSE;
 		merged.ras = other->ras;
 	}
-	if (other->ras_swap != NO_RESOURCE)
-	{
-		if (merged.ras_swap != NO_RESOURCE && merged.ras_swap != other->ras_swap)
-			return FALSE;
-		merged.ras_swap = other->ras_swap;
-	}
+	merged.ras_swap &= other->ras_swap;
+	if (!merged.ras_swap)
+		return FALSE;
 	*into = merged;
 	return TRUE;
 }
 
 static struct operand materialized(struct translation *translation, int portion, struct operand value);
+static BOOL register_available(const struct translation *translation, int portion);
+static BOOL operand_reads(const struct operand *value, int reading_portion, int reg, int pool);
+
+/* whether an operation reads a register of its portion's pool, other than
+through input `except` */
+static BOOL operation_reads(const struct operation *operation, int portion, int reg, int except)
+{
+	int index;
+
+	for (index = 0; index < 4; index++)
+	{
+		if (index != except && operand_reads(&operation->in[index], portion, reg, portion))
+			return TRUE;
+	}
+	return FALSE;
+}
 
 /* queues an operation whose inputs may clash: the ones that do are first
 computed into registers of their own */
@@ -482,11 +530,37 @@ static void emit(struct translation *translation, int portion, struct operation 
 	resources_clear(&resources);
 	for (index = 0; index < 4; index++)
 	{
-		if (!resources_add(&resources, &operation->in[index], portion))
+		if (resources_add(&resources, &operation->in[index], portion))
+			continue;
+		if (register_available(translation, portion))
 		{
 			operation->in[index] = materialized(translation, portion, operation->in[index]);
 			if (operation->in[index].kind == _kind_register)
 				temporaries[index] = operation->in[index].index;
+		}
+		else if (!operation_reads(operation, portion, operation->dest, index))
+		{
+			/* (no free register: the input goes to the operation's own
+			destination first, which nothing else it reads is) */
+			struct operation copy = operation_new(operation->dest);
+			unsigned char negative = operation->in[index].negative;
+
+			copy.in[3] = operation->in[index];
+			copy.in[3].negative = 0;
+			if (copy.in[3].invert)
+			{
+				copy.in[3].invert = 0;
+				copy.in[0] = one;
+				copy.in[2] = copy.in[3];
+				copy.in[3] = zero;
+			}
+			queue(translation, portion, &copy);
+			operation->in[index] = operand(_kind_register, operation->dest, _channel_natural);
+			operation->in[index].negative = negative;
+		}
+		else
+		{
+			fail(translation, "no free register");
 		}
 	}
 	queue(translation, portion, operation);
@@ -499,6 +573,8 @@ the caller frees it */
 static struct operand materialized(struct translation *translation, int portion, struct operand value)
 {
 	struct operation operation;
+	struct operand copy;
+	unsigned char negative;
 	int reg = register_allocate(translation, portion);
 
 	if (reg < 0)
@@ -507,6 +583,9 @@ static struct operand materialized(struct translation *translation, int portion,
 		return zero;
 	}
 	operation = operation_new(reg);
+	/* (a negation stays with the copy: -x is x's copy, negated) */
+	negative = value.negative;
+	value.negative = 0;
 	if (value.invert)
 	{
 		/* (1 - c) * a */
@@ -519,7 +598,9 @@ static struct operand materialized(struct translation *translation, int portion,
 		operation.in[3] = value;
 	}
 	emit(translation, portion, &operation);
-	return operand(_kind_register, (unsigned char)reg, _channel_natural);
+	copy = operand(_kind_register, (unsigned char)reg, _channel_natural);
+	copy.negative = negative;
+	return copy;
 }
 
 /* a combiner output's mapping (its flags' 0x38) as TEV's bias and scale */
@@ -545,6 +626,9 @@ static void emit_product(struct translation *translation, int portion, struct op
 
 	x = folded(x);
 	y = folded(y);
+	/* (a negated factor: the product subtracted from d) */
+	operation.subtract = (unsigned char)(x.negative ^ y.negative);
+	x.negative = y.negative = 0;
 	if (x.invert && y.invert)
 	{
 		x = materialized(translation, portion, x);
@@ -592,6 +676,110 @@ static void emit_product(struct translation *translation, int portion, struct op
 	register_free(translation, portion, d_temporary);
 }
 
+/* ---------- dot products
+
+dot(x, y) over red, green and blue, in all three: TEV has no dot product,
+but its swap tables put one channel of a texture or rasterized colour in
+all three (gx_psh_initialize), and its constant selections one channel of
+a constant: three products, summed in a register. Of two constants, the dot
+product is a constant. Neither can be a register (no swap reaches them): the
+product is then taken as 1, and the program marked approximate. */
+
+/* an operand's value per channel, when it is a constant */
+static BOOL constant_value(const struct translation *translation, const struct operand *value, float out[3])
+{
+	int channel;
+	float v[4];
+
+	switch (value->kind)
+	{
+	case _kind_zero: v[0] = v[1] = v[2] = v[3] = 0.0f; break;
+	case _kind_one: v[0] = v[1] = v[2] = v[3] = 1.0f; break;
+	case _kind_half: v[0] = v[1] = v[2] = v[3] = 0.5f; break;
+	case _kind_konst:
+	{
+		DWORD color = translation->program->konst[value->index];
+
+		v[0] = (float)((color >> 16) & 0xFF) / 255.0f;
+		v[1] = (float)((color >> 8) & 0xFF) / 255.0f;
+		v[2] = (float)(color & 0xFF) / 255.0f;
+		v[3] = (float)(color >> 24) / 255.0f;
+		break;
+	}
+	default:
+		return FALSE;
+	}
+	for (channel = 0; channel < 3; channel++)
+	{
+		float x = value->channel == _channel_alpha ? v[3] : v[channel];
+
+		out[channel] = value->invert ? 1.0f - x : x;
+	}
+	return TRUE;
+}
+
+/* one channel of an operand in all three of the colour's */
+static struct operand broadcast(struct operand value, int channel)
+{
+	static const unsigned char channels[3] = { _channel_red_all, _channel_green_all, _channel_blue_all };
+
+	/* (the same in every channel already: constants, alphas) */
+	if (value.kind == _kind_zero || value.kind == _kind_one || value.kind == _kind_half ||
+		value.channel == _channel_alpha)
+		return value;
+	value.channel = channels[channel];
+	return value;
+}
+
+static BOOL broadcastable(const struct operand *value)
+{
+	return value->kind != _kind_register || value->channel == _channel_alpha;
+}
+
+static struct operand emit_dot(struct translation *translation, struct operand x, struct operand y, int *temporary)
+{
+	float a[3], b[3];
+	unsigned char negative = (unsigned char)(x.negative ^ y.negative);
+	struct operand result;
+	int reg, channel;
+
+	*temporary = -1;
+	x = folded(x);
+	y = folded(y);
+	x.negative = y.negative = 0;
+	if (constant_value(translation, &x, a) && constant_value(translation, &y, b))
+	{
+		float dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+		DWORD level;
+
+		if (dot > 1.0f)
+			dot = 1.0f;
+		level = (DWORD)(dot * 255.0f + 0.5f);
+		result = operand(_kind_konst, konst_slot(translation, (level << 24) | (level << 16) | (level << 8) | level),
+			_channel_natural);
+		result.negative = negative;
+		return result;
+	}
+	if (!broadcastable(&x) || !broadcastable(&y) || translation->economical)
+	{
+		translation->program->approximate = TRUE;
+		return one;
+	}
+	reg = register_allocate(translation, translation->portion_now);
+	if (reg < 0)
+	{
+		translation->program->approximate = TRUE;
+		return one;
+	}
+	result = operand(_kind_register, (unsigned char)reg, _channel_natural);
+	for (channel = 0; channel < 3; channel++)
+		emit_product(translation, _portion_color, broadcast(x, channel), broadcast(y, channel), channel ? result : zero, 0,
+			reg);
+	*temporary = reg;
+	result.negative = negative;
+	return result;
+}
+
 /* ---------- combiner inputs */
 
 /* one general combiner input, mapped: signed mappings clamped */
@@ -599,41 +787,71 @@ static struct operand combiner_input(struct translation *translation, unsigned l
 	int *temporary)
 {
 	struct operand value = register_operand(translation, input & 0x0f, (input & 0x10) != 0, portion, stage);
+	unsigned mapping = input & 0xe0;
 	struct operation operation;
 	int reg;
 
 	*temporary = -1;
-	switch (input & 0xe0)
+	switch (mapping)
 	{
 	case 0x00: case 0xc0:
 		return value;
-	case 0x20: case 0x60:
-		/* invert; expand negate (1 - 2x) as an inversion */
+	case 0x20:
 		value.invert = 1;
 		return folded(value);
-	case 0x40: case 0x80:
-		/* expand (2x - 1), half bias (x - 0.5): clamped */
-		if (value.kind == _kind_zero || value.kind == _kind_half)
+	case 0xe0:
+		/* signed negation: -x, which a sum takes as a subtraction */
+		if (value.kind == _kind_zero)
 			return zero;
-		if (value.kind == _kind_one)
-			return input & 0x40 ? one : operand(_kind_half, 0, 0);
-		reg = register_allocate(translation, portion);
-		if (reg < 0)
-		{
-			fail(translation, "no free register");
-			return zero;
-		}
-		operation = operation_new(reg);
-		operation.in[3] = value;
-		operation.bias = GX_TB_SUBHALF;
-		operation.scale = (input & 0xe0) == 0x40 ? GX_CS_SCALE_2 : GX_CS_SCALE_1;
-		emit(translation, portion, &operation);
-		*temporary = reg;
-		return operand(_kind_register, (unsigned char)reg, _channel_natural);
+		value.negative = 1;
+		return value;
 	default:
-		/* negations: clamped, nothing */
+		break;
+	}
+	/* the mappings computed into a register of their own, clamped to [0, 1]
+	as TEV's registers are: expand 2x - 1, half bias x - 0.5, expand
+	negate 1 - 2x, half bias negate 0.5 - x */
+	if (value.kind == _kind_zero)
+		return mapping == 0x40 || mapping == 0x80 ? zero : mapping == 0x60 ? one : operand(_kind_half, 0, 0);
+	if (value.kind == _kind_one)
+		return mapping == 0x40 ? one : mapping == 0x80 ? operand(_kind_half, 0, 0) : zero;
+	if (value.kind == _kind_half)
+		return zero;
+	reg = translation->economical && (mapping == 0x60 || mapping == 0xa0) ? -1 : register_allocate(translation, portion);
+	if (reg < 0 && (mapping == 0x60 || mapping == 0xa0))
+	{
+		/* (no register: expand negate as an inversion, half bias negate as
+		0, as they were before they had one) */
+		translation->program->approximate = TRUE;
+		if (mapping == 0xa0)
+			return zero;
+		value.invert = 1;
+		return folded(value);
+	}
+	if (reg < 0)
+	{
+		fail(translation, "no free register");
 		return zero;
 	}
+	operation = operation_new(reg);
+	if (mapping == 0x40 || mapping == 0x80)
+	{
+		/* (x - 0.5), times 2 for the expansion */
+		operation.in[3] = value;
+		operation.bias = GX_TB_SUBHALF;
+		operation.scale = mapping == 0x40 ? GX_CS_SCALE_2 : GX_CS_SCALE_1;
+	}
+	else
+	{
+		/* (0.5 - x), times 2 for the expansion: TEV's subtraction, d - a */
+		operation.in[3] = operand(_kind_half, 0, 0);
+		operation.in[0] = value;
+		operation.subtract = 1;
+		operation.scale = mapping == 0x60 ? GX_CS_SCALE_2 : GX_CS_SCALE_1;
+	}
+	emit(translation, portion, &operation);
+	*temporary = reg;
+	return operand(_kind_register, (unsigned char)reg, _channel_natural);
 }
 
 /* ---------- liveness */
@@ -738,6 +956,8 @@ static BOOL product_operand(struct operand x, struct operand y, struct operand *
 		*result = zero;
 		return TRUE;
 	}
+	if (x.negative || y.negative)
+		return FALSE;
 	if (x.kind == _kind_one && !y.invert)
 	{
 		*result = y;
@@ -753,6 +973,31 @@ static BOOL product_operand(struct operand x, struct operand y, struct operand *
 
 /* whether an operand, read in a portion, reads a register of a portion's
 pool (the colour half reads the alpha pool through an alpha channel) */
+/* A*B + C*D as x/2 + y/2: one of each pair a half, the others plain (not
+inverted or negative) */
+static BOOL half_pair(const struct operand *inputs, struct operand *x, struct operand *y)
+{
+	int first, second;
+
+	for (first = 0; first < 2; first++)
+	{
+		for (second = 2; second < 4; second++)
+		{
+			const struct operand *a = &inputs[first], *c = &inputs[second];
+			const struct operand *b = &inputs[1 - first], *d = &inputs[5 - second];
+
+			if (a->kind == _kind_half && !a->invert && !a->negative && c->kind == _kind_half && !c->invert &&
+				!c->negative && !b->invert && !b->negative && !d->invert && !d->negative)
+			{
+				*x = *b;
+				*y = *d;
+				return TRUE;
+			}
+		}
+	}
+	return FALSE;
+}
+
 static BOOL operand_reads(const struct operand *value, int reading_portion, int reg, int pool)
 {
 	int read_pool = reading_portion == _portion_color && value->channel != _channel_alpha ? _portion_color :
@@ -874,8 +1119,9 @@ static void combiner_portion(struct translation *translation, int stage, int por
 	DWORD inputs = state[(portion == _portion_alpha ? D3DRS_PSALPHAINPUTS0 : D3DRS_PSRGBINPUTS0) + stage];
 	DWORD outputs = state[(portion == _portion_alpha ? D3DRS_PSALPHAOUTPUTS0 : D3DRS_PSRGBOUTPUTS0) + stage];
 	unsigned flags = (unsigned)(outputs >> 12);
-	struct operand inputs_mapped[4], later[4];
+	struct operand inputs_mapped[4], later[4], sum_saved[4];
 	int later_count;
+	int dot_temporaries[2] = { -1, -1 };
 	int temporaries[4];
 	unsigned long ab_name = (outputs >> 4) & 0x0f, cd_name = outputs & 0x0f, sum_name = (outputs >> 8) & 0x0f;
 	int dest, index;
@@ -910,11 +1156,18 @@ static void combiner_portion(struct translation *translation, int stage, int por
 			inputs_mapped[index] = combiner_input(translation, input, portion, stage, &temporaries[index]);
 		}
 	}
-	/* (a dot product, of a bump map and a light, as 1: unlit) */
+	/* dot products: into a register of their own (emit_dot), then a
+product with 1 */
 	if (portion == _portion_color && (flags & 0x02))
-		inputs_mapped[0] = inputs_mapped[1] = one;
+	{
+		inputs_mapped[0] = emit_dot(translation, inputs_mapped[0], inputs_mapped[1], &dot_temporaries[0]);
+		inputs_mapped[1] = one;
+	}
 	if (portion == _portion_color && (flags & 0x01))
-		inputs_mapped[2] = inputs_mapped[3] = one;
+	{
+		inputs_mapped[2] = emit_dot(translation, inputs_mapped[2], inputs_mapped[3], &dot_temporaries[1]);
+		inputs_mapped[3] = one;
+	}
 	if (portion == _portion_color)
 		memcpy(translation->color_operands, inputs_mapped, sizeof(inputs_mapped));
 	/* what the writes after the sum still read: A and B for A*B's own
@@ -955,16 +1208,25 @@ static void combiner_portion(struct translation *translation, int stage, int por
 			sum_name = 0;
 		}
 	}
+	/* (the sum may order its products: the inputs as they were after it) */
+	memcpy(sum_saved, inputs_mapped, sizeof(sum_saved));
 	if (name_of(sum_name) >= 0)
 	{
 		if (flags & 0x04)
 		{
 			/* the mux: r0's alpha chooses, as a blend of the two (each product
-			in a register of its own, unless it is a value as it is) */
+			in a register of its own, unless it is a value as it is; a
+			negative product clamps to 0 there) */
 			struct operand ab, cd;
 			int ab_register = -1, cd_register = -1;
 			struct operand chooser = translation->names[_portion_alpha][_name_r0];
 			struct operation operation;
+
+			for (index = 0; index < 4; index++)
+			{
+				if (inputs_mapped[index].negative)
+					translation->program->approximate = TRUE;
+			}
 
 			if (!product_operand(inputs_mapped[0], inputs_mapped[1], &ab))
 			{
@@ -1017,8 +1279,45 @@ static void combiner_portion(struct translation *translation, int stage, int por
 			struct operand ab;
 			int ab_register = -1;
 			unsigned mapping = flags & 0x38;
+			BOOL ab_negative = (inputs_mapped[0].negative ^ inputs_mapped[1].negative) &&
+				inputs_mapped[0].kind != _kind_zero && inputs_mapped[1].kind != _kind_zero;
+			BOOL cd_negative = (inputs_mapped[2].negative ^ inputs_mapped[3].negative) &&
+				inputs_mapped[2].kind != _kind_zero && inputs_mapped[3].kind != _kind_zero;
 
-			if (!memcmp(&inputs_mapped[0], &inputs_mapped[2], 2 * sizeof(inputs_mapped[0])) &&
+			/* (a negative product is the one subtracted: second; both
+			negative, the sum is below 0, which clamps to 0) */
+			if (ab_negative && cd_negative)
+			{
+				inputs_mapped[0] = inputs_mapped[2] = zero;
+			}
+			else if (ab_negative)
+			{
+				struct operand swap[2];
+
+				memcpy(swap, inputs_mapped, sizeof(swap));
+				memcpy(inputs_mapped, inputs_mapped + 2, sizeof(swap));
+				memcpy(inputs_mapped + 2, swap, sizeof(swap));
+			}
+
+			struct operand half_x, half_y;
+
+			if (half_pair(inputs_mapped, &half_x, &half_y))
+			{
+				/* (x/2 + y/2: TEV's blend of the two, by a half) */
+				struct operation operation;
+
+				dest = output_register(translation, portion, sum_name, later, later_count);
+				if (dest >= 0)
+				{
+					operation = operation_new(dest);
+					operation.in[0] = half_x;
+					operation.in[1] = half_y;
+					operation.in[2] = operand(_kind_half, 0, 0);
+					output_mapping(&operation, flags);
+					emit(translation, portion, &operation);
+				}
+			}
+			else if (!memcmp(&inputs_mapped[0], &inputs_mapped[2], 2 * sizeof(inputs_mapped[0])) &&
 				(mapping == 0 || mapping == 0x10 || mapping == 0x30))
 			{
 				/* (A*B + A*B: A*B twice) */
@@ -1029,8 +1328,7 @@ static void combiner_portion(struct translation *translation, int stage, int por
 						(flags & ~0x38u) | (mapping == 0 ? 0x10u : mapping == 0x10 ? 0x20u : 0x00u), dest);
 				}
 			}
-			else if (product_operand(inputs_mapped[0], inputs_mapped[1], &ab) && ab.kind != _kind_texture &&
-				ab.kind != _kind_ras && ab.kind != _kind_konst)
+			else if (product_operand(inputs_mapped[0], inputs_mapped[1], &ab))
 			{
 				/* (A*B is a value as it is: the sum's d) */
 				dest = output_register(translation, portion, sum_name, later, later_count);
@@ -1071,20 +1369,21 @@ static void combiner_portion(struct translation *translation, int stage, int por
 			}
 		}
 	}
+	memcpy(inputs_mapped, sum_saved, sizeof(sum_saved));
 	/* a product that is an operand as it is, unmapped, is that operand: the
 	name stands for it, no stage made (not a register of the other pool) */
 	if (!(flags & 0x38))
 	{
 		struct operand value;
 
-		if (name_of(ab_name) >= 0 && !(portion == _portion_color && (flags & 0x02)) &&
-			product_operand(inputs_mapped[0], inputs_mapped[1], &value) && aliasable(&value, portion))
+		if (name_of(ab_name) >= 0 && product_operand(inputs_mapped[0], inputs_mapped[1], &value) &&
+			aliasable(&value, portion))
 		{
 			name_alias(translation, portion, ab_name, value);
 			ab_name = 0;
 		}
-		if (name_of(cd_name) >= 0 && !(portion == _portion_color && (flags & 0x01)) &&
-			product_operand(inputs_mapped[2], inputs_mapped[3], &value) && aliasable(&value, portion))
+		if (name_of(cd_name) >= 0 && product_operand(inputs_mapped[2], inputs_mapped[3], &value) &&
+			aliasable(&value, portion))
 		{
 			name_alias(translation, portion, cd_name, value);
 			cd_name = 0;
@@ -1123,6 +1422,8 @@ static void combiner_portion(struct translation *translation, int stage, int por
 	}
 	for (index = 0; index < 4; index++)
 		register_free(translation, portion, temporaries[index]);
+	register_free(translation, portion, dot_temporaries[0]);
+	register_free(translation, portion, dot_temporaries[1]);
 }
 
 /* ---------- stages */
@@ -1141,8 +1442,11 @@ static unsigned char input_code(const struct operand *value, int portion)
 		case _kind_half: return GX_CC_HALF;
 		case _kind_register:
 			return value->channel == _channel_alpha ? alpha_registers[value->index & 3] : color_registers[value->index & 3];
-		case _kind_texture: return value->channel == _channel_alpha ? GX_CC_TEXA : GX_CC_TEXC;
-		case _kind_ras: return value->channel == _channel_alpha ? GX_CC_RASA : GX_CC_RASC;
+		/* (the blue everywhere: the alpha, which table 3 makes the blue) */
+		case _kind_texture:
+			return value->channel == _channel_alpha || value->channel == _channel_blue_all ? GX_CC_TEXA : GX_CC_TEXC;
+		case _kind_ras:
+			return value->channel == _channel_alpha || value->channel == _channel_blue_all ? GX_CC_RASA : GX_CC_RASC;
 		case _kind_konst: return GX_CC_KONST;
 		default: return GX_CC_ZERO;
 		}
@@ -1189,6 +1493,19 @@ static void stage_half(struct gx_psh_stage *stage, const struct operation *opera
 	}
 }
 
+/* the first of the swap tables a set allows */
+static unsigned char swap_table(unsigned char tables)
+{
+	unsigned char table;
+
+	for (table = 0; table < 4; table++)
+	{
+		if (tables & (1u << table))
+			return (unsigned char)(GX_TEV_SWAP0 + table);
+	}
+	return GX_TEV_SWAP0;
+}
+
 static BOOL stage_append(struct translation *translation, const struct operation *color,
 	const struct operation *alpha)
 {
@@ -1219,9 +1536,9 @@ static BOOL stage_append(struct translation *translation, const struct operation
 		stage->konst_alpha = GX_TEV_KASEL_1;
 	}
 	stage->texture_map = resources.texture_map;
-	stage->texture_swap = resources.texture_swap == 1 ? GX_TEV_SWAP1 : GX_TEV_SWAP0;
+	stage->texture_swap = swap_table(resources.texture_swap);
 	stage->ras_channel = resources.ras;
-	stage->ras_swap = resources.ras_swap == 1 ? GX_TEV_SWAP1 : GX_TEV_SWAP0;
+	stage->ras_swap = swap_table(resources.ras_swap);
 	/* (a half with nothing to do keeps PREV as it is) */
 	nop = operation_new(0);
 	if (color)
@@ -1431,8 +1748,8 @@ static void final_combiner(struct translation *translation)
 
 /* ---------- public code */
 
-BOOL gx_psh_translate(const DWORD *render_state, const struct gx_psh_textures *textures,
-	struct gx_psh_program *program)
+static BOOL translate_once(const DWORD *render_state, const struct gx_psh_textures *textures,
+	struct gx_psh_program *program, BOOL economical)
 {
 	static struct translation translation;
 	unsigned long combiner_count = render_state[D3DRS_PSCOMBINERCOUNT] & 0xff;
@@ -1444,6 +1761,7 @@ BOOL gx_psh_translate(const DWORD *render_state, const struct gx_psh_textures *t
 	translation.state = render_state;
 	translation.textures = textures;
 	translation.program = program;
+	translation.economical = economical;
 	names_initialize(&translation);
 	if (combiner_count > 8)
 		combiner_count = 8;
@@ -1452,7 +1770,10 @@ BOOL gx_psh_translate(const DWORD *render_state, const struct gx_psh_textures *t
 		memset(translation.color_operands, 0, sizeof(translation.color_operands));
 		translation.stage = (int)stage;
 		for (portion = 0; portion < NUMBER_OF_PORTIONS; portion++)
+		{
+			translation.portion_now = portion;
 			combiner_portion(&translation, (int)stage, portion);
+		}
 		queues_flush(&translation);
 		names_retire(&translation, (int)stage);
 	}
@@ -1460,6 +1781,13 @@ BOOL gx_psh_translate(const DWORD *render_state, const struct gx_psh_textures *t
 		final_combiner(&translation);
 	program->reason = translation.failed ? translation.reason : NULL;
 	return !translation.failed && program->stage_count > 0;
+}
+
+BOOL gx_psh_translate(const DWORD *render_state, const struct gx_psh_textures *textures,
+	struct gx_psh_program *program)
+{
+	return translate_once(render_state, textures, program, FALSE) ||
+		translate_once(render_state, textures, program, TRUE);
 }
 
 void gx_psh_apply(const struct gx_psh_program *program)
@@ -1480,8 +1808,10 @@ void gx_psh_apply(const struct gx_psh_program *program)
 		u8 tev = (u8)(GX_TEVSTAGE0 + index);
 
 		GX_SetTevOrder(tev,
-			stage->texture_map == NO_RESOURCE ? GX_TEXCOORDNULL : (u8)(GX_TEXCOORD0 + (stage->texture_map & 3)),
-			stage->texture_map == NO_RESOURCE ? GX_TEXMAP_NULL : (u8)(GX_TEXMAP0 + stage->texture_map),
+			stage->texture_map == NO_RESOURCE ? GX_TEXCOORDNULL :
+				stage->texture_map == GX_PSH_FOG_MAP ? GX_PSH_FOG_TEXCOORD : (u8)(GX_TEXCOORD0 + (stage->texture_map & 3)),
+			stage->texture_map == NO_RESOURCE ? GX_TEXMAP_NULL :
+				stage->texture_map == GX_PSH_FOG_MAP ? GX_PSH_FOG_TEXMAP : (u8)(GX_TEXMAP0 + stage->texture_map),
 			stage->ras_channel == NO_RESOURCE ? GX_COLORNULL : stage->ras_channel ? GX_COLOR1A1 : GX_COLOR0A0);
 		GX_SetTevSwapMode(tev, stage->ras_swap, stage->texture_swap);
 		GX_SetTevKColorSel(tev, stage->konst_color);
@@ -1496,5 +1826,7 @@ void gx_psh_apply(const struct gx_psh_program *program)
 void gx_psh_initialize(void)
 {
 	GX_SetTevSwapModeTable(GX_TEV_SWAP0, GX_CH_RED, GX_CH_GREEN, GX_CH_BLUE, GX_CH_ALPHA);
-	GX_SetTevSwapModeTable(GX_TEV_SWAP1, GX_CH_RED, GX_CH_GREEN, GX_CH_BLUE, GX_CH_BLUE);
+	GX_SetTevSwapModeTable(GX_TEV_SWAP1, GX_CH_RED, GX_CH_RED, GX_CH_RED, GX_CH_RED);
+	GX_SetTevSwapModeTable(GX_TEV_SWAP2, GX_CH_GREEN, GX_CH_GREEN, GX_CH_GREEN, GX_CH_GREEN);
+	GX_SetTevSwapModeTable(GX_TEV_SWAP3, GX_CH_RED, GX_CH_GREEN, GX_CH_BLUE, GX_CH_BLUE);
 }

@@ -15,6 +15,11 @@ enum
 {
 	GX_PSH_MAXIMUM_STAGES = 16,
 	GX_PSH_TEXTURES = 4,
+	/* the fog ramp's texture map, as the translation names it: GX's map 7,
+	read at texture coordinate 4 (the vertex's fog factor) */
+	GX_PSH_FOG_MAP = 8,
+	GX_PSH_FOG_TEXMAP = 7,
+	GX_PSH_FOG_TEXCOORD = 4,
 };
 
 /* what a texture stage's texture holds */
@@ -35,6 +40,9 @@ struct gx_psh_textures
 	/* the stages whose alpha is in the texture map four after (DXT3, DXT5) */
 	unsigned separate_alpha;
 	unsigned char contents[GX_PSH_TEXTURES];
+	/* fog (D3DRS_FOGENABLE, its ramp bound) and its colour */
+	unsigned char fog;
+	DWORD fog_color;
 };
 
 struct gx_psh_stage
