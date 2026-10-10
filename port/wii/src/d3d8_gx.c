@@ -1852,6 +1852,14 @@ static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct d
 		(unsigned long)D3D__RenderState[D3DRS_PSCOMBINERCOUNT], (unsigned long)D3D__RenderState[D3DRS_PSFINALCOMBINERINPUTSABCD],
 		(unsigned long)D3D__RenderState[D3DRS_PSFINALCOMBINERINPUTSEFG], (unsigned long)D3D__RenderState[D3DRS_PSTEXTUREMODES],
 		textures);
+	platform_log("  constants: c0 %08lx c1 %08lx (stage 0), final c0 %08lx c1 %08lx, fog %lu %08lx, shader %s",
+		(unsigned long)D3D__RenderState[D3DRS_PSCONSTANT0_0], (unsigned long)D3D__RenderState[D3DRS_PSCONSTANT1_0],
+		(unsigned long)D3D__RenderState[D3DRS_PSFINALCOMBINERCONSTANT0],
+		(unsigned long)D3D__RenderState[D3DRS_PSFINALCOMBINERCONSTANT1],
+		(unsigned long)D3D__RenderState[D3DRS_FOGENABLE], (unsigned long)D3D__RenderState[D3DRS_FOGCOLOR],
+		pixel_shader_last < pixel_shader_cache_count ?
+			(!pixel_shader_cache[pixel_shader_last].usable ? "beyond GX (texture times colour)" :
+				pixel_shader_cache[pixel_shader_last].program.approximate ? "approximate" : "exact") : "?");
 }
 
 /* a draw's vertices: each fetched (its inputs), run and sent */

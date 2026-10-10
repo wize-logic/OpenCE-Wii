@@ -741,6 +741,7 @@ static struct operand emit_dot(struct translation *translation, struct operand x
 	float a[3], b[3];
 	unsigned char negative = (unsigned char)(x.negative ^ y.negative);
 	struct operand result;
+	unsigned terms;
 	int reg, channel;
 
 	*temporary = -1;
@@ -760,7 +761,20 @@ static struct operand emit_dot(struct translation *translation, struct operand x
 		result.negative = negative;
 		return result;
 	}
-	if (!broadcastable(&x) || !broadcastable(&y) || translation->economical)
+	/* (the terms whose constant is 0 are left out: a constant of one
+	channel, as the game's are to pick a channel, is one stage) */
+	terms = 0;
+	for (channel = 0; channel < 3; channel++)
+	{
+		BOOL a_constant = constant_value(translation, &x, a), b_constant = constant_value(translation, &y, b);
+
+		if (!((a_constant && a[channel] == 0.0f) || (b_constant && b[channel] == 0.0f)))
+			terms |= 1u << channel;
+	}
+	if (!terms)
+		return zero;
+	if (!broadcastable(&x) || !broadcastable(&y) ||
+		(translation->economical && (terms & (terms - 1))))
 	{
 		translation->program->approximate = TRUE;
 		return one;
@@ -772,9 +786,18 @@ static struct operand emit_dot(struct translation *translation, struct operand x
 		return one;
 	}
 	result = operand(_kind_register, (unsigned char)reg, _channel_natural);
-	for (channel = 0; channel < 3; channel++)
-		emit_product(translation, _portion_color, broadcast(x, channel), broadcast(y, channel), channel ? result : zero, 0,
-			reg);
+	{
+		BOOL first = TRUE;
+
+		for (channel = 0; channel < 3; channel++)
+		{
+			if (!(terms & (1u << channel)))
+				continue;
+			emit_product(translation, _portion_color, broadcast(x, channel), broadcast(y, channel), first ? zero : result,
+				0, reg);
+			first = FALSE;
+		}
+	}
 	*temporary = reg;
 	result.negative = negative;
 	return result;

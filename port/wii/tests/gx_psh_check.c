@@ -324,6 +324,13 @@ static int game_programs(void)
 			textures.present = 7;
 			textures.separate_alpha = separate;
 			state[D3DRS_PSCOMBINERCOUNT] = programs[index].count;
+			/* (the constants the menu gives the first: a channel each to pick) */
+			if (index == 0)
+			{
+				state[D3DRS_PSCONSTANT0_0] = 0x00ff0000;
+				state[D3DRS_PSCONSTANT1_0] = 0x0000ff00;
+				state[D3DRS_PSFINALCOMBINERCONSTANT0] = 0xffffffff;
+			}
 			state[D3DRS_PSFINALCOMBINERINPUTSABCD] = programs[index].abcd;
 			state[D3DRS_PSFINALCOMBINERINPUTSEFG] = programs[index].efg;
 			for (unsigned stage = 0; stage < (programs[index].count & 0xff); stage++)
@@ -353,6 +360,11 @@ static int game_programs(void)
 			{
 				printf("game program %d (separate alphas %x): not translated (%s)\n", index, separate, program.reason);
 				failures++;
+			}
+			else if (separate == 0)
+			{
+				printf("game program %d: %u stages, %s\n", index, program.stage_count,
+					program.approximate ? "approximate" : "exact");
 			}
 		}
 	}
