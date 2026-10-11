@@ -4402,7 +4402,8 @@ static BOOL sphere_bake(const struct texture_entry *world, const float frame[3][
 	enum { GRID = 24, SIZE = GX_LIGHTING_SPHERE_SIZE };
 	unsigned which, row, column;
 	Mtx44 matrix;
-	static float coordinates[GRID + 1][GRID + 1][2];
+	static float coordinates[GRID + 1][GRID + 1][2], points[GRID + 1][GRID + 1][3];
+	static BOOL points_made;
 	void *buffer = NULL;
 
 	if (sphere_bakes_frame != device.frames)
@@ -4437,10 +4438,18 @@ static BOOL sphere_bake(const struct texture_entry *world, const float frame[3][
 		sphere_bakes_in_frame++;
 		sphere_bakes_made++;
 
-		/* each grid point's place on the world's sphere map */
+		/* each grid point's place on the world's sphere map (its point on the
+		sphere found once) */
+		if (!points_made)
+		{
+			for (row = 0; row <= GRID; row++)
+				for (column = 0; column <= GRID; column++)
+					gx_lighting_sphere_point((float)column / GRID, (float)row / GRID, points[row][column]);
+			points_made = TRUE;
+		}
 		for (row = 0; row <= GRID; row++)
 			for (column = 0; column <= GRID; column++)
-				gx_lighting_sphere_texel(frame, scale, (float)column / GRID, (float)row / GRID, coordinates[row][column]);
+				gx_lighting_sphere_point_texel(frame, scale, points[row][column], coordinates[row][column]);
 		/* the grid over the rows below the back buffer, the world's sphere map
 		(texture map 3) on it */
 		GX_SetViewport(0.0f, (f32)SPHERE_BAKE_ROW, SIZE, SIZE, 0.0f, 1.0f);
@@ -4608,7 +4617,7 @@ static void lit_sphere_matrix(const float rows[3][4], u32 id)
 	int row, column, k;
 
 	for (row = 0; row < 3; row++)
-		scale += sqrtf(rows[row][0] * rows[row][0] + rows[row][1] * rows[row][1] + rows[row][2] * rows[row][2]);
+		scale += nv2a_sqrtf(rows[row][0] * rows[row][0] + rows[row][1] * rows[row][1] + rows[row][2] * rows[row][2]);
 	length = scale > 1.0e-12f ? 3.0f / scale : 0.0f;
 	memset(matrix, 0, sizeof(matrix));
 	for (row = 0; row < 2; row++)
