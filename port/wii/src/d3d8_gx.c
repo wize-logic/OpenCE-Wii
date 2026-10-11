@@ -5575,12 +5575,30 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		/* (the device set GX behind WiiLibs' shadow) */
 		wl_gx_invalidate_shadow();
 		/* (GX's draws finished first, timed apart from the copy to the
-		display and the wait for its retrace, which wl_gx_end_frame makes) */
+		display, which wl_gx_end_frame makes: it waits for a free display
+		buffer, not for the retrace; the retrace interrupt shows the frame) */
 		(void)wl_gx_sync();
 		timing.present_gx += wl_platform_time_us() - started;
 		/* the display copy's own state, whatever the frame's copies to
 		textures and drawing below the back buffer (sphere_bake) left */
 		display_copy_restore();
+		/* each frame on the screen for as many retraces as the game's
+		presentation interval asks (two: 30 Hz), as the Xbox's display does;
+		an early frame waits in WiiLibs' display queue, not here. GX still
+		finishes each frame before Present returns: D3DResource_IsBusy and
+		D3DDevice_IsBusy say FALSE, and what the frame drew from (the game's
+		textures and vertex buffers, the palettes and fog ramp rewritten in
+		place, the textures evicted during it) is reused straight after */
+		{
+			static uint32_t interval;
+			uint32_t wanted = device.presentation.FullScreen_PresentationInterval == D3DPRESENT_INTERVAL_TWO ? 2 : 1;
+
+			if (wanted != interval)
+			{
+				wl_platform_video_set_interval(wanted);
+				interval = wanted;
+			}
+		}
 		wl_gx_end_frame();
 		device.frame_open = FALSE;
 		/* (the frame drawn: the textures evicted during it can go) */
@@ -5707,9 +5725,22 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 					(unsigned long)(timing.present / 1000 / STATISTICS_FRAMES),
 					(unsigned long)((now - timing.window_start - timing.draws - timing.textures - timing.pixel_shaders -
 						timing.present) / 1000 / STATISTICS_FRAMES));
-				platform_log("Direct3D: the end of the frame: GX's draws %lu ms, the copy and the display's retrace %lu",
+				platform_log("Direct3D: the end of the frame: GX's draws %lu ms, the copy and a free display buffer %lu",
 					(unsigned long)(timing.present_gx / 1000 / STATISTICS_FRAMES),
 					(unsigned long)((timing.present - timing.present_gx) / 1000 / STATISTICS_FRAMES));
+				{
+					static WlVideoStats last;
+					WlVideoStats video;
+
+					wl_platform_video_stats(&video);
+					platform_log("Direct3D: the display: %lu frames shown (%lu late), every %lu retraces at the "
+						"last; %lu waits for a free buffer, %lu ms in all, the longest %lu",
+						(unsigned long)(video.shown - last.shown), (unsigned long)(video.late - last.late),
+						(unsigned long)video.last_gap, (unsigned long)(video.buffer_waits - last.buffer_waits),
+						(unsigned long)((video.buffer_wait_us - last.buffer_wait_us) / 1000),
+						(unsigned long)(video.buffer_wait_us_max / 1000));
+					last = video;
+				}
 			}
 			memset(&timing, 0, sizeof(timing));
 			timing.window_start = now;
