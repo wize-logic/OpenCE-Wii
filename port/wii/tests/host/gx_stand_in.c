@@ -854,10 +854,14 @@ void VIDEO_WaitVSync(void)
 {
 }
 
+/* (a line at a time, as libogc's: dcbf has no effect in qemu's user mode, but
+counts) */
 void PPCDCacheFlushAsync(const volatile void *buffer, size_t size)
 {
-	(void)buffer;
-	(void)size;
+	unsigned long address = (unsigned long)buffer & ~31UL, end = (unsigned long)buffer + size;
+
+	for (; address < end; address += 32)
+		__asm__ volatile("dcbf 0, %0" : : "r"(address) : "memory");
 }
 
 void PPCDCacheInvalidate(const volatile void *buffer, size_t size)

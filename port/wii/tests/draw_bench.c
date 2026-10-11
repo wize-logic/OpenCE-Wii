@@ -825,8 +825,9 @@ int main(int argc, char **argv)
 	}
 	if (recording)
 		print("errors: %lu vertex writes outside a primitive or primitives left short\n", gx_stand_in_errors());
-#ifdef KEY_RECORDS
-	print("node keys: %lu kept, %lu made, %lu bytes\n", key_records_kept, key_records_made, key_record_bytes);
+#ifdef INDEX_RECORDS
+	print("index records: ranges %lu kept, %lu found; node keys %lu kept, %lu made; %lu bytes\n", ranges_kept,
+		ranges_found, key_records_kept, key_records_made, index_record_bytes);
 #endif
 	print("hardware: %lu draws, %lu matrices kept, %lu keyed, %lu blended, %lu lit, %lu refused\n", hardware_draws,
 		hardware_cache_hits, hardware_keyed_draws, hardware_blended_draws, lit_draws, lit_refused);

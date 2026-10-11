@@ -353,6 +353,32 @@ void nv2a_cpu_analyze_uniform(const struct nv2a_cpu_program *program, unsigned l
 	memcpy(dependencies->position, registers.position, sizeof(dependencies->position));
 }
 
+unsigned long nv2a_cpu_live_inputs(const struct nv2a_cpu_dependencies *dependencies, unsigned live)
+{
+	unsigned long reads = 0;
+	int component, stage;
+
+	for (component = 0; component < 4; component++)
+	{
+		if (live & NV2A_CPU_LIVE_POSITION)
+			reads |= dependencies->clip[component] | dependencies->position[component];
+		if (live & NV2A_CPU_LIVE_D0)
+			reads |= dependencies->d0[component];
+		if (live & NV2A_CPU_LIVE_D1)
+			reads |= dependencies->d1[component];
+		if (live & NV2A_CPU_LIVE_BACK)
+			reads |= dependencies->b0[component] | dependencies->b1[component];
+		for (stage = 0; stage < 4; stage++)
+			if (live & (NV2A_CPU_LIVE_T0 << stage))
+				reads |= dependencies->t[stage][component];
+	}
+	if (live & NV2A_CPU_LIVE_FOG)
+		reads |= dependencies->fog;
+	if (live & NV2A_CPU_LIVE_POINT_SIZE)
+		reads |= dependencies->point_size;
+	return reads & 0xFFFF;
+}
+
 unsigned long nv2a_cpu_hash(const DWORD *instructions, unsigned long instruction_count)
 {
 	unsigned long hash = 2166136261UL, index;

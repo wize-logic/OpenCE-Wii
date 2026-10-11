@@ -7,7 +7,9 @@ each of the game's programs is run as its function and on the interpreter
 (port/wii/src/nv2a_cpu.c) over random constants and inputs, and the two
 must give the same outputs, bit for bit; so must its function for the
 outputs a draw reads (nv2a_cpu_run_live), in those outputs, for random sets
-of them. A model's vertex on one node (weight 1 on its first index, or 0
+of them; and for the inputs the analysis says some outputs read
+(nv2a_cpu_live_inputs: d3d8_gx.c fetches no others), those outputs must be
+the same whatever the others hold. A model's vertex on one node (weight 1 on its first index, or 0
 on its second) must give every output that the node with weight 1 alone
 does, whatever the other index (port/wii/src/d3d8_gx.c keys such vertices
 by their node). Then the functions' own arithmetic: nv2a_sqrtf's
@@ -136,7 +138,7 @@ int main(int argc, char **argv)
 	static DWORD words[65536];
 	static float constants[NV2A_CPU_CONSTANT_COUNT][4], inputs[NV2A_CPU_INPUT_COUNT][4];
 	static struct nv2a_cpu_program program;
-	unsigned long count = 0, position, checked = 0, differ = 0, native = 0, one_node_checked = 0;
+	unsigned long count = 0, position, checked = 0, differ = 0, native = 0, one_node_checked = 0, inputs_checked = 0;
 	char line[512];
 	int in_comment = 0;
 	FILE *in;
@@ -240,6 +242,47 @@ int main(int argc, char **argv)
 					break;
 				}
 			}
+			/* the inputs the analysis says those outputs read: the outputs the
+			same whatever the others hold (d3d8_gx.c fetches no more) */
+			{
+				static float others[NV2A_CPU_INPUT_COUNT][4];
+				static struct nv2a_cpu_dependencies dependencies;
+				struct nv2a_cpu_output first, second;
+				unsigned live = (unsigned)rand() & NV2A_CPU_LIVE_ALL;
+				unsigned long reads;
+
+				if (!trial)
+					nv2a_cpu_analyze(&program, &dependencies);
+				reads = nv2a_cpu_live_inputs(&dependencies, live);
+				for (row = 0; row < NV2A_CPU_INPUT_COUNT; row++)
+					for (component = 0; component < 4; component++)
+						others[row][component] = (reads & (1UL << row)) ? inputs[row][component] : random_float();
+				nv2a_cpu_run_live(&program, (const float (*)[4])constants, (const float (*)[4])inputs, 1.0f, &first, live);
+				nv2a_cpu_run_live(&program, (const float (*)[4])constants, (const float (*)[4])others, 1.0f, &second, live);
+				inputs_checked++;
+				if (!live_same(&first, &second, live))
+				{
+					printf("program %08lx: the outputs %03x read more than inputs %04lx\n",
+						nv2a_cpu_hash(instructions, instruction_count), live, reads);
+					differ++;
+					break;
+				}
+				reads = nv2a_cpu_live_inputs(&dependencies, NV2A_CPU_LIVE_D0 | NV2A_CPU_LIVE_D1 | NV2A_CPU_LIVE_FOG);
+				for (row = 0; row < NV2A_CPU_INPUT_COUNT; row++)
+					for (component = 0; component < 4; component++)
+						others[row][component] = (reads & (1UL << row)) ? inputs[row][component] : random_float();
+				memset(&first, 0, sizeof(first));
+				memset(&second, 0, sizeof(second));
+				nv2a_cpu_run_colors(&program, (const float (*)[4])constants, (const float (*)[4])inputs, &first);
+				nv2a_cpu_run_colors(&program, (const float (*)[4])constants, (const float (*)[4])others, &second);
+				if (!live_same(&first, &second, NV2A_CPU_LIVE_D0 | NV2A_CPU_LIVE_D1 | NV2A_CPU_LIVE_FOG))
+				{
+					printf("program %08lx: its colours read more than inputs %04lx\n",
+						nv2a_cpu_hash(instructions, instruction_count), reads);
+					differ++;
+					break;
+				}
+			}
 			/* its colour-only function: the same colours and fog */
 			{
 				struct nv2a_cpu_output colors;
@@ -290,8 +333,8 @@ int main(int argc, char **argv)
 			}
 		}
 	}
-	printf("%lu programs with functions, %lu runs compared, %lu vertices on one node, %lu differ\n", native, checked,
-		one_node_checked, differ);
+	printf("%lu programs with functions, %lu runs compared, %lu vertices on one node, %lu runs of the inputs read alone, "
+		"%lu differ\n", native, checked, one_node_checked, inputs_checked, differ);
 	differ += arithmetic_check();
 	return differ != 0;
 }

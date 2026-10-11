@@ -118,6 +118,9 @@ struct nv2a_cpu_dependencies
 
 void nv2a_cpu_run_colors(const struct nv2a_cpu_program *program, const float (*constants)[4], const float (*inputs)[4],
 	struct nv2a_cpu_output *output);
+/* the input registers the outputs in live (NV2A_CPU_LIVE_...) read, as the
+analysis found them (bit n: v[n]): the others may hold anything */
+unsigned long nv2a_cpu_live_inputs(const struct nv2a_cpu_dependencies *dependencies, unsigned live);
 void nv2a_cpu_analyze(const struct nv2a_cpu_program *program, struct nv2a_cpu_dependencies *dependencies);
 void nv2a_cpu_analyze_uniform(const struct nv2a_cpu_program *program, unsigned long uniform,
 	struct nv2a_cpu_dependencies *dependencies);

@@ -4168,92 +4168,186 @@ static BOOL node_keys_find(const struct stream_fetch *fetch, UINT count, const u
 	return TRUE;
 }
 
-/* ---------- what node_keys found, kept
+/* ---------- what a draw's indices make, kept
 
-A model's part is drawn with the same indices and vertices in each of its
-passes and frames, and node_keys_find's two passes over its indices are
-most of its setup (some 50 instructions an index). What they found is kept
-by the indices (their address and count, and the base vertex) and the node
-indices' and weights' elements, with copies of the indices and of the node
-indices and weight of each vertex from the least index to the most: a
-later draw whose copies are still equal takes the keys as they were, for
-about a word an index and two a vertex compared. A buffer the game writes
-(its dynamic ones, the decals') only fails the comparison. */
-#define KEY_RECORDS 128
-#define KEY_RECORD_BYTES (256UL * 1024UL)
+Every indexed draw in hardware finds its indices' range (the arrays it
+flushes for GX, GX's 16-bit indices), and a model's node_keys_find two
+passes over its indices: each vertex's value from its node indices and
+weight, and the values that take the draw's matrices (some 50 instructions
+an index). The structure's sections are drawn with the same indices each
+frame (written again into the game's dynamic triangles), and a model's part
+with the same indices and vertices in each of its passes and frames. So
+what they make is kept, by the indices' address and count and the base
+vertex, with a hash of the indices (two lanes of 32-bit FNV-1, over their
+words in turn): the range, and for a model's part, its keys, with a copy of the
+node indices and weight of each vertex in the range. A later draw whose
+indices hash the same, and whose vertices' node indices and weights are
+the copy's, takes them as they were: about two instructions an index and
+two a vertex. A buffer the game rewrites only fails the comparison. */
+#define INDEX_RECORDS 256
+#define INDEX_RECORD_BYTES (256UL * 1024UL)
 
-struct key_record
+struct index_record
 {
 	const WORD *indices;
 	UINT count, base;
-	const unsigned char *nodes, *weights;
-	UINT node_stride, weight_stride;
+	unsigned long long hash;
 	/* the index range, and the frame the record was last used in */
 	unsigned long least, most, used;
-	/* node_keys_find's result, and draw_keys */
+	/* node_keys_find's result for these node indices' and weights' elements
+	(where block is not NULL), and draw_keys */
+	const unsigned char *nodes, *weights;
+	UINT node_stride, weight_stride;
 	BOOL found;
 	unsigned key_count;
 	UINT processor, representative[MATRIX_KEYS];
-	/* in one block: the indices' copy, each vertex's node indices and weight
-	(two shorts), each index's key */
+	/* in one block: each vertex's node indices and weight (two shorts), then
+	each index's key */
 	unsigned char *block;
 	unsigned long bytes;
 };
 
-static struct key_record key_records[KEY_RECORDS];
-static unsigned long key_record_bytes, key_records_kept, key_records_made;
+static struct index_record index_records[INDEX_RECORDS];
+static unsigned long index_record_bytes;
+/* in the statistics' window: draws whose range, and models' draws whose
+keys, were taken as kept, and those that found them */
+static unsigned long ranges_kept, ranges_found, key_records_kept, key_records_made;
 
-static WORD *key_record_indices(const struct key_record *record)
+/* the index range of the draw being made, and its record (if it has one) */
+static struct
 {
-	return (WORD *)record->block;
+	unsigned long serial, least, most;
+	struct index_record *record;
+} draw_range;
+
+static unsigned short *index_record_vertices(const struct index_record *record)
+{
+	return (unsigned short *)record->block;
 }
 
-static unsigned short *key_record_vertices(const struct key_record *record)
+static unsigned char *index_record_keys(const struct index_record *record)
 {
-	return (unsigned short *)(record->block + ((record->count * sizeof(WORD) + 3) & ~3UL));
+	return record->block + 4 * (record->most - record->least + 1);
 }
 
-static unsigned char *key_record_keys(const struct key_record *record)
-{
-	return (unsigned char *)(key_record_vertices(record) + 2 * (record->most - record->least + 1));
-}
-
-static void key_record_free(struct key_record *record)
+static void index_record_keys_free(struct index_record *record)
 {
 	free(record->block);
-	key_record_bytes -= record->bytes;
-	memset(record, 0, sizeof(*record));
+	index_record_bytes -= record->bytes;
+	record->block = NULL;
+	record->bytes = 0;
 }
 
-/* whether the record's indices and vertices are still these */
-static BOOL key_record_equal(const struct key_record *record)
+/* the indices' hash: two lanes, each a word's of two (an index alone first
+where they are not aligned to a word, and those left after the last two
+words, each lane's in turn) */
+static unsigned long long indices_hash(const WORD *indices, UINT count)
 {
-	const unsigned short *kept = key_record_vertices(record);
-	const unsigned char *nodes = record->nodes + record->least * record->node_stride;
-	const unsigned char *weights = record->weights + record->least * record->weight_stride;
+	u32 a = 2166136261U ^ count, b = 0x9E3779B9U;
+	const WORD *end = indices + count;
+
+	if (((unsigned long)indices & 3) && indices < end)
+		a = (a ^ *indices++) * 16777619U;
+	for (; indices + 3 < end; indices += 4)
+	{
+		a = (a ^ ((const u32 *)indices)[0]) * 16777619U;
+		b = (b ^ ((const u32 *)indices)[1]) * 2246822519U;
+	}
+	for (; indices < end; indices++)
+		b = (b ^ *indices) * 2246822519U;
+	return (unsigned long long)a << 32 | b;
+}
+
+/* the draw's index range, from its record or found (and recorded): once a
+draw, in draw_range */
+static void draw_range_find(const struct stream_fetch *fetch, UINT count)
+{
+	struct index_record *record = NULL;
+	unsigned long long hash;
+	unsigned smallest = 0xFFFF, largest = 0, set, way;
+	UINT vertex;
+
+	if (draw_range.serial == draw_serial)
+		return;
+	draw_range.serial = draw_serial;
+	draw_range.record = NULL;
+	if (!fetch->indices)
+	{
+		draw_range.least = fetch->first;
+		draw_range.most = fetch->first + count - 1;
+		return;
+	}
+	hash = indices_hash(fetch->indices, count);
+	/* (four ways for each place, by the indices' address and count) */
+	set = (unsigned)(((((unsigned long)fetch->indices >> 1) + count) * 2654435761UL) >> 16) % (INDEX_RECORDS / 4) * 4;
+	for (way = 0; way < 4; way++)
+	{
+		struct index_record *candidate = &index_records[set + way];
+
+		if (candidate->indices == fetch->indices && candidate->count == count &&
+			candidate->base == device.base_vertex_index)
+		{
+			record = candidate;
+			break;
+		}
+		if (!record || (record->indices && (!candidate->indices || candidate->used < record->used)))
+			record = candidate;
+	}
+	if (way < 4 && record->hash == hash)
+	{
+		record->used = device.frames;
+		draw_range.least = record->least;
+		draw_range.most = record->most;
+		draw_range.record = record;
+		ranges_kept++;
+		return;
+	}
+	for (vertex = 0; vertex < count; vertex++)
+	{
+		unsigned value = fetch->indices[vertex];
+
+		smallest = value < smallest ? value : smallest;
+		largest = value > largest ? value : largest;
+	}
+	draw_range.least = smallest + (unsigned long)device.base_vertex_index;
+	draw_range.most = largest + (unsigned long)device.base_vertex_index;
+	ranges_found++;
+	/* (a place used this frame or the last is kept: a structure of more
+	draws than the records goes without, rather than every draw losing its
+	record each frame) */
+	if (record->indices && record->indices != fetch->indices && record->used + 1 >= device.frames)
+		return;
+	if (record->block)
+		index_record_keys_free(record);
+	record->indices = fetch->indices;
+	record->count = count;
+	record->base = device.base_vertex_index;
+	record->hash = hash;
+	record->least = draw_range.least;
+	record->most = draw_range.most;
+	record->used = device.frames;
+	draw_range.record = record;
+}
+
+/* whether the record's node keys were found of these vertices' node indices
+and weights (and are still theirs) */
+static BOOL index_record_keys_equal(const struct index_record *record, const unsigned char *nodes,
+	const unsigned char *weights, UINT node_stride, UINT weight_stride)
+{
+	const unsigned short *kept = index_record_vertices(record);
 	unsigned long vertex, vertices = record->most - record->least + 1;
 
-	/* (a word at a time where both are aligned: the indices, and the node
-	indices and weight where the weight follows them, as in the maps') */
-	if (!((unsigned long)record->indices & 3))
-	{
-		const u32 *now = (const u32 *)record->indices, *then = (const u32 *)key_record_indices(record);
-		unsigned long words = record->count / 2, word;
-
-		for (word = 0; word < words; word++)
-			if (now[word] != then[word])
-				return FALSE;
-		if ((record->count & 1) && record->indices[record->count - 1] != key_record_indices(record)[record->count - 1])
-			return FALSE;
-	}
-	else if (memcmp(record->indices, key_record_indices(record), record->count * sizeof(WORD)))
+	if (!record->block || record->nodes != nodes || record->weights != weights || record->node_stride != node_stride ||
+		record->weight_stride != weight_stride)
 		return FALSE;
-	if (weights == nodes + 2 && record->weight_stride == record->node_stride && !((unsigned long)nodes & 3) &&
-		!(record->node_stride & 3))
+	nodes += record->least * node_stride;
+	weights += record->least * weight_stride;
+	/* (a word at a time where the weight follows the node indices, aligned,
+	as in the maps) */
+	if (weights == nodes + 2 && weight_stride == node_stride && !((unsigned long)nodes & 3) && !(node_stride & 3))
 	{
-		const u32 *pair = (const u32 *)kept;
-		UINT stride = record->node_stride / 4;
-		const u32 *now = (const u32 *)nodes;
+		const u32 *pair = (const u32 *)kept, *now = (const u32 *)nodes;
+		UINT stride = node_stride / 4;
 
 		for (vertex = 0; vertex < vertices; vertex++, now += stride)
 			if (*now != pair[vertex])
@@ -4269,85 +4363,63 @@ static BOOL key_record_equal(const struct key_record *record)
 		if (node != kept[0] || weight != kept[1])
 			return FALSE;
 		kept += 2;
-		nodes += record->node_stride;
-		weights += record->weight_stride;
+		nodes += node_stride;
+		weights += weight_stride;
 	}
 	return TRUE;
 }
 
-/* a record of what node_keys_find just found (in vertex_keys and draw_keys) */
-static void key_record_make(struct key_record *record, const struct stream_fetch *fetch, UINT count,
-	const unsigned char *nodes, const unsigned char *weights, UINT node_stride, UINT weight_stride, BOOL found)
+/* the record's node keys: what node_keys_find just found (in vertex_keys and
+draw_keys), with a copy of each vertex's node indices and weight */
+static void index_record_keys_make(struct index_record *record, UINT count, const unsigned char *nodes,
+	const unsigned char *weights, UINT node_stride, UINT weight_stride, BOOL found)
 {
-	unsigned smallest = 0xFFFF, largest = 0, vertex;
-	unsigned long vertices, bytes;
+	unsigned long vertices = record->most - record->least + 1, bytes = vertices * 4 + count, vertex;
 	unsigned short *kept;
 
-	for (vertex = 0; vertex < count; vertex++)
-	{
-		unsigned value = fetch->indices[vertex];
-
-		smallest = value < smallest ? value : smallest;
-		largest = value > largest ? value : largest;
-	}
-	vertices = largest - smallest + 1;
-	bytes = ((count * sizeof(WORD) + 3) & ~3UL) + vertices * 2 * sizeof(unsigned short) + count;
 	if (record->block)
-		key_record_free(record);
-	if (bytes > KEY_RECORD_BYTES / 8)
+		index_record_keys_free(record);
+	if (bytes > INDEX_RECORD_BYTES / 8)
 		return;
-	/* (room: the least recently used go) */
-	while (key_record_bytes + bytes > KEY_RECORD_BYTES)
+	/* (room: the least recently used records' keys go, but those of this
+	frame's and the last's draws) */
+	while (index_record_bytes + bytes > INDEX_RECORD_BYTES)
 	{
-		struct key_record *oldest = NULL;
+		struct index_record *oldest = NULL;
 		unsigned index;
 
-		for (index = 0; index < KEY_RECORDS; index++)
-			if (key_records[index].block && (!oldest || key_records[index].used < oldest->used))
-				oldest = &key_records[index];
-		if (!oldest)
-			break;
-		key_record_free(oldest);
+		for (index = 0; index < INDEX_RECORDS; index++)
+			if (index_records[index].block && (!oldest || index_records[index].used < oldest->used))
+				oldest = &index_records[index];
+		if (!oldest || oldest->used + 1 >= device.frames)
+			return;
+		index_record_keys_free(oldest);
 	}
 	record->block = malloc(bytes);
 	if (!record->block)
 		return;
 	record->bytes = bytes;
-	key_record_bytes += bytes;
-	record->indices = fetch->indices;
-	record->count = count;
-	record->base = device.base_vertex_index;
+	index_record_bytes += bytes;
 	record->nodes = nodes;
 	record->weights = weights;
 	record->node_stride = node_stride;
 	record->weight_stride = weight_stride;
-	record->least = smallest + (unsigned long)device.base_vertex_index;
-	record->most = largest + (unsigned long)device.base_vertex_index;
-	record->used = device.frames;
 	record->found = found;
 	record->key_count = draw_keys.count;
 	record->processor = draw_keys.processor;
 	memcpy(record->representative, draw_keys.representative, sizeof(record->representative));
-	memcpy(key_record_indices(record), fetch->indices, count * sizeof(WORD));
-	kept = key_record_vertices(record);
+	kept = index_record_vertices(record);
 	for (vertex = 0; vertex < vertices; vertex++)
 	{
 		memcpy(&kept[2 * vertex], nodes + (record->least + vertex) * node_stride, sizeof(unsigned short));
 		memcpy(&kept[2 * vertex + 1], weights + (record->least + vertex) * weight_stride, sizeof(unsigned short));
 	}
-	memcpy(key_record_keys(record), vertex_keys, count);
+	memcpy(index_record_keys(record), vertex_keys, count);
 	key_records_made++;
 }
 
-/* the index range of the draw being made, where a record has it (else
-draw_hardware finds it) */
-static struct
-{
-	unsigned long serial, least, most;
-} draw_range;
-
-/* node_keys_find's keys for the draw, as a record of the same indices and
-vertices has them, or else found and recorded */
+/* node_keys_find's keys for the draw, as its indices' record has them, or
+else found and recorded */
 static BOOL node_keys(const struct vertex_shader_object *shader, const struct stream_fetch *fetch, UINT count)
 {
 	const struct vertex_element *node_element = element_of(shader, NODE_INDICES);
@@ -4357,58 +4429,25 @@ static BOOL node_keys(const struct vertex_shader_object *shader, const struct st
 	const unsigned char *nodes = fetch->streams[node_stream] + node_element->offset;
 	const unsigned char *weights = fetch->streams[weight_stream] + weight_element->offset;
 	UINT node_stride = device.streams[node_stream].stride, weight_stride = device.streams[weight_stream].stride;
-	struct key_record *record = NULL;
+	struct index_record *record;
 	BOOL found;
 
 	if (count > sizeof(vertex_keys))
 		return FALSE;
-	if (fetch->indices)
+	draw_range_find(fetch, count);
+	record = draw_range.record;
+	if (record && index_record_keys_equal(record, nodes, weights, node_stride, weight_stride))
 	{
-		/* (four ways for each place, by the indices' address and count) */
-		unsigned set = (unsigned)(((((unsigned long)fetch->indices >> 1) + count) * 2654435761UL) >> 16) %
-			(KEY_RECORDS / 4) * 4;
-		unsigned way;
-
-		for (way = 0; way < 4; way++)
-		{
-			struct key_record *candidate = &key_records[set + way];
-
-			if (candidate->block && candidate->indices == fetch->indices && candidate->count == count &&
-				candidate->base == device.base_vertex_index && candidate->nodes == nodes &&
-				candidate->weights == weights && candidate->node_stride == node_stride &&
-				candidate->weight_stride == weight_stride)
-			{
-				record = candidate;
-				break;
-			}
-			if (!record || (record->block && (!candidate->block || candidate->used < record->used)))
-				record = candidate;
-		}
-		if (way < 4 && key_record_equal(record))
-		{
-			record->used = device.frames;
-			draw_keys.count = record->key_count;
-			draw_keys.processor = record->processor;
-			memcpy(draw_keys.representative, record->representative, sizeof(draw_keys.representative));
-			draw_key_of = key_record_keys(record);
-			draw_range.serial = draw_serial;
-			draw_range.least = record->least;
-			draw_range.most = record->most;
-			key_records_kept++;
-			return record->found;
-		}
+		draw_keys.count = record->key_count;
+		draw_keys.processor = record->processor;
+		memcpy(draw_keys.representative, record->representative, sizeof(draw_keys.representative));
+		draw_key_of = index_record_keys(record);
+		key_records_kept++;
+		return record->found;
 	}
 	found = node_keys_find(fetch, count, nodes, weights, node_stride, weight_stride);
 	if (record)
-	{
-		key_record_make(record, fetch, count, nodes, weights, node_stride, weight_stride, found);
-		if (record->block)
-		{
-			draw_range.serial = draw_serial;
-			draw_range.least = record->least;
-			draw_range.most = record->most;
-		}
-	}
+		index_record_keys_make(record, count, nodes, weights, node_stride, weight_stride, found);
 	return found;
 }
 
@@ -5288,6 +5327,9 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	UINT position_stride;
 	unsigned long long key;
 	struct hardware_matrices *cached;
+	/* (fetch's elements for what the processor computes of a vertex) */
+	struct stream_fetch vertex_fetch;
+	int sphere_list[4], sphere_count = 0;
 	uint64_t started = wl_platform_time_us(), emitting;
 	float fog_base = 0.0f, fog_slope = 0.0f;
 
@@ -5405,30 +5447,9 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	display.gx_lighting) */
 	lit_on = lit_choose(program, shader, fetch, cpu_colors, cpu_spheres);
 	/* the vertices' range: GX's indices are 16 bits */
-	if (draw_range.serial == draw_serial)
-	{
-		least = draw_range.least;
-		most = draw_range.most;
-	}
-	else if (indices)
-	{
-		unsigned smallest = 0xFFFF, largest = 0;
-
-		for (vertex = 0; vertex < count; vertex++)
-		{
-			unsigned value = indices[vertex];
-
-			smallest = value < smallest ? value : smallest;
-			largest = value > largest ? value : largest;
-		}
-		least = smallest + (unsigned long)device.base_vertex_index;
-		most = largest + (unsigned long)device.base_vertex_index;
-	}
-	else
-	{
-		least = first;
-		most = first + count - 1;
-	}
+	draw_range_find(fetch, count);
+	least = draw_range.least;
+	most = draw_range.most;
 	if (most > 0xFFFF)
 		return hardware_rejected(program, "an index past 16 bits");
 
@@ -5685,7 +5706,31 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 			}
 		}
 		vertex_memo_draw++;
+		/* (the registers what the processor computes reads, alone: its
+		fetch's elements for the outputs it runs the program for, and a lit
+		draw's blended vertices' position, normal, node indices and weight) */
+		{
+			const struct nv2a_cpu_dependencies *general = &shader->dependencies;
+			unsigned long reads = 0;
+			unsigned element;
+
+			if (draw_keys.processor)
+				reads |= nv2a_cpu_live_inputs(general, NV2A_CPU_LIVE_POSITION) |
+					(lit_on ? 1UL << 0 | 1UL << 1 | 1UL << NODE_INDICES | 1UL << NODE_WEIGHT : 0);
+			if (cpu_colors)
+				reads |= nv2a_cpu_live_inputs(general, NV2A_CPU_LIVE_D0 | NV2A_CPU_LIVE_D1 | NV2A_CPU_LIVE_FOG);
+			reads |= nv2a_cpu_live_inputs(general, cpu_spheres * NV2A_CPU_LIVE_T0);
+			vertex_fetch = *fetch;
+			vertex_fetch.element_count = 0;
+			for (element = 0; element < fetch->element_count; element++)
+				if (reads & (1UL << fetch->elements[element].reg))
+					vertex_fetch.elements[vertex_fetch.element_count++] = fetch->elements[element];
+		}
 	}
+	/* (the stages whose sphere maps' coordinates the processor's, in order) */
+	for (stage = 0; stage < 4; stage++)
+		if (cpu_spheres & (1U << stage))
+			sphere_list[sphere_count++] = stage;
 	/* (nothing of the vertices the processor's: emit_indices) */
 	plain = !cpu_colors && !cpu_spheres && !draw_keys.processor && !(lit_on && lit.alpha);
 
@@ -5722,7 +5767,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 				{
 					struct nv2a_cpu_output out;
 
-					stream_fetch(fetch, vertex, inputs);
+					stream_fetch(&vertex_fetch, vertex, inputs);
 					if (processor || cpu_spheres)
 					{
 						live = (processor ? NV2A_CPU_LIVE_POSITION : 0) |
@@ -5831,9 +5876,9 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 			}
 			for (component = 0; component < texture_count; component++)
 				GX_TexCoord1x16(index);
-			for (stage = 0; stage < 4; stage++)
-				if (cpu_spheres & (1U << stage))
-					GX_TexCoord2f32(computed->texcoord[stage][0], computed->texcoord[stage][1]);
+			for (component = 0; component < sphere_count; component++)
+				GX_TexCoord2f32(computed->texcoord[sphere_list[component]][0],
+					computed->texcoord[sphere_list[component]][1]);
 		}
 	GX_End();
 	if (lit_on)
@@ -6122,9 +6167,10 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			hardware_vertices, hardware_colors_run, processor_positions);
 		hardware_draws = hardware_vertices = hardware_colors_run = hardware_cache_hits = hardware_keyed_draws = 0;
 		hardware_blended_draws = processor_positions = 0;
-		platform_log("Direct3D: models' node keys: %lu draws took them as kept, %lu found them (%lu KB kept)",
-			key_records_kept, key_records_made, key_record_bytes / 1024);
-		key_records_kept = key_records_made = 0;
+		platform_log("Direct3D: draws' index ranges: %lu taken as kept, %lu found; models' node keys: %lu taken as "
+			"kept, %lu found (%lu KB kept)", ranges_kept, ranges_found, key_records_kept, key_records_made,
+			index_record_bytes / 1024);
+		ranges_kept = ranges_found = key_records_kept = key_records_made = 0;
 		platform_log("Direct3D: in hardware with the processor's sphere map coordinates: %lu draws, %lu vertices run",
 			hardware_sphere_draws, hardware_spheres_run);
 		hardware_sphere_draws = hardware_spheres_run = 0;
