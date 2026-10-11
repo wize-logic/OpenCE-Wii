@@ -11,13 +11,17 @@ camera and lights, models' nodes - for some frames:
   triangles are) over static vertices;
 - rigid: a model of one node, its parts drawn in two passes;
 - skinned: a character's parts of many nodes, some vertices blending two,
-  lit on GX's lights (display.gx_lighting), with a reflection.
+  lit on GX's lights (display.gx_lighting), with a reflection;
+- unlit: the same with display.gx_lighting off (the colours and the
+  reflection's coordinates the processor's).
+The environment's every other section has a reflection too, whose sphere
+map's coordinates are the processor's.
 Each draw is bracketed by bench_region_begin and bench_region_end, whose
 calls the script finds in qemu's trace to count the instructions between
 them; with the stand-in's recording, each draw's digest of what GX draws is
 printed instead, to compare two builds of the device.
 
-usage: draw_bench <scene> <frames> (scene: environment, rigid, skinned, all)
+usage: draw_bench <scene> <frames> [record] (scene: environment, rigid, skinned, unlit, all)
 */
 
 #include "d3d8_gx.c"
@@ -479,7 +483,7 @@ static struct
 } sections[SECTIONS];
 static D3DIndexBuffer environment_index_buffer;
 static WORD *environment_indices;
-static D3DTexture *environment_textures[3];
+static D3DTexture *environment_textures[3], *environment_cube;
 
 static void environment_make(void)
 {
@@ -490,6 +494,7 @@ static void environment_make(void)
 	environment_index_buffer.Data = (DWORD)environment_indices;
 	for (section = 0; section < 3; section++)
 		environment_textures[section] = texture_make(section == 2 ? 128 : 256, FALSE);
+	environment_cube = texture_make(64, TRUE);
 	for (section = 0; section < SECTIONS; section++)
 	{
 		unsigned vertex_count = (SECTION_COLUMNS + 1) * (SECTION_ROWS + 1), row, column;
@@ -546,8 +551,26 @@ static void environment_draw(int frame)
 		next += triangles * 3;
 	}
 	D3DDevice_SetIndices(&environment_index_buffer, 0);
-	for (pass = 0; pass < 2; pass++)
+	for (pass = 0; pass < 3; pass++)
 	{
+		if (pass == 2)
+		{
+			/* a reflection of every other section's: its cube map's direction the
+			vertices', the sphere map's coordinates the processor's */
+			D3DDevice_SetVertexShader(vertex_shader_handles[vertex_shader_find(0x10c30c53UL)]);
+			pixel_shader_set(1 | 3 << 15, 0x0B200000, 0x000000C0, 0x18200000);
+			D3DDevice_SetTexture(0, (D3DBaseTexture *)environment_textures[0]);
+			D3DDevice_SetTexture(1, NULL);
+			D3DDevice_SetTexture(3, (D3DBaseTexture *)environment_cube);
+			for (section = 0; section < SECTIONS; section += 2)
+			{
+				D3DDevice_SetStreamSource(0, sections[section].vertices, 32);
+				D3DDevice_SetStreamSource(1, sections[section].lightmap, 8);
+				draw("environment", frame, D3DPT_TRIANGLELIST, starts[section], counts[section]);
+			}
+			D3DDevice_SetTexture(3, NULL);
+			break;
+		}
 		D3DDevice_SetVertexShader(vertex_shader_handles[vertex_shader_find(pass ? 0xa60ed22cUL : 0x0dfdf660UL)]);
 		if (pass)
 		{
@@ -708,7 +731,7 @@ static void rigid_draw(int frame)
 	}
 }
 
-static void skinned_draw(int frame)
+static void skinned_draw(int frame, const char *scene)
 {
 	unsigned model, part;
 
@@ -721,10 +744,10 @@ static void skinned_draw(int frame)
 			D3DDevice_SetStreamSource(0, skinned_parts[part].vertices, 32);
 			D3DDevice_SetVertexShader(vertex_shader_handles[vertex_shader_find(0xcfc6f3a4UL)]);
 			model_pass(TRUE);
-			draw("skinned", frame, D3DPT_TRIANGLESTRIP, skinned_parts[part].strip, skinned_parts[part].strip_count);
+			draw(scene, frame, D3DPT_TRIANGLESTRIP, skinned_parts[part].strip, skinned_parts[part].strip_count);
 			D3DDevice_SetVertexShader(vertex_shader_handles[vertex_shader_find(0x9d2757d2UL)]);
 			model_pass(FALSE);
-			draw("skinned", frame, D3DPT_TRIANGLESTRIP, skinned_parts[part].strip, skinned_parts[part].strip_count);
+			draw(scene, frame, D3DPT_TRIANGLESTRIP, skinned_parts[part].strip, skinned_parts[part].strip_count);
 		}
 	}
 }
@@ -744,9 +767,10 @@ int main(int argc, char **argv)
 		programs_list();
 		return 0;
 	}
-	if (!all && strcmp(scene, "environment") && strcmp(scene, "rigid") && strcmp(scene, "skinned"))
+	if (!all && strcmp(scene, "environment") && strcmp(scene, "rigid") && strcmp(scene, "skinned") &&
+		strcmp(scene, "unlit"))
 	{
-		print("usage: draw_bench programs|environment|rigid|skinned|all [frames] [record]\n");
+		print("usage: draw_bench programs|environment|rigid|skinned|unlit|all [frames] [record]\n");
 		return 1;
 	}
 	recording = argc > 3 && !strcmp(argv[3], "record");
@@ -761,7 +785,15 @@ int main(int argc, char **argv)
 		if (all || !strcmp(scene, "rigid"))
 			rigid_draw(frame);
 		if (all || !strcmp(scene, "skinned"))
-			skinned_draw(frame);
+			skinned_draw(frame, "skinned");
+		/* (the same characters with display.gx_lighting off: their colours and
+		reflection the processor's) */
+		if (all || !strcmp(scene, "unlit"))
+		{
+			gx_lighting_on = 0;
+			skinned_draw(frame, "unlit");
+			gx_lighting_on = -1;
+		}
 		D3DDevice_Present(NULL, NULL, NULL, NULL);
 		if (recording)
 		{
@@ -772,7 +804,9 @@ int main(int argc, char **argv)
 	}
 	if (recording)
 		print("errors: %lu vertex writes outside a primitive or primitives left short\n", gx_stand_in_errors());
+#ifdef KEY_RECORDS
 	print("node keys: %lu kept, %lu made, %lu bytes\n", key_records_kept, key_records_made, key_record_bytes);
+#endif
 	print("hardware: %lu draws, %lu matrices kept, %lu keyed, %lu blended, %lu lit, %lu refused\n", hardware_draws,
 		hardware_cache_hits, hardware_keyed_draws, hardware_blended_draws, lit_draws, lit_refused);
 	return 0;

@@ -93,20 +93,23 @@ def run(command, **kwargs):
     return result
 
 
-def build(record: bool) -> Path:
+def build(record: bool, device: str = None) -> Path:
     devkitpro = Path(os.environ.get("DEVKITPRO") or "/opt/devkitpro")
     wiilibs = wiilibs_dir()
     semantics = ROOT / "build" / "wii" / "platform_msvc_semantics.h"
     if not semantics.is_file():
         sys.exit("wii_draw_bench: no build/wii/platform_msvc_semantics.h (configure and run `ninja wii` first)")
     kind = "record" if record else "count"
-    out_dir = WORK / kind
+    # (the device's sources: port/wii/src, or another copy of them, to compare with)
+    src = Path(device).resolve() if device else WII / "src"
+    out_dir = WORK / (kind + ("-device" if device else ""))
     out_dir.mkdir(parents=True, exist_ok=True)
     # the vertex programs compiled ahead of time, as tools/wii_nv2a_check.py makes them
     codegen = WORK / "nv2a_codegen"
     programs = WORK / "nv2a_programs.c"
-    run(["cc", "-std=gnu11", "-O1", "-DNV2A_CPU_NO_NATIVES", f"-I{WII / 'tests' / 'host'}", f"-I{WII / 'src'}",
-         "-o", str(codegen), str(WII / "tools" / "nv2a_codegen.c"), "-lm"])
+    run(["cc", "-std=gnu11", "-O1", "-DNV2A_CPU_NO_NATIVES", f"-I{WII / 'tests' / 'host'}", f"-I{src}",
+         "-o", str(codegen), str(src.parent / "tools" / "nv2a_codegen.c" if device else WII / "tools" / "nv2a_codegen.c"),
+         "-lm"])
     run([str(codegen), str(MICROCODE), str(programs)])
     user_mode_headers(devkitpro, out_dir / "include")
     includes = [f"-I{out_dir / 'include'}"]
@@ -117,18 +120,18 @@ def build(record: bool) -> Path:
     flags = [*" ".join(wii_abi_flags(devkitpro)).split(), *PLATFORM_FLAGS, "-Wno-unused-but-set-variable",
              *defines, *includes,
              "-include", str(WII / "include" / "halo_wii_prefix.h"), "-include", str(semantics),
-             f"-I{WII / 'src'}", f"-I{LINUX_SOURCES}", f"-I{WII / 'include'}",
+             f"-I{src}", f"-I{LINUX_SOURCES}", f"-I{WII / 'include'}",
              f"-I{ROOT / 'port' / 'linux' / 'include'}", f"-I{wiilibs}", f"-I{ROOT / 'source'}",
              f"-I{ROOT / 'source' / 'cseries'}", "-idirafter", str(ROOT / "port" / "include" / "xdk")]
     plain = [*" ".join(wii_abi_flags(devkitpro)).split(), "-std=gnu11", *defines, *includes, f"-I{wiilibs}",
-             f"-I{WII / 'src'}", f"-I{WII / 'tests' / 'host'}"]
+             f"-I{src}", f"-I{WII / 'tests' / 'host'}"]
     units = [
         (WII / "tests" / "draw_bench.c", flags),
         (WII / "tests" / "host" / "gx_stand_in.c", plain),
-        (WII / "src" / "gx_psh.c", flags),
-        (WII / "src" / "gx_psh_cache.c", flags),
-        (WII / "src" / "gx_lighting.c", flags),
-        (WII / "src" / "nv2a_cpu.c", flags),
+        (src / "gx_psh.c", flags),
+        (src / "gx_psh_cache.c", flags),
+        (src / "gx_lighting.c", flags),
+        (src / "nv2a_cpu.c", flags),
         (programs, flags),
         (LINUX_SOURCES / "d3d8_state.c", flags),
         (LINUX_SOURCES / "xbox_texture_formats.c", flags),
@@ -153,7 +156,7 @@ def bench_arguments(args) -> list:
 
 
 def count(args) -> int:
-    binary = build(record=False)
+    binary = build(record=False, device=args.device)
     with tempfile.TemporaryDirectory() as temporary:
         fifo = Path(temporary) / "trace"
         os.mkfifo(fifo)
@@ -168,12 +171,15 @@ def count(args) -> int:
         symbol_pattern = re.compile(r"\] (\S+)\s*$")
         pc_pattern = re.compile(r"\[[0-9a-f]+/([0-9a-f]+)/")
         lines = collections.Counter()
+        callers = collections.Counter()
+        stack = ["draw_streams"]
         with open(fifo, "r", encoding="utf-8", errors="replace") as trace:
             for line in trace:
                 match = symbol_pattern.search(line)
                 symbol = match.group(1) if match else "?"
                 if symbol == "bench_region_begin":
                     inside = collections.Counter()
+                    stack = ["draw_streams"]
                     continue
                 if symbol == "bench_region_end":
                     if inside is not None:
@@ -182,6 +188,17 @@ def count(args) -> int:
                     continue
                 if inside is not None:
                     inside[symbol] += 1
+                    if args.callers:
+                        # (calls and returns guessed from the symbol's changes: a symbol on the
+                        # stack is a return to it, any other a call)
+                        if symbol != stack[-1]:
+                            if symbol in stack:
+                                del stack[len(stack) - stack[::-1].index(symbol):]
+                            else:
+                                stack.append(symbol)
+                        if args.callers in stack:
+                            at = len(stack) - 1 - stack[::-1].index(args.callers)
+                            callers[stack[at - 1] if at else "?"] += 1
                     if args.lines and symbol == args.lines:
                         pc = pc_pattern.search(line)
                         if pc:
@@ -200,6 +217,10 @@ def count(args) -> int:
         print(f"{args.lines}: {total} instructions")
         for place, instructions in by_line.most_common(40):
             print(f"    {instructions:10d}  {place}")
+    if args.callers:
+        print(f"{args.callers}, with what it calls, by its caller:")
+        for caller, instructions in callers.most_common(20):
+            print(f"    {instructions:10d}  {caller}")
     if len(labels) != len(regions):
         print(f"wii_draw_bench: {len(labels)} regions named, {len(regions)} counted")
     # (scene, first frame or later) -> draws, indices, instructions, by function
@@ -229,7 +250,7 @@ def count(args) -> int:
 
 
 def record(args) -> int:
-    binary = build(record=True)
+    binary = build(record=True, device=args.device)
     output = run(["qemu-ppc", str(binary), *bench_arguments(args), "record"], stdout=subprocess.PIPE,
                  text=True).stdout
     lines = [line for line in output.splitlines() if line.startswith("draw ")]
@@ -260,12 +281,14 @@ def main() -> int:
     sub = parser.add_subparsers(dest="mode", required=True)
     for name in ("count", "record", "programs"):
         command = sub.add_parser(name)
-        command.add_argument("--scene", default="all", help="environment, rigid, skinned or all")
+        command.add_argument("--scene", default="all", help="environment, rigid, skinned, unlit or all")
         command.add_argument("--frames", type=int, default=4)
+        command.add_argument("--device", help="another copy of port/wii/src (with tools/ beside it) to build instead")
         if name == "count":
             command.add_argument("--top", type=int, default=12, help="functions listed for the later frames")
             command.add_argument("--verbose", action="store_true", help="the first frame's functions too")
             command.add_argument("--lines", help="the hottest source lines of this function")
+            command.add_argument("--callers", help="this function's instructions (and its callees') by its caller")
         if name == "record":
             command.add_argument("--save", help="keep the digests in this file")
             command.add_argument("--compare", help="compare with the digests this file kept")

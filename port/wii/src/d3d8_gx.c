@@ -5051,15 +5051,21 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	}
 	else
 	{
+	/* (the outputs read of the program's runs alone, which
+	nv2a_cpu_run_live gives as nv2a_cpu_run does: the texture coordinates
+	the stages read and the fog, and for no input the colours) */
+	unsigned columns_live = (tev_texcoords & 15) * NV2A_CPU_LIVE_T0 | NV2A_CPU_LIVE_FOG;
+
 	matrix_inputs(shader, inputs);
-	nv2a_cpu_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size, &base);
+	nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size, &base,
+		columns_live | NV2A_CPU_LIVE_D0 | NV2A_CPU_LIVE_D1);
 	for (component = 0; component < 4; component++)
 	{
 		if (component < 3)
 		{
 			inputs[position_register][component] = 1.0f;
-			nv2a_cpu_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
-				&column);
+			nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
+				&column, columns_live);
 			inputs[position_register][component] = 0.0f;
 			for (stage = 0; stage < 4; stage++)
 			{
@@ -5090,8 +5096,8 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		for (which = 0; which < 2; which++)
 		{
 			inputs[texture_registers[stage_source[stage]]][which] = 1.0f;
-			nv2a_cpu_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
-				point_size, &column);
+			nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
+				point_size, &column, columns_live);
 			inputs[texture_registers[stage_source[stage]]][which] = 0.0f;
 			for (s_t = 0; s_t < 2; s_t++)
 			{
