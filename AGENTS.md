@@ -99,6 +99,10 @@ Running the game without a person at it:
   test settings.
 - `debug.exit_after`, `debug.hidden_window`, `debug.null_renderer`,
   `debug.menu_open` (start on one menu screen), `debug.telnet_console`.
+- `debug.test_input = "script:<file>"` plays controller 1 from a file of
+  steps through the menus and a level, as a person would, logging each
+  screen and step (`port/linux/src/test_input.c`; `port/wii/tests/playthrough.txt`,
+  with `display.menus = "xbox"`).
 - Use a virtual display (Xvfb, with `SDL_VIDEO_DRIVER=x11`) for windowed
   runs, never the desktop of the person you work for, and stop only the
   processes you started.

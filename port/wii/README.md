@@ -781,6 +781,41 @@ Dolphin it counts instructions executed (about one cycle each, no cache or bus w
 is taken at the end of a translated block); on the console it counts where the processor waits as
 well. Use Dolphin's profile to find what the game does, and the console's to find what it costs.
 
+## The playthrough check
+
+The game played as a person plays it, through the menus, rather than started by the network test:
+`debug.test_input = "script:<file>"` plays controller 1 from a file of steps
+(`port/linux/src/test_input.c` lists them: wait for a menu screen or focused widget by its tag's
+name, for play, ticks or a checkpoint; press, hold and move the sticks; walk to a point of the
+level). `tests/playthrough.txt` is a first session: the main menu, CAMPAIGN, a new profile, NORMAL,
+a10's opening skipped, the cryo tube's look training and its exit, a walk across the cryo bay,
+SAVE AND QUIT from the pause menu, the profile's settings, and the saved game loaded and played.
+
+- Copy it to `apps/halo/playthrough.txt` on the SD card, empty `apps/halo/saves` (the script
+  makes the first profile), and set in `apps/halo/config.toml`:
+
+  ```toml
+  [display]
+  menus = "xbox"
+
+  [debug]
+  test_input = "script:playthrough.txt"
+  ```
+
+  with no `debug.network_test` (the menus must run) and no `debug.fixed_ticks`.
+- The log has a line for each screen and focused widget as they change (`test_input: screen
+  "ui\shell\main_menu\main_menu", focus ...`), each step as it begins, with the script's clock,
+  each `log` line with where the player is (`step 9: ... (at -57.2 -3.0 0.0, facing -94
+  degrees, tick ...)`), and each checkpoint saved, reverted or loaded (`game state: ...`). It ends
+  with `test_input: script finished`, or `test_input: script stopped at line N (...): timed out`
+  and what was shown then. Its last step quits, which on the Wii goes back to the loader.
+- The x86 Linux build plays the same script (`HALO_MENUS=xbox HALO_TEST_INPUT=script:...`, headless
+  or on a virtual display with `debug.screenshot_every`) to the same screens and places.
+- The Xbox's pause menu has no settings (the PC version's has); the settings are reached from the
+  main menu. a10's first checkpoint after its opening comes past the cryo bay's tutorial (the red
+  and yellow squares, the panels to look at, the shield test), which the script does not play yet:
+  the saved game is the opening's checkpoint.
+
 ## What only a real Wii can show
 
 Dolphin runs the game, but these need the console:

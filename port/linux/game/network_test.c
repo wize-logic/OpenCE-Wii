@@ -73,8 +73,13 @@ void damage_kill_object_for_player(long object_index, long player_index);
 void network_distributed_statistics(long *sent, long *received, long *corrections);
 void network_distributed_item_statistics(long *creates, long *deletes, long *failures, long *removed);
 void network_damage_statistics(long *sent_reports, long *dealt_reports, long *rejected_reports, long *replayed_events);
-/* xinput_sdl.c's */
+/* test_input.c's */
 void test_input_hold_action(int hold);
+int test_input_scripted(void);
+void test_input_observe(const char *screen, const char *focus, long tick, long checkpoints, const float *place);
+/* ui_widget.c's, game_state.c's */
+void ui_widget_port_active_screen(long *screen_tag_index, long *focused_tag_index);
+long game_state_port_checkpoints_saved(void);
 
 enum
 {
@@ -774,6 +779,42 @@ void network_test_update(
 {
 	if (!network_test.checked)
 		network_test_read_settings();
+	/* what the menus show and how far the game has run, for a scripted
+	controller (debug.test_input "script:<file>", test_input.c) */
+	if (test_input_scripted())
+	{
+		long screen, focused;
+		boolean in_game = game_in_progress() && !main_menu_loaded;
+		struct player_datum *player;
+		struct data_iterator iterator;
+		float place[6];
+		boolean placed = FALSE;
+
+		ui_widget_port_active_screen(&screen, &focused);
+		/* (the first local player's unit: where it is, which way it faces,
+		and whether it rides) */
+		if (in_game)
+		{
+			data_iterator_new(&iterator, player_data);
+			while (!placed && (player = (struct player_datum *)data_iterator_next(&iterator)) != NULL)
+			{
+				if (player->local_player_index == 0 && player->unit_index != NONE)
+				{
+					struct object_datum *object = object_get(player->unit_index);
+
+					place[0] = object->object.position.x;
+					place[1] = object->object.position.y;
+					place[2] = object->object.position.z;
+					place[3] = object->object.forward.i;
+					place[4] = object->object.forward.j;
+					place[5] = object->object.parent_object_index != NONE ? 1.0f : 0.0f;
+					placed = TRUE;
+				}
+			}
+		}
+		test_input_observe(screen != NONE ? tag_get_name(screen) : "", focused != NONE ? tag_get_name(focused) : "",
+			in_game ? (long)game_time_get() : -1, game_state_port_checkpoints_saved(), placed ? place : NULL);
+	}
 	if (network_test.mode == _network_test_off)
 		return;
 

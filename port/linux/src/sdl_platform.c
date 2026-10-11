@@ -1236,7 +1236,8 @@ static void platform_show_pending_message(void)
 /* ---------- events */
 
 /* quits as closing the window does, when the events are next read (the
-menus' Quit: port/linux/game/menu_functions.c); on Android at once */
+menus' Quit: port/linux/game/menu_functions.c); on Android at once, and
+with no window (debug.null_renderer), whose events nothing reads */
 void platform_request_quit(void)
 {
 #ifdef HALO_ANDROID
@@ -1245,6 +1246,11 @@ void platform_request_quit(void)
 #else
 	SDL_Event event;
 
+	if (!platform_window)
+	{
+		platform_log("quitting");
+		exit(EXIT_SUCCESS);
+	}
 	memset(&event, 0, sizeof(event));
 	event.type = SDL_EVENT_QUIT;
 	SDL_PushEvent(&event);
