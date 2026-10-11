@@ -23,7 +23,8 @@ resampling) and applies:
 	  environment's HF reference: a sound behind a wall is muffled.
 3D voices also send to an I3DL2 reverb of the environment the listener is in
 (reverb). Doppler and cones are not modelled. A look-ahead limiter keeps the
-sum under full scale (limit).
+sum under full scale (limit). The Wii mixes its voices at their own rates
+instead of resampling each, on two buses (the Wii's mixing).
 
 Packets the mixer has finished are completed from DirectSoundDoWork, which
 the game calls every frame, and from Flush, never from the audio thread:
@@ -59,8 +60,10 @@ turns the reverb off; audio.enabled = false skips opening a device
 #include <unistd.h>
 
 #ifdef HALO_WII
-/* (a third less mixing for the Wii's processor; its DSP plays it at 48 kHz) */
-#define OUTPUT_RATE 32000
+/* (twice the low bus's rate, at which the game's 44 kHz voices play as they
+are: the Wii's mixing; its DSP plays it at 48 kHz) */
+#define OUTPUT_RATE 44100
+#define LOW_RATE 22050
 #else
 #define OUTPUT_RATE 48000
 #endif
@@ -143,10 +146,26 @@ struct sdl_stream
 	unsigned long packet_count;
 	/* the next frame to take from the first packet not finished */
 	unsigned long cursor;
-	/* the ADPCM block the cursor is in, decoded (take_frame), and the bytes
+	/* the ADPCM block the cursor is in, decoded (take_frame, voice_run), and the bytes
 	it was decoded from (NULL: none) */
 	short block[XBOX_ADPCM_BLOCK_SAMPLES * 2];
 	const unsigned char *block_source;
+#ifdef HALO_WII
+	/* the Wii's mixing (resampler_reset): the bus the voice plays on, its
+	last four frames (each channel's, the newest last), the time of the
+	output past the second of them in frames, how many frames of silence
+	were taken since the packets ran out, and whether it has stopped; the
+	gains it ramps to (voice_gains) and the voice_parameters_serial they
+	were worked out at */
+	BOOL high_bus;
+	float window[2][4];
+	double phase;
+	unsigned long silence;
+	BOOL ended;
+	float target_left, target_right, target_room;
+	float target_direct_lowpass, target_room_lowpass;
+	unsigned long gains_serial;
+#else
 	/* the resampler's (resampler_reset): the last RESAMPLER_HISTORY frames
 	taken, each channel's apart and each frame twice, RESAMPLER_HISTORY apart,
 	so that the frames a low pass reaches are side by side however the ring
@@ -158,6 +177,7 @@ struct sdl_stream
 	unsigned long center;
 	double phase;
 	unsigned long silence;
+#endif
 	/* gains and low pass coefficients the mixer is ramping from, to avoid
 	clicks */
 	float current_left, current_right, current_room;
@@ -185,6 +205,12 @@ static struct
 
 static float master_volume = 1.0f;
 
+/* counts the changes to what a voice's gains come from (voice_gains): its
+own settings, the listener's, the environment's, the master volume and
+audio.reverb. The Wii's mixing works a voice's gains out again only when it
+has moved on */
+static unsigned long voice_parameters_serial;
+
 /* the I3DL2 listener properties (SetI3DL2Listener), which the reverb models:
 DirectSound's defaults until the game sets an environment, their room level
 leaving it silent; serial counts the changes */
@@ -195,6 +221,13 @@ static DSI3DL2LISTENER environment =
 static unsigned long environment_serial;
 /* audio.reverb */
 static BOOL reverb_enabled = TRUE;
+
+/* the rate the reverb runs at: the Wii's, its low bus's (the Wii's mixing) */
+#ifdef HALO_WII
+#define REVERB_RATE LOW_RATE
+#else
+#define REVERB_RATE OUTPUT_RATE
+#endif
 
 static float gain_from_millibels(LONG millibels)
 {
@@ -211,15 +244,15 @@ static float flush_denormal(float value)
 	return fabsf(value) < 1.0e-20f ? 0.0f : value;
 }
 
-/* cos(2 pi f / OUTPUT_RATE) of a filter's frequency f, within what the
-output rate holds */
-static float frequency_cosine(float frequency)
+/* cos(2 pi f / rate) of a filter's frequency f, at the rate it runs at (the
+output's, or the Wii's buses'), within what that rate holds */
+static float frequency_cosine(float frequency, float rate)
 {
 	if (frequency < 20.0f)
 		frequency = 20.0f;
-	if (frequency > 0.45f * OUTPUT_RATE)
-		frequency = 0.45f * OUTPUT_RATE;
-	return cosf(2.0f * 3.14159265f * frequency / OUTPUT_RATE);
+	if (frequency > 0.45f * rate)
+		frequency = 0.45f * rate;
+	return cosf(2.0f * 3.14159265f * frequency / rate);
 }
 
 /* the coefficient a of the one-pole low pass y = x + a (y' - x) whose gain is
@@ -281,30 +314,87 @@ first, and the nibbles code the 63 after it: the 64th nibble only pads the
 block (the maps' sounds always have 0 there), and decoding it in place of the
 header's sample put a wrong sample in every 64, a buzz at 344 Hz in 22 kHz
 sounds. */
+/* ima_expand worked out ahead: the difference a nibble's low three bits make
+at each step index, and the step index after each nibble. A sample costs a
+table look-up, an add and a clamp, a third of what working each out did (the
+Wii decodes every sound as it plays) */
+static unsigned short ima_differences[89][8];
+static unsigned char ima_next_index[89][16];
+static BOOL ima_tables_ready;
+
+static void ima_tables_initialize(void)
+{
+	int index, nibble;
+
+	for (index = 0; index <= 88; index++)
+	{
+		int step = ima_step_table[index];
+
+		for (nibble = 0; nibble < 16; nibble++)
+		{
+			int predictor = 0, next = index;
+
+			ima_expand(nibble, &predictor, &next);
+			ima_next_index[index][nibble] = (unsigned char)next;
+		}
+		for (nibble = 0; nibble < 8; nibble++)
+		{
+			ima_differences[index][nibble] = (unsigned short)((step >> 3) + (nibble & 1 ? step >> 2 : 0) +
+				(nibble & 2 ? step >> 1 : 0) + (nibble & 4 ? step : 0));
+		}
+	}
+	ima_tables_ready = TRUE;
+}
+
+/* the sample after predictor that nibble codes, at the step index (which it
+moves on), as ima_expand */
+#define IMA_EXPAND(nibble, predictor, index) \
+	do \
+	{ \
+		int difference_ = ima_differences[index][(nibble) & 7]; \
+		int sign_ = -((nibble) >> 3); \
+		\
+		predictor += (difference_ ^ sign_) - sign_; \
+		if (predictor > 32767) \
+			predictor = 32767; \
+		if (predictor < -32768) \
+			predictor = -32768; \
+		index = ima_next_index[index][nibble]; \
+	} while (0)
+
 static void decode_adpcm_block(const unsigned char *data, unsigned long channels, short *output)
 {
 	unsigned long channel;
 
+	if (!ima_tables_ready)
+		ima_tables_initialize();
 	for (channel = 0; channel < channels; channel++)
 	{
 		const unsigned char *header = data + channel * 4;
 		int predictor = (short)(header[0] | (header[1] << 8));
 		int index = header[2] > 88 ? 88 : header[2];
+		short *sample = output + channel;
 		unsigned long group, byte;
 
-		output[channel] = (short)predictor;
+		*sample = (short)predictor;
+		sample += channels;
 		for (group = 0; group < 8; group++)
 		{
 			const unsigned char *nibbles = data + 4 * channels + (group * channels + channel) * 4;
 
+			/* nibble n codes sample n + 1 */
 			for (byte = 0; byte < 4; byte++)
 			{
-				/* nibble n codes sample n + 1 */
-				unsigned long sample = group * 8 + byte * 2 + 1;
+				int low = nibbles[byte] & 0xf, high = nibbles[byte] >> 4;
 
-				output[sample * channels + channel] = (short)ima_expand(nibbles[byte] & 0xf, &predictor, &index);
-				if (sample + 1 < XBOX_ADPCM_BLOCK_SAMPLES)
-					output[(sample + 1) * channels + channel] = (short)ima_expand(nibbles[byte] >> 4, &predictor, &index);
+				IMA_EXPAND(low, predictor, index);
+				*sample = (short)predictor;
+				sample += channels;
+				if (group == 7 && byte == 3)
+					break;
+				IMA_EXPAND(high, predictor, index);
+				*sample = (short)predictor;
+				sample += channels;
 			}
 		}
 	}
@@ -393,8 +483,8 @@ static void spatialize(const struct sdl_stream *stream, float *left, float *righ
 /* the voice's gains to the left and right, and to the reverb (only 3D voices
 send to it, as their I3DL2 mix bin did on the Xbox), with the coefficients of
 the low passes of its direct path (3D voices: obstruction and occlusion
-muffle it) and of the send */
-static void voice_gains(const struct sdl_stream *stream, float *left, float *right, float *room,
+muffle it) and of the send, which run at rate */
+static void voice_gains(const struct sdl_stream *stream, float rate, float *left, float *right, float *room,
 	float *direct_lowpass, float *room_lowpass)
 {
 	*room = 0.0f;
@@ -402,7 +492,7 @@ static void voice_gains(const struct sdl_stream *stream, float *left, float *rig
 	*room_lowpass = 0.0f;
 	if (stream->has_3d && stream->mode != DS3DMODE_DISABLE)
 	{
-		float rolloff, cosine = frequency_cosine(environment.flHFReference);
+		float rolloff, cosine = frequency_cosine(environment.flHFReference, rate);
 
 		spatialize(stream, left, right, &rolloff);
 		if (stream->direct_hf < stream->direct)
@@ -424,7 +514,7 @@ static void voice_gains(const struct sdl_stream *stream, float *left, float *rig
 		and its room send made as a 3D voice's are (SetI3DL2Source) */
 		float angle = (stream->stereo_pan + 1.0f) * 0.25f * 3.14159265f;
 		float direct = gain_from_millibels(stream->direct);
-		float cosine = frequency_cosine(environment.flHFReference);
+		float cosine = frequency_cosine(environment.flHFReference, rate);
 
 		*left = cosf(angle) * 1.41421356f * stream->mix_left * direct;
 		*right = sinf(angle) * 1.41421356f * stream->mix_right * direct;
@@ -457,6 +547,22 @@ static void voice_gains(const struct sdl_stream *stream, float *left, float *rig
 	*room *= stream->volume * master_volume;
 }
 
+/* the modified Bessel function I0, of the Kaiser windows of the low passes
+(resampling, and the Wii's upsampler) */
+static double bessel_i0(double x)
+{
+	double sum = 1.0, term = 1.0;
+	int k;
+
+	for (k = 1; k < 64 && term > 1.0e-12 * sum; k++)
+	{
+		term *= (x / (2.0 * k)) * (x / (2.0 * k));
+		sum += term;
+	}
+	return sum;
+}
+
+#ifndef HALO_WII
 /* ---------- resampling
 
 Each voice is resampled to the output rate by band-limited interpolation (J.
@@ -483,19 +589,6 @@ next, so the blend is a multiply and an add a tap */
 #define RESAMPLER_TAPS (2 * RESAMPLER_ZERO_CROSSINGS)
 static float resampler_phases[RESAMPLER_TABLE_STEPS + 1][RESAMPLER_TAPS] RESAMPLER_ALIGNED;
 static float resampler_deltas[RESAMPLER_TABLE_STEPS][RESAMPLER_TAPS] RESAMPLER_ALIGNED;
-
-static double bessel_i0(double x)
-{
-	double sum = 1.0, term = 1.0;
-	int k;
-
-	for (k = 1; k < 64 && term > 1.0e-12 * sum; k++)
-	{
-		term *= (x / (2.0 * k)) * (x / (2.0 * k));
-		sum += term;
-	}
-	return sum;
-}
 
 static void resampler_initialize(void)
 {
@@ -742,7 +835,7 @@ static void mix_voice(struct sdl_stream *stream, float *output, float *send, uns
 		resampler_reset(stream);
 		stream->gains_valid = FALSE;
 	}
-	voice_gains(stream, &target_left, &target_right, &target_room, &target_direct_lowpass, &target_room_lowpass);
+	voice_gains(stream, OUTPUT_RATE, &target_left, &target_right, &target_room, &target_direct_lowpass, &target_room_lowpass);
 	if (!stream->gains_valid)
 	{
 		stream->current_left = target_left;
@@ -898,6 +991,7 @@ static void mix_voice(struct sdl_stream *stream, float *output, float *send, uns
 	stream->current_direct_lowpass = target_direct_lowpass;
 	stream->current_room_lowpass = target_room_lowpass;
 }
+#endif
 
 /* ---------- reverb
 
@@ -933,7 +1027,7 @@ until something is sent again (outdoors, in the menus). */
 #define REVERB_DIFFUSER_SIZE 1024
 #define REVERB_LINES 8
 #define REVERB_LINE_SIZE 4096
-#define REVERB_FADE_FRAMES 4096 /* 85 ms */
+#define REVERB_FADE_FRAMES 4096 /* 85 ms at 48 kHz (the Wii's reverb runs at 22 kHz: 186 ms) */
 /* the input delays, then the diffusers, played out */
 #define REVERB_QUIET_FRAMES (REVERB_DELAY_SIZE + REVERB_DIFFUSERS * REVERB_DIFFUSER_SIZE)
 #define REVERB_QUIET_PEAK 1.0e-6f
@@ -1002,7 +1096,7 @@ static float clamp_real(float value, float minimum, float maximum)
 /* whole samples */
 static unsigned long reverb_samples(float seconds)
 {
-	return (unsigned long)floorf(seconds * OUTPUT_RATE + 0.5f);
+	return (unsigned long)floorf(seconds * REVERB_RATE + 0.5f);
 }
 
 /* the sample buffer got delay samples before position, crossfaded from the
@@ -1029,23 +1123,23 @@ static void reverb_parameters_set(struct reverb_parameters *parameters, const DS
 	last longer */
 	float high_decay = decay * clamp_real(properties->flDecayHFRatio, 0.1f, 1.0f);
 	float scale = 0.25f + 0.75f * clamp_real(properties->flDensity / 100.0f, 0.0f, 1.0f);
-	float cosine = frequency_cosine(properties->flHFReference);
+	float cosine = frequency_cosine(properties->flHFReference, REVERB_RATE);
 	float mean_length = 0.0f, mean_feedback;
 	unsigned long reflections_delay;
 	int index;
 
 	for (index = 0; index < REVERB_LINES; index++)
 	{
-		float length = floorf(reverb_line_times[index] * 0.001f * OUTPUT_RATE * scale + 0.5f);
+		float length = floorf(reverb_line_times[index] * 0.001f * REVERB_RATE * scale + 0.5f);
 		float high_feedback;
 
 		parameters->lengths[index] = (unsigned long)length;
-		parameters->feedback[index] = powf(10.0f, -3.0f * length / (decay * OUTPUT_RATE));
-		high_feedback = powf(10.0f, -3.0f * length / (high_decay * OUTPUT_RATE));
+		parameters->feedback[index] = powf(10.0f, -3.0f * length / (decay * REVERB_RATE));
+		high_feedback = powf(10.0f, -3.0f * length / (high_decay * REVERB_RATE));
 		parameters->damping[index] = lowpass_coefficient(high_feedback / parameters->feedback[index], cosine);
 		mean_length += length / REVERB_LINES;
 	}
-	mean_feedback = powf(10.0f, -3.0f * mean_length / (decay * OUTPUT_RATE));
+	mean_feedback = powf(10.0f, -3.0f * mean_length / (decay * REVERB_RATE));
 	reflections_delay = reverb_samples(clamp_real(properties->flReflectionsDelay, 0.0f, 0.3f));
 	for (index = 0; index < REVERB_TAPS; index++)
 		parameters->taps[index] = reflections_delay + reverb_samples(reverb_tap_times[index] * 0.001f);
@@ -1212,14 +1306,17 @@ static struct
 	/* the frames the output is delayed by, and the gain each needs */
 	float delay[LIMITER_LOOKAHEAD][OUTPUT_CHANNELS];
 	float needed[LIMITER_LOOKAHEAD];
-	/* how many of them are under 1: none while nothing is too loud, when the
-	smallest is 1 without looking */
-	unsigned long limiting;
+	/* the smallest of them, looked for again only when the frame that needed
+	it has played (looking every frame cost the Wii's mixer more than all
+	its voices while gunfire was limited) */
+	float lowest;
 	/* the gain held down to what the frames ahead need, coming back up */
 	float held;
-	/* its last LIMITER_LOOKAHEAD values, and their sum */
+	/* its last LIMITER_LOOKAHEAD values, their sum, and how many are under 1
+	(none: the sum is LIMITER_LOOKAHEAD, whatever its additions rounded) */
 	float history[LIMITER_LOOKAHEAD];
 	double history_sum;
+	unsigned long history_below;
 	unsigned long position;
 	BOOL initialized;
 } limiter;
@@ -1227,7 +1324,9 @@ static struct
 static void limit(float *output, unsigned long frames)
 {
 	float release = 1.0f - expf(-1.0f / (LIMITER_RELEASE_SECONDS * OUTPUT_RATE));
-	unsigned long frame, index, channel;
+	unsigned long frame, index, position = limiter.position, history_below;
+	float loudest = 0.0f, lowest, held;
+	double history_sum;
 
 	if (!limiter.initialized)
 	{
@@ -1236,29 +1335,55 @@ static void limit(float *output, unsigned long frames)
 			limiter.needed[index] = 1.0f;
 			limiter.history[index] = 1.0f;
 		}
+		limiter.lowest = 1.0f;
 		limiter.held = 1.0f;
 		limiter.history_sum = LIMITER_LOOKAHEAD;
+		limiter.history_below = 0;
 		limiter.initialized = TRUE;
 	}
+	/* nothing limited, and nothing here to limit: the frames only delayed,
+	as below with every gain 1 */
+	for (frame = 0; frame < frames * OUTPUT_CHANNELS; frame++)
+		loudest = fabsf(output[frame]) > loudest ? fabsf(output[frame]) : loudest;
+	if (loudest <= LIMITER_CEILING && limiter.lowest == 1.0f && limiter.held == 1.0f && !limiter.history_below)
+	{
+		for (frame = 0; frame < frames; frame++)
+		{
+			float *sample = output + frame * OUTPUT_CHANNELS, left = sample[0], right = sample[1];
+			unsigned long oldest = (position + 1) % LIMITER_LOOKAHEAD;
+
+			sample[0] = limiter.delay[oldest][0];
+			sample[1] = limiter.delay[oldest][1];
+			limiter.delay[position][0] = left;
+			limiter.delay[position][1] = right;
+			position = oldest;
+		}
+		limiter.position = position;
+		return;
+	}
+	/* (the limiter's state here while the frames are written, which the
+	compiler cannot tell from it) */
+	lowest = limiter.lowest;
+	held = limiter.held;
+	history_sum = limiter.history_sum;
+	history_below = limiter.history_below;
 	for (frame = 0; frame < frames; frame++)
 	{
-		float *sample = output + frame * OUTPUT_CHANNELS;
-		unsigned long position = limiter.position;
+		float *sample = output + frame * OUTPUT_CHANNELS, left = sample[0], right = sample[1];
 		unsigned long oldest = (position + 1) % LIMITER_LOOKAHEAD;
-		float peak = 0.0f, lowest, gain;
+		float peak = fabsf(left) > fabsf(right) ? fabsf(left) : fabsf(right), played, needed, gain;
 
 		/* the new frame takes the slot of the oldest, which has played */
-		for (channel = 0; channel < OUTPUT_CHANNELS; channel++)
+		limiter.delay[position][0] = left;
+		limiter.delay[position][1] = right;
+		played = limiter.needed[position];
+		needed = peak > LIMITER_CEILING ? LIMITER_CEILING / peak : 1.0f;
+		limiter.needed[position] = needed;
+		if (needed <= lowest)
 		{
-			if (fabsf(sample[channel]) > peak)
-				peak = fabsf(sample[channel]);
-			limiter.delay[position][channel] = sample[channel];
+			lowest = needed;
 		}
-		limiter.limiting -= limiter.needed[position] < 1.0f;
-		limiter.needed[position] = peak > LIMITER_CEILING ? LIMITER_CEILING / peak : 1.0f;
-		limiter.limiting += limiter.needed[position] < 1.0f;
-		lowest = 1.0f;
-		if (limiter.limiting)
+		else if (played == lowest)
 		{
 			lowest = limiter.needed[0];
 			for (index = 1; index < LIMITER_LOOKAHEAD; index++)
@@ -1267,20 +1392,718 @@ static void limit(float *output, unsigned long frames)
 					lowest = limiter.needed[index];
 			}
 		}
-		if (lowest < limiter.held)
-			limiter.held = lowest;
+		if (lowest < held)
+			held = lowest;
 		else
-			limiter.held += (lowest - limiter.held) * release;
-		limiter.history_sum += limiter.held - limiter.history[position];
-		limiter.history[position] = limiter.held;
-		gain = (float)(limiter.history_sum / LIMITER_LOOKAHEAD);
+			held += (lowest - held) * release;
+		history_sum += held - limiter.history[position];
+		history_below += (held < 1.0f) - (limiter.history[position] < 1.0f);
+		limiter.history[position] = held;
+		if (!history_below)
+			history_sum = LIMITER_LOOKAHEAD;
+		gain = (float)(history_sum / LIMITER_LOOKAHEAD);
 		/* the frame LIMITER_LOOKAHEAD - 1 frames old plays */
-		for (channel = 0; channel < OUTPUT_CHANNELS; channel++)
-			sample[channel] = limiter.delay[oldest][channel] * gain;
-		limiter.position = oldest;
+		sample[0] = limiter.delay[oldest][0] * gain;
+		sample[1] = limiter.delay[oldest][1] * gain;
+		position = oldest;
+	}
+	limiter.lowest = lowest;
+	limiter.held = held;
+	limiter.history_sum = history_sum;
+	limiter.history_below = history_below;
+	limiter.position = position;
+}
+
+#ifdef HALO_WII
+/* ---------- the Wii's mixing
+
+Resampling every voice by its low pass took two thirds of the Wii's processor
+in b30 (a 22 kHz voice cost 530 instructions an output frame at 32 kHz, a 44
+kHz one, its low pass stretched, 4000). The Wii mixes each voice at the rate
+of one of two buses instead, the low one at 22050 Hz and the high one at the
+output's 44100 Hz, as the game's voices play at their own rates unless their
+pitch is changed: the game's 22 kHz voices go to the low bus, its 44 kHz ones
+to the high one, each frame as it is. A voice played at another frequency
+(SetFrequency: a sound's random pitch, an engine) is interpolated onto the
+high bus by a cubic (Catmull-Rom) through four of its frames. The low bus is
+then doubled to the output's rate by a half-band low pass (the upsampler),
+the one windowed sinc left, run once for all its voices: it keeps a 22 kHz
+voice flat to 9.5 kHz, and takes the images of it out from 12.5 kHz, 70 dB
+down. The voices' gains, pans, low passes and room sends are the other
+platforms', at their bus's rate, worked out again only when what they come
+from changes; the reverb runs at the low bus's rate, and the limiter on the
+output. A voice out of earshot only moves on, not decoded. A scene of 16
+voices heard and 8 not, counted under qemu-ppc, cost 910 instructions an
+output frame where it cost 15,100 (port/wii/README.md, "Sound";
+tools/harness/tests/test_mixer_wii.py) */
+
+/* the upsampler's taps on each side of the moment it interpolates */
+#define UPSAMPLER_PAIRS 16
+#define UPSAMPLER_KAISER_BETA 7.0
+/* the frames of the low bus the upsampler reads before a mix's */
+#define LOW_HISTORY (2 * UPSAMPLER_PAIRS)
+/* the output frames mixed at a time (an even number: mix) */
+#define MIX_AHEAD_FRAMES 288
+#define LOW_CHUNK_FRAMES (MIX_AHEAD_FRAMES / 2)
+/* the frames of a voice's window: one before the moment played, three from it */
+#define WINDOW_FRAMES 4
+
+/* the upsampler's weights of the low bus's frames k + 1/2 from the moment
+between two of them */
+static float upsampler_weights[UPSAMPLER_PAIRS];
+
+static struct
+{
+	/* the low bus, stereo: LOW_HISTORY frames of the mixes before, then
+	this one's */
+	float frames[(LOW_HISTORY + LOW_CHUNK_FRAMES) * OUTPUT_CHANNELS];
+	/* the high bus's send to the reverb (the low bus's is the reverb's), and
+	whether any voice sent to each in this mix */
+	float high_send[MIX_CHUNK_FRAMES];
+	BOOL low_sent, high_sent;
+	/* whether anything was mixed into the low bus in this mix, and for how
+	many of its frames before nothing has been */
+	BOOL low_written;
+	unsigned long low_quiet;
+	/* the output mixed ahead of what was asked for (mix): how much, and how
+	much of it has been given */
+	float ahead[MIX_AHEAD_FRAMES * OUTPUT_CHANNELS];
+	unsigned long ahead_count, ahead_used;
+} wii_mix;
+
+/* the half-band low pass: a sinc whose zeros fall on the low bus's frames,
+so that every other output frame is the bus's own, Kaiser windowed; the
+weights sum to 1 */
+static void upsampler_initialize(void)
+{
+	double weights[UPSAMPLER_PAIRS], sum = 0.0;
+	int k;
+
+	for (k = 0; k < UPSAMPLER_PAIRS; k++)
+	{
+		double distance = k + 0.5, edge = distance / UPSAMPLER_PAIRS, angle = 3.14159265358979 * distance;
+
+		weights[k] = sin(angle) / angle * bessel_i0(UPSAMPLER_KAISER_BETA * sqrt(1.0 - edge * edge)) /
+			bessel_i0(UPSAMPLER_KAISER_BETA);
+		sum += 2.0 * weights[k];
+	}
+	for (k = 0; k < UPSAMPLER_PAIRS; k++)
+		upsampler_weights[k] = (float)(weights[k] / sum);
+}
+
+/* a voice starting (over): silence before its first frame, three of which
+are taken before its first output frame (the window's second, at phase 0) */
+static void resampler_reset(struct sdl_stream *stream)
+{
+	memset(stream->window, 0, sizeof(stream->window));
+	stream->phase = WINDOW_FRAMES - 1;
+	stream->silence = 0;
+	stream->ended = FALSE;
+}
+
+/* the frames in a row at the voice's cursor in the first packet not
+finished: how many, and where, in the voice's ADPCM block (decoded first if
+decode) or the packet's little-endian PCM; 0 once the packets run out. The
+packets with none left are marked finished on the way */
+static unsigned long voice_run(struct sdl_stream *stream, BOOL decode, const short **block,
+	const unsigned char **pcm)
+{
+	unsigned long position, channels = stream->channels;
+
+	for (position = 0; position < stream->packet_count; position++)
+	{
+		struct voice_packet *packet = &stream->packets[(stream->packet_head + position) % MAXIMUM_STREAM_PACKETS];
+
+		if (packet->finished)
+			continue;
+		if (stream->cursor < packet->frames)
+		{
+			if (stream->adpcm)
+			{
+				unsigned long offset = stream->cursor % XBOX_ADPCM_BLOCK_SAMPLES;
+				const unsigned char *source = packet->source +
+					stream->cursor / XBOX_ADPCM_BLOCK_SAMPLES * XBOX_ADPCM_BLOCK_BYTES * channels;
+
+				if (decode && stream->block_source != source)
+				{
+					decode_adpcm_block(source, channels, stream->block);
+					stream->block_source = source;
+				}
+				*block = stream->block + offset * channels;
+				*pcm = NULL;
+				return XBOX_ADPCM_BLOCK_SAMPLES - offset;
+			}
+			*block = NULL;
+			*pcm = packet->source + stream->cursor * channels * 2;
+			return packet->frames - stream->cursor;
+		}
+		stream->cursor = 0;
+		packet->finished = TRUE;
+	}
+	return 0;
+}
+
+/* whether the voice has a frame to take */
+static BOOL voice_has_frames(struct sdl_stream *stream)
+{
+	const short *block;
+	const unsigned char *pcm;
+
+	return voice_run(stream, FALSE, &block, &pcm) != 0;
+}
+
+/* passes over count of the voice's frames, a run at a time, not decoded:
+the frames mix_voice_wii would take while the voice is out of earshot. Its
+window falls silent; it comes back into earshot from a gain of 0 (its gains
+ramp from those of the mix before), so the frames of silence its window
+holds then are not heard */
+static void voice_pass(struct sdl_stream *stream, unsigned long count)
+{
+	memset(stream->window, 0, sizeof(stream->window));
+	while (count)
+	{
+		const short *block;
+		const unsigned char *pcm;
+		unsigned long run = voice_run(stream, FALSE, &block, &pcm);
+
+		if (!run)
+		{
+			stream->silence += count;
+			break;
+		}
+		if (run > count)
+			run = count;
+		stream->cursor += run;
+		stream->silence = 0;
+		count -= run;
 	}
 }
 
+/* the bus frames a voice is mixed in at a time, and the most frames it takes
+for each (the frequency it plays at, at most this many times its bus's) */
+#define VOICE_PIECE_FRAMES 128
+#define VOICE_MAXIMUM_STEP 8
+
+/* a piece of a voice (mix_voice_wii): its window, then the frames it takes,
+each channel's; and what it plays, where it is not those frames as they are */
+static float voice_taken[2][WINDOW_FRAMES + VOICE_PIECE_FRAMES * VOICE_MAXIMUM_STEP + 2];
+/* (voice_take: 1.5 * 2^23 and its bits; a 16-bit sample added to them is
+the float 1.5 * 2^23 plus the sample, exactly) */
+#define VOICE_SAMPLE_BIAS 12582912.0f
+#define VOICE_SAMPLE_BIAS_BITS 0x4B400000U
+static float voice_played[2][VOICE_PIECE_FRAMES];
+
+/* the voice's gains to its bus, ramped across a mix from those of the last */
+struct voice_ramp
+{
+	float left, right, room, direct_lowpass, room_lowpass;
+	float ramp_left, ramp_right, ramp_room, ramp_direct_lowpass, ramp_room_lowpass;
+	float direct_state[2], room_state;
+};
+
+/* takes count of the voice's frames into voice_taken after its window, and
+moves its window to the last four */
+static void voice_take(struct sdl_stream *stream, unsigned long count)
+{
+	unsigned long channels = stream->channels, taken = 0, frame;
+	float *left = voice_taken[0], *right = voice_taken[channels == 2];
+	int index;
+
+	for (index = 0; index < WINDOW_FRAMES; index++)
+	{
+		left[index] = stream->window[0][index];
+		right[index] = stream->window[1][index];
+	}
+	left += WINDOW_FRAMES;
+	right += WINDOW_FRAMES;
+	while (taken < count)
+	{
+		const short *block;
+		const unsigned char *pcm;
+		unsigned long run = voice_run(stream, TRUE, &block, &pcm);
+		float *left_run = left + taken, *right_run = right + taken;
+
+		if (!run)
+		{
+			/* after the last packet, silence */
+			for (frame = taken; frame < count; frame++)
+				left[frame] = right[frame] = 0.0f;
+			stream->silence += count - taken;
+			break;
+		}
+		if (run > count - taken)
+			run = count - taken;
+		/* the samples made floats without the processor's conversion (the
+		750 has none from an integer register; the compiler's goes through
+		memory with a double for each): written as the bits of the float
+		1.5 * 2^23 plus the sample, then that float taken away */
+		if (block && channels == 2)
+		{
+			for (frame = 0; frame < run; frame++)
+			{
+				((unsigned int *)left_run)[frame] = VOICE_SAMPLE_BIAS_BITS + block[frame * 2];
+				((unsigned int *)right_run)[frame] = VOICE_SAMPLE_BIAS_BITS + block[frame * 2 + 1];
+			}
+		}
+		else if (block)
+		{
+			for (frame = 0; frame < run; frame++)
+				((unsigned int *)left_run)[frame] = VOICE_SAMPLE_BIAS_BITS + block[frame];
+		}
+		else if (channels == 2)
+		{
+			for (frame = 0; frame < run; frame++)
+			{
+				((unsigned int *)left_run)[frame] = VOICE_SAMPLE_BIAS_BITS + (short)(pcm[frame * 4] | pcm[frame * 4 + 1] << 8);
+				((unsigned int *)right_run)[frame] = VOICE_SAMPLE_BIAS_BITS + (short)(pcm[frame * 4 + 2] | pcm[frame * 4 + 3] << 8);
+			}
+		}
+		else
+		{
+			for (frame = 0; frame < run; frame++)
+				((unsigned int *)left_run)[frame] = VOICE_SAMPLE_BIAS_BITS + (short)(pcm[frame * 2] | pcm[frame * 2 + 1] << 8);
+		}
+		for (frame = 0; frame < run; frame++)
+			left_run[frame] = (left_run[frame] - VOICE_SAMPLE_BIAS) * (1.0f / 32768.0f);
+		if (channels == 2)
+		{
+			for (frame = 0; frame < run; frame++)
+				right_run[frame] = (right_run[frame] - VOICE_SAMPLE_BIAS) * (1.0f / 32768.0f);
+		}
+		stream->cursor += run;
+		stream->silence = 0;
+		taken += run;
+	}
+	for (index = 0; index < WINDOW_FRAMES; index++)
+	{
+		stream->window[0][index] = left[(long)count - WINDOW_FRAMES + index];
+		stream->window[1][index] = right[(long)count - WINDOW_FRAMES + index];
+	}
+}
+
+/* mixes frames of a voice's channels into output (and its send) with its
+gains: the direct path, muffled, or as it is, a mono voice's mix bins or pan
+splitting it across the speakers, and the room send with its own low pass */
+static void voice_apply(const struct sdl_stream *stream, const float *left_frames, const float *right_frames,
+	float *output, float *send, unsigned long frames, struct voice_ramp *ramp)
+{
+	BOOL stereo = stream->channels == 2;
+	/* (a stereo voice panned towards its sound: voice_gains) */
+	BOOL positioned = stereo && stream->stereo_positioned;
+	BOOL filtered = ramp->direct_lowpass || ramp->ramp_direct_lowpass;
+	BOOL sent = ramp->room || ramp->ramp_room;
+	float left = ramp->left, right = ramp->right, ramp_left = ramp->ramp_left, ramp_right = ramp->ramp_right;
+	unsigned long frame;
+
+	if (!filtered && !sent && !positioned)
+	{
+		/* (most voices: their frames into the bus at their gains) */
+		if (stereo)
+		{
+			for (frame = 0; frame < frames; frame++)
+			{
+				output[frame * 2] += left_frames[frame] * left;
+				output[frame * 2 + 1] += right_frames[frame] * right;
+				left += ramp_left;
+				right += ramp_right;
+			}
+		}
+		else
+		{
+			for (frame = 0; frame < frames; frame++)
+			{
+				output[frame * 2] += left_frames[frame] * left;
+				output[frame * 2 + 1] += left_frames[frame] * right;
+				left += ramp_left;
+				right += ramp_right;
+			}
+		}
+		ramp->direct_state[0] = left_frames[frames - 1];
+		ramp->direct_state[1] = right_frames[frames - 1];
+		ramp->room += ramp->ramp_room * frames;
+		ramp->direct_lowpass += ramp->ramp_direct_lowpass * frames;
+		ramp->room_lowpass += ramp->ramp_room_lowpass * frames;
+	}
+	else if (!sent && !positioned && !stereo)
+	{
+		/* (a mono voice in the world behind something, the reverb off) */
+		float direct_lowpass = ramp->direct_lowpass, ramp_direct_lowpass = ramp->ramp_direct_lowpass;
+		float state = ramp->direct_state[0];
+
+		for (frame = 0; frame < frames; frame++)
+		{
+			state = left_frames[frame] + direct_lowpass * (state - left_frames[frame]);
+			output[frame * 2] += state * left;
+			output[frame * 2 + 1] += state * right;
+			left += ramp_left;
+			right += ramp_right;
+			direct_lowpass += ramp_direct_lowpass;
+		}
+		ramp->direct_lowpass = direct_lowpass;
+		ramp->direct_state[0] = ramp->direct_state[1] = state;
+		ramp->room_lowpass += ramp->ramp_room_lowpass * frames;
+	}
+	else
+	{
+		float room = ramp->room, direct_lowpass = ramp->direct_lowpass, room_lowpass = ramp->room_lowpass;
+		float direct_left = ramp->direct_state[0], direct_right = ramp->direct_state[1], room_state = ramp->room_state;
+
+		for (frame = 0; frame < frames; frame++)
+		{
+			float sample_left = left_frames[frame], sample_right = right_frames[frame];
+
+			if (sent)
+			{
+				float mono = stereo ? 0.5f * (sample_left + sample_right) : sample_left;
+
+				room_state = mono + room_lowpass * (room_state - mono);
+				send[frame] += room_state * room;
+			}
+			if (filtered)
+			{
+				sample_left = sample_left + direct_lowpass * (direct_left - sample_left);
+				sample_right = sample_right + direct_lowpass * (direct_right - sample_right);
+			}
+			direct_left = sample_left;
+			direct_right = sample_right;
+			if (positioned)
+			{
+				/* the channels' middle panned, and their difference kept as
+				wide as the far ear's gain: the sound comes from where it is,
+				still stereo */
+				float middle = 0.5f * (sample_left + sample_right);
+				float side = 0.5f * (sample_left - sample_right);
+				float far_gain = left < right ? left : right;
+
+				output[frame * 2] += middle * left + side * far_gain;
+				output[frame * 2 + 1] += middle * right - side * far_gain;
+			}
+			else
+			{
+				output[frame * 2] += sample_left * left;
+				output[frame * 2 + 1] += sample_right * right;
+			}
+			left += ramp_left;
+			right += ramp_right;
+			room += ramp->ramp_room;
+			direct_lowpass += ramp->ramp_direct_lowpass;
+			room_lowpass += ramp->ramp_room_lowpass;
+		}
+		ramp->room = room;
+		ramp->direct_lowpass = direct_lowpass;
+		ramp->room_lowpass = room_lowpass;
+		ramp->direct_state[0] = direct_left;
+		ramp->direct_state[1] = direct_right;
+		ramp->room_state = room_state;
+	}
+	ramp->left = left;
+	ramp->right = right;
+}
+
+/* mixes one voice into its bus: low_frames frames of the low bus and its
+send to the reverb, or twice as many of the high bus and its */
+static void mix_voice_wii(struct sdl_stream *stream, float *low_output, float *low_send, float *high_output,
+	float *high_send, unsigned long low_frames)
+{
+	unsigned long frequency, rate, frames, done, frame;
+	float *output, *send;
+	double step, phase;
+	BOOL native, stereo = stream->channels == 2;
+	struct voice_ramp ramp;
+
+	if (stream->paused || !stream->packet_count || !stream->sample_rate)
+		return;
+	frequency = stream->frequency ? stream->frequency : stream->sample_rate;
+	/* a voice that ran dry and stopped starts over once it has frames again:
+	stream_process starts over only a stream with no packets, and the next
+	can come before the finished ones are completed */
+	if (stream->ended)
+	{
+		if (!voice_has_frames(stream))
+			return;
+		resampler_reset(stream);
+		stream->gains_valid = FALSE;
+	}
+	/* only a voice played at the low bus's rate plays on it; one played at
+	another frequency is interpolated onto the high bus, where the cubic's
+	images fall above what most hear (onto the low one, they fold back
+	beside the sound). It keeps its bus while it plays: a change of bus would
+	move it in time by the upsampler's delay */
+	if (!stream->gains_valid)
+		stream->high_bus = frequency != LOW_RATE;
+	rate = stream->high_bus ? OUTPUT_RATE : LOW_RATE;
+	frames = stream->high_bus ? 2 * low_frames : low_frames;
+	output = stream->high_bus ? high_output : low_output;
+	send = stream->high_bus ? high_send : low_send;
+	step = (double)frequency / rate;
+	if (step > VOICE_MAXIMUM_STEP)
+		step = VOICE_MAXIMUM_STEP;
+	/* played as it is: a frame an output frame, at whole frames */
+	native = frequency == rate && stream->phase == (double)(unsigned long)stream->phase;
+
+	/* the gains, worked out again only when something they come from has
+	changed (voice_parameters_serial) */
+	if (!stream->gains_valid || stream->gains_serial != voice_parameters_serial)
+	{
+		voice_gains(stream, (float)rate, &stream->target_left, &stream->target_right, &stream->target_room,
+			&stream->target_direct_lowpass, &stream->target_room_lowpass);
+		stream->gains_serial = voice_parameters_serial;
+	}
+	if (!stream->gains_valid)
+	{
+		stream->current_left = stream->target_left;
+		stream->current_right = stream->target_right;
+		stream->current_room = stream->target_room;
+		stream->current_direct_lowpass = stream->target_direct_lowpass;
+		stream->current_room_lowpass = stream->target_room_lowpass;
+		stream->direct_lowpass[0] = stream->direct_lowpass[1] = 0.0f;
+		stream->room_lowpass = 0.0f;
+		stream->gains_valid = TRUE;
+	}
+	ramp.left = stream->current_left;
+	ramp.right = stream->current_right;
+	ramp.room = stream->current_room;
+	ramp.direct_lowpass = stream->current_direct_lowpass;
+	ramp.room_lowpass = stream->current_room_lowpass;
+	ramp.ramp_left = (stream->target_left - ramp.left) / (float)frames;
+	ramp.ramp_right = (stream->target_right - ramp.right) / (float)frames;
+	ramp.ramp_room = (stream->target_room - ramp.room) / (float)frames;
+	ramp.ramp_direct_lowpass = (stream->target_direct_lowpass - ramp.direct_lowpass) / (float)frames;
+	ramp.ramp_room_lowpass = (stream->target_room_lowpass - ramp.room_lowpass) / (float)frames;
+	ramp.direct_state[0] = stream->direct_lowpass[0];
+	ramp.direct_state[1] = stream->direct_lowpass[1];
+	ramp.room_state = stream->room_lowpass;
+	stream->current_left = stream->target_left;
+	stream->current_right = stream->target_right;
+	stream->current_room = stream->target_room;
+	stream->current_direct_lowpass = stream->target_direct_lowpass;
+	stream->current_room_lowpass = stream->target_room_lowpass;
+
+	if (!ramp.left && !ramp.right && !ramp.room && !ramp.ramp_left && !ramp.ramp_right && !ramp.ramp_room)
+	{
+		/* a voice turned all the way down (out of earshot), and not sending
+		to the reverb, only moves on: the frames it would take, taken */
+		unsigned long count = 0;
+
+		phase = stream->phase;
+		if (native)
+		{
+			/* (as below: the frames up to a whole frame of phase, then one
+			each) */
+			count = (unsigned long)phase + frames - 1;
+			phase = 1.0;
+		}
+		else
+		{
+			for (frame = 0; frame < frames; frame++)
+			{
+				while (phase >= 1.0)
+				{
+					phase -= 1.0;
+					count++;
+				}
+				phase += step;
+			}
+		}
+		stream->phase = phase;
+		voice_pass(stream, count);
+		stream->ended = stream->silence >= WINDOW_FRAMES;
+		return;
+	}
+	if (!stream->high_bus)
+		wii_mix.low_written = TRUE;
+	if (ramp.room || ramp.ramp_room)
+	{
+		if (stream->high_bus)
+			wii_mix.high_sent = TRUE;
+		else
+			wii_mix.low_sent = TRUE;
+	}
+
+	for (done = 0; done < frames; done += VOICE_PIECE_FRAMES)
+	{
+		unsigned long count = frames - done < VOICE_PIECE_FRAMES ? frames - done : VOICE_PIECE_FRAMES;
+		const float *left_frames, *right_frames;
+
+		phase = stream->phase;
+		if (native)
+		{
+			/* the window's second frame plays, after the frames up to a
+			whole frame of phase, then one each */
+			unsigned long ahead = (unsigned long)phase;
+
+			voice_take(stream, ahead + count - 1);
+			left_frames = voice_taken[0] + 1 + ahead;
+			right_frames = voice_taken[stereo] + 1 + ahead;
+			stream->phase = 1.0;
+		}
+		else
+		{
+			/* the frames before each output frame's moment, counted, taken,
+			and the cubic (Catmull-Rom) through the four around it */
+			unsigned long count_taken = 0, base = 0;
+			const float *left_taken = voice_taken[0], *right_taken = voice_taken[stereo];
+
+			for (frame = 0; frame < count; frame++)
+			{
+				while (phase >= 1.0)
+				{
+					phase -= 1.0;
+					count_taken++;
+				}
+				phase += step;
+			}
+			voice_take(stream, count_taken);
+			phase = stream->phase;
+			for (frame = 0; frame < count; frame++)
+			{
+				float t, w0, w1, w2, w3;
+				const float *left_window, *right_window;
+
+				while (phase >= 1.0)
+				{
+					phase -= 1.0;
+					base++;
+				}
+				t = (float)phase;
+				w0 = 0.5f * t * ((2.0f - t) * t - 1.0f);
+				w1 = 0.5f * (t * t * (3.0f * t - 5.0f) + 2.0f);
+				w2 = 0.5f * t * ((4.0f - 3.0f * t) * t + 1.0f);
+				w3 = 0.5f * t * t * (t - 1.0f);
+				left_window = left_taken + base;
+				right_window = right_taken + base;
+				voice_played[0][frame] = left_window[0] * w0 + left_window[1] * w1 + left_window[2] * w2 +
+					left_window[3] * w3;
+				if (stereo)
+				{
+					voice_played[1][frame] = right_window[0] * w0 + right_window[1] * w1 + right_window[2] * w2 +
+						right_window[3] * w3;
+				}
+				phase += step;
+			}
+			stream->phase = phase;
+			left_frames = voice_played[0];
+			right_frames = voice_played[stereo];
+		}
+		voice_apply(stream, left_frames, right_frames, output + done * 2, send + done, count, &ramp);
+	}
+	stream->ended = stream->silence >= WINDOW_FRAMES;
+	/* (the states of the low passes fed silence decay into the denormals:
+	flush_denormal) */
+	stream->direct_lowpass[0] = flush_denormal(ramp.direct_state[0]);
+	stream->direct_lowpass[1] = flush_denormal(ramp.direct_state[1]);
+	stream->room_lowpass = flush_denormal(ramp.room_state);
+}
+
+/* mixes 2 pairs frames of output: the voices into the buses, the reverb into
+the low bus, the low bus doubled into the output */
+static void mix_pairs(float *output, unsigned long pairs)
+{
+	struct sdl_stream *stream;
+	DSI3DL2LISTENER properties;
+	BOOL enabled = reverb_enabled, changed = FALSE;
+	unsigned long serial = 0, frames = 2 * pairs, pair;
+	float *low = wii_mix.frames + LOW_HISTORY * OUTPUT_CHANNELS;
+
+	memset(output, 0, frames * OUTPUT_CHANNELS * sizeof(float));
+	memset(low, 0, pairs * OUTPUT_CHANNELS * sizeof(float));
+	memset(reverb.send, 0, pairs * sizeof(float));
+	memset(wii_mix.high_send, 0, frames * sizeof(float));
+	wii_mix.low_sent = wii_mix.high_sent = wii_mix.low_written = FALSE;
+	pthread_mutex_lock(&mixer_lock);
+	for (stream = streams; stream; stream = stream->next)
+		mix_voice_wii(stream, low, reverb.send, output, wii_mix.high_send, pairs);
+	/* a new environment, once the fade to the last is over */
+	if (reverb.serial != environment_serial && !reverb.fade)
+	{
+		properties = environment;
+		serial = environment_serial;
+		changed = TRUE;
+	}
+	pthread_mutex_unlock(&mixer_lock);
+	if (changed)
+		reverb_update(&properties, serial);
+	/* the high bus's send, at the low bus's rate */
+	if (wii_mix.high_sent)
+	{
+		for (pair = 0; pair < pairs; pair++)
+			reverb.send[pair] += 0.5f * (wii_mix.high_send[pair * 2] + wii_mix.high_send[pair * 2 + 1]);
+		wii_mix.low_sent = TRUE;
+	}
+	/* the reverb runs while something reverberates, and stops once it is
+	turned off and faded out, or quiet */
+	if (!reverb.silent || (enabled && wii_mix.low_sent && reverb_sent(reverb.send, pairs)))
+	{
+		reverb_process(reverb.send, low, pairs, enabled ? 1.0f : 0.0f);
+		wii_mix.low_written = TRUE;
+		if ((!enabled && reverb.level <= 0.0f) || reverb.quiet > REVERB_QUIET_FRAMES)
+			reverb_clear();
+	}
+	/* (a low bus silent for as long as the upsampler reaches back adds
+	nothing) */
+	if (wii_mix.low_written)
+	{
+		wii_mix.low_quiet = 0;
+	}
+	else if (wii_mix.low_quiet >= LOW_HISTORY)
+	{
+		voice_audio_mix(output, frames);
+		limit(output, frames);
+		return;
+	}
+	else
+	{
+		wii_mix.low_quiet += pairs;
+	}
+	/* the low bus doubled: the frame UPSAMPLER_PAIRS before the newest as it
+	is, then the moment after it, from the frames on each side */
+	for (pair = 0; pair < pairs; pair++)
+	{
+		const float *center = low + ((long)pair - UPSAMPLER_PAIRS) * OUTPUT_CHANNELS;
+		float between_left = 0.0f, between_right = 0.0f;
+		int k;
+
+		for (k = 0; k < UPSAMPLER_PAIRS; k++)
+		{
+			between_left += upsampler_weights[k] * (center[-2 * k] + center[2 * (k + 1)]);
+			between_right += upsampler_weights[k] * (center[1 - 2 * k] + center[3 + 2 * k]);
+		}
+		output[pair * 4] += center[0];
+		output[pair * 4 + 1] += center[1];
+		output[pair * 4 + 2] += between_left;
+		output[pair * 4 + 3] += between_right;
+	}
+	memmove(wii_mix.frames, wii_mix.frames + pairs * OUTPUT_CHANNELS, LOW_HISTORY * OUTPUT_CHANNELS * sizeof(float));
+	/* the players' voices (voice_audio.c), dry, under the limiter */
+	voice_audio_mix(output, frames);
+	limit(output, frames);
+}
+
+/* frames of output, from mixes of MIX_AHEAD_FRAMES (what each voice costs a
+mix, its gains and set-up, is then paid every 6.5 ms, not as often as the
+output asks), the frames mixed past those asked for kept for the next */
+static void mix(float *output, unsigned long frames)
+{
+	while (frames)
+	{
+		unsigned long count;
+
+		if (wii_mix.ahead_used == wii_mix.ahead_count)
+		{
+			mix_pairs(wii_mix.ahead, MIX_AHEAD_FRAMES / 2);
+			wii_mix.ahead_count = MIX_AHEAD_FRAMES;
+			wii_mix.ahead_used = 0;
+		}
+		count = wii_mix.ahead_count - wii_mix.ahead_used;
+		if (count > frames)
+			count = frames;
+		memcpy(output, wii_mix.ahead + wii_mix.ahead_used * OUTPUT_CHANNELS, count * OUTPUT_CHANNELS * sizeof(float));
+		wii_mix.ahead_used += count;
+		output += count * OUTPUT_CHANNELS;
+		frames -= count;
+	}
+}
+#else
 static void mix(float *output, unsigned long frames)
 {
 	struct sdl_stream *stream;
@@ -1315,6 +2138,7 @@ static void mix(float *output, unsigned long frames)
 	voice_audio_mix(output, frames);
 	limit(output, frames);
 }
+#endif
 
 /* ---------- output */
 
@@ -1369,13 +2193,14 @@ void dsound_wii_audio_report(void)
 /* without output, drain voices in real time */
 static void *silent_clock_thread(void *parameter)
 {
-	float buffer[320 * OUTPUT_CHANNELS];
+	/* (10 ms of output) */
+	float buffer[OUTPUT_RATE / 100 * OUTPUT_CHANNELS];
 	struct timespec period = { 0, 10000000L };
 
 	(void)parameter;
 	for (;;)
 	{
-		mix(buffer, 320);
+		mix(buffer, OUTPUT_RATE / 100);
 		nanosleep(&period, NULL);
 	}
 	return NULL;
@@ -1388,8 +2213,7 @@ static void audio_start(void)
 	audio_started = TRUE;
 	master_volume = (float)config_real("audio.volume");
 	reverb_enabled = config_boolean("audio.reverb");
-	resampler_initialize();
-	resampler_phases_initialize();
+	upsampler_initialize();
 	reverb_initialize();
 	if (config_boolean("audio.enabled") && wl_platform_audio_start(OUTPUT_RATE, 256, audio_fill, NULL) == WL_OK)
 		return;
@@ -1756,6 +2580,7 @@ void dsound_sdl_stream_set_stereo_position(IDirectSoundStream *object, BOOL posi
 	/* (as the game gives a 3D channel: no maximum) */
 	stream->minimum_distance = minimum_distance > 0.0f ? minimum_distance : 0.0f;
 	stream->maximum_distance = 3.4e38f;
+	voice_parameters_serial++;
 	pthread_mutex_unlock(&mixer_lock);
 }
 
@@ -1807,6 +2632,7 @@ VOID WINAPI DirectSoundDoWork(void)
 		volume_read_at = config_changes();
 		master_volume = (float)config_real("audio.volume");
 		reverb_enabled = config_boolean("audio.reverb");
+		voice_parameters_serial++;
 	}
 	streams_complete_finished();
 }
@@ -1854,6 +2680,7 @@ HRESULT WINAPI IDirectSound_SetI3DL2Listener(LPDIRECTSOUND sound, LPCDSI3DL2LIST
 	pthread_mutex_lock(&mixer_lock);
 	environment = *listener_properties;
 	environment_serial++;
+	voice_parameters_serial++;
 	pthread_mutex_unlock(&mixer_lock);
 	return DS_OK;
 }
@@ -1874,6 +2701,7 @@ HRESULT WINAPI IDirectSound_SetRolloffFactor(LPDIRECTSOUND sound, FLOAT factor, 
 	(void)apply;
 	pthread_mutex_lock(&mixer_lock);
 	listener.rolloff_factor = factor >= 0.0f ? factor : 1.0f;
+	voice_parameters_serial++;
 	pthread_mutex_unlock(&mixer_lock);
 	return DS_OK;
 }
@@ -1886,6 +2714,7 @@ HRESULT WINAPI IDirectSound_SetPosition(LPDIRECTSOUND sound, FLOAT x, FLOAT y, F
 	listener.position[0] = x;
 	listener.position[1] = y;
 	listener.position[2] = z;
+	voice_parameters_serial++;
 	pthread_mutex_unlock(&mixer_lock);
 	return DS_OK;
 }
@@ -1918,6 +2747,7 @@ HRESULT WINAPI IDirectSound_SetOrientation(LPDIRECTSOUND sound, FLOAT x_front, F
 	listener.top[2] = z_top;
 	normalize3(listener.front);
 	normalize3(listener.top);
+	voice_parameters_serial++;
 	pthread_mutex_unlock(&mixer_lock);
 	return DS_OK;
 }
@@ -1981,6 +2811,7 @@ unsigned long __stdcall DirectSoundGetStreamVoiceStatus(LPDIRECTSOUNDSTREAM stre
 	struct sdl_stream *record = stream_from_interface(stream); \
 	pthread_mutex_lock(&mixer_lock); \
 	body; \
+	voice_parameters_serial++; \
 	pthread_mutex_unlock(&mixer_lock); \
 	return DS_OK;
 
@@ -2018,6 +2849,7 @@ HRESULT WINAPI IDirectSoundStream_SetMixBinVolumes(LPDIRECTSOUNDSTREAM stream, D
 			record->mix_right = gain_from_millibels(volumes[index]);
 		index++;
 	}
+	voice_parameters_serial++;
 	pthread_mutex_unlock(&mixer_lock);
 	return DS_OK;
 }

@@ -60,6 +60,20 @@ static void voice_audio_mix(float *output, unsigned long frames)
 
 /* ---------- voices */
 
+/* count 16-bit samples as a packet keeps them: little-endian PCM */
+static unsigned char *packet_pcm(const short *samples, unsigned long count)
+{
+	unsigned char *bytes = malloc(count * 2);
+	unsigned long n;
+
+	for (n = 0; n < count; n++)
+	{
+		bytes[n * 2] = (unsigned char)(samples[n] & 0xff);
+		bytes[n * 2 + 1] = (unsigned char)((samples[n] >> 8) & 0xff);
+	}
+	return bytes;
+}
+
 /* a voice of frames frames of channels channels at rate, played at frequency
 (0: its rate), a 2D voice heard at full volume in both speakers */
 static struct sdl_stream *voice_new(const short *samples, unsigned long frames, unsigned long channels,
@@ -73,8 +87,7 @@ static struct sdl_stream *voice_new(const short *samples, unsigned long frames, 
 	stream->volume = 1.0f;
 	stream->mix_left = stream->mix_right = 1.0f;
 	stream->room = stream->room_hf = DSBVOLUME_MIN;
-	stream->packets[0].samples = malloc(frames * channels * sizeof(short));
-	memcpy(stream->packets[0].samples, samples, frames * channels * sizeof(short));
+	stream->packets[0].source = packet_pcm(samples, frames * channels);
 	stream->packets[0].frames = frames;
 	stream->packet_count = 1;
 	resampler_reset(stream);
@@ -83,7 +96,7 @@ static struct sdl_stream *voice_new(const short *samples, unsigned long frames, 
 
 static void voice_delete(struct sdl_stream *stream)
 {
-	free(stream->packets[0].samples);
+	free((void *)stream->packets[0].source);
 	free(stream);
 }
 
@@ -383,11 +396,17 @@ static void scene(unsigned long voices, unsigned long silent, BOOL indoor, doubl
 			stream->room_hf = 0;
 		}
 		/* a packet as long as the scene */
-		free(stream->packets[0].samples);
-		stream->packets[0].frames = (unsigned long)(seconds * 50000);
-		stream->packets[0].samples = malloc(stream->packets[0].frames * stream->channels * sizeof(short));
-		for (n = 0; n < stream->packets[0].frames * stream->channels; n++)
-			stream->packets[0].samples[n] = (v == 0 ? stereo : mono)[n % frames];
+		{
+			unsigned long count = (unsigned long)(seconds * 50000) * stream->channels;
+			short *samples = malloc(count * sizeof(short));
+
+			for (n = 0; n < count; n++)
+				samples[n] = (v == 0 ? stereo : mono)[n % frames];
+			free((void *)stream->packets[0].source);
+			stream->packets[0].frames = (unsigned long)(seconds * 50000);
+			stream->packets[0].source = packet_pcm(samples, count);
+			free(samples);
+		}
 		stream->next = streams;
 		streams = stream;
 	}

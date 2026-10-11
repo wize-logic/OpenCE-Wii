@@ -75,11 +75,15 @@ vertices, and draws simpler ones sooner) */
 #define OBJECT_SHADOWS_DEFAULT "false"
 #define BUMPED_HIGHLIGHTS_DEFAULT "false"
 #define GX_LIGHTING_DEFAULT "true"
+/* (audio.reverb's: the reverb would add half again to what the Wii's processor spends
+on a battle's sound, 3% of it; dsound_sdl.c, the Wii's mixing) */
+#define REVERB_DEFAULT "false"
 #else
 #define MODEL_DETAIL_DEFAULT "1.0"
 #define OBJECT_SHADOWS_DEFAULT "true"
 #define BUMPED_HIGHLIGHTS_DEFAULT "true"
 #define GX_LIGHTING_DEFAULT "false"
+#define REVERB_DEFAULT "true"
 #endif
 
 static const struct config_setting config_settings[] =
@@ -212,7 +216,7 @@ static const struct config_setting config_settings[] =
 	{ "audio.effects_volume", _config_real, "1.0", "HALO_EFFECTS_VOLUME", _environment_value, _platform_all,
 		"The volume of every other sound (effects and speech), 0.0 to 1.0 (of\n"
 		"audio.volume)." },
-	{ "audio.reverb", _config_boolean, "true", "HALO_REVERB", _environment_value, _platform_all,
+	{ "audio.reverb", _config_boolean, REVERB_DEFAULT, "HALO_REVERB", _environment_value, _platform_all,
 		"Reverberate the world's sounds as the place the player is in does (the\n"
 		"maps' sound environments, as the Xbox's I3DL2 reverb did); false keeps\n"
 		"them dry." },

@@ -39,7 +39,7 @@ static void reset(int count,int finished,int wrapped) {
  for(int i=0;i<count;i++) {
   struct voice_packet *p=&stream.packets[(stream.packet_head+i)%MAXIMUM_STREAM_PACKETS];
   p->finished=finished==2 || (finished==1 && i==0);
-  p->samples=malloc(16); p->packet.dwMaxSize=512;
+  static unsigned char bytes[512]; p->source=bytes; p->packet.dwMaxSize=512;
   status[i]=XMEDIAPACKET_STATUS_PENDING; completed[i]=999;
   p->packet.pdwStatus=&status[i]; p->packet.pdwCompletedSize=&completed[i];
   p->packet.pContext=(void *)(long)(i+1);

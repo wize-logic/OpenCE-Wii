@@ -196,9 +196,33 @@ inflated it to, and the Wii reads it where it is.
   length (`square_root`).
 - **Movies.** Bink movies are skipped (`source/bink/bink_playback.c`).
 - **Sound.** The shared DirectSound mixer (`port/linux/src/dsound_sdl.c`) fills WiiLibs' audio
-  stream (AESND, 32 kHz). Every 240 frames the log reports blocks mixed and played, underruns,
+  stream (AESND, 44.1 kHz). Every 240 frames the log reports blocks mixed and played, underruns,
   the time a block takes to mix, and the loudest sample. In the menu: no underruns, the music
-  near full scale, about 0.6 ms to mix a block.
+  near full scale, about 0.6 ms to mix a block (measured at 32 kHz, with the other platforms'
+  mixing).
+  - The other platforms resample every voice to the output's rate with a 48-tap windowed sinc.
+    That took two thirds of the processor in b30 (the first sampling profile, `mix`): counted
+    under qemu-ppc, a 22 kHz voice cost 530 instructions an output frame at 32 kHz and a 44 kHz
+    one 3,900, its low pass stretched tap by tap. The Wii mixes each voice at its own rate
+    instead ("the Wii's mixing" in `dsound_sdl.c`): the game's 22 kHz voices on a 22,050 Hz bus
+    and its 44 kHz ones on the 44,100 Hz output, each frame as it is; one half-band low pass
+    (32 taps) doubles the low bus for all of them; a voice the game plays at another frequency
+    (a sound's random pitch, an engine) is interpolated onto the output by a cubic
+    (Catmull-Rom). The gains, pans, low passes and room sends are the other platforms'.
+  - The figures (`python tools/harness/tests/test_mixer_wii.py metrics`): a 22 kHz voice flat
+    within 0.01 dB to 9.5 kHz with the images 70 dB down, 1.8 dB down at 10.5 kHz; a 44 kHz
+    voice exact; a pitched one 0.2 dB down at a fifth of its rate and 2 dB at two fifths, the
+    cubic's images 33 dB down at a fifth, above 16 kHz for a voice played near its rate.
+  - Counted (instructions an output frame, the scene of `mixer_wii.c`'s "bench": 12 mono 22 kHz
+    voices in the world, two of them pitched, two stereo 44 kHz and two stereo 22 kHz voices, 8
+    out of earshot, loud enough to be limited): 910 with ADPCM (40 million instructions a
+    second, 5.5% of the processor), 680 with PCM, against 15,100 at 32 kHz (480 million, two
+    thirds of the processor, as in the profile) with every voice resampled and the packets
+    decoded beforehand. Of the 910: 240 decoding ADPCM, 160 making the samples floats, 300 the
+    voices' gains, filters and interpolation, 100 the limiter, 70 the upsampler. A voice out of
+    earshot costs about 1, the mix with nothing playing 50.
+  - `audio.reverb` is `false` on the Wii: the reverb (at the low bus's rate) adds about 480 an
+    output frame to that scene, half as much again.
 
 ## Memory
 
