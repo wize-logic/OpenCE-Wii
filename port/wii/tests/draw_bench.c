@@ -436,6 +436,17 @@ static void camera_set(int frame)
 	C(-71)[1] = -1.0f;
 	C(-70)[0] = C(-70)[1] = C(-70)[2] = 0.3f;
 	C(-69)[0] = C(-69)[1] = C(-69)[2] = 0.15f;
+	/* the fogs: two planes and the atmospheric distance's (c-88 to c-86),
+	and their amounts (c-85) */
+	C(-88)[2] = 0.2f;
+	C(-88)[3] = 0.1f;
+	C(-87)[0] = 0.05f;
+	C(-87)[3] = 0.4f;
+	C(-86)[1] = 0.02f;
+	C(-86)[3] = 0.3f;
+	C(-85)[0] = 0.5f;
+	C(-85)[1] = 0.6f;
+	C(-85)[2] = 0.7f;
 	/* (c-96 to c-69: the viewport's, c-38 and c-37, are the device's) */
 	D3DDevice_SetVertexShaderConstant(-96, C(-96), 28);
 }
@@ -751,7 +762,11 @@ static void skinned_draw(int frame, const char *scene)
 			D3DDevice_SetVertexShader(vertex_shader_handles[vertex_shader_find(0xcfc6f3a4UL)]);
 			model_pass(TRUE);
 			draw(scene, frame, D3DPT_TRIANGLESTRIP, skinned_parts[part].strip, skinned_parts[part].strip_count);
-			D3DDevice_SetVertexShader(vertex_shader_handles[vertex_shader_find(0x9d2757d2UL)]);
+			/* (the second the point lights', with the planar fog for the second
+			model, and with the planar and atmospheric fogs' product for the
+			third: GX's fog ramp and the processor's alpha) */
+			D3DDevice_SetVertexShader(vertex_shader_handles[vertex_shader_find(model == 0 ? 0x9d2757d2UL :
+				model == 1 ? 0x8f831b43UL : 0x1d3f5b13UL)]);
 			model_pass(FALSE);
 			draw(scene, frame, D3DPT_TRIANGLESTRIP, skinned_parts[part].strip, skinned_parts[part].strip_count);
 		}

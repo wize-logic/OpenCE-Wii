@@ -495,8 +495,20 @@ and pixel shaders.
       one opposite for a translucent shader's back side), and each point light. COLOR1A1 is
       D1, the Fresnel colour c-80 + c-81 (n.e): two lights at the eye, signed
       (`GX_DF_SIGNED`), one for the channels where c-81 is positive and one, with a negative
-      attenuation, for those where it is negative. D0's alpha is 0, or the planar fog's, which
-      the processor computes from the world position (about 110 instructions a vertex).
+      attenuation, for those where it is negative. D0's alpha is 0, or the planar fog's.
+    - The planar fog's alpha (`8f831b43`: the Pelican, the first-person weapon, b30's
+      scenery at sea level) is a function of two values affine in the world position, the
+      depth below the fog's plane (c-87) and the distance ahead (c-86), constant beyond 0 and
+      1. A 32 by 32 intensity texture (the ramp, written once for each fog's c-85.y and z,
+      four kept) holds it, read at texture coordinate 5, which GX makes of the position
+      through the vertex's own position matrix (to E) and a post-transform matrix
+      (`GX_DTTMTX0`, E to the ramp's coordinates). The pixel shader is translated again with
+      D0's alpha that texture's (`gx_psh_textures.d0_alpha_map`, a map of 4 to 7 the stages
+      leave free), so the vertices send no alpha. The fog is then the fog's at each pixel,
+      where the Xbox interpolates the vertices'. The product with the atmospheric fog
+      (`1d3f5b13`, `e6e006c7`), a draw with no map free or whose coordinates at its centre
+      are more than 256 ramps from it, and a pixel shader beyond GX with it keep the
+      processor's alpha, computed from the world position.
     - A point light's fall-off, max(1 - d^2/r^2, 0), is not a form GX has: its reciprocal's
       second-order expansion about the draw's distance gives GX's k0 + k1 d + k2 d^2. Its spot,
       clamp(cos s + o, 0, 1), is a parabola through the same cut-off, 1 on its axis.
@@ -520,18 +532,24 @@ and pixel shaders.
       each other, lights about it) and compares what GX makes of the same vertices: D0 with
       the distant lights 0.8 to 0.9/255 on average (the largest, 30/255, where a blend of
       two nodes shortens the programs' normal, which GX makes unit again), with point lights
-      1.8 to 2.6/255 (their fit; largest 166/255), D1 0.6/255, the planar fog's alpha exact,
-      the position within 0.007 pixels. The reflection's direction is 7 degrees off on average
+      1.8 to 2.6/255 (their fit; largest 166/255), D1 0.6/255, the planar fog's alpha exact
+      on the processor and from GX's ramp 0.25/255 on average at the vertices (largest
+      1/255; GX's bilinear filter in 128ths of a texel) and 0.32/255 halfway between two
+      (largest 1.5/255; against the programs' interpolation 0.41/255, largest 20/255), the
+      position within 0.007 pixels. The reflection's direction is 7 degrees off on average
       (25 with the eye straight ahead of every draw, 3.3 with each draw's own direction), and
       the grid's interpolation of the world's sphere map 1.4 texels in 128 on average (the
       largest across the mirror ball's rim, straight down).
     - On the processor, a vertex of these draws takes 17 instructions (the normal's decode and
       the FIFO's words), 129 with the planar fog's alpha, where the hybrid path took 920 to
       1,200 (`qemu-ppc` counts, with GCC's code: `cfc6f3a4` 920 to 17, `9d2757d2` 1,149 to 17,
-      `8f831b43` 1,200 to 129). A vertex whose position is the processor's (a blend beyond the
+      `8f831b43` 1,200 to 129). The planar fog's ramp takes `8f831b43`'s back to the others'
+      (a harness of the loop's lit vertex, with its call: 193 to 54, 206 to 66 with a node's
+      matrix index, about 140 fewer). A vertex whose position is the processor's (a blend beyond the
       draw's matrices) still runs the program for its position and is skinned for its normal.
     - The log's `lit by GX` line counts the draws, their vertices, those refused (no such space,
-      more lights or colours than GX holds) and the view's sphere maps drawn.
+      more lights or colours than GX holds), the view's sphere maps drawn, and the draws whose
+      planar fog was the ramp's (and the ramps written) or the processor's.
 
   GX then draws the results:
   - A program that divides by its clip-space w is sent as (x·w, y·w, −w) through a perspective
@@ -680,7 +698,8 @@ the Wii's other defaults (`display.model_detail = 0.5`, no object shadows).
 - `display.model_detail` changes almost nothing here (b30: 89,700 vertices at 1.0, 91,800 at
   0.5, 91,200 at 0.25). The grunts, elites and jackals far away are already at their lowest
   level of detail (about 450 vertices a grunt), and the trees, shrubs and rocks have only one.
-  b30's objects at that moment: the Pelican (10,700, its planar fog the processor's), 12 grunts
+  b30's objects at that moment: the Pelican (10,700, its planar fog the processor's, or GX's ramp with
+  `display.gx_lighting`), 12 grunts
   (5,400), about 25 trees (17,000), 4 elites (3,300).
 - None of these settings changes the game's state: with each on and off, the x86 build's
   lockstep hashes agree at every logged tick (a10 to tick 88,500 for the lightmaps and 32,200

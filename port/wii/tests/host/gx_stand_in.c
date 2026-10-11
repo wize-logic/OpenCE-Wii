@@ -77,8 +77,10 @@ struct vertex_state
 	unsigned array_stride[ATTRIBUTES];
 	uint32_t current_matrix;
 	unsigned texgens;
-	struct { uint32_t type, source, matrix; } texgen[8];
+	struct { uint32_t type, source, matrix, normalize, post; } texgen[8];
 	float rows[MATRIX_ROWS][4];
+	/* the post-transform matrices (GX_DTTMTX0 on) */
+	float post_rows[MATRIX_ROWS][4];
 	float normal[NORMAL_MATRICES][3][3];
 };
 
@@ -333,6 +335,15 @@ static uint64_t vertex_digest(uint64_t hash, const struct vertex_state *state, u
 		else
 			for (row = 0; row < (state->texgen[gen].type == GX_TG_MTX2x4 ? 2u : 3u) && matrix + row < MATRIX_ROWS; row++)
 				hash = hash_bytes(hash, state->rows[matrix + row], sizeof(state->rows[0]));
+		/* (and its post-transform matrix, where it has one) */
+		if (state->texgen[gen].post != GX_DTTIDENTITY)
+		{
+			uint32_t post = state->texgen[gen].post - GX_DTTMTX0;
+
+			hash = hash_bytes(hash, &state->texgen[gen].normalize, sizeof(state->texgen[gen].normalize));
+			for (row = 0; row < 3 && post + row < MATRIX_ROWS; row++)
+				hash = hash_bytes(hash, state->post_rows[post + row], sizeof(state->post_rows[0]));
+		}
 	}
 	return hash;
 }
@@ -582,7 +593,7 @@ void GX_SetNumTexGens(u32 count)
 #endif
 }
 
-void GX_SetTexCoordGen(u16 texcoord, u32 type, u32 source, u32 matrix)
+void GX_SetTexCoordGen2(u16 texcoord, u32 type, u32 source, u32 matrix, u32 normalize, u32 post)
 {
 	calls++;
 #ifdef GX_STAND_IN_RECORD
@@ -591,13 +602,22 @@ void GX_SetTexCoordGen(u16 texcoord, u32 type, u32 source, u32 matrix)
 		vs.texgen[texcoord].type = type;
 		vs.texgen[texcoord].source = source;
 		vs.texgen[texcoord].matrix = matrix;
+		vs.texgen[texcoord].normalize = normalize;
+		vs.texgen[texcoord].post = post;
 	}
 #else
 	(void)texcoord;
 	(void)type;
 	(void)source;
 	(void)matrix;
+	(void)normalize;
+	(void)post;
 #endif
+}
+
+void GX_SetTexCoordGen(u16 texcoord, u32 type, u32 source, u32 matrix)
+{
+	GX_SetTexCoordGen2(texcoord, type, source, matrix, GX_FALSE, GX_DTTIDENTITY);
 }
 
 static void rows_load(const float (*matrix)[4], u32 first, unsigned count)
@@ -605,6 +625,12 @@ static void rows_load(const float (*matrix)[4], u32 first, unsigned count)
 #ifdef GX_STAND_IN_RECORD
 	unsigned row;
 
+	if (first >= GX_DTTMTX0)
+	{
+		for (row = 0; row < count && first - GX_DTTMTX0 + row < MATRIX_ROWS; row++)
+			memcpy(vs.post_rows[first - GX_DTTMTX0 + row], matrix[row], sizeof(vs.post_rows[0]));
+		return;
+	}
 	for (row = 0; row < count && first + row < MATRIX_ROWS; row++)
 		memcpy(vs.rows[first + row], matrix[row], sizeof(vs.rows[0]));
 #else

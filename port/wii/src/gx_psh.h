@@ -30,6 +30,11 @@ enum
 	GX_PSH_BUMP_TEXMAP = 5,
 	GX_PSH_BUMP_TEXCOORD_S = 1,
 	GX_PSH_BUMP_TEXCOORD_T = 2,
+	/* D0's alpha from a texture (gx_psh_textures.d0_alpha_map): the map's
+	alpha, read at texture coordinate 5; as the translation names it, the
+	map plus GX_PSH_D0_ALPHA_MAP */
+	GX_PSH_D0_ALPHA_TEXCOORD = 5,
+	GX_PSH_D0_ALPHA_MAP = 16,
 };
 
 /* a stage's part in a bumped lookup (gx_psh_program.indirect): GX's
@@ -101,6 +106,10 @@ struct gx_psh_textures
 	/* fog (D3DRS_FOGENABLE, its ramp bound) and its colour */
 	unsigned char fog;
 	DWORD fog_color;
+	/* D0's alpha read from this texture map (4 to 7, one the stages leave
+	free) rather than the rasterized colour, 0 as it is: the planar fog's,
+	which the device makes of the position (gx_lighting.h) */
+	unsigned char d0_alpha_map;
 };
 
 struct gx_psh_program
