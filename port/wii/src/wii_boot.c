@@ -198,9 +198,11 @@ void wii_missing_symbol(const char *name)
 	wii_report("\nThe Wii port does not provide %s yet.\nPress HOME (or START) to return to the loader.\n", name);
 	wl_platform_log_flush();
 	/* (the console's framebuffer on the screen again, if the game's frames
-	had taken its place) */
+	had taken its place: after the last frame presented, which the retrace
+	interrupt would otherwise put on the screen over it) */
 	if (console_framebuffer)
 	{
+		wl_platform_video_wait_shown();
 		VIDEO_SetNextFramebuffer(console_framebuffer);
 		VIDEO_Flush();
 	}
