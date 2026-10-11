@@ -477,7 +477,7 @@ and pixel shaders.
     instructions a vertex for `8f831b43`: its skinning and lighting are most of it); each index
     sends 7 words to the FIFO in place of 14.
   - In the menu, the draws take 10 ms a frame compiled, against 58 ms interpreted.
-  - **The models' lighting on GX's lights** (`display.gx_lighting`, off by default until its streaks are fixed;
+  - **The models' lighting on GX's lights** (`display.gx_lighting`, on by default on the Wii;
     `src/gx_lighting.c`). The models' lit programs (`cfc6f3a4`, `9d2757d2`, `8f831b43`: the
     reflection, lights and planar fog permutations of a skinned model; `71f9f272`, `1d3f5b13`,
     `e6e006c7`) light each vertex by its skinned normal, and take a cube map at the eye's

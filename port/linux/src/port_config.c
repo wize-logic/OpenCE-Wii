@@ -74,7 +74,7 @@ vertices, and draws simpler ones sooner) */
 #define MODEL_DETAIL_DEFAULT "0.5"
 #define OBJECT_SHADOWS_DEFAULT "false"
 #define BUMPED_HIGHLIGHTS_DEFAULT "false"
-#define GX_LIGHTING_DEFAULT "false"
+#define GX_LIGHTING_DEFAULT "true"
 #define BUMPED_LIGHTMAPS_DEFAULT "false"
 #define ENVIRONMENT_REFLECTIONS_DEFAULT "false"
 /* (audio.reverb's: the reverb would add half again to what the Wii's processor spends
