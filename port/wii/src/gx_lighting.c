@@ -45,6 +45,7 @@ interpreter.
 */
 
 #include "gx_lighting.h"
+#include "nv2a_cpu_native.h"
 
 #include <math.h>
 #include <string.h>
@@ -548,28 +549,42 @@ void gx_lighting_skin(const float (*c)[4], const float nodes[4], const float wei
 
 /* ---------- the sphere maps */
 
+/* 1 / sqrt(x) for x > 0, to about a millionth: frsqrte's estimate and two
+of Newton's steps (the sphere maps' grids, a few hundred points each: their
+library square roots were most of a grid's time) */
+static float reciprocal_root(float x)
+{
+	double y = nv2a_reciprocal_root_estimate(x);
+
+	y = y * (1.5 - 0.5 * x * y * y);
+	y = y * (1.5 - 0.5 * x * y * y);
+	return (float)y;
+}
+
 void gx_lighting_sphere_coordinates(const float direction[3], float out[2])
 {
-	float x = direction[0], y = direction[1], z = direction[2];
-	float length = sqrtf(x * x + y * y + z * z), m;
+	float x = direction[0], y = direction[1], z = direction[2], length2 = x * x + y * y + z * z, scale, m2;
 
-	if (!(length > 1.0e-12f))
+	if (!(length2 > 1.0e-24f))
 	{
 		out[0] = out[1] = 0.5f;
 		return;
 	}
-	x /= length;
-	y /= length;
-	z /= length;
-	m = 2.0f * sqrtf(x * x + y * y + (z + 1.0f) * (z + 1.0f));
-	if (!(m > 1.0e-6f))
+	scale = reciprocal_root(length2);
+	x *= scale;
+	y *= scale;
+	z *= scale;
+	m2 = x * x + y * y + (z + 1.0f) * (z + 1.0f);
+	if (!(m2 > 0.25e-12f))
 	{
 		out[0] = 0.5f;
 		out[1] = 1.0f;
 		return;
 	}
-	out[0] = x / m + 0.5f;
-	out[1] = y / m + 0.5f;
+	/* (x / m + 1/2, m twice the root) */
+	scale = 0.5f * reciprocal_root(m2);
+	out[0] = x * scale + 0.5f;
+	out[1] = y * scale + 0.5f;
 }
 
 void gx_lighting_view_frame(const struct gx_lighting_space *space, const float toward[3], float step, float frame[3][3],
@@ -628,16 +643,16 @@ void gx_lighting_sphere_texel(const float frame[3][3], float reflection_scale, f
 	float x = 2.0f * s - 1.0f, y = 2.0f * t - 1.0f, z, r2 = x * x + y * y, reflection[3], world[3];
 	int row, column;
 
-	if (r2 > 1.0f)
+	if (r2 >= 1.0f)
 	{
-		float r = sqrtf(r2);
+		float scale = reciprocal_root(r2);
 
-		x /= r;
-		y /= r;
+		x *= scale;
+		y *= scale;
 		z = 0.0f;
 	}
 	else
-		z = sqrtf(1.0f - r2);
+		z = (1.0f - r2) * reciprocal_root(1.0f - r2);
 	/* (the eye along the frame's z) */
 	reflection[0] = reflection_scale * z * x;
 	reflection[1] = reflection_scale * z * y;

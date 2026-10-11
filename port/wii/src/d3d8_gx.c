@@ -83,7 +83,10 @@ void d3d8_state_defaults(void);
 #define SPHERE_BAKE_VERTEX_FORMAT GX_VTXFMT5
 /* bytes of decoded textures kept (in the game's heap) */
 #define TEXTURE_CACHE_BYTES (1536UL * 1024UL)
-#define TEXTURE_CACHE_ENTRIES 128
+/* the textures known (a converted bitmap's entry holds no memory: b30 binds
+more than 128 a frame, which an LRU of 128 lost and found again each frame) */
+#define TEXTURE_CACHE_ENTRIES 1024
+#define TEXTURE_BUCKETS 512
 /* frames between the draw counts in the log */
 #define STATISTICS_FRAMES 60
 
@@ -136,6 +139,9 @@ struct frame_timing
 	uint64_t hardware_setup, hardware_vertices, processor, immediate;
 	/* the processor's vertices' steps, in timebase ticks (60.75 a microsecond) */
 	unsigned long long fetch_ticks, program_ticks, store_ticks, emit_ticks;
+	/* the part of present spent waiting for GX to finish the frame's draws
+	(the rest: the copy to the display and its retrace) */
+	uint64_t present_gx;
 };
 
 struct draw_statistics
@@ -795,6 +801,10 @@ static void frame_begin(D3DCOLOR clear_color)
 	guMtxIdentity(identity);
 	GX_LoadPosMtxImm(identity, GX_PNMTX0);
 	GX_SetCurrentMtx(GX_PNMTX0);
+	/* (and GX_IDENTITY, the texture matrix the draws in screen space read
+	their coordinates through, as GX_Init left it: nothing else may load it,
+	but a frame begins with it right whatever did) */
+	GX_LoadTexMtxImm(identity, GX_IDENTITY, GX_MTX3x4);
 
 	GX_SetVtxAttrFmt(DEVICE_VERTEX_FORMAT, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
 	GX_SetVtxAttrFmt(DEVICE_VERTEX_FORMAT, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
@@ -1017,6 +1027,14 @@ struct texture_entry
 	/* a decoded texture's pixels when it was decoded, hashed: the game
 	rewrites some (its text's glyph cache) */
 	unsigned long hash, source_bytes;
+	/* (a decoded texture outside the map's texture cache: one the game made
+	and writes, hashed once a frame as well as when it is locked) */
+	BOOL outside;
+	/* a number given each time the entry is filled (textures_bind keeps a
+	stage's texture object while it is the same) */
+	unsigned long serial;
+	/* the next entry in its bucket, plus one (texture_lookup) */
+	unsigned short next;
 };
 
 struct gx_native_format
@@ -1029,6 +1047,20 @@ struct gx_native_format
 
 static struct texture_entry texture_cache[TEXTURE_CACHE_ENTRIES];
 static unsigned long texture_cache_bytes;
+/* the entries by their data's address (each the first entry plus one) */
+static unsigned short texture_buckets[TEXTURE_BUCKETS];
+static unsigned long texture_serial;
+/* GX's texture cache (TMEM) holds texels by their address: it is
+invalidated before a draw only when memory GX reads textures from has
+changed since the last time (a decode, a converted bitmap loaded again, a
+copy out of the EFB) and at each frame's start, not at every bind */
+static BOOL texture_memory_changed = TRUE;
+/* what the textures cost, the last STATISTICS_FRAMES frames (the log) */
+static struct
+{
+	unsigned long marked, looked_up, created, hashed, hashed_bytes, decoded, flushed, flushed_bytes,
+		invalidations, objects;
+} texture_counts;
 /* why textures were not drawn (logged with the frame statistics) */
 static unsigned long texture_failures[5];
 enum { _failure_no_data, _failure_shape, _failure_memory, _failure_decode, _failure_format };
@@ -1212,7 +1244,86 @@ static unsigned long texture_hash(const D3DBaseTexture *texture, unsigned long b
 
 	for (index = 0; index < bytes / 4; index++)
 		hash = (hash ^ words[index]) * 16777619UL;
+	texture_counts.hashed++;
+	texture_counts.hashed_bytes += bytes;
 	return hash;
+}
+
+/* The device's mark in a texture's Lock, D3D's own field (no other code
+reads it): the entry the device found the texture in, and that its pixels
+are as the device last saw them through this header. The game sets Lock to
+0 when it builds a header (a bitmap loaded into the map's texture cache:
+xbox_texture_cache.c), and the resources' lock functions do when it is
+about to write the pixels (d3d8_resources.c: the text's glyph cache), so a
+texture without the mark is checked again: a converted bitmap's pixels
+flushed to memory, a decoded one's hashed. */
+#define TEXTURE_MARK 0x47580000UL
+#define TEXTURE_MARK_MASK 0xFFFF0000UL
+
+static unsigned texture_bucket(DWORD data)
+{
+	return (unsigned)((data * 2654435761UL) >> 23) & (TEXTURE_BUCKETS - 1);
+}
+
+/* an entry, filled, into its bucket */
+static void texture_link(struct texture_entry *entry)
+{
+	unsigned bucket = texture_bucket(entry->data);
+
+	entry->serial = ++texture_serial;
+	entry->next = texture_buckets[bucket];
+	texture_buckets[bucket] = (unsigned short)(entry - texture_cache + 1);
+}
+
+static void texture_unlink(struct texture_entry *entry)
+{
+	unsigned short *link = &texture_buckets[texture_bucket(entry->data)];
+	unsigned short self = (unsigned short)(entry - texture_cache + 1);
+
+	while (*link)
+	{
+		if (*link == self)
+		{
+			*link = entry->next;
+			break;
+		}
+		link = &texture_cache[*link - 1].next;
+	}
+}
+
+/* the entry of a texture's data, format and size */
+static struct texture_entry *texture_lookup(const D3DBaseTexture *texture)
+{
+	unsigned short link = texture_buckets[texture_bucket(texture->Data)];
+
+	texture_counts.looked_up++;
+	while (link)
+	{
+		struct texture_entry *entry = &texture_cache[link - 1];
+
+		if (entry->data == texture->Data && entry->format == texture->Format && entry->size == texture->Size)
+			return entry;
+		link = entry->next;
+	}
+	return NULL;
+}
+
+/* the entry to fill: an empty one, else the least recently drawn */
+static struct texture_entry *texture_victim(void)
+{
+	struct texture_entry *oldest = &texture_cache[0];
+	unsigned long index;
+
+	for (index = 0; index < TEXTURE_CACHE_ENTRIES; index++)
+	{
+		struct texture_entry *candidate = &texture_cache[index];
+
+		if (!candidate->texels)
+			return candidate;
+		if (candidate->used_frame < oldest->used_frame)
+			oldest = candidate;
+	}
+	return oldest;
 }
 
 /* the pixels of textures evicted while a frame is open: GX may still read
@@ -1230,6 +1341,8 @@ static void texture_frees_flush(void)
 
 static void texture_evict(struct texture_entry *entry)
 {
+	if (entry->texels)
+		texture_unlink(entry);
 	if (entry->texels && !entry->native)
 	{
 		if (device.frame_open)
@@ -1310,9 +1423,30 @@ static struct texture_entry *texture_native(struct texture_entry *entry, const D
 	entry->channels = format->channels;
 	entry->alpha_texels = format->dual ? texels + bytes / 2 : NULL;
 	entry->linear = description->linear;
-	entry->used_frame = device.frames - 1;
+	entry->used_frame = device.frames;
+	texture_link(entry);
 	textures_native++;
 	return entry;
+}
+
+/* a converted bitmap's pixels, which the processor wrote as it read them
+into the texture cache, to memory before GX reads them */
+static void texture_flush(const struct texture_entry *entry)
+{
+	DCFlushRange(entry->texels, entry->bytes);
+	texture_counts.flushed++;
+	texture_counts.flushed_bytes += entry->bytes;
+	texture_memory_changed = TRUE;
+}
+
+/* the header marked as seen, in its entry (flushed: a converted bitmap's
+pixels are in memory) */
+#define TEXTURE_MARK_FLUSHED 0x8000UL
+
+static void texture_mark(const D3DBaseTexture *texture, const struct texture_entry *entry, BOOL flushed)
+{
+	((D3DBaseTexture *)texture)->Lock = TEXTURE_MARK | (flushed ? TEXTURE_MARK_FLUSHED : 0) |
+		(unsigned long)(entry - texture_cache);
 }
 
 /* ---------- textures drawn by the device
@@ -1372,6 +1506,7 @@ static struct texture_entry *render_target_texture(const D3DBaseTexture *texture
 	entry->channels = _channels_all;
 	entry->linear = description.linear;
 	entry->used_frame = device.frames;
+	entry->serial = ++texture_serial;
 	return entry;
 }
 
@@ -1385,7 +1520,8 @@ static struct texture_entry *texture_get(const D3DBaseTexture *texture, const D3
 	unsigned char *rgba;
 	const unsigned char *source;
 	unsigned char *swapped;
-	unsigned long index, texel_count;
+	unsigned long index, texel_count, mark;
+	BOOL seen, flushed;
 
 	if (!texture || !texture->Data)
 	{
@@ -1395,24 +1531,28 @@ static struct texture_entry *texture_get(const D3DBaseTexture *texture, const D3
 	entry = render_target_texture(texture);
 	if (entry)
 		return entry;
-	for (index = 0; index < TEXTURE_CACHE_ENTRIES; index++)
+	/* (the header's mark: its pixels unchanged since the device saw them
+	through it, in the entry it names, which still holds them; a mark whose
+	entry has gone, or whose header now names other pixels, counts for
+	nothing) */
+	mark = texture->Lock;
+	index = mark & (TEXTURE_MARK_FLUSHED - 1);
+	seen = (mark & TEXTURE_MARK_MASK) == TEXTURE_MARK && index < TEXTURE_CACHE_ENTRIES &&
+		texture_cache[index].texels && texture_cache[index].data == texture->Data &&
+		texture_cache[index].format == texture->Format && texture_cache[index].size == texture->Size;
+	flushed = seen && (mark & TEXTURE_MARK_FLUSHED);
+	if (seen)
 	{
-		struct texture_entry *candidate = &texture_cache[index];
-
-		if (candidate->texels && candidate->data == texture->Data && candidate->format == texture->Format &&
-			candidate->size == texture->Size)
-		{
-			entry = candidate;
-			break;
-		}
-		if (!oldest || candidate->used_frame < oldest->used_frame || !candidate->texels)
-			oldest = candidate;
+		entry = &texture_cache[index];
+		texture_counts.marked++;
 	}
-	/* (a texture the game writes as it draws, outside the map's texture
-	cache: the glyph cache, whose strings bring their glyphs in just before
-	they are drawn, checked at each bind; the others once a frame) */
-	if (entry && !entry->native &&
-		(entry->used_frame != device.frames || !texture_in_texture_cache(texture)) &&
+	else
+		entry = texture_lookup(texture);
+	/* (a decoded texture is hashed again when its header has lost the mark:
+	the glyph cache, whose strings bring their glyphs in just before they
+	are drawn, is locked for each; one outside the map's texture cache once a
+	frame as well, for pixels written without a lock) */
+	if (entry && !entry->native && (!seen || (entry->outside && entry->used_frame != device.frames)) &&
 		texture_hash(texture, entry->source_bytes) != entry->hash)
 	{
 		/* (rewritten since it was decoded: again) */
@@ -1422,13 +1562,18 @@ static struct texture_entry *texture_get(const D3DBaseTexture *texture, const D3
 	}
 	if (entry)
 	{
-		/* (the processor wrote a converted bitmap's pixels as it read them:
-		they reach memory before GX reads them, once a frame) */
-		if (entry->native && entry->used_frame != device.frames)
-			DCFlushRange(entry->texels, entry->bytes);
+		if (entry->native && !flushed)
+		{
+			texture_flush(entry);
+			flushed = TRUE;
+		}
 		entry->used_frame = device.frames;
+		texture_mark(texture, entry, flushed);
 		return entry;
 	}
+	if (!oldest)
+		oldest = texture_victim();
+	texture_counts.created++;
 
 	xgpu_texture_describe(texture->Format, texture->Size, &description);
 	if (!description.cube_map && description.depth <= 1 &&
@@ -1447,8 +1592,8 @@ static struct texture_entry *texture_get(const D3DBaseTexture *texture, const D3
 				platform_log("Direct3D: converted bitmap %lux%lu, format %02lx, %lu of %lu levels at %08lx",
 					description.width, description.height, (unsigned long)description.format, levels,
 					description.levels, (unsigned long)texture->Data);
-			DCFlushRange(entry->texels, entry->bytes);
-			entry->used_frame = device.frames;
+			texture_flush(entry);
+			texture_mark(texture, entry, TRUE);
 			return entry;
 		}
 	}
@@ -1479,7 +1624,9 @@ static struct texture_entry *texture_get(const D3DBaseTexture *texture, const D3
 			entry->channels = _channels_all;
 			entry->sphere = TRUE;
 			entry->used_frame = device.frames;
-			DCFlushRange(entry->texels, entry->bytes);
+			texture_link(entry);
+			texture_flush(entry);
+			texture_mark(texture, entry, TRUE);
 			return entry;
 		}
 	}
@@ -1618,8 +1765,15 @@ static struct texture_entry *texture_get(const D3DBaseTexture *texture, const D3
 		entry->linear = description.linear;
 		entry->source_bytes = xgpu_texture_level_bytes(&description, 0);
 		entry->hash = texture_hash(texture, entry->source_bytes);
+		entry->outside = !texture_in_texture_cache(texture);
 		entry->used_frame = device.frames;
+		texture_link(entry);
 		texture_cache_bytes += bytes;
+		texture_counts.decoded++;
+		/* (new texels, perhaps where others were: GX's texture cache may hold
+		those) */
+		texture_memory_changed = TRUE;
+		texture_mark(texture, entry, flushed);
 	}
 	return entry;
 }
@@ -1666,19 +1820,28 @@ alpha to the map four after); which stages have one */
 texture coordinates are a direction, which sphere_coordinates maps */
 static unsigned sphere_stages;
 
+/* each stage's texture objects as last built, and what they were built from
+(an entry's serial and the stage's states): a stage drawing the same texture
+the same way loads them again without building them */
+static struct
+{
+	unsigned long serial;
+	u8 wrap_s, wrap_t, minification, magnification;
+	GXTexObj alpha;
+} stage_objects[D3DTSS_MAXSTAGES];
+
 static unsigned textures_bind(void)
 {
 	unsigned stages = 0;
 	DWORD stage;
 
-	GX_InvalidateTexAll();
 	sphere_stages = 0;
 	for (stage = 0; stage < D3DTSS_MAXSTAGES; stage++)
 	{
 		struct texture_entry *entry;
 		GXTexObj object;
 		BOOL mipmapped, repeatable;
-		u8 wrap_s, wrap_t, minification;
+		u8 wrap_s, wrap_t, minification, magnification;
 
 		bound_entries[stage] = NULL;
 		texcoord_scale[stage][0] = texcoord_scale[stage][1] = 1.0f;
@@ -1702,6 +1865,7 @@ static unsigned textures_bind(void)
 		if (entry->sphere)
 			sphere_stages |= 1U << stage;
 		minification = gx_minification(stage, mipmapped);
+		magnification = D3D__TextureState[stage][D3DTSS_MAGFILTER] == D3DTEXF_POINT ? GX_NEAR : GX_LINEAR;
 		if (entry->gx_format == GX_TF_CI8)
 		{
 			const struct palette_tlut *tlut = palette_tlut(device.palettes[stage]);
@@ -1720,26 +1884,37 @@ static unsigned textures_bind(void)
 				loaded_tluts[stage] = tlut;
 				loaded_tlut_hashes[stage] = tlut->hash;
 			}
-			GX_InitTexObjCI(&object, entry->texels, (u16)entry->width, (u16)entry->height, GX_TF_CI8, wrap_s, wrap_t,
-				mipmapped ? GX_TRUE : GX_FALSE, GX_TLUT0 + stage);
 		}
-		else
-			GX_InitTexObj(&object, entry->texels, (u16)entry->width, (u16)entry->height, entry->gx_format, wrap_s,
-				wrap_t, mipmapped ? GX_TRUE : GX_FALSE);
-		GX_InitTexObjLOD(&object, minification,
-			D3D__TextureState[stage][D3DTSS_MAGFILTER] == D3DTEXF_POINT ? GX_NEAR : GX_LINEAR,
-			0.0f, mipmapped ? (f32)(entry->levels - 1) : 0.0f, 0.0f, GX_FALSE, GX_FALSE, GX_ANISO_1);
-		GX_LoadTexObj(&object, (u8)(GX_TEXMAP0 + stage));
-		bound_objects[stage] = object;
-		if (entry->alpha_texels)
+		if (stage_objects[stage].serial != entry->serial || stage_objects[stage].wrap_s != wrap_s ||
+			stage_objects[stage].wrap_t != wrap_t || stage_objects[stage].minification != minification ||
+			stage_objects[stage].magnification != magnification)
 		{
-			GX_InitTexObj(&object, entry->alpha_texels, (u16)entry->width, (u16)entry->height, GX_TF_I4, wrap_s, wrap_t,
-				mipmapped ? GX_TRUE : GX_FALSE);
-			GX_InitTexObjLOD(&object, minification,
-				D3D__TextureState[stage][D3DTSS_MAGFILTER] == D3DTEXF_POINT ? GX_NEAR : GX_LINEAR,
-				0.0f, mipmapped ? (f32)(entry->levels - 1) : 0.0f, 0.0f, GX_FALSE, GX_FALSE, GX_ANISO_1);
-			GX_LoadTexObj(&object, (u8)(GX_TEXMAP4 + stage));
+			if (entry->gx_format == GX_TF_CI8)
+				GX_InitTexObjCI(&object, entry->texels, (u16)entry->width, (u16)entry->height, GX_TF_CI8, wrap_s,
+					wrap_t, mipmapped ? GX_TRUE : GX_FALSE, GX_TLUT0 + stage);
+			else
+				GX_InitTexObj(&object, entry->texels, (u16)entry->width, (u16)entry->height, entry->gx_format, wrap_s,
+					wrap_t, mipmapped ? GX_TRUE : GX_FALSE);
+			GX_InitTexObjLOD(&object, minification, magnification, 0.0f,
+				mipmapped ? (f32)(entry->levels - 1) : 0.0f, 0.0f, GX_FALSE, GX_FALSE, GX_ANISO_1);
+			bound_objects[stage] = object;
+			if (entry->alpha_texels)
+			{
+				GX_InitTexObj(&stage_objects[stage].alpha, entry->alpha_texels, (u16)entry->width, (u16)entry->height,
+					GX_TF_I4, wrap_s, wrap_t, mipmapped ? GX_TRUE : GX_FALSE);
+				GX_InitTexObjLOD(&stage_objects[stage].alpha, minification, magnification, 0.0f,
+					mipmapped ? (f32)(entry->levels - 1) : 0.0f, 0.0f, GX_FALSE, GX_FALSE, GX_ANISO_1);
+			}
+			stage_objects[stage].serial = entry->serial;
+			stage_objects[stage].wrap_s = wrap_s;
+			stage_objects[stage].wrap_t = wrap_t;
+			stage_objects[stage].minification = minification;
+			stage_objects[stage].magnification = magnification;
+			texture_counts.objects++;
 		}
+		GX_LoadTexObj(&bound_objects[stage], (u8)(GX_TEXMAP0 + stage));
+		if (entry->alpha_texels)
+			GX_LoadTexObj(&stage_objects[stage].alpha, (u8)(GX_TEXMAP4 + stage));
 		bound_entries[stage] = entry;
 		if (entry->linear)
 		{
@@ -1747,6 +1922,12 @@ static unsigned textures_bind(void)
 			texcoord_scale[stage][1] = 1.0f / (float)entry->height;
 		}
 		stages |= 1U << stage;
+	}
+	if (texture_memory_changed)
+	{
+		GX_InvalidateTexAll();
+		texture_memory_changed = FALSE;
+		texture_counts.invalidations++;
 	}
 	return stages;
 }
@@ -3396,6 +3577,8 @@ static void efb_copy(void *destination, unsigned long width, unsigned long heigh
 	GX_SetTexCopyDst((u16)width, (u16)height, format, GX_FALSE);
 	GX_CopyTex(destination, GX_FALSE);
 	GX_PixModeSync();
+	/* (GX's texture cache may hold what was there) */
+	texture_memory_changed = TRUE;
 }
 
 static void efb_park(void)
@@ -3539,6 +3722,22 @@ static void efb_quad(float x0, float y0, float x1, float y1, const GXColor *colo
 		GX_SetZTexture(GX_ZT_DISABLE, GX_TF_Z8, 0);
 		GX_SetZCompLoc(GX_TRUE);
 	}
+}
+
+/* what the frame's display copy (wl_gx_end_frame's) reads, as WiiLibs set
+it up: the whole EFB, its scale to the XFB and its filter, and the screen's
+viewport and scissor */
+static void display_copy_restore(void)
+{
+	GXRModeObj *mode = VIDEO_GetPreferredMode(NULL);
+
+	GX_SetViewport(0.0f, 0.0f, SCREEN_WIDTH, SCREEN_HEIGHT, 0.0f, 1.0f);
+	GX_SetScissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+	if (!mode)
+		return;
+	GX_SetDispCopySrc(0, 0, mode->fbWidth, mode->efbHeight);
+	GX_SetDispCopyDst(mode->fbWidth, (u16)GX_SetDispCopyYScale(GX_GetYScaleFactor(mode->efbHeight, mode->xfbHeight)));
+	GX_SetCopyFilter(mode->aa, mode->sample_pattern, GX_TRUE, mode->vfilter);
 }
 
 static void efb_restore(void)
@@ -3895,16 +4094,22 @@ static BOOL node_keys(const struct vertex_shader_object *shader, const struct st
 	unsigned short seen[256 + BLEND_VALUES];
 	unsigned seen_count = 0, which;
 	struct node_values values;
-	/* (each vertex's value, from the first pass to the second; in the heap) */
+	/* (each vertex's value, from the first pass to the second; in the heap,
+	as long as the longest draw yet) */
 	static short *values_of;
+	static UINT values_room;
 
 	if (count > sizeof(vertex_keys))
 		return FALSE;
-	if (!values_of)
+	if (count > values_room)
 	{
-		values_of = malloc(sizeof(vertex_keys) * sizeof(*values_of));
-		if (!values_of)
+		UINT room = (count + 1023) & ~1023u;
+		short *grown = realloc(values_of, room * sizeof(*values_of));
+
+		if (!grown)
 			return FALSE;
+		values_of = grown;
+		values_room = room;
 	}
 	memset(indices_of, 0, sizeof(indices_of));
 	values.blend_count = values.last = 0;
@@ -4143,24 +4348,34 @@ coordinates from the normal (gx_lighting.c says how, and how close it is):
   or the planar fog's, the processor's (a world position's, by each node's
   matrix), sent as the vertex's colour;
 - texture coordinate 3 (the reflection's cube map) is made of the normal by
-  a matrix for each node (texture matrix rows LIT_SPHERE_ROW on, given with
-  each vertex as its position matrix is), into a sphere map of the view:
-  drawn from the world's in the EFB's rows below the back buffer
-  (sphere_bake), for each cube map and direction of a draw from the eye
-  (rounded to LIT_SPHERE_STEP), once a frame. */
+  a matrix for each node (lit_sphere_rows, given with each vertex as its
+  position matrix is), into a sphere map of the view: drawn from the
+  world's in the EFB's rows below the back buffer (sphere_bake), for each
+  cube map and direction of a draw from the eye (rounded to
+  LIT_SPHERE_STEP), and kept while the view turns no further. */
 
 /* (config.toml's display.gx_lighting; -1 not read yet) */
 static int gx_lighting_on = -1;
 /* the view frames' rounding (tests/gx_lighting_check.c's REFLECTION_STEP) */
 #define LIT_SPHERE_STEP (15.0f * 3.14159265f / 180.0f)
-/* the texture matrices of the normal's sphere map coordinates: a node's
-(two rows each, past the stages' TEXMTX0 to TEXMTX4), and those of the
-processor's vertices (texture coordinate 3's own) */
-#define LIT_SPHERE_ROW 45
-#define LIT_SPHERE_PROCESSOR_ROW (GX_TEXMTX0 + 3 * 3)
-/* the view's sphere maps: kept for the frame, and the most made in one */
-#define SPHERE_BAKES 16
+/* the texture matrices of the normal's sphere map coordinates, two rows
+each: the keys' in order, then the processor's vertices'. Texture
+coordinate 3's own (GX_TEXMTX3, which the draw does not use for it), then
+the free pairs past the stages' TEXMTX0 to TEXMTX4, short of GX_IDENTITY
+(row 60), the identity every draw in screen space reads its texture
+coordinates through: a matrix over it draws them all wrong. */
+static const u8 lit_sphere_rows[] = { GX_TEXMTX3, 45, 47, 49, 51, 53, 55, 57 };
+#define LIT_SPHERE_MATRICES (sizeof(lit_sphere_rows) / sizeof(lit_sphere_rows[0]))
+/* (the last pair, 57 and 58, short of GX_IDENTITY; the first past TEXMTX4's
+pair, 42 and 43) */
+typedef char lit_sphere_rows_short_of_identity[57 + 2 <= GX_IDENTITY && 45 > GX_TEXMTX4 + 1 ? 1 : -1];
+/* the view's sphere maps kept (a buffer can be drawn again in the frame:
+GX copies into it after the draws before it have read it), the most drawn
+in a frame, and how far a view's frame may turn and still keep one (in its
+rows' components: about a tenth of a degree) */
+#define SPHERE_BAKES 8
 #define SPHERE_BAKES_A_FRAME 48
+#define SPHERE_BAKE_KEPT 2.0e-3f
 /* the first row of the EFB below the back buffer, where they are drawn */
 #define SPHERE_BAKE_ROW SCREEN_HEIGHT
 
@@ -4215,14 +4430,22 @@ static BOOL sphere_bake(const struct texture_entry *world, const float frame[3][
 		sphere_bakes_frame = device.frames;
 		sphere_bakes_in_frame = 0;
 	}
-	for (which = 0; which < SPHERE_BAKES; which++)
-		if (sphere_bakes[which].buffer && sphere_bakes[which].frame_number == device.frames &&
-			sphere_bakes[which].texels == world->texels && sphere_bakes[which].scale == scale &&
-			!memcmp(sphere_bakes[which].frame, frame, sizeof(sphere_bakes[which].frame)))
+	for (which = 0; which < SPHERE_BAKES && !buffer; which++)
+	{
+		unsigned row, column;
+		BOOL near = sphere_bakes[which].buffer && sphere_bakes[which].texels == world->texels &&
+			sphere_bakes[which].scale == scale;
+
+		for (row = 0; row < 3 && near; row++)
+			for (column = 0; column < 3; column++)
+				if (fabsf(sphere_bakes[which].frame[row][column] - frame[row][column]) > SPHERE_BAKE_KEPT)
+					near = FALSE;
+		if (near)
 		{
 			buffer = sphere_bakes[which].buffer;
-			break;
+			sphere_bakes[which].frame_number = device.frames;
 		}
+	}
 	if (!buffer)
 	{
 		if (sphere_bakes_in_frame >= SPHERE_BAKES_A_FRAME)
@@ -4497,6 +4720,9 @@ static BOOL lit_prepare(const struct vertex_shader_object *shader, struct stream
 	if (lit.alpha)
 		for (key = 0; key < keys; key++)
 			lit_world_rows(lit.rows[key], lit.world[key]);
+	/* (a matrix for each key, and the processor's vertices', where they fit) */
+	if (lit.reflection && (keyed ? draw_keys.count + (draw_keys.processor ? 1u : 0u) : 1u) > LIT_SPHERE_MATRICES)
+		lit.reflection = FALSE;
 	if (lit.reflection)
 	{
 		float toward[3];
@@ -4558,7 +4784,7 @@ static void lit_state(BOOL keyed, const struct draw_projection *projection, cons
 	if (lit.reflection)
 	{
 		for (key = 0; key < keys; key++)
-			lit_sphere_matrix((const float (*)[4])lit.rows[key], LIT_SPHERE_ROW + 2 * key);
+			lit_sphere_matrix((const float (*)[4])lit.rows[key], lit_sphere_rows[key]);
 		if (draw_keys.processor)
 		{
 			float rows[3][4];
@@ -4566,11 +4792,11 @@ static void lit_state(BOOL keyed, const struct draw_projection *projection, cons
 
 			for (row = 0; row < 3; row++)
 				memcpy(rows[row], lit.space.world_to_eye[row], sizeof(rows[row]));
-			lit_sphere_matrix((const float (*)[4])rows, LIT_SPHERE_PROCESSOR_ROW);
+			lit_sphere_matrix((const float (*)[4])rows, lit_sphere_rows[keys]);
 		}
 		if (keyed)
 			GX_SetVtxDesc(GX_VA_TEX3MTXIDX, GX_DIRECT);
-		GX_SetTexCoordGen(GX_TEXCOORD3, GX_TG_MTX2x4, GX_TG_NRM, LIT_SPHERE_ROW);
+		GX_SetTexCoordGen(GX_TEXCOORD3, GX_TG_MTX2x4, GX_TG_NRM, lit_sphere_rows[0]);
 		GX_LoadTexObj(&lit.sphere, GX_TEXMAP3);
 	}
 }
@@ -5007,7 +5233,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		if (keyed)
 			GX_MatrixIndex1x8((u8)(processor ? GX_PNMTX0 : GX_PNMTX1 + 3 * vertex_keys[vertex]));
 		if (lit_on && lit.reflection && keyed)
-			GX_MatrixIndex1x8((u8)(processor ? LIT_SPHERE_PROCESSOR_ROW : LIT_SPHERE_ROW + 2 * vertex_keys[vertex]));
+			GX_MatrixIndex1x8(lit_sphere_rows[processor ? draw_keys.count : vertex_keys[vertex]]);
 		if (processor || cpu_colors || cpu_spheres)
 		{
 			/* what the processor computes of the vertex: its position (in
@@ -5348,11 +5574,20 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		}
 		/* (the device set GX behind WiiLibs' shadow) */
 		wl_gx_invalidate_shadow();
+		/* (GX's draws finished first, timed apart from the copy to the
+		display and the wait for its retrace, which wl_gx_end_frame makes) */
+		(void)wl_gx_sync();
+		timing.present_gx += wl_platform_time_us() - started;
+		/* the display copy's own state, whatever the frame's copies to
+		textures and drawing below the back buffer (sphere_bake) left */
+		display_copy_restore();
 		wl_gx_end_frame();
 		device.frame_open = FALSE;
 		/* (the frame drawn: the textures evicted during it can go) */
 		GX_DrawDone();
 		texture_frees_flush();
+		/* (GX's texture cache emptied once a frame, whatever was written) */
+		texture_memory_changed = TRUE;
 		timing.present += wl_platform_time_us() - started;
 	}
 	flip_count++;
@@ -5421,6 +5656,13 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			texture_failures[_failure_shape],
 			texture_failures[_failure_format], texture_failures[_failure_memory], texture_failures[_failure_decode],
 			textures_native);
+		platform_log("Direct3D: textures found %lu by their mark, %lu looked up, %lu new; %lu objects built, "
+			"TMEM emptied %lu times", texture_counts.marked, texture_counts.looked_up, texture_counts.created,
+			texture_counts.objects, texture_counts.invalidations);
+		platform_log("Direct3D: textures' pixels: %lu hashed (%lu KB), %lu decoded, %lu flushed (%lu KB)",
+			texture_counts.hashed, texture_counts.hashed_bytes / 1024, texture_counts.decoded, texture_counts.flushed,
+			texture_counts.flushed_bytes / 1024);
+		memset(&texture_counts, 0, sizeof(texture_counts));
 		{
 			static struct gx_psh_cache_counts shaders_last;
 			struct gx_psh_cache_counts shaders;
@@ -5465,6 +5707,9 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 					(unsigned long)(timing.present / 1000 / STATISTICS_FRAMES),
 					(unsigned long)((now - timing.window_start - timing.draws - timing.textures - timing.pixel_shaders -
 						timing.present) / 1000 / STATISTICS_FRAMES));
+				platform_log("Direct3D: the end of the frame: GX's draws %lu ms, the copy and the display's retrace %lu",
+					(unsigned long)(timing.present_gx / 1000 / STATISTICS_FRAMES),
+					(unsigned long)((timing.present - timing.present_gx) / 1000 / STATISTICS_FRAMES));
 			}
 			memset(&timing, 0, sizeof(timing));
 			timing.window_start = now;

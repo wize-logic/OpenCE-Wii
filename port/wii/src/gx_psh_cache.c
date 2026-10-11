@@ -38,7 +38,6 @@ program.
 
 #include "gx_psh_cache.h"
 
-#include <stdlib.h>
 #include <string.h>
 
 /* ---------- constants */
@@ -54,8 +53,7 @@ enum
 	_slot_fog = 18,
 	NUMBER_OF_SLOTS = 19,
 
-	/* (in the heap: MEM1's is full, the rest is MEM2's) */
-	CACHE_SETS = 64,
+	CACHE_SETS = 32,
 	CACHE_WAYS = 4,
 	/* the structures pushed out of the cache, remembered by their hash to
 	count those translated again */
@@ -109,7 +107,7 @@ struct cache_entry
 
 /* ---------- globals */
 
-static struct cache_entry (*cache)[CACHE_WAYS];
+static struct cache_entry cache[CACHE_SETS][CACHE_WAYS];
 static uint32_t evicted_hashes[EVICTED_HASHES];
 static unsigned evicted_next;
 static unsigned long cache_stamp;
@@ -501,17 +499,6 @@ const struct gx_psh_program *gx_psh_cache_program(const DWORD *render_state,
 	int way;
 
 	*translated = FALSE;
-	if (!cache)
-	{
-		cache = calloc(CACHE_SETS, sizeof(*cache));
-		if (!cache)
-		{
-			static struct gx_psh_program none;
-
-			*usable = FALSE;
-			return &none;
-		}
-	}
 	/* (as the last call: its program, still as it was left) */
 	if (last_entry && !memcmp(last_state, render_state, sizeof(last_state)) &&
 		last_texture_modes == render_state[D3DRS_PSTEXTUREMODES] &&
