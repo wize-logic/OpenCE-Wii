@@ -3894,6 +3894,22 @@ void ui_widget_port_go_back(
 	widget_instance_go_back_to_previous(widget);
 }
 
+/* port: the tags of the screen the first local player's menus show and of
+its focused widget, the deepest down its chain of focus (NONE, NONE when
+none is shown), for the scripted controller (port/linux/src/test_input.c) */
+void ui_widget_port_active_screen(
+	long *screen_tag_index,
+	long *focused_tag_index)
+{
+	struct widget_instance *screen = widget_globals.initialized ? widget_globals.active_widgets[0] : NULL;
+	struct widget_instance *focused = screen;
+
+	while (focused && focused->focused_child)
+		focused = focused->focused_child;
+	*screen_tag_index = screen ? screen->definition_tag_index : NONE;
+	*focused_tag_index = focused ? focused->definition_tag_index : NONE;
+}
+
 struct widget_instance *ui_widget_load_by_name_or_tag(
 	char const *name,
 	long tag_index,

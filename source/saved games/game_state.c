@@ -273,12 +273,24 @@ void game_state_dispose(
 game_state_check_data_arrays' report */
 static char const *game_state_last_event = "startup";
 static long game_state_last_event_time = NONE;
+/* port: the checkpoints saved since the start, for the scripted controller
+(port/linux/src/test_input.c) */
+static long game_state_checkpoints_saved = 0;
 
 static void game_state_note_event(
 	char const *event)
 {
 	game_state_last_event = event;
 	game_state_last_event_time = game_time_initialized() ? game_time_get() : NONE;
+	/* port: each in the log, with its game time */
+	platform_log("game state: %s at tick %ld", event, game_state_last_event_time);
+}
+
+/* port: (game_state_checkpoints_saved) */
+long game_state_port_checkpoints_saved(
+	void)
+{
+	return game_state_checkpoints_saved;
 }
 
 static void game_state_data_arrays_new_map(void);
@@ -328,6 +340,8 @@ void game_state_save(
 	game_state_globals.saved_game_valid = (game_state_write_to_file()!=FALSE);
 	main_start_time();
 	game_state_note_event("checkpoint saved");
+	/* port: (counted, for the scripted controller) */
+	game_state_checkpoints_saved++;
 
 	return;
 }

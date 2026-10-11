@@ -1,0 +1,109 @@
+# A person's first session, for debug.test_input = "script:playthrough.txt"
+# (port/linux/src/test_input.c reads it; port/wii/README.md, "The playthrough
+# check"). With the Xbox's menus (display.menus = "xbox", the Wii's only ones)
+# and no saves yet (an empty saves folder): the main menu, CAMPAIGN, a new
+# profile, NORMAL, a10 from its opening to the cryo bay's floor, its saved
+# game kept with SAVE AND QUIT, the profile's settings, and the saved game
+# loaded and played. Every line the log gets starts "test_input:"; each
+# "step" line below is one of the checkpoint's steps.
+
+# the main menu: CAMPAIGN
+screen main_menu\main_menu 300
+wait 2
+log step 1: the main menu, CAMPAIGN
+press a
+
+# the first time, a profile is made: its name (New001) on the keyboard, DONE
+screen new_campaign_creating_profile 60
+wait 2
+log step 2: the new profile's name, DONE
+press a
+
+# the difficulty: NORMAL
+screen difficulty_select 120
+wait 2
+log step 3: the difficulty, NORMAL
+select normal_difficulty_item
+press a
+
+# a10 loads; its opening cinematic is skipped (A), which goes back to the
+# checkpoint saved at its first tick
+play 300
+log step 4: a10 plays
+wait 8
+log step 5: the opening cinematic skipped
+press a
+ticks 150
+
+# the cryo tube: the look training (the right stick every way, A for the
+# look's choice), then X held until the player is out of the tube
+log step 6: the look training
+repeat 6
+stick 0 0 -1 0 1.5
+stick 0 0 1 0 1.5
+stick 0 0 0 1 1.5
+stick 0 0 0 -1 1.5
+press a
+end
+stick 0 0 0 1 1
+log step 7: out of the cryo tube
+repeat 12
+hold x 5 afoot
+wait 1
+end
+afoot 30
+
+# a walk across the cryo bay, toward the red square
+log step 8: walking
+walk -57.2 -3.0 120
+log step 9: on the cryo bay's floor, past the opening's checkpoint
+ticks 90
+
+# pause: SAVE AND QUIT (the last checkpoint is the saved game)
+log step 10: the pause menu
+press start
+screen pause_game 60
+wait 2
+log step 11: SAVE AND QUIT
+select quit_to_main_menu_button
+press a
+
+# the main menu again: SETTINGS, the profile, its settings, and back
+screen main_menu\main_menu 300
+wait 3
+log step 12: the main menu, SETTINGS
+select main_menu_item_settings
+press a
+screen player_profile_select_screen 60
+wait 2
+log step 13: the profile's settings
+press a
+screen player_profile_edit_screen 60
+wait 2
+log step 14: back from the settings
+press b
+screen player_profile_select_screen 60
+wait 1
+press b
+screen main_menu\main_menu 60
+wait 2
+
+# CAMPAIGN again: the profile, its level (a10, the saved game's) and its
+# difficulty load the saved game
+log step 15: CAMPAIGN, the saved game
+select main_menu_item_load_camp up
+press a
+screen load_campaign_player_profile 60
+wait 2
+press a
+screen solo_level_select 60
+wait 2
+press a
+screen difficulty_select 60
+wait 2
+press a
+play 300
+log step 16: the saved game plays
+ticks 300
+log step 17: done
+quit
