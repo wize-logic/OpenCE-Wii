@@ -20,6 +20,8 @@ enum
 	/* the view-space sphere map's side, in texels (it is drawn in the EFB's
 	rows below the back buffer: d3d8_gx.c) */
 	GX_LIGHTING_SPHERE_SIZE = 48,
+	/* the planar fog's ramp's side, in texels */
+	GX_LIGHTING_FOG_SIZE = 32,
 };
 
 /* what D0's alpha is */
@@ -123,6 +125,34 @@ void gx_lighting_evaluate(const struct gx_lighting *lighting, const float positi
 
 /* D0's alpha of the planar fog, 0 to 1, at a world position */
 float gx_lighting_planar_fog(const struct gx_lighting *lighting, const float world[3]);
+
+/* The planar fog's alpha on GX. It is a function of two values affine in
+the world position, s = c-87 p (the depth below the fog's plane, of its
+greatest) and t = c-86 p (the distance ahead, of the fog's greatest), and
+the same as at 0 or 1 beyond them: a square texture (the ramp, intensities)
+over s and t from 0 to 1 holds it, clamped beyond. GX makes the ramp's
+coordinates of the position (GX_TG_POS) through the position's own matrix
+(to E) and a post-transform matrix (E to the ramp's coordinates), so a
+vertex costs the processor nothing, and the value is the fog's at each
+pixel, where the programs' is interpolated between the vertices.
+
+Whether D0's alpha can be the ramp's (the planar fog's alone: the product
+with the atmospheric fog is not a function of two values) */
+BOOL gx_lighting_fog_ramped(const struct gx_lighting *lighting);
+/* the ramp of the draw's fog (its c-85.y and z): texels[t][s], the value
+at s and t of column / (size - 1) and row / (size - 1), 0 to 255 */
+void gx_lighting_fog_ramp(const struct gx_lighting *lighting,
+	unsigned char texels[GX_LIGHTING_FOG_SIZE][GX_LIGHTING_FOG_SIZE]);
+/* the post-transform matrix of the ramp's coordinates of a position in E,
+(s, t, 1) placed on the texels' centres; FALSE where at center (a point
+of the draw in E) they are beyond the range this takes GX's to hold (the
+ramp's side times 256 texels from it) */
+BOOL gx_lighting_fog_matrix(const struct gx_lighting *lighting, const struct gx_lighting_space *space,
+	const float center[3], float out[3][4]);
+/* the ramp read at texture coordinates (s, t) as GX filters it (bilinear,
+a texel's fractions in 128ths, clamped at its edges) */
+unsigned char gx_lighting_fog_sample(const unsigned char texels[GX_LIGHTING_FOG_SIZE][GX_LIGHTING_FOG_SIZE],
+	float s, float t);
 
 /* the skinned programs' matrix of a vertex (its node indices v5 and
 weights v6): the rows they blend, as the program blends them */

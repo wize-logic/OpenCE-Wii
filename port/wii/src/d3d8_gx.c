@@ -1949,6 +1949,9 @@ static void tev_fallback(unsigned stages)
 coordinates (bit n: GX_TEXCOORDn) and the colour channels (bit 0 COLOR0A0,
 bit 1 COLOR1A1). draw_hardware leaves an output nothing reads alone */
 static unsigned tev_texcoords = 0x1F, tev_channels = 3;
+/* the textures the stages set up last were translated for (a lit draw's
+planar fog translates them again with D0's alpha a ramp's: lit_fog_ramp) */
+static struct gx_psh_textures tev_textures;
 
 static void tev_setup(unsigned stages)
 {
@@ -2039,6 +2042,8 @@ static void tev_setup(unsigned stages)
 		textures.fog = 1;
 		fog_ramp_bind();
 	}
+	/* (padding and all, as the cache compares them) */
+	memcpy(&tev_textures, &textures, sizeof(tev_textures));
 	program = gx_psh_cache_program(D3D__RenderState, &textures, &usable, &translated);
 	pixel_shader_program = program;
 	pixel_shader_usable = usable;
@@ -4166,8 +4171,12 @@ coordinates from the normal (gx_lighting.c says how, and how close it is):
   vertex whose position is the processor's (it goes through GX_PNMTX0,
   then K's inverse, the normal through the world's turn to E);
 - COLOR0 is D0's colour, COLOR1A1 D1 (the Fresnel colour); D0's alpha is 0,
-  or the planar fog's, the processor's (a world position's, by each node's
-  matrix), sent as the vertex's colour;
+  or the planar fog's: read from a ramp at texture coordinate 5, which GX
+  makes of the position through its matrix to E and a post-transform matrix
+  (lit_fog_ramp, gx_lighting.h), the pixel shader translated to read it in
+  place of the rasterized alpha; else (the product with the atmospheric fog,
+  no texture map free, a pixel shader beyond GX with it) the processor's (a
+  world position's, by each node's matrix), sent as the vertex's colour;
 - texture coordinate 3 (the reflection's cube map) is made of the normal by
   a matrix for each node (lit_sphere_rows, given with each vertex as its
   position matrix is), into a sphere map of the view: drawn from the
@@ -4205,8 +4214,8 @@ static struct
 	const struct gx_lighting_recipe *recipe;
 	/* what GX makes: the colours, the reflection */
 	BOOL colors, reflection;
-	/* D0's alpha the processor's (the fog) */
-	BOOL alpha;
+	/* D0's alpha the processor's (the fog), or GX's ramp's (lit_fog_ramp) */
+	BOOL alpha, fog_ramped;
 	struct gx_lighting_space space;
 	struct gx_lighting lighting;
 	/* each key's rows in E, and in the world (for the fog) */
@@ -4219,6 +4228,8 @@ static struct
 	const unsigned char *normals;
 	UINT normal_stride;
 	BOOL normal_packed;
+	/* a point of the draw in E */
+	float center[3];
 } lit;
 
 /* in the statistics' window: draws lit, their vertices, the draws refused
@@ -4484,7 +4495,7 @@ static BOOL lit_choose(const struct nv2a_cpu_program *program, const struct vert
 	const struct vertex_element *normal;
 
 	lit.recipe = NULL;
-	lit.colors = lit.reflection = lit.alpha = FALSE;
+	lit.colors = lit.reflection = lit.alpha = lit.fog_ramped = FALSE;
 	if (gx_lighting_on < 0)
 		gx_lighting_on = config_boolean("display.gx_lighting") ? 1 : 0;
 	if (!gx_lighting_on || !(cpu_colors || (cpu_spheres & 8)))
@@ -4537,6 +4548,7 @@ static BOOL lit_prepare(const struct vertex_shader_object *shader, struct stream
 			lit.rows[0][row][3];
 	if (!gx_lighting_make(lit.recipe, constants, &lit.space, center, &lit.lighting))
 		return FALSE;
+	memcpy(lit.center, center, sizeof(lit.center));
 	lit.alpha = lit.colors && lit.lighting.alpha != _gx_lighting_alpha_zero;
 	if (lit.alpha)
 		for (key = 0; key < keys; key++)
@@ -4555,6 +4567,110 @@ static BOOL lit_prepare(const struct vertex_shader_object *shader, struct stream
 			lit.reflection = FALSE;
 	}
 	return lit.colors || lit.reflection;
+}
+
+/* the planar fog's ramps, each of one fog (c-85's y and z), kept while it
+is the same: one is written again only when no draw of this frame has read
+it (the frames before are drawn: GX_DrawDone at Present) */
+#define FOG_RAMPS 4
+static struct
+{
+	unsigned char texels[GX_LIGHTING_FOG_SIZE * GX_LIGHTING_FOG_SIZE] __attribute__((aligned(32)));
+	float fog[2];
+	unsigned long frame_number;
+	BOOL made;
+} fog_ramps[FOG_RAMPS];
+static unsigned fog_ramps_next;
+/* in the statistics' window: draws whose fog GX made, ramps written, and
+draws whose fog stayed the processor's (the product with the atmospheric
+fog, no map free, no ramp, beyond the ramp's range, a pixel shader beyond
+GX with it) */
+static unsigned long lit_fog_draws, fog_ramps_made, lit_fog_refused;
+
+/* D0's alpha the planar fog's ramp (lit.fog_ramped): the ramp bound to a
+texture map the pixel shader leaves free, the pixel shader translated again
+to read its alpha there for D0's, and texture coordinate 5 made of the
+position through the vertex's own matrix (to E) and the post-transform
+matrix GX_DTTMTX0 (to the ramp's coordinates), so the vertices send no
+alpha. FALSE: the vertices' alpha, the pixel shader as it was. */
+static BOOL lit_fog_ramp(BOOL keyed)
+{
+	const struct gx_psh_textures *textures = &tev_textures;
+	struct gx_psh_textures ramped;
+	const struct gx_psh_program *program;
+	BOOL usable, translated;
+	float matrix[3][4];
+	unsigned which, slot;
+	int map;
+	GXTexObj object;
+
+	if (!gx_lighting_fog_ramped(&lit.lighting) || !pixel_shader_usable)
+		return FALSE;
+	/* (a map of 4 to 7 that the stages' separate alphas, the fog's ramp
+	and a bumped lookup leave free) */
+	for (map = 7; map >= 4; map--)
+		if (!(textures->separate_alpha & (1U << (map - 4))) && !(map == GX_PSH_FOG_TEXMAP && textures->fog) &&
+			!(map == GX_PSH_BUMP_TEXMAP && (textures->bumped || textures->vertex_color)))
+			break;
+	if (map < 4 || !gx_lighting_fog_matrix(&lit.lighting, &lit.space, lit.center, matrix))
+		return FALSE;
+	for (which = 0; which < FOG_RAMPS; which++)
+		if (fog_ramps[which].made && fog_ramps[which].fog[0] == lit.lighting.fog[1] &&
+			fog_ramps[which].fog[1] == lit.lighting.fog[2])
+			break;
+	if (which == FOG_RAMPS)
+	{
+		static unsigned char texels[GX_LIGHTING_FOG_SIZE][GX_LIGHTING_FOG_SIZE];
+		unsigned row, column;
+
+		for (slot = 0; slot < FOG_RAMPS; slot++)
+		{
+			which = (fog_ramps_next + slot) % FOG_RAMPS;
+			if (!fog_ramps[which].made || fog_ramps[which].frame_number != device.frames)
+				break;
+		}
+		if (slot == FOG_RAMPS)
+			return FALSE;
+		fog_ramps_next = which + 1;
+		/* (I8 in 8x4 tiles) */
+		gx_lighting_fog_ramp(&lit.lighting, texels);
+		for (row = 0; row < GX_LIGHTING_FOG_SIZE; row++)
+			for (column = 0; column < GX_LIGHTING_FOG_SIZE; column++)
+				fog_ramps[which].texels[((row / 4) * (GX_LIGHTING_FOG_SIZE / 8) + column / 8) * 32 + (row % 4) * 8 +
+					column % 8] = texels[row][column];
+		DCFlushRange(fog_ramps[which].texels, sizeof(fog_ramps[which].texels));
+		/* (GX's texture cache may hold the texels it had) */
+		GX_InvalidateTexAll();
+		fog_ramps[which].fog[0] = lit.lighting.fog[1];
+		fog_ramps[which].fog[1] = lit.lighting.fog[2];
+		fog_ramps[which].made = TRUE;
+		fog_ramps_made++;
+	}
+	memcpy(&ramped, textures, sizeof(ramped));
+	ramped.d0_alpha_map = (unsigned char)map;
+	program = gx_psh_cache_program(D3D__RenderState, &ramped, &usable, &translated);
+	if (!usable)
+	{
+		/* (the draw's own again: the cache keeps the last program it gave) */
+		pixel_shader_program = gx_psh_cache_program(D3D__RenderState, textures, &usable, &translated);
+		return FALSE;
+	}
+	fog_ramps[which].frame_number = device.frames;
+	pixel_shader_program = program;
+	gx_psh_apply(program);
+	indirect_apply(program);
+	GX_InitTexObj(&object, fog_ramps[which].texels, GX_LIGHTING_FOG_SIZE, GX_LIGHTING_FOG_SIZE, GX_TF_I8, GX_CLAMP,
+		GX_CLAMP, GX_FALSE);
+	GX_InitTexObjFilterMode(&object, GX_LINEAR, GX_LINEAR);
+	GX_LoadTexObj(&object, (u8)map);
+	/* (the first matrix the position's own: GX_PNMTX1 for a draw of one
+	matrix, else each vertex's index, as its position's) */
+	GX_LoadTexMtxImm(matrix, GX_DTTMTX0, GX_MTX3x4);
+	GX_SetTexCoordGen2(GX_TEXCOORD5, GX_TG_MTX3x4, GX_TG_POS, GX_PNMTX1, GX_FALSE, GX_DTTMTX0);
+	GX_SetNumTexGens(GX_PSH_D0_ALPHA_TEXCOORD + 1);
+	if (keyed)
+		GX_SetVtxDesc(GX_VA_TEX5MTXIDX, GX_DIRECT);
+	return TRUE;
 }
 
 /* GX's state for a lit draw: E's matrices (the normal's too) and
@@ -4595,6 +4711,14 @@ static void lit_state(BOOL keyed, const struct draw_projection *projection, cons
 	GX_SetVtxAttrFmt(HARDWARE_VERTEX_FORMAT, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
 	if (lit.colors)
 	{
+		if (lit.alpha && lit_fog_ramp(keyed))
+		{
+			lit.alpha = FALSE;
+			lit.fog_ramped = TRUE;
+			lit_fog_draws++;
+		}
+		else if (lit.alpha)
+			lit_fog_refused++;
 		lit_lights_load(d1_constant);
 		if (lit.alpha)
 		{
@@ -5055,6 +5179,8 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 			GX_MatrixIndex1x8((u8)(processor ? GX_PNMTX0 : GX_PNMTX1 + 3 * vertex_keys[vertex]));
 		if (lit_on && lit.reflection && keyed)
 			GX_MatrixIndex1x8(lit_sphere_rows[processor ? draw_keys.count : vertex_keys[vertex]]);
+		if (lit_on && lit.fog_ramped && keyed)
+			GX_MatrixIndex1x8((u8)(processor ? GX_PNMTX0 : GX_PNMTX1 + 3 * vertex_keys[vertex]));
 		if (processor || cpu_colors || cpu_spheres)
 		{
 			/* what the processor computes of the vertex: its position (in
@@ -5187,6 +5313,9 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	{
 		lit_draws++;
 		lit_vertices += count;
+		/* (the texture coordinates the other draws make) */
+		if (lit.fog_ramped)
+			GX_SetNumTexGens(5);
 		if (draw_keys.processor)
 		{
 			/* (GX_PNMTX0 the identity again, as the processor's draws take it) */
@@ -5464,8 +5593,10 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			hardware_sphere_draws, hardware_spheres_run);
 		hardware_sphere_draws = hardware_spheres_run = 0;
 		platform_log("Direct3D: lit by GX (display.gx_lighting): %lu draws, %lu vertices, %lu refused; %lu view sphere "
-			"maps drawn", lit_draws, lit_vertices, lit_refused, sphere_bakes_made);
+			"maps drawn; the planar fog by GX's ramp in %lu draws (%lu ramps written), the processor's in %lu",
+			lit_draws, lit_vertices, lit_refused, sphere_bakes_made, lit_fog_draws, fog_ramps_made, lit_fog_refused);
 		lit_draws = lit_vertices = lit_refused = sphere_bakes_made = 0;
+		lit_fog_draws = fog_ramps_made = lit_fog_refused = 0;
 		platform_log("Direct3D: textures not drawn: %lu without data, %lu of a shape, %lu of a format, "
 			"%lu without memory, %lu not decoded; %lu converted bitmaps found", texture_failures[_failure_no_data],
 			texture_failures[_failure_shape],

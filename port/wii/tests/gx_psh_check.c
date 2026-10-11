@@ -45,6 +45,9 @@ static unsigned check_vertex_color, check_bumped;
 static int fog_on;
 static DWORD fog_color;
 static float fog_factor;
+/* D0's alpha read from this texture map (gx_psh_textures.d0_alpha_map: the
+planar fog's ramp, which holds the vertex's alpha here), 0 the rasterized */
+static unsigned check_d0_alpha_map;
 static v4 reg_value(const DWORD *s, int reg, int stage, v4 *regs /* indexed by reg number */)
 {
 	v4 z = {{0}};
@@ -377,6 +380,7 @@ static int check(const DWORD *state, unsigned present, const char *name, int ver
 	textures.vertex_color = check_vertex_color;
 	textures.fog = (unsigned char)fog_on;
 	textures.fog_color = fog_color & 0x00FFFFFFUL;
+	textures.d0_alpha_map = (unsigned char)check_d0_alpha_map;
 	if (!gx_psh_translate(state, &textures, &program)) { if (verbose) printf("%s: not translated (%s)\n", name, program.reason); return -1; }
 	int valid = validate(&program);
 	stages_made += program.tev.stage_count;
@@ -392,6 +396,9 @@ static int check(const DWORD *state, unsigned present, const char *name, int ver
 		memset(maps, 0, sizeof(maps));
 		fog_factor = frand();
 		for (int ch = 0; ch < 4; ch++) maps[GX_PSH_FOG_TEXMAP].c[ch] = fog_factor;
+		/* (an intensity texture: its value in all four channels) */
+		if (check_d0_alpha_map)
+			for (int ch = 0; ch < 4; ch++) maps[check_d0_alpha_map].c[ch] = in.v0.c[3];
 		for (int i = 0; i < 4; i++) maps[i] = in.t[i];
 		v4 want = reference(state, &in, present), got = simulate(&program, &in, maps);
 		for (int ch = 0; ch < 4; ch++) { float d = fabsf(want.c[ch] - got.c[ch]); if (d > worst) worst = d; }
@@ -890,6 +897,31 @@ static int game_programs(void)
 					program.approximate && program.approximation ? program.approximation : "",
 					program.approximate ? "" : agrees > 0 ? ", agrees with the combiners" : ", DIFFERS from the combiners");
 				failures += !program.approximate && agrees <= 0;
+				/* (the models' program, its D0's alpha the planar fog's ramp, as
+				display.gx_lighting draws it: with and without the reflection's
+				sphere map at stage 3) */
+				for (unsigned sphere = 0; index == 0 && sphere < 2; sphere++)
+				{
+					struct gx_psh_textures ramped = textures;
+
+					ramped.present = sphere ? 0xF : programs[index].present;
+					ramped.cube = sphere ? 8 : 0;
+					ramped.d0_alpha_map = 7;
+					snprintf(name, sizeof(name), "game program %d, ramped", index);
+					check_cube = ramped.cube;
+					check_d0_alpha_map = 7;
+					agrees = check(state, ramped.present, name, 1);
+					check_cube = 0;
+					check_d0_alpha_map = 0;
+					if (!gx_psh_translate(state, &ramped, &program))
+						agrees = 0;
+					printf("game program %d (%s%s), D0's alpha from a texture: %u stages, %s%s%s\n", index,
+						programs[index].what, sphere ? ", its sphere map" : "", program.tev.stage_count,
+						program.approximate ? "approximate: " : "exact",
+						program.approximate && program.approximation ? program.approximation : "",
+						program.approximate ? "" : agrees > 0 ? ", agrees with the combiners" : ", DIFFERS from the combiners");
+					failures += !program.approximate && agrees <= 0;
+				}
 			}
 		}
 	}
@@ -901,6 +933,10 @@ int main(int argc, char **argv)
 	int seed_count = argc > 1 ? atoi(argv[1]) : 2000;
 	int only = argc > 2 ? atoi(argv[2]) : -1;
 	int ok = 0, bad = 0, untranslated = 0, approximated = 0;
+	/* (the same programs with D0's alpha from a texture: those translated
+	with the rasterized alpha that agree, differ, are approximate, are not
+	translated) */
+	int d0_ok = 0, d0_bad = 0, d0_untranslated = 0, d0_approximated = 0;
 	for (int seed = 0; seed < seed_count; seed++) {
 		DWORD state[200]; memset(state, 0, sizeof(state));
 		srand(seed);
@@ -934,7 +970,7 @@ int main(int argc, char **argv)
 			state[D3DRS_PSFINALCOMBINERINPUTSABCD] = abcd;
 			state[D3DRS_PSFINALCOMBINERINPUTSEFG] = (e << 24) | (f << 16) | (g << 8) | ((rand() % 2) ? 0x20 : 0) | ((rand() % 2) ? 0x40 : 0);
 		}
-		char name[32]; snprintf(name, sizeof(name), "seed %d", seed);
+		char name[64]; snprintf(name, sizeof(name), "seed %d", seed);
 		if (only >= 0 && seed != only) continue;
 		if (only >= 0) {
 			printf("count %08x final %08x %08x\n", state[D3DRS_PSCOMBINERCOUNT], state[D3DRS_PSFINALCOMBINERINPUTSABCD], state[D3DRS_PSFINALCOMBINERINPUTSEFG]);
@@ -950,8 +986,18 @@ int main(int argc, char **argv)
 		if (r > 0) { ok++; if (getenv("LIST")) printf("AGREE %d\n", seed); }
 		else if (r == 0) { bad++; if (getenv("LIST")) printf("DIFFER %d\n", seed); } else if (r == -2) approximated++;
 		else { untranslated++; if (getenv("LIST")) printf("UNTRANSLATED %d\n", seed); }
+		if (r > 0) {
+			/* (map 7, or 6 where the fog ramp has 7) */
+			check_d0_alpha_map = fog_on ? 6 : 7;
+			snprintf(name, sizeof(name), "seed %d, D0's alpha a texture's", seed);
+			r = check(state, 0x7, name, d0_bad < 6);
+			check_d0_alpha_map = 0;
+			if (r > 0) d0_ok++; else if (r == 0) d0_bad++; else if (r == -2) d0_approximated++; else d0_untranslated++;
+		}
 	}
 	printf("%d exact and agree, %d differ, %d approximate, %d not translated\n", ok, bad, approximated, untranslated);
+	printf("D0's alpha from a texture, of those: %d exact and agree, %d differ, %d approximate, %d not translated\n",
+		d0_ok, d0_bad, d0_approximated, d0_untranslated);
 	printf("%lu TEV stages for the %lu translated (%.2f a program)\n", stages_made, programs_made,
 		programs_made ? (double)stages_made / (double)programs_made : 0.0);
 	{
@@ -966,6 +1012,6 @@ int main(int argc, char **argv)
 				eval_programs[0], eval_differ[0], eval_worst[0], eval_programs[1], eval_differ[1], eval_worst[1],
 				eval_refused);
 		}
-		return bad != 0 || game != 0;
+		return bad != 0 || d0_bad != 0 || game != 0;
 	}
 }
