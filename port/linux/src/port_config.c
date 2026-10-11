@@ -74,12 +74,20 @@ vertices, and draws simpler ones sooner) */
 #define MODEL_DETAIL_DEFAULT "0.5"
 #define OBJECT_SHADOWS_DEFAULT "false"
 #define BUMPED_HIGHLIGHTS_DEFAULT "false"
-#define GX_LIGHTING_DEFAULT "true"
+#define GX_LIGHTING_DEFAULT "false"
+#define BUMPED_LIGHTMAPS_DEFAULT "false"
+#define ENVIRONMENT_REFLECTIONS_DEFAULT "false"
+/* (audio.reverb's: the reverb would add half again to what the Wii's processor spends
+on a battle's sound, 3% of it; dsound_sdl.c, the Wii's mixing) */
+#define REVERB_DEFAULT "false"
 #else
 #define MODEL_DETAIL_DEFAULT "1.0"
 #define OBJECT_SHADOWS_DEFAULT "true"
 #define BUMPED_HIGHLIGHTS_DEFAULT "true"
 #define GX_LIGHTING_DEFAULT "false"
+#define BUMPED_LIGHTMAPS_DEFAULT "true"
+#define ENVIRONMENT_REFLECTIONS_DEFAULT "true"
+#define REVERB_DEFAULT "true"
 #endif
 
 static const struct config_setting config_settings[] =
@@ -186,6 +194,18 @@ static const struct config_setting config_settings[] =
 		"(drawn by GX's indirect unit, their vertices on the processor); false\n"
 		"draws those surfaces as before, flat (the Wii's default: they cost about\n"
 		"two fifths of a10's frame). The other builds always draw them." },
+	{ "display.bumped_lightmaps", _config_boolean, BUMPED_LIGHTMAPS_DEFAULT, "HALO_BUMPED_LIGHTMAPS", _environment_value,
+		_platform_all,
+		"The environment's bump maps in its light: each surface's lightmap\n"
+		"shaded by its bump map along the light's direction, as on the Xbox;\n"
+		"false draws the lightmap flat (the Wii's default: the bump's direction\n"
+		"is a cube map lookup, each vertex's on the processor)." },
+	{ "display.environment_reflections", _config_boolean, ENVIRONMENT_REFLECTIONS_DEFAULT,
+		"HALO_ENVIRONMENT_REFLECTIONS", _environment_value, _platform_all,
+		"The environment's reflections (shiny floors and walls: a cube map\n"
+		"through a mask of the lightmap, two more passes over those surfaces);\n"
+		"false draws none (the Wii's default: in a10 they are two of the\n"
+		"environment's five passes)." },
 	{ "display.gx_lighting", _config_boolean, GX_LIGHTING_DEFAULT, "HALO_GX_LIGHTING", _environment_value, _platform_all,
 		"The Wii: the models' lighting and reflections by GX's own lights and\n"
 		"texture coordinates, not the processor's for each vertex (close: point\n"
@@ -212,7 +232,7 @@ static const struct config_setting config_settings[] =
 	{ "audio.effects_volume", _config_real, "1.0", "HALO_EFFECTS_VOLUME", _environment_value, _platform_all,
 		"The volume of every other sound (effects and speech), 0.0 to 1.0 (of\n"
 		"audio.volume)." },
-	{ "audio.reverb", _config_boolean, "true", "HALO_REVERB", _environment_value, _platform_all,
+	{ "audio.reverb", _config_boolean, REVERB_DEFAULT, "HALO_REVERB", _environment_value, _platform_all,
 		"Reverberate the world's sounds as the place the player is in does (the\n"
 		"maps' sound environments, as the Xbox's I3DL2 reverb did); false keeps\n"
 		"them dry." },

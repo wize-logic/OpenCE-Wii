@@ -18,7 +18,11 @@ This port is in bring-up. In Dolphin, the game boots from the SD card and loads 
   second). On the Wii, `display.bumped_highlights` is off by default (bumped specular and bumped
   reflections: their passes' vertices run on the processor, about two fifths of a10's frame),
   `display.object_shadows` is off by default (each object's shadow draws it again, a pass of
-  skinned vertices) and `display.model_detail` is 0.5.
+  skinned vertices), `display.model_detail` is 0.5, `display.bumped_lightmaps` is off (the
+  environment's lightmap pass drawn flat, without the cube map lookup whose direction each
+  vertex gives on the processor) and `display.environment_reflections` is off (two of the
+  environment's five passes over its shiny surfaces). "What the frame draws" below has the
+  counts.
 - **Loading**: the menu is up within a second of the game's start.
 - **Every map converts**: the 24 Xbox maps (campaign and multiplayer) go through
   `tools/wii_convert_maps.py` with nothing left unconverted.
@@ -41,6 +45,7 @@ tools/wii_convert_maps.py XBOX/maps/ui.map XBOX/maps/bloodgulch.map   # into bui
 tools/wii_dolphin.py --seconds 300 --until "frame 360:"            # run it in Dolphin from WSL
 tools/wii_gx_psh_check.py                   # the combiner translation, checked on the host (WIILIBS=DIR)
 tools/wii_nv2a_check.py                     # the compiled vertex programs against the interpreter
+tools/wii_math_check.py                     # the Wii's sqrtf against the host's, bit for bit (--all: every float)
 tools/wii_animation_check.py --converted DIR XBOX/maps/*.map   # the converted maps against the Xbox's (map conversion, below)
 tools/wii_data_check.py --converted DIR XBOX/maps/*.map
 tools/wii_placeholder_check.py XBOX/maps/*.map    # the game reads none of the tag bytes left as they are
@@ -70,9 +75,11 @@ image (with WiiLibs checked out into `./WiiLibs`) and keeps it as an artifact.
   runner now acts only on its own (its `--name` user folder).
 - The game's log (`src/d3d8_gx.c`, not the runner) reports how long a frame takes in emulated time
   every 60 frames, split into draws, textures, pixel shaders, the end of the frame and the game,
-  with the draws' split (GX's transform, the processor's, immediate) and the processor's
-  vertices (fetch, program, store, emit). A frame of more than half a second (loading, mostly)
-  gets a split of its own.
+  with the draws' split (GX's transform, the processor's, immediate), the processor's
+  vertices (fetch, program, store, emit), the end of the frame's (GX finishing the frame's
+  draws; the copy to the display and the wait for its retrace) and the textures' counts (found
+  by their mark or looked up, made, hashed, decoded, flushed, TMEM emptied). A frame of more than
+  half a second (loading, mostly) gets a split of its own.
 
 ## Game data
 
@@ -92,7 +99,15 @@ inflated it to, and the Wii reads it where it is.
   the other ports.
 - **Flags.** The ABI flags reproduce the MSVC/Xbox environment, as the Linux build's do:
   - `-msvr4-struct-return` is PowerPC's spelling of `-freg-struct-return`
-  - `-ffp-contract=off` because PowerPC has fused multiply-adds
+  - `-ffp-contract=off` because PowerPC has fused multiply-adds. Clang has let them through in a
+    function it does not optimise (`#pragma optimize("", off)`: `ai_handle_spatial_effect`,
+    `source/ai/ai.c`, now with `#pragma clang fp contract(off)`), so `ninja wii` reads the game's
+    objects for them (`tools/wii_fp_check.py`). The sound mixer (`dsound_sdl.c`) alone has them on
+    (`CONTRACTED_SOURCES`, `tools/wii_build.py`): its output only reaches the speakers, and they take
+    14% off its instructions
+  - `-fomit-frame-pointer`, unlike the x86 builds: PowerPC's frames are chained through each
+    frame's first word whether or not r31 holds a frame pointer, and that chain is what WiiLibs'
+    backtraces follow. Without one the game's code is 2.3% smaller
   - `-femulated-tls`: native thread-local storage would use r2, which the EABI gives the small
     data area. WiiLibs provides `__emutls_get_address` for each libogc thread.
 - **Prefix header.** `include/halo_wii_prefix.h` is force-included and wraps the Linux one. Its
@@ -122,28 +137,10 @@ inflated it to, and the Wii reads it where it is.
   `tools/wii_link.py` stubs any symbol still missing with a function that stops the game and names
   it (`build/wii/missing_symbols.txt`).
 - **Memory.** The Wii's cached memory is at virtual 0x80000000 + P, as the Xbox's is, so the
-  game's and Direct3D's physical/virtual arithmetic holds. `src/wii_memory.c` claims two fixed
-  ranges from WiiLibs (`wl_platform_mem_claim_fixed`) before anything else runs:
-
-  | Range | Holds |
-  | --- | --- |
-  | MEM1 `0x813C0000`–`0x81800000` | the game state (4 MB CPU, 256 KB GPU) |
-  | MEM2 `0x90100000`–`0x92D00000` | the tag cache at its bottom (22 MB, which converted maps are linked to), then the 12 MB texture cache, the 4 MB sound cache and Direct3D's resources |
-
-  WiiLibs' heaps (`src/wii_boot.c`) are in MEM2. The game's own heap is newlib's, in what MEM1
-  leaves (about 4 MB). WiiLibs' heap overflow (`wl/platform/heap_overflow.h`, its
-  `wii/heap_wrap_wii.c`) wraps the allocators, newlib's internal ones included, so that what MEM1
-  cannot hold comes from a 5 MB heap in MEM2 (`WII_MEMORY_TAG_GAME`). The link wraps the names in
-  WiiLibs' `WL_HEAP_OVERFLOW_WRAPS` (`cmake/WiiLibs.cmake`, which `tools/wii_build.py` reads) and
-  pulls the wrappers in with `-u __wrap_malloc`; `__wrap_main` turns the overflow on with
-  `wl_heap_overflow_enable` once WiiLibs' heaps are up. Its blocks carry a 32-byte header, so
-  they are 32-byte aligned; the log says so at the first one, and "malloc(N) failed, from ..."
-  (addresses for `addr2line` on `build/wii/halo.elf`) when both heaps are full. The memory
-  report's MEM1 line (`wii_heap_usage`) and `GlobalMemoryStatus` (`sysconf` in `src/wii_posix.c`)
-  read WiiLibs' `wl_heap_overflow_usage`; the second counts MEM1's free bytes and the overflow
-  heap's free budget. The game's pools are the Xbox's
-  sizes (`HALO_WII` in `port/linux/include/halo_port_capacity.h`), so the Wii can't join the
-  other builds' distributed games.
+  game's and Direct3D's physical/virtual arithmetic holds. Every byte of both regions, and the
+  memory report in the log, is in "Memory" below. The game's pools are the Xbox's sizes
+  (`HALO_WII` in `port/linux/include/halo_port_capacity.h`), so the Wii can't join the other
+  builds' distributed games.
 - **Ways out.** The link wraps `exit`, `_exit`, `abort` and `SYS_ResetSystem` (WiiLibs'
   `wii/trace_wii.c`): each logs "exit(0) from 80001234 ..." (tag `exit`; the return addresses up
   the frame chain, for `addr2line` on `build/wii/halo.elf`) before it goes on, so a game that
@@ -168,7 +165,7 @@ inflated it to, and the Wii reads it where it is.
 - **Threads.** libogc's threads are strictly prioritised. Each of the game's threads gets the
   game's main priority (WiiLibs' `WL_THREAD_PRIO_MAIN`, LWP 64: `WII_GAME_MAIN_PRIO` in
   `src/wii_posix.c`), moved by its Win32 priority, and a 128 KB stack. The game's main runs on a
-  thread of its own with a 1 MB stack, started by WiiLibs' `wl_platform_run_on_stack`
+  thread of its own with a 512 KB stack, started by WiiLibs' `wl_platform_run_on_stack`
   (`src/wii_boot.c`): libogc's main thread has 128 KB, below which lie its audio DSP structures,
   and a deep AI path search in b30 went past it (the game's stack reaches about 290 KB; the memory
   report says how deep, from `wl_platform_stack_used`, which measures the pattern WiiLibs fills the
@@ -198,12 +195,132 @@ inflated it to, and the Wii reads it where it is.
     `tag_to_string`, `source/cseries/cseries.c`, the first character the high byte) and the PCM
     samples of the sounds the shared mixer plays (`port/linux/src/dsound_sdl.c`)
 - **Floating point.** `_controlfp`/`_statusfp` map the MSVC control word onto the FPSCR
-  (`port/linux/src/msvc_crt.c`).
+  (`port/linux/src/msvc_crt.c`). The 750 has no square root instruction, and newlib's `sqrtf` works
+  a bit at a time (about 290 instructions); the link wraps it (`-Wl,--wrap=sqrtf`) with
+  `src/wii_math.c`'s, which refines `frsqrte`'s estimate and gives the same correctly rounded root
+  in about 60 (`tools/wii_math_check.py` checks every float). The game calls it for every vector's
+  length (`square_root`).
 - **Movies.** Bink movies are skipped (`source/bink/bink_playback.c`).
 - **Sound.** The shared DirectSound mixer (`port/linux/src/dsound_sdl.c`) fills WiiLibs' audio
-  stream (AESND, 32 kHz). Every 240 frames the log reports blocks mixed and played, underruns,
+  stream (AESND, 44.1 kHz). Every 240 frames the log reports blocks mixed and played, underruns,
   the time a block takes to mix, and the loudest sample. In the menu: no underruns, the music
-  near full scale, about 0.6 ms to mix a block.
+  near full scale, about 0.6 ms to mix a block (measured at 32 kHz, with the other platforms'
+  mixing).
+  - The other platforms resample every voice to the output's rate with a 48-tap windowed sinc.
+    That took two thirds of the processor in b30 (the first sampling profile, `mix`): counted
+    under qemu-ppc, a 22 kHz voice cost 530 instructions an output frame at 32 kHz and a 44 kHz
+    one 3,900, its low pass stretched tap by tap. The Wii mixes each voice at its own rate
+    instead ("the Wii's mixing" in `dsound_sdl.c`): the game's 22 kHz voices on a 22,050 Hz bus
+    and its 44 kHz ones on the 44,100 Hz output, each frame as it is; one half-band low pass
+    (32 taps) doubles the low bus for all of them; a voice the game plays at another frequency
+    (a sound's random pitch, an engine) is interpolated onto the output by a cubic
+    (Catmull-Rom). The gains, pans, low passes and room sends are the other platforms'.
+  - The figures (`python tools/harness/tests/test_mixer_wii.py metrics`): a 22 kHz voice flat
+    within 0.01 dB to 9.5 kHz with the images 70 dB down, 1.8 dB down at 10.5 kHz; a 44 kHz
+    voice exact; a pitched one 0.2 dB down at a fifth of its rate and 2 dB at two fifths, the
+    cubic's images 33 dB down at a fifth, above 16 kHz for a voice played near its rate.
+  - Counted (instructions an output frame, the scene of `mixer_wii.c`'s "bench": 12 mono 22 kHz
+    voices in the world, two of them pitched, two stereo 44 kHz and two stereo 22 kHz voices, 8
+    out of earshot, loud enough to be limited): 910 with ADPCM (40 million instructions a
+    second, 5.5% of the processor), 680 with PCM, against 15,100 at 32 kHz (480 million, two
+    thirds of the processor, as in the profile) with every voice resampled and the packets
+    decoded beforehand. Of the 910: 240 decoding ADPCM, 160 making the samples floats, 300 the
+    voices' gains, filters and interpolation, 100 the limiter, 70 the upsampler. A voice out of
+    earshot costs about 1, the mix with nothing playing 50.
+  - `audio.reverb` is `false` on the Wii: the reverb (at the low bus's rate) adds about 480 an
+    output frame to that scene, half as much again.
+
+## Memory
+
+The Wii has 24 MB of MEM1 (fast; the program is loaded there) and 64 MB of MEM2, of which IOS 58
+keeps the top (above `0x933E0000`) and libogc a little at the bottom. `src/wii_memory.c` claims
+two fixed ranges from WiiLibs (`wl_platform_mem_claim_fixed`) before anything else runs, the game
+state's in MEM1 and the window in MEM2; WiiLibs' heaps (`src/wii_boot.c`) take what is left of
+MEM2, and newlib's malloc what is left of MEM1.
+
+The tables give every range in KB, before (the build whose b30 run ran out: MEM1's heap full
+before the first frame, the MEM2 heap's 122 failed allocations, decoded textures and the
+profiler's ring refused) and now. The executable's part is `llvm-readelf -S build/wii/halo.elf`;
+its largest symbols are `llvm-nm -S --size-sort -r build/wii/halo.elf`.
+
+**MEM1** (`0x80000000`–`0x81800000`, 24576 KB):
+
+| Range | Holds | Before | Now |
+| --- | --- | ---: | ---: |
+| `0x80000000`–`0x80003F00` | the system's: exception vectors, the loader's and the OS's globals | 16 | 16 |
+| from `0x80003F00` | the code (`.init`, `.text`) | 3677 | 3614 |
+| then | read-only data and data: `.rodata` 380, `.eh_frame` 73 (unwind tables nothing reads), `.data` 502 | 965 | 967 |
+| then | zeroed data (`.sbss`, `.bss`): below | 12571 | 7896 |
+| to `0x813C0000` | libogc's arena: newlib's heap (the "MEM1 heap": all the game mallocs first, WiiLibs' two video framebuffers among it, 600 KB each at 480 lines and 718 at 574) and libogc's own (about 64 KB) | 2996 | 7732 |
+| `0x813C0000`–`0x81800000` | the game state: 4 MB for the CPU's part (the Xbox's 3,165,260 bytes of pools and the port's additions), 256 KB for the GPU's | 4352 | 4352 |
+
+What changed in MEM1:
+
+| What | Before | Now | How |
+| --- | ---: | ---: | --- |
+| the tag validator's claims (`tag_validate_claims`, a bit a byte of the tag cache) | 2944 | 0 | They cover only the region being checked, in the tag cache's free bytes: the tags' above the tags, a bsp's between the tags and the bsp (bsps load at the tag cache's top), else malloc'd while the bsp is checked (b30's is 790 KB, a10's largest 1020: the heap's, not MEM1's for good) |
+| the game's profiler's frame history (`profile_globals`) | 1103 | 40 | 8 frames, not 256 (`source/cseries/profile.c`; the profiler is the Xbox debug build's) |
+| the game's stack (`game_stack`) | 1024 | 512 | the deepest seen is about 290 KB |
+| the window's page tables (`window_protection`, `window_blocks`) | 96 | 51 | 16 bits a page |
+| the console's framebuffer (in the MEM1 heap) | 600 | 0 | the bring-up console writes into one of WiiLibs' two |
+| the game state revert's copy (malloc'd, 4352: never had) | | | read into the game state, as the Xbox did (`source/saved games/game_state_xbox.c`) |
+| the sounds' packets, decoded (malloc'd as the game queued them: 8 to 32 KB each, up to 4 a voice) | | | read where the sound cache keeps them as they play, an ADPCM block of 64 frames at a time into the voice (`port/linux/src/dsound_sdl.c`; the same samples) |
+
+The largest zeroed data now: `render` 692 (the game's render globals), `ai_debug` 534 (the AI's
+debug state, whose layout is asserted), `update_client_globals` 513 and `update_server_globals`
+128 (`source/game/player_queues_new.c`), `late_joiner_players` 512
+(`source/networking/network_server_manager.c`), `game_stack` 512, the distributed netcode's
+damage history (`port/linux/game/network_damage.c`: `damage_trails` 384, `damage_history` 192,
+`damage_explosions` 161) and batches (`network_distributed.c`, `distributed_batches` 151),
+`reverb` 276 (the mixer's delays, `port/linux/src/dsound_sdl.c`), `widget_walk` 256 (the
+validator's walk of the menus' widgets, `tag_schema_effects.c`, sized for 65536 tags),
+`local_lens_flare_occlusion_test_results2` 256, libogc's Bluetooth buffers
+(`memb_mem_pool_pbufs`) 200, `custom_edition_maps_globals` 200 (the Custom Edition map list,
+though the Wii runs none), libogc's main thread's stack (`s_mainStack`, which only waits once
+the game's thread starts) 128.
+
+**MEM2** (`0x90000000`–`0x933E0000` as IOS 58 leaves it, 53120 KB):
+
+| Range | Holds | Before | Now |
+| --- | --- | ---: | ---: |
+| `0x90000000` to libogc's MEM2 arena | libogc's IOS buffers (the memory report's window line says where the arena began) | a few | a few |
+| from there to `0x90100000` | before, no one's; now the window's lowest pages, which only its top-down blocks reach | about 1000 | in the window |
+| `0x90100000`–`0x91700000` | the tag cache (22528 KB), at the window's bottom: a map's tags (at most 16.2 MB, b40) and the structure bsp loaded at its top (at most 8.6 MB, c20) | 22528 | 22528 |
+| top-down from the window's top | the texture cache (12288 KB, the game's own cache of the map's bitmaps, converted to GX's formats), the sound cache (4096 KB), Direct3D's resources (vertex and index buffers, textures the game makes, render targets: b30 1.4 to 3.8 MB) and what is free | 22528 | 23040 and the pages below |
+| window, in all | `0x90100000`–`0x92D00000`, now from libogc's arena to `0x92D80000` | 45056 | 45568 and about 1000 |
+| above the window | WiiLibs' heaps: the GX FIFO 1024, the game's heap (the MEM1 heap's overflow) 5120, thread stacks 256 then 64 (24 in use: the audio thread's), the audio output's buffers 256 then 64 (4 in use), asynchronous reads 256 then 64 (none in use); the rest WiiLibs' reserve | 7040 | 6528 |
+
+So the game's malloc has the MEM1 heap and the game's heap together: about 8 MB before (2.9 and
+5.1), about 12.6 MB now (7.7, of which the two framebuffers take 1.2, and 5.1 less the 64 KB of
+the accounting's tables).
+
+**How malloc works.** The game's heap is newlib's, in what MEM1 leaves. WiiLibs' heap overflow
+(`wl/platform/heap_overflow.h`, its `wii/heap_wrap_wii.c`) wraps the allocators, newlib's
+internal ones included, so that what MEM1 cannot hold comes from a 5 MB heap in MEM2
+(`WII_MEMORY_TAG_GAME`). The link wraps the names in WiiLibs' `WL_HEAP_OVERFLOW_WRAPS`
+(`cmake/WiiLibs.cmake`, which `tools/wii_build.py` reads) and pulls the wrappers in with
+`-u __wrap_malloc`; `__wrap_main` turns the overflow on with `wl_heap_overflow_enable` once
+WiiLibs' heaps are up. Its blocks carry a 32-byte header, so they are 32-byte aligned; the log
+says so at the first one, and "malloc(N) failed, from ..." (addresses for `addr2line` on
+`build/wii/halo.elf`) when both heaps are full. `GlobalMemoryStatus` (`sysconf` in
+`src/wii_posix.c`) counts MEM1's free bytes and the overflow heap's free budget.
+
+**The memory report.** Every 240 frames the log has:
+- `memory: MEM1 heap N KB used, N KB free` (newlib's `mallinfo`);
+- `memory: decoded textures N KB of 1536 in N, N given up for others (N KB)`: the textures the
+  device decodes into GX's RGBA8 in the heap (those the converter could not leave in a GX format
+  in the texture cache, and those the game makes and writes). They are kept to 1.5 MB, least
+  recently drawn going first; when the heap has no room for one, decoded textures are given up
+  (and freed at once, once GX has drawn what it was given) until it has;
+- `memory: the game's stack at most N KB deep of 512`;
+- `memory: MEM2 window ... at ADDRESS, N KB: N KB used, N KB free (N KB together)`: the largest
+  free run is what the biggest new resource can have;
+- WiiLibs' heaps, one `[mem]` line each (`game` is the overflow heap: its use, peak and failures);
+- `[heap] by call site` (WiiLibs' `heap_sites.h`, turned on in `src/wii_boot.c` with
+  `wl_heap_overflow_track_sites`): the blocks of 1 KB or more in both heaps by the two return
+  addresses above the allocator, the 16 sites holding the most (`N KiB in N blocks (peak N KiB, N
+  made) from ADDRESS ADDRESS`, for `powerpc-eabi-addr2line -f -e build/wii/halo.elf`), and the
+  smaller blocks by size.
 
 ## Map conversion
 
@@ -360,7 +477,7 @@ and pixel shaders.
     instructions a vertex for `8f831b43`: its skinning and lighting are most of it); each index
     sends 7 words to the FIFO in place of 14.
   - In the menu, the draws take 10 ms a frame compiled, against 58 ms interpreted.
-  - **The models' lighting on GX's lights** (`display.gx_lighting`, on by default on the Wii;
+  - **The models' lighting on GX's lights** (`display.gx_lighting`, off by default until its streaks are fixed;
     `src/gx_lighting.c`). The models' lit programs (`cfc6f3a4`, `9d2757d2`, `8f831b43`: the
     reflection, lights and planar fog permutations of a skinned model; `71f9f272`, `1d3f5b13`,
     `e6e006c7`) light each vertex by its skinned normal, and take a cube map at the eye's
@@ -390,7 +507,14 @@ and pixel shaders.
       Its sphere map of the view is drawn from the world's in the 48 rows of the EFB below the
       back buffer, 48 texels square, a 24 by 24 grid each of whose points is the world's
       sphere map at the reflection a normal there makes of the eye straight along the frame,
-      then copied out: once a frame for each cube map and rounded direction.
+      then copied out, for each cube map and rounded direction, and kept while the view turns
+      less than about a tenth of a degree. The node matrices take texture matrix rows 39 (texture
+      coordinate 3's own) and 45 to 58, eight of them, so a draw of more nodes (with its blended
+      vertices' matrix) has its reflection's coordinates from the processor. Row 60 is
+      `GX_IDENTITY`, which every draw in screen space reads its texture coordinates through: the
+      first build put the eighth and ninth nodes' matrices over it, and every such draw after came out as
+      streaks. Each frame now begins with `GX_IDENTITY` loaded again, and the display copy's
+      source, scale and filter are set again before the frame's copy.
     - `tests/gx_lighting_check.c` (run by `tools/wii_nv2a_check.py`) runs each program on the
       interpreter for random scenes (a camera, a skinned model of nodes within 40 degrees of
       each other, lights about it) and compares what GX makes of the same vertices: D0 with
@@ -512,7 +636,14 @@ and pixel shaders.
   other texture is decoded to RGBA8 into a 1.5 MB cache, such as the glyph cache, which is
   re-decoded when its pixels change. The game writes some of those itself (the glyphs, the
   fallback checkers), with 16- and 32-bit texels in the Wii's byte order, so the decoder, which
-  reads them as the Xbox stored them, is given a swapped copy. A cube map is bound as its sphere
+  reads them as the Xbox stored them, is given a swapped copy. The device marks a texture's
+  header once it has seen its pixels (D3D's `Lock` field: the entry it found them in), and a
+  marked texture is bound without being looked up, hashed or flushed again. The game clears the
+  field when it loads a bitmap into the texture cache, and `d3d8_resources.c`'s lock functions
+  clear it before the game writes a texture (the glyph cache's new glyphs); a texture outside the
+  texture cache is hashed once a frame as well. GX's texture cache (TMEM) is emptied only when
+  texture memory has changed (a decode, a bitmap loaded, a copy out of the EFB) and at each
+  frame's start, not before every draw. A cube map is bound as its sphere
   map, and each vertex's direction is mapped onto it (on the CPU): the normalization cube map's
   too, whose texel is the direction a bump map's dot product takes.
 - **Depth.** A program's position matrix and its depth's a + b/w come from its constants alone,
@@ -523,6 +654,37 @@ and pixel shaders.
 - **Debugging.** The desktop ports' `debug.gpu_debug_flat` and `debug.gpu_debug_texture0` (in
   `config.toml`) show the diffuse colour, or the first texture, alone. One frame's draws are
   described in the log (`DRAW_LOG_FRAME`).
+
+### What the frame draws
+
+The game's own passes, counted in the x86 build (headless, `debug.null_renderer`, which still
+runs the game's rasterizer) with the scripted player at the same ticks as the lockstep check:
+vertices a frame (each draw's range of indices), averaged over 30 frames after tick 1300, with
+the Wii's other defaults (`display.model_detail = 0.5`, no object shadows).
+
+| Pass | a10 (cryo bay) | b30 (beach) |
+| --- | --- | --- |
+| The environment's lightmap pass (`10c30c53`, a cube map at each vertex's direction) | 33,000 | 7,000 |
+| Its texture pass, its fog pass (GX's) | 33,000 each | 7,000 each |
+| Its reflections: the lightmap mask and the cube map (GX's) | 32,000 each | 3,700 each |
+| Objects (skinned and lit) | 11,600 | 52,000 |
+| The first-person weapon and hands | (none at that tick) | 3,200 |
+| Object shadows (off on the Wii) | | 14,000 |
+| Decals, particles, contrails, lens flares, the HUD | under 1,500 | under 1,500 |
+| In all | 178,000 | 89,000 |
+
+- `display.environment_reflections = false` leaves out two of a10's five passes over its
+  environment: 178,000 vertices a frame become 113,000. `display.bumped_lightmaps = false`
+  takes the cube map's direction out of the first pass, so GX transforms it and the processor
+  computes only its colours.
+- `display.model_detail` changes almost nothing here (b30: 89,700 vertices at 1.0, 91,800 at
+  0.5, 91,200 at 0.25). The grunts, elites and jackals far away are already at their lowest
+  level of detail (about 450 vertices a grunt), and the trees, shrubs and rocks have only one.
+  b30's objects at that moment: the Pelican (10,700, its planar fog the processor's), 12 grunts
+  (5,400), about 25 trees (17,000), 4 elites (3,300).
+- None of these settings changes the game's state: with each on and off, the x86 build's
+  lockstep hashes agree at every logged tick (a10 to tick 88,500 for the lightmaps and 32,200
+  for both settings; b30 to tick 1,400 for `display.model_detail` 0.25 to 1).
 
 ## The lockstep check
 
@@ -618,7 +780,8 @@ Dolphin runs the game, but these need the console:
   in Dolphin) and **the controllers** (the Classic Controller, the
   GameCube pad, the Wiimote and Nunchuk mappings in `xinput_wii.c`).
 - **Memory.** MEM1 and MEM2 as the console's IOS leaves them, with the
-  Homebrew Channel's loader (the memory report in the log).
+  Homebrew Channel's loader: the memory report's window line says where libogc's MEM2 began
+  (the window reaches down to it), and WiiLibs' `[mem]` lines what its heaps were given.
 - **TEV's arithmetic.** The bump mapping's signed sums rely on TEV's lerp with a bias of -1/2,
   its scale, and results kept unclamped between stages (-4 to 4); it has been checked only
   against the host check's simulation of the documented rules in 8-bit steps, not on the console

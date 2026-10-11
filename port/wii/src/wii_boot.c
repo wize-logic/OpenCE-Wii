@@ -9,14 +9,17 @@ __wrap_main here, which then calls the game's:
   allocate there (port/wii/src/wii_memory.c);
 - WiiLibs: the reset and power buttons, the log, its heaps (sized for what
   the port uses it for), IOS 58 for USB 2.0, the SD card and a USB drive;
-- for the bring-up, a text console on the screen;
+- for the bring-up, a text console on the screen, in one of WiiLibs' video
+  framebuffers;
 - the sampling profiler's watcher, when the game's folder holds profile.txt
   (port/wii/src/wii_profile.c);
-- the game's main runs on a thread of its own with a 1 MB stack (WiiLibs'
+- the game's main runs on a thread of its own with a 512 KB stack (WiiLibs'
   wl_platform_run_on_stack; libogc's
   main thread has 128 KB, below which lie its audio DSP structures: a deep
   path search in b30 ran past it, and the audio interrupt then wrote into
-  the search's frames).
+  the search's frames);
+- the accounting of the heaps by call site, for the memory report
+  (WiiLibs' wl_heap_overflow_track_sites).
 
 Also the trap the bring-up stubs call (tools/wii_link.py): a platform
 function the port does not provide yet stops the game, naming it.
@@ -43,25 +46,36 @@ void wii_network_start(void);
 void wii_profile_arm(void);
 int __real_main(void);
 
-/* WiiLibs' heaps, all in MEM2: thread stacks, the audio output's buffers, the
-GX command FIFO, the asynchronous reads' buffers (which the port does not
-use), and the game's malloc once MEM1's is full (WiiLibs' heap overflow,
-enabled in __wrap_main). MEM1
-holds the game, its game state, and libogc's malloc heap below them. Its
-own scene graph, network, asset and sample bank heaps the port has no use
-for. */
+/* WiiLibs' heaps, all in MEM2: thread stacks (the audio output's 24 KB, and
+32 KB for an IO thread), the audio output's buffers (4 KB in use), the GX
+command FIFO, the asynchronous reads' buffers (which the port does not use),
+and the game's malloc once MEM1's is full (WiiLibs' heap overflow, enabled
+in __wrap_main). MEM1 holds the game, its game state, and libogc's malloc
+heap below them. Its own scene graph, network, asset and sample bank heaps
+the port has no use for. port/wii/README.md, "Memory", has the whole
+budget. */
 static const WlMemTagDef wii_memory_tags[WII_MEMORY_TAG_COUNT] =
 {
-	[WL_TAG_STACK] = { "stack", WL_MEM2, 256u * 1024u },
+	[WL_TAG_STACK] = { "stack", WL_MEM2, 64u * 1024u },
 	[WL_TAG_GXFIFO] = { "gxfifo", WL_MEM2, 1024u * 1024u },
 	[WL_TAG_HOT] = { "hot", WL_MEM1, 0 },
-	[WL_TAG_AUDIO] = { "audio", WL_MEM2, 256u * 1024u },
+	[WL_TAG_AUDIO] = { "audio", WL_MEM2, 64u * 1024u },
 	[WL_TAG_NET] = { "net", WL_MEM1, 0 },
 	[WL_TAG_ASSET] = { "asset", WL_MEM2, 0 },
 	[WL_TAG_AUDIO_BANK] = { "audio_bank", WL_MEM2, 0 },
-	[WL_TAG_IO] = { "io", WL_MEM2, 256u * 1024u },
+	[WL_TAG_IO] = { "io", WL_MEM2, 64u * 1024u },
 	[WII_MEMORY_TAG_GAME] = { "game", WL_MEM2, 5120u * 1024u },
 };
+
+/* the accounting of the heaps by call site (the memory report's "heap"
+lines): blocks of 1 KB or more by the two return addresses that asked for
+them, the rest by size; its tables in the game's heap in MEM2 */
+#if defined(__has_include)
+#if __has_include("wl/platform/heap_sites.h")
+#define WII_HEAP_SITES 1
+#define WII_HEAP_SITES_STORAGE (64u * 1024u)
+#endif
+#endif
 
 static void wii_report(const char *format, ...)
 {
@@ -76,27 +90,29 @@ static void wii_report(const char *format, ...)
 	WL_LOG_I("wii", "%s", line);
 }
 
+/* the console's framebuffer: one of WiiLibs' two, which the device draws
+into later (its frames cover the text once they start), not a third of its
+own (600 KB of MEM1's heap) */
+static void *console_framebuffer;
+
 static void wii_console_start(void)
 {
 	GXRModeObj *mode;
-	void *framebuffer;
 
-	VIDEO_Init();
+	if (wl_platform_video_init() != WL_OK)
+		return;
 	mode = VIDEO_GetPreferredMode(NULL);
-	framebuffer = MEM_K0_TO_K1(SYS_AllocateFramebuffer(mode));
-	console_init(framebuffer, 20, 20, mode->fbWidth, mode->xfbHeight, mode->fbWidth * VI_DISPLAY_PIX_SZ);
-	VIDEO_Configure(mode);
-	VIDEO_SetNextFramebuffer(framebuffer);
-	VIDEO_SetBlack(false);
+	console_framebuffer = wl_platform_video_back_buffer();
+	console_init(console_framebuffer, 20, 20, mode->fbWidth, mode->xfbHeight, mode->fbWidth * VI_DISPLAY_PIX_SZ);
+	VIDEO_SetNextFramebuffer(console_framebuffer);
 	VIDEO_Flush();
 	VIDEO_WaitVSync();
-	if (mode->viTVMode & VI_NON_INTERLACE)
-		VIDEO_WaitVSync();
 }
 
 /* the game's main thread: its stack, which WiiLibs fills with a pattern so the
-memory report can tell how deep it has been (wii_game_stack_used) */
-#define GAME_STACK_SIZE (1024u * 1024u)
+memory report can tell how deep it has been (wii_game_stack_used); the
+deepest seen is about 290 KB (an AI path search in b30) */
+#define GAME_STACK_SIZE (512u * 1024u)
 static unsigned char game_stack[GAME_STACK_SIZE] __attribute__((aligned(64)));
 
 static void *game_main(void *argument)
@@ -139,6 +155,14 @@ int __wrap_main(void)
 	(the link wraps malloc and the rest: tools/wii_build.py) */
 	if (wl_heap_overflow_enable(WII_MEMORY_TAG_GAME) != WL_OK)
 		wii_missing_symbol("the game's heap in MEM2 (see the log)");
+#ifdef WII_HEAP_SITES
+	{
+		void *storage = WL_MEM_ALLOC(WII_MEMORY_TAG_GAME, WII_HEAP_SITES_STORAGE);
+
+		if (!storage || wl_heap_overflow_track_sites(storage, WII_HEAP_SITES_STORAGE, 256u, 1024u) != WL_OK)
+			WL_LOG_W("wii", "no accounting of the heaps by call site");
+	}
+#endif
 
 	/* USB 2.0 needs IOS 58; then the SD card and a USB drive, either of
 	which may hold the game (platform_data_root) */
@@ -173,6 +197,13 @@ void wii_missing_symbol(const char *name)
 	}
 	wii_report("\nThe Wii port does not provide %s yet.\nPress HOME (or START) to return to the loader.\n", name);
 	wl_platform_log_flush();
+	/* (the console's framebuffer on the screen again, if the game's frames
+	had taken its place) */
+	if (console_framebuffer)
+	{
+		VIDEO_SetNextFramebuffer(console_framebuffer);
+		VIDEO_Flush();
+	}
 	for (;;)
 	{
 		WlRawInput input;

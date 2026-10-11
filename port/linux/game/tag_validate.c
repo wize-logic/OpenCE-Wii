@@ -45,6 +45,7 @@ data and which the game takes as models (tag_schema_custom_edition_groups).
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ---------- constants */
@@ -212,7 +213,19 @@ static struct
 
 /* a bit for each byte of the tag cache that a tag's root, block or data
 holds */
+#ifdef HALO_WII
+/* The Wii's cover only the region being checked (the tags, or the bsp that is
+loading: every claim is in it, region_contains first), from the tag cache's
+offset claims_first: 2.9 MB of its 24 MB of MEM1 otherwise. They are kept in
+the tag cache's free bytes between the tags and the bsp, where they fit,
+else in a block of their own for the check (claims_cover). */
+static unsigned long *tag_validate_claims;
+static unsigned long claims_first;
+static unsigned long claims_word_count;
+static void *claims_block;
+#else
 static unsigned long tag_validate_claims[CLAIM_WORDS];
+#endif
 
 static char const tag_validate_empty_name[] = "";
 
@@ -354,6 +367,70 @@ static boolean region_contains(
 		size <= validation->region_size - offset;
 }
 
+/* the word of the claims that holds the bit of the tag cache's offset bit;
+NULL where there are none (the Wii's, outside the region being checked) */
+static unsigned long *claim_word(
+	unsigned long bit)
+{
+#ifdef HALO_WII
+	if (bit < claims_first || (bit - claims_first) / CLAIM_BITS >= claims_word_count)
+		return NULL;
+	return &tag_validate_claims[(bit - claims_first) / CLAIM_BITS];
+#else
+	return &tag_validate_claims[bit / CLAIM_BITS];
+#endif
+}
+
+#ifdef HALO_WII
+/* the claims for a check of the size bytes at the tag cache's offset first,
+none claimed: where they fit in the tag cache's free bytes (from free_first
+to free_end), else in a block of their own; FALSE without memory for them */
+static boolean claims_cover(
+	unsigned long first,
+	unsigned long size,
+	unsigned long free_first,
+	unsigned long free_end)
+{
+	unsigned long bytes;
+
+	/* (the game's free halts on a null pointer: its debug memory's) */
+	if (claims_block)
+		free(claims_block);
+	claims_block = NULL;
+	tag_validate_claims = NULL;
+	claims_first = first - first % CLAIM_BITS;
+	claims_word_count = (first + size - claims_first + CLAIM_BITS - 1) / CLAIM_BITS;
+	bytes = claims_word_count * sizeof(unsigned long);
+	free_first = (free_first + 31) & ~31UL;
+	if (free_first < free_end && bytes <= free_end - free_first)
+		tag_validate_claims = (unsigned long *)((byte *)tag_validate_globals.header + free_first);
+	else
+		tag_validate_claims = claims_block = malloc(bytes);
+	if (!tag_validate_claims)
+	{
+		claims_word_count = 0;
+		return FALSE;
+	}
+	memset(tag_validate_claims, 0, bytes);
+
+	return TRUE;
+}
+
+/* the claims' own block, once the check is over */
+static void claims_release(
+	void)
+{
+	/* (the game's free halts on a null pointer: its debug memory's) */
+	if (claims_block)
+		free(claims_block);
+	claims_block = NULL;
+	tag_validate_claims = NULL;
+	claims_word_count = 0;
+
+	return;
+}
+#endif
+
 /* marks size bytes at address (in the tag cache, as the region is) as a
 tag's: FALSE if any of them already were */
 static boolean claim(
@@ -374,8 +451,11 @@ static boolean claim(
 	bit = first;
 	while (bit < end)
 	{
-		unsigned long *word = &tag_validate_claims[bit / CLAIM_BITS];
+		unsigned long *word = claim_word(bit);
 
+		/* (none: outside what the claims cover, which no check claims) */
+		if (!word)
+			return FALSE;
 		if (bit % CLAIM_BITS == 0 && end - bit >= CLAIM_BITS)
 		{
 			if (*word)
@@ -410,14 +490,18 @@ static void unclaim(
 		return;
 	for (bit = first; bit < end; )
 	{
+		unsigned long *word = claim_word(bit);
+
 		if (bit % CLAIM_BITS == 0 && end - bit >= CLAIM_BITS)
 		{
-			tag_validate_claims[bit / CLAIM_BITS] = 0;
+			if (word)
+				*word = 0;
 			bit += CLAIM_BITS;
 		}
 		else
 		{
-			tag_validate_claims[bit / CLAIM_BITS] &= ~(1UL << (bit % CLAIM_BITS));
+			if (word)
+				*word &= ~(1UL << (bit % CLAIM_BITS));
 			bit++;
 		}
 	}
@@ -1157,8 +1241,20 @@ static void validation_begin(
 	tag_validate_globals.tag_cache_size = tag_cache_size;
 	tag_validate_globals.custom_edition = custom_edition;
 	snprintf(tag_validate_globals.map_name, sizeof(tag_validate_globals.map_name), "%s", map_name);
-	memset(tag_validate_claims, 0, sizeof(tag_validate_claims));
 	validation_new(validation, tag_header, (unsigned long)tag_data_size);
+#ifdef HALO_WII
+	/* (the tags' claims in the tag cache above them, where the bsps load
+	later; a size out of range is refused before anything is claimed) */
+	{
+		unsigned long size = tag_data_size < 0 ? 0 :
+			(unsigned long)tag_data_size < tag_cache_size ? (unsigned long)tag_data_size : tag_cache_size;
+
+		if (!claims_cover(0, size, size, tag_cache_size))
+			tag_validate_refuse(validation, "cannot be checked: no memory for its claims (%lu KB)", size / 8 / 1024);
+	}
+#else
+	memset(tag_validate_claims, 0, sizeof(tag_validate_claims));
+#endif
 
 	return;
 }
@@ -1243,7 +1339,7 @@ boolean tag_validate_custom_edition_tags(
 	return validate_tag_table(&validation, header->instances, header->tag_count);
 }
 
-boolean tag_validate_structure_bsp(
+static boolean validate_structure_bsp(
 	long tag_index,
 	void *base,
 	long size)
@@ -1296,6 +1392,45 @@ boolean tag_validate_structure_bsp(
 	return !validation.refused;
 }
 
+boolean tag_validate_structure_bsp(
+	long tag_index,
+	void *base,
+	long size)
+{
+#ifdef HALO_WII
+	/* the bsp's claims, in the free bytes between the tags and it, or in a
+	block of their own while it is checked; none for one out of range, which
+	is refused before anything is claimed */
+	unsigned long offset = (unsigned long)((byte *)base - (byte *)tag_validate_globals.header);
+	unsigned long tag_data_size = (unsigned long)tag_validate_globals.tag_data_size;
+	boolean result;
+
+	if (!tag_validate_globals.header || (byte *)base < (byte *)tag_validate_globals.header ||
+		tag_validate_globals.tag_data_size < 0 || size < 0 || offset < tag_data_size ||
+		offset > tag_validate_globals.tag_cache_size ||
+		(unsigned long)size > tag_validate_globals.tag_cache_size - offset)
+	{
+		claims_release();
+	}
+	else if (!claims_cover(offset, (unsigned long)size, tag_data_size, offset))
+	{
+		struct tag_validation validation;
+
+		validation_new(&validation, base, (unsigned long)size);
+		validation.tag_index = tag_index;
+		tag_validate_refuse(&validation, "cannot be checked: no memory for its claims (%lu KB)",
+			(unsigned long)size / 8 / 1024);
+		return FALSE;
+	}
+	result = validate_structure_bsp(tag_index, base, size);
+	claims_release();
+
+	return result;
+#else
+	return validate_structure_bsp(tag_index, base, size);
+#endif
+}
+
 long tag_validate_corrections(
 	void)
 {
@@ -1315,7 +1450,7 @@ boolean tag_validate_claimed(
 		return FALSE;
 	}
 
-	return (tag_validate_claims[offset / CLAIM_BITS] & (1UL << (offset % CLAIM_BITS))) != 0;
+	return claim_word(offset) && (*claim_word(offset) & (1UL << (offset % CLAIM_BITS))) != 0;
 }
 
 /* whether any of the size bytes at address were found to be a tag's root,
@@ -1335,7 +1470,8 @@ boolean tag_validate_any_claimed(
 	}
 	for (bit = offset; bit < offset + size; )
 	{
-		unsigned long word = tag_validate_claims[bit / CLAIM_BITS];
+		/* (none where the claims do not reach: nothing was claimed there) */
+		unsigned long word = claim_word(bit) ? *claim_word(bit) : 0;
 
 		if (bit % CLAIM_BITS == 0 && offset + size - bit >= CLAIM_BITS)
 		{

@@ -64,7 +64,13 @@ struct platform_file_reads platform_file_reads;
 void dsound_wii_audio_report(void) {}
 void wii_heap_usage(unsigned long *used, unsigned long *free_bytes) { *used = *free_bytes = 0; }
 unsigned long wii_game_stack_used(unsigned long *size) { *size = 0; return 0; }
-void wii_memory_window_usage(unsigned long *used, unsigned long *free_bytes) { *used = *free_bytes = 0; }
+void wii_memory_window_usage(unsigned long *used, unsigned long *free_bytes, unsigned long *largest_free)
+{
+	*used = *free_bytes = *largest_free = 0;
+}
+void wii_memory_window_range(unsigned long *base, unsigned long *size) { *base = *size = 0; }
+void wl_heap_overflow_log_sites(size_t count) { (void)count; }
+bool wl_gx_sync(void) { return true; }
 void wl_mem_log_usage(void) {}
 void wl_gx_begin_frame(uint32_t clear_rgba) { (void)clear_rgba; }
 uint32_t wl_gx_end_frame(void) { return 0; }

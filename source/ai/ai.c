@@ -2889,6 +2889,13 @@ void ai_handle_spatial_effect(
 	short volume,
 	short count)
 {
+#ifdef __clang__
+	/* port: clang forgets -ffp-contract=off in a function it does not
+	optimise (this pragma's, or optnone's), and fused the weighted sums of
+	the positions below into multiply-adds where the processor has them
+	(PowerPC, ARM64, x86 with FMA), unlike the other ports' */
+#pragma clang fp contract(off)
+#endif
 	if (ai_globals->ai_initialized_for_map)
 	{
 		long now = game_time_get();

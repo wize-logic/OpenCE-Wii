@@ -711,6 +711,10 @@ void GX_SetCopyFilter(u8 aa, u8 pattern[12][2], u8 vertical, u8 filter[7])
 }
 void GX_SetTexCopySrc(u16 left, u16 top, u16 width, u16 height) { CALL("copy source", 0, left, top, width, height); }
 void GX_SetTexCopyDst(u16 width, u16 height, u32 format, u8 mipmap) { CALL("copy destination", 0, width, height, format, mipmap); }
+void GX_SetDispCopySrc(u16 left, u16 top, u16 width, u16 height) { CALL("display copy source", 0, left, top, width, height); }
+void GX_SetDispCopyDst(u16 width, u16 height) { CALL("display copy destination", 0, width, height); }
+u32 GX_SetDispCopyYScale(f32 scale) { CALL("display copy scale", 0, F(scale)); return 480; }
+f32 GX_GetYScaleFactor(u16 efb_height, u16 xfb_height) { calls++; return (f32)xfb_height / (f32)efb_height; }
 void GX_CopyTex(void *destination, u8 clear) { CALL("copy", 0, CANONICAL((uint32_t)destination), clear); }
 void GX_PeekARGB(u16 x, u16 y, GXColor *color)
 {
