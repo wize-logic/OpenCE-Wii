@@ -276,6 +276,10 @@ static void names_initialize(struct translation *translation)
 		translation->names[portion][_name_v1] = operand(_kind_ras, 1, _channel_natural);
 		translation->names[portion][_name_r1] = zero;
 	}
+	/* (v0's alpha a texture's, where the device makes it one) */
+	if (translation->textures->d0_alpha_map)
+		translation->names[_portion_alpha][_name_v0] = operand(_kind_texture,
+			(unsigned char)(GX_PSH_D0_ALPHA_MAP + translation->textures->d0_alpha_map), _channel_natural);
 	translation->names[_portion_color][_name_r0] = zero;
 	translation->names[_portion_alpha][_name_r0] = texture_operand(translation, 0, _portion_alpha);
 }
@@ -740,9 +744,11 @@ static BOOL resources_add(WlTevNeeds *needs, const struct operand *value, int po
 	if (value->kind == _kind_ras)
 		return wl_tev_needs_channel(needs, value->index ? WL_TEV_CH_COLOR1A1 : WL_TEV_CH_COLOR0A0, swap);
 	/* (a texture stage's map, or four after for its separate alpha, at the
-	stage's coordinate; the fog ramp's) */
+	stage's coordinate; the fog ramp's; D0's alpha's map) */
 	if (value->index == GX_PSH_FOG_MAP)
 		return wl_tev_needs_texture(needs, GX_PSH_FOG_TEXCOORD, GX_PSH_FOG_TEXMAP, swap);
+	if (value->index >= GX_PSH_D0_ALPHA_MAP)
+		return wl_tev_needs_texture(needs, GX_PSH_D0_ALPHA_TEXCOORD, (uint8_t)(value->index - GX_PSH_D0_ALPHA_MAP), swap);
 	return wl_tev_needs_texture(needs, (uint8_t)(value->index & 3), value->index, swap);
 }
 
@@ -3208,7 +3214,7 @@ static BOOL specular_lightmap_match(const DWORD *state, const struct gx_psh_text
 	if ((textures->present & 0xF) != 0xF || (textures->cube & 0xC) != 0xC || (textures->cube & 3) ||
 		textures->separate_alpha || textures->bumped || textures->vertex_color ||
 		textures->contents[0] != _gx_psh_texture_all || textures->contents[1] == _gx_psh_texture_alpha ||
-		textures->fog)
+		textures->fog || textures->d0_alpha_map)
 		return FALSE;
 	for (index = 0; index < sizeof(words) / sizeof(words[0]); index++)
 	{
