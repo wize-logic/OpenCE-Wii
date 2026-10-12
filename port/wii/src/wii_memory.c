@@ -15,8 +15,10 @@ blocks from them, as the Linux layer does from its window:
 - the window (PLATFORM_CONTIGUOUS_WINDOW, in MEM2): the tag cache placed at
   its bottom, which converted maps are linked to; the texture and sound
   caches and Direct3D's resources top-down. It reaches down from there to
-  the start of what libogc leaves of MEM2 (about 1 MB more), which only the
-  top-down blocks reach;
+  the start of what libogc leaves of MEM2 (about 1 MB more), which the
+  top-down blocks reach last. The Direct3D device's kept buffers come from
+  the bottom up (wii_memory_window_alloc_low), and give their pages back to
+  a top-down block that finds no room (wii_memory_window_set_reclaim);
 - the game state's, at the top of MEM1 (HALO_PORT_GAME_STATE_BASE_ADDRESS).
 
 Page protection is only recorded (XQueryMemoryProtect reports it).
@@ -70,8 +72,14 @@ static struct contiguous_window windows[] =
 
 static pthread_mutex_t window_lock = PTHREAD_MUTEX_INITIALIZER;
 /* (a change of the windows' pages, taken or freed: wii_memory_window_usage
-counts them again only after one, as the device asks every draw) */
+counts them again only after one) */
 static unsigned long window_changes = 1;
+/* (the window's pages freed: wii_memory_window_frees) */
+static unsigned long window_frees;
+/* (what frees the device's kept buffers when a block finds no room, and
+whether it is running) */
+static int (*window_reclaim)(void);
+static int window_reclaiming;
 
 BOOL wii_memory_claim(void)
 {
@@ -135,7 +143,7 @@ static BOOL pages_free(const struct contiguous_window *window, unsigned long fir
 	return TRUE;
 }
 
-void *platform_contiguous_alloc(unsigned long size, unsigned long alignment,
+static void *contiguous_alloc_once(unsigned long size, unsigned long alignment,
 	unsigned long physical_address, DWORD protect)
 {
 	unsigned long count = (size + PAGE_SIZE_BYTES - 1) / PAGE_SIZE_BYTES;
@@ -202,6 +210,105 @@ void *platform_contiguous_alloc(unsigned long size, unsigned long alignment,
 	return address;
 }
 
+void *platform_contiguous_alloc(unsigned long size, unsigned long alignment,
+	unsigned long physical_address, DWORD protect)
+{
+	void *address = contiguous_alloc_once(size, alignment, physical_address, protect);
+
+	/* (no room: the device's kept buffers give theirs back, and it is looked
+	for again; the game's and the device's own blocks come before them) */
+	if (!address && physical_address == PLATFORM_ANY_PHYSICAL_ADDRESS && window_reclaim && !window_reclaiming)
+	{
+		int freed;
+
+		window_reclaiming = 1;
+		freed = window_reclaim();
+		window_reclaiming = 0;
+		if (freed)
+		{
+			address = contiguous_alloc_once(size, alignment, physical_address, protect);
+			platform_log("contiguous memory: the Direct3D device's kept buffers given back for a block of %lu bytes%s",
+				size, address ? "" : ", and still no room");
+		}
+	}
+	return address;
+}
+
+/* the device's kept buffers, from the window's bottom: the smallest free run
+they fit, at its bottom (best fit: the runs the game's blocks left between
+them first), unless it is the window's largest and would be left below
+keep_largest */
+void *wii_memory_window_alloc_low(unsigned long size, unsigned long keep_largest)
+{
+	struct contiguous_window *window = &windows[0];
+	unsigned long count = (size + PAGE_SIZE_BYTES - 1) / PAGE_SIZE_BYTES;
+	unsigned long page, run = 0, best = (unsigned long)-1, best_run = 0, largest = 0, second = 0, largest_first = 0;
+	unsigned long after;
+	void *address;
+
+	if (!count)
+		count = 1;
+	pthread_mutex_lock(&window_lock);
+	if (!window->claimed)
+	{
+		pthread_mutex_unlock(&window_lock);
+		return NULL;
+	}
+	for (page = 0; page <= window->page_count; page++)
+	{
+		if (page < window->page_count && !window->page_protection[page])
+		{
+			run++;
+			continue;
+		}
+		if (run)
+		{
+			unsigned long first = page - run;
+
+			if (run >= count && (best == (unsigned long)-1 || run < best_run))
+			{
+				best = first;
+				best_run = run;
+			}
+			if (run > largest)
+			{
+				second = largest;
+				largest = run;
+				largest_first = first;
+			}
+			else if (run > second)
+			{
+				second = run;
+			}
+			run = 0;
+		}
+	}
+	/* (the largest run the window keeps once the block is taken) */
+	after = best != largest_first ? largest : best_run - count > second ? best_run - count : second;
+	if (best == (unsigned long)-1 || (after != largest && after * PAGE_SIZE_BYTES < keep_largest))
+	{
+		pthread_mutex_unlock(&window_lock);
+		return NULL;
+	}
+	address = (void *)(window->base + best * PAGE_SIZE_BYTES);
+	for (page = best; page < best + count; page++)
+		window->page_protection[page] = PAGE_READWRITE;
+	window->block_page_count[best] = (unsigned short)count;
+	window_changes++;
+	pthread_mutex_unlock(&window_lock);
+	return address;
+}
+
+unsigned long wii_memory_window_frees(void)
+{
+	return window_frees;
+}
+
+void wii_memory_window_set_reclaim(int (*reclaim)(void))
+{
+	window_reclaim = reclaim;
+}
+
 /* the main window's pages in use and free, and the largest free run, for
 the log */
 void wii_memory_window_usage(unsigned long *used_bytes, unsigned long *free_bytes, unsigned long *largest_free)
@@ -260,6 +367,7 @@ void platform_contiguous_free(void *address)
 		window->page_protection[page] = 0;
 	window->block_page_count[first] = 0;
 	window_changes++;
+	window_frees++;
 	pthread_mutex_unlock(&window_lock);
 }
 

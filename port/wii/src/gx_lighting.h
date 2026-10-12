@@ -20,8 +20,11 @@ enum
 	/* the view-space sphere map's side, in texels (it is drawn in the EFB's
 	rows below the back buffer: d3d8_gx.c) */
 	GX_LIGHTING_SPHERE_SIZE = 48,
-	/* the planar fog's ramp's side, in texels */
+	/* the planar fog's ramp's side, in texels (its columns; and its rows
+	but where it holds the fogs' product over a longer distance, at most
+	GX_LIGHTING_FOG_ROWS) */
 	GX_LIGHTING_FOG_SIZE = 32,
+	GX_LIGHTING_FOG_ROWS = 256,
 };
 
 /* what D0's alpha is */
@@ -129,30 +132,52 @@ float gx_lighting_planar_fog(const struct gx_lighting *lighting, const float wor
 /* The planar fog's alpha on GX. It is a function of two values affine in
 the world position, s = c-87 p (the depth below the fog's plane, of its
 greatest) and t = c-86 p (the distance ahead, of the fog's greatest), and
-the same as at 0 or 1 beyond them: a square texture (the ramp, intensities)
-over s and t from 0 to 1 holds it, clamped beyond. GX makes the ramp's
-coordinates of the position (GX_TG_POS) through the position's own matrix
-(to E) and a post-transform matrix (E to the ramp's coordinates), so a
-vertex costs the processor nothing, and the value is the fog's at each
-pixel, where the programs' is interpolated between the vertices.
+the same as at 0 or 1 beyond them: a texture (the ramp, intensities) over s
+from 0 to 1 and t from t_low to t_high holds it, clamped beyond. GX makes
+the ramp's coordinates of the position (GX_TG_POS) through the position's
+own matrix (to E) and a post-transform matrix (E to the ramp's
+coordinates), so a vertex costs the processor nothing, and the value is the
+fog's at each pixel, where the programs' is interpolated between the
+vertices.
 
-Whether D0's alpha can be the ramp's (the planar fog's alone: the product
-with the atmospheric fog is not a function of two values) */
-BOOL gx_lighting_fog_ramped(const struct gx_lighting *lighting);
-/* the ramp of the draw's fog (its c-85.y and z): texels[t][s], the value
-at s and t of column / (size - 1) and row / (size - 1), 0 to 255 */
-void gx_lighting_fog_ramp(const struct gx_lighting *lighting,
-	unsigned char texels[GX_LIGHTING_FOG_SIZE][GX_LIGHTING_FOG_SIZE]);
+The product with the atmospheric fog (1d3f5b13, e6e006c7) is (1 - r' f)
+(1 - a), r' = clamp(r, 0, 1), r = c-88 p the atmospheric fog's distance
+and f its density (c-85.x). The game makes c-88 and c-86 of the same
+direction, the camera's forward (rasterizer_xbox.c, _rasterizer_window_set_fog):
+r = alpha t + beta, so the product too is a function of s and t, the same
+beyond 0 and 1 in s and beyond both [0, 1] and r's [0, 1] in t: the ramp
+over that t holds it, its rows in fours, 32 a unit of t (else 16 or 8,
+where GX_LIGHTING_FOG_ROWS hold no more; else refused), r's 0 and 1 each on
+a row, so that the atmospheric fog's, linear between them, is the filter's. */
+struct gx_lighting_fog_form
+{
+	/* the fog's c-85.y and z (the planar fog's), and the product's: the
+	atmospheric fog's density and its distance of t, alpha t + beta */
+	float fog[2];
+	BOOL product;
+	float density, alpha, beta;
+	/* the t of the ramp's first row and of its last, and its rows */
+	float t_low, t_high;
+	unsigned rows;
+};
+/* the form of the ramp of the draw's fog: FALSE where D0's alpha cannot be
+a ramp's (none, or the product of fogs whose distances are not of one
+direction, or whose t spans too long a ramp) */
+BOOL gx_lighting_fog_form(const struct gx_lighting *lighting, struct gx_lighting_fog_form *form);
+/* the ramp of the form, rows first_row to first_row + row_count - 1:
+texels[t][s] (rows of GX_LIGHTING_FOG_SIZE), the value at s of column /
+(size - 1) and t of t_low + (t_high - t_low) row / (rows - 1), 0 to 255 */
+void gx_lighting_fog_ramp(const struct gx_lighting_fog_form *form, unsigned first_row, unsigned row_count,
+	unsigned char *texels);
 /* the post-transform matrix of the ramp's coordinates of a position in E,
 (s, t, 1) placed on the texels' centres; FALSE where at center (a point
 of the draw in E) they are beyond the range this takes GX's to hold (the
 ramp's side times 256 texels from it) */
-BOOL gx_lighting_fog_matrix(const struct gx_lighting *lighting, const struct gx_lighting_space *space,
-	const float center[3], float out[3][4]);
-/* the ramp read at texture coordinates (s, t) as GX filters it (bilinear,
-a texel's fractions in 128ths, clamped at its edges) */
-unsigned char gx_lighting_fog_sample(const unsigned char texels[GX_LIGHTING_FOG_SIZE][GX_LIGHTING_FOG_SIZE],
-	float s, float t);
+BOOL gx_lighting_fog_matrix(const struct gx_lighting *lighting, const struct gx_lighting_fog_form *form,
+	const struct gx_lighting_space *space, const float center[3], float out[3][4]);
+/* the ramp of rows rows read at texture coordinates (s, t) as GX filters
+it (bilinear, a texel's fractions in 128ths, clamped at its edges) */
+unsigned char gx_lighting_fog_sample(const unsigned char *texels, unsigned rows, float s, float t);
 
 /* the skinned programs' matrix of a vertex (its node indices v5 and
 weights v6): the rows they blend, as the program blends them */
