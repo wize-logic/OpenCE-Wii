@@ -10,8 +10,9 @@ outputs a draw reads (nv2a_cpu_run_live), in those outputs, for random sets
 of them. A model's vertex on one node (weight 1 on its first index, or 0
 on its second) must give every output that the node with weight 1 alone
 does, whatever the other index (port/wii/src/d3d8_gx.c keys such vertices
-by their node). Then the functions' own arithmetic: nv2a_sqrtf's
-refinement, from estimates as coarse as frsqrte's, against sqrtf, and
+by their node). Then the functions' own arithmetic: nv2a_sqrtf (WiiLibs'
+wl_sqrtf_exact, which WiiLibs' own tests cover) with its refinement,
+wl_sqrtf_refine, from estimates as coarse as frsqrte's, against sqrtf, and
 nv2a_floor_index against floorf.
 
 usage: nv2a_native_check microcode.inc
@@ -87,7 +88,7 @@ static unsigned long arithmetic_check(void)
 		exact = sqrtf(x);
 		for (which = 0; which < 3; which++)
 		{
-			float refined = nv2a_sqrt_refined(x, coarse_estimate(x, which));
+			float refined = wl_sqrtf_refine(x, coarse_estimate(x, which));
 
 			checked++;
 			if (memcmp(&refined, &exact, sizeof(exact)))

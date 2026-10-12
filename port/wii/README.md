@@ -45,7 +45,6 @@ tools/wii_convert_maps.py XBOX/maps/ui.map XBOX/maps/bloodgulch.map   # into bui
 tools/wii_dolphin.py --seconds 300 --until "frame 360:"            # run it in Dolphin from WSL
 tools/wii_gx_psh_check.py                   # the combiner translation, checked on the host (WIILIBS=DIR)
 tools/wii_nv2a_check.py                     # the compiled vertex programs against the interpreter
-tools/wii_math_check.py                     # the Wii's sqrtf against the host's, bit for bit (--all: every float)
 tools/wii_animation_check.py --converted DIR XBOX/maps/*.map   # the converted maps against the Xbox's (map conversion, below)
 tools/wii_data_check.py --converted DIR XBOX/maps/*.map
 tools/wii_placeholder_check.py XBOX/maps/*.map    # the game reads none of the tag bytes left as they are
@@ -196,10 +195,13 @@ inflated it to, and the Wii reads it where it is.
     samples of the sounds the shared mixer plays (`port/linux/src/dsound_sdl.c`)
 - **Floating point.** `_controlfp`/`_statusfp` map the MSVC control word onto the FPSCR
   (`port/linux/src/msvc_crt.c`). The 750 has no square root instruction, and newlib's `sqrtf` works
-  a bit at a time (about 290 instructions); the link wraps it (`-Wl,--wrap=sqrtf`) with
-  `src/wii_math.c`'s, which refines `frsqrte`'s estimate and gives the same correctly rounded root
-  in about 60 (`tools/wii_math_check.py` checks every float). The game calls it for every vector's
-  length (`square_root`).
+  a bit at a time (about 290 instructions); the link wraps it (`-Wl,--wrap=sqrtf`) with WiiLibs'
+  (`wl/gfx/gfx_sqrt_wrap.c`), which refines `frsqrte`'s estimate and gives the same correctly
+  rounded root in about 60. WiiLibs' tests (`tests/gfx/test_gfx_sqrt.c`) compare it with the
+  host's `sqrtf` bit for bit, from estimates as coarse as the 750's (`WL_TEST_EXHAUSTIVE=1`: every
+  float); `nv2a_cpu_native.h`'s `nv2a_sqrtf` is the same function (`wl_sqrtf_exact`), and
+  `tools/wii_nv2a_check.py` builds it from WiiLibs. The game calls it for every vector's length
+  (`square_root`).
 - **Movies.** Bink movies are skipped (`source/bink/bink_playback.c`).
 - **Sound.** The shared DirectSound mixer (`port/linux/src/dsound_sdl.c`) fills WiiLibs' audio
   stream (AESND, 44.1 kHz). Every 240 frames the log reports blocks mixed and played, underruns,

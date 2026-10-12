@@ -314,11 +314,13 @@ def generate_wii_build(n: Writer, sln: Any) -> None:
     programs = build_dir / "gen" / "nv2a_programs.c"
     n.rule(name="wii_host_cc",
            command=f"cc -O1 -std=gnu11 -DNV2A_CPU_NO_NATIVES -I{PORT_DIR / 'tests' / 'host'} -I{wii_platform_dir} "
-                   "-o $out $in -lm",
+                   f"-I{_quote(wiilibs)} -o $out $in -lm",
            description="WII HOST CC $out")
-    n.build(outputs=codegen, rule="wii_host_cc", inputs=codegen_source,
+    # (with WiiLibs' sqrt, which nv2a_cpu_native.h's nv2a_sqrtf is)
+    n.build(outputs=codegen, rule="wii_host_cc", inputs=[codegen_source, wiilibs / "wl" / "gfx" / "gfx_sqrt.c"],
             implicit=[wii_platform_dir / "nv2a_cpu.c", wii_platform_dir / "nv2a_cpu.h",
-                      wii_platform_dir / "nv2a_cpu_native.h", PORT_DIR / "tests" / "host" / "platform.h"])
+                      wii_platform_dir / "nv2a_cpu_native.h", PORT_DIR / "tests" / "host" / "platform.h",
+                      wiilibs / "wl" / "gfx" / "gfx_sqrt.h"])
     n.rule(name="wii_nv2a_codegen", command="$in $microcode $out > /dev/null", description="WII NV2A PROGRAMS $out")
     n.build(outputs=programs, rule="wii_nv2a_codegen", inputs=codegen, implicit=[microcode],
             variables={"microcode": str(microcode)})
@@ -357,8 +359,9 @@ def generate_wii_build(n: Writer, sln: Any) -> None:
                         # (every way out logged, with who took it: WiiLibs' wii/trace_wii.c)
                         "-Wl,--wrap=exit", "-Wl,--wrap=abort", "-Wl,--wrap=_exit", "-Wl,--wrap=SYS_ResetSystem",
                         "-Wl,--wrap=sched_yield",
-                        # (sqrtf without newlib's loop of a bit a step: port/wii/src/wii_math.c)
-                        "-Wl,--wrap=sqrtf",
+                        # (sqrtf without newlib's loop of a bit a step: WiiLibs' wl/gfx/gfx_sqrt_wrap.c, which -u
+                        # pulls out of the archive even when only libc's own objects call sqrtf)
+                        "-Wl,--wrap=sqrtf", "-Wl,-u,__wrap_sqrtf",
                         # (the game's heap, MEM1's malloc with MEM2's behind it: WiiLibs' wii/heap_wrap_wii.c,
                         # enabled in port/wii/src/wii_boot.c; -u pulls the wrappers out of the archive even when
                         # only libc's own objects call malloc)
