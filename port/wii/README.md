@@ -1250,6 +1250,13 @@ and pixel shaders.
   from two points along w's gradient. Both vertex paths take them, so a surface's passes meet
   their equal-depth tests whichever path each pass took. A draw whose vertices are all at one w
   takes the last fit's depth: any draw's whose depth was fitted, on either path.
+  - Nothing is clipped at the far plane, as on the Xbox: every draw's depth is scaled by
+    1 / (1 + 1/8192) (`projection_unclipped`), which keeps it under 1 at any distance while the
+    far plane is over 8192 times the near one's distance (b30: 1024 and 1/16), and keeps the
+    draws' depths in the same order. b30's sea lies past its far plane (w 1024) out to the
+    horizon, where GX stopped it and left a band of the sky's clear colour between it and the
+    sky's own water (a violet line along the horizon). The Xbox clamps a depth past the far
+    plane to 1; these stay just under it, so two surfaces both past it compare by distance.
   - The z bias (`D3DRS_ZBIAS`, a polygon offset of -bias depth units and -bias/4 times the
     depth's slope on the Xbox) has no GX form: a biased draw's depth is pulled toward the eye by
     bias / 16384 of its distance (b of a + b/w). The decals (bias 8, `LESSEQUAL` over their

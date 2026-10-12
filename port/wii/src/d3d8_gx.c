@@ -2756,6 +2756,31 @@ static float projection_bias(void)
 	return offset < 0.0f ? -offset : 0.0f;
 }
 
+/* The far plane. The game's projection puts it where depth a + b / w is 1
+(b30's: w 1024, a = 1024 / (1024 - 1/16)), and GX clips everything past
+it. The Xbox draws what lies past it: b30's sea reaches the horizon there,
+up to the sky's own water, where on GX it stopped at w 1024 and left a band
+of the sky's clear colour between (a violet line along the horizon). So
+every perspective draw's depth is scaled by DEPTH_SCALE, which keeps
+depth (s a + s b / w) below 1 for every w while a is below 1 / s: nothing
+is clipped at the far plane, and as the scale is the same for every draw,
+their depths compare as before (to the rounding of 24 bits, 1 / 8192 of the
+range nearer). The near plane, where the depth is 0, is unchanged. A
+projection whose a is larger (a far plane under 8192 times the near
+plane's distance) is scaled by its own 1 / a instead. Past the far plane
+the Xbox's depth is clamped to 1, where these depths stay just under it:
+two surfaces both past it compare by their distance here, and draw in
+their order there. */
+#define DEPTH_SCALE (1.0f / (1.0f + 1.0f / 8192.0f))
+
+static void projection_unclipped(float a, float b, float *out_a, float *out_b)
+{
+	float scale = a * DEPTH_SCALE > 1.0f ? 1.0f / a : DEPTH_SCALE;
+
+	*out_a = a * scale;
+	*out_b = b * scale;
+}
+
 static void projection_load(const struct draw_projection *projection)
 {
 	Mtx44 matrix;
@@ -2773,14 +2798,18 @@ static void projection_load(const struct draw_projection *projection)
 	memset(matrix, 0, sizeof(matrix));
 	if (projection->perspective)
 	{
-		/* x' = 2/W X + Z, y' = -2/H Y - Z, z' = (1 - a) Z + b, w' = -Z */
+		float a, b;
+
+		/* x' = 2/W X + Z, y' = -2/H Y - Z, z' = (1 - a) Z + b, w' = -Z,
+		with a and b the depth's without its far plane */
+		projection_unclipped(projection->a, projection->b, &a, &b);
 		matrix[0][0] = 2.0f / SCREEN_WIDTH;
 		matrix[0][2] = 1.0f;
 		matrix[1][1] = -2.0f / SCREEN_HEIGHT;
 		matrix[1][2] = -1.0f;
-		matrix[2][2] = 1.0f - projection->a;
+		matrix[2][2] = 1.0f - a;
 		/* (b / w nearer by bias / 16384 of itself: projection_bias) */
-		matrix[2][3] = projection->b - fabsf(projection->b) * bias * (1.0f / 16384.0f);
+		matrix[2][3] = b - fabsf(b) * bias * (1.0f / 16384.0f);
 		matrix[3][2] = -1.0f;
 		GX_LoadProjectionMtx(matrix, GX_PERSPECTIVE);
 	}
@@ -2790,9 +2819,11 @@ static void projection_load(const struct draw_projection *projection)
 		matrix[0][3] = -1.0f;
 		matrix[1][1] = -2.0f / SCREEN_HEIGHT;
 		matrix[1][3] = 1.0f;
-		matrix[2][2] = 1.0f;
+		/* (the depth, z + 1, scaled as the perspective draws' are, which a
+		draw in screen space is tested against: projection_unclipped) */
+		matrix[2][2] = DEPTH_SCALE;
 		/* (in screen space, bias depth units of the 24 bits nearer) */
-		matrix[2][3] = -bias * (1.0f / 16777216.0f);
+		matrix[2][3] = DEPTH_SCALE - 1.0f - bias * (1.0f / 16777216.0f);
 		matrix[3][3] = 1.0f;
 		GX_LoadProjectionMtx(matrix, GX_ORTHOGRAPHIC);
 	}
@@ -5815,10 +5846,12 @@ projection, the normal, the lights and the sphere map's coordinates
 (after position_matrix_load and the texture coordinates' generation) */
 static void lit_state(BOOL keyed, const struct draw_projection *projection, const float d1_constant[4])
 {
-	float matrix[4][4];
+	float matrix[4][4], a, b;
 	unsigned key, keys = keyed ? draw_keys.count : 1;
 
-	gx_lighting_space_projection(&lit.space, SCREEN_WIDTH, SCREEN_HEIGHT, projection->a, projection->b, matrix);
+	/* (the depth as projection_load gives it, without its far plane) */
+	projection_unclipped(projection->a, projection->b, &a, &b);
+	gx_lighting_space_projection(&lit.space, SCREEN_WIDTH, SCREEN_HEIGHT, a, b, matrix);
 	GX_LoadProjectionMtx(matrix, GX_PERSPECTIVE);
 	projection_valid = FALSE;
 	for (key = 0; key < keys; key++)
