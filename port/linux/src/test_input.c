@@ -45,6 +45,22 @@ the script with a line in the log saying where it was.
 	                                is and faces in a game
 	quit                            the game quits, as its menus' Quit does
 
+The Wii's (they change the controllers' raw input before the port reads it,
+the same way the console's would; port/wii/README.md, "The controllers"):
+
+	home                            HOME pressed and let go, on any Remote
+	remote <port> off|on|real       Wii Remote 0 to 3 gone, there (with
+	                                nothing pressed, if none is), as reported
+	extension <port> none|nunchuk|classic|real
+	                                what is plugged into the Remote
+	battery <port> <percent>|real   the Remote's battery
+	event reset|power               the console's reset or power button as
+	                                far as the watcher thread: logged, and
+	                                nothing leaves
+
+While the HOME menu is up the script's D-pad up and down, a and b steer it
+(press down, press a): the game sees none of the script's buttons then.
+
 Buttons are a, b, x, y, black, white, lt, rt, up, down, left, right, start,
 back, lthumb and rthumb, joined with + to press several at once. The text a
 screen or focus waits for is matched without regard to case. Times are
@@ -189,6 +205,8 @@ enum
 	_step_bot,
 	_step_log,
 	_step_quit,
+	/* the Wii's verbs (script_parse_wii) */
+	_step_wii,
 	/* (only while the file is read: repeat <count> ... end) */
 	_step_repeat,
 	_step_end,
@@ -322,6 +340,154 @@ static int script_parse_buttons(const char *text, struct script_step *step)
 	return 1;
 }
 
+/* ---------- the Wii's verbs
+
+home, remote, extension, battery and event: parsed into a step, run at once
+(script_wii_step), and kept as the state test_input_remote_override and
+test_input_home_pressed give the port. They are read on every platform so
+that one script serves all, but only the Wii's input uses them. */
+
+#define WII_PORTS 4
+#define WII_HOME_PRESS_READS 8
+
+enum
+{
+	_wii_home,
+	_wii_remote,
+	_wii_extension,
+	_wii_battery,
+	_wii_event
+};
+
+static struct
+{
+	/* 0 as reported, else the override plus one */
+	signed char connected[WII_PORTS];
+	signed char extension[WII_PORTS];
+	short battery[WII_PORTS];
+	int home_reads;
+} wii_script;
+
+/* the step's own fields: sticks[0] the verb, [1] the port, [2] the value (-1 as reported) */
+static int script_parse_wii(char **words, int count, struct script_step *step)
+{
+	int port = 0;
+	const char *value = count >= 3 ? words[2] : "";
+
+	if (!strcmp(words[0], "home") && count == 1)
+	{
+		step->sticks[0] = _wii_home;
+		return 1;
+	}
+	if (!strcmp(words[0], "event") && count == 2)
+	{
+		if (strcmp(words[1], "reset") && strcmp(words[1], "power"))
+			return 0;
+		step->sticks[0] = _wii_event;
+		step->sticks[2] = !strcmp(words[1], "power");
+		return 1;
+	}
+	if (count != 3 || (words[1][0] < '0' || words[1][0] > '3' || words[1][1]))
+		return 0;
+	port = words[1][0] - '0';
+	step->sticks[1] = port;
+	step->sticks[2] = -1;
+	if (!strcmp(words[0], "remote"))
+	{
+		step->sticks[0] = _wii_remote;
+		if (!strcmp(value, "off"))
+			step->sticks[2] = 0;
+		else if (!strcmp(value, "on"))
+			step->sticks[2] = 1;
+		else if (strcmp(value, "real"))
+			return 0;
+	}
+	else if (!strcmp(words[0], "extension"))
+	{
+		step->sticks[0] = _wii_extension;
+		if (!strcmp(value, "none"))
+			step->sticks[2] = 0;
+		else if (!strcmp(value, "nunchuk"))
+			step->sticks[2] = 1;
+		else if (!strcmp(value, "classic"))
+			step->sticks[2] = 2;
+		else if (strcmp(value, "real"))
+			return 0;
+	}
+	else if (!strcmp(words[0], "battery"))
+	{
+		step->sticks[0] = _wii_battery;
+		if (strcmp(value, "real"))
+		{
+			char *end;
+			long percent = strtol(value, &end, 10);
+
+			if (*end || percent < 0 || percent > 100)
+				return 0;
+			step->sticks[2] = (double)percent;
+		}
+	}
+	else
+	{
+		return 0;
+	}
+	return 1;
+}
+
+#ifdef HALO_WII
+/* the reset or power button as the watcher thread sees it, without leaving
+(port/wii/src/wii_system.c) */
+int wii_system_simulate(int power);
+#endif
+
+static void script_wii_step(struct script_step const *step)
+{
+	int verb = (int)step->sticks[0], port = (int)step->sticks[1], value = (int)step->sticks[2];
+
+	switch (verb)
+	{
+	case _wii_home:
+		wii_script.home_reads = WII_HOME_PRESS_READS;
+		break;
+	case _wii_remote:
+		wii_script.connected[port] = (signed char)(value < 0 ? 0 : value + 1);
+		break;
+	case _wii_extension:
+		wii_script.extension[port] = (signed char)(value < 0 ? 0 : value + 1);
+		break;
+	case _wii_battery:
+		wii_script.battery[port] = (short)(value < 0 ? 0 : value + 1);
+		break;
+	case _wii_event:
+#ifdef HALO_WII
+		if (wii_system_simulate(value))
+			platform_log("test_input: the watcher thread is not running: no %s button", value ? "power" : "reset");
+#endif
+		break;
+	}
+#ifndef HALO_WII
+	platform_log("test_input: %s: the Wii's verbs change only the Wii's controllers", step->text);
+#endif
+}
+
+BOOL test_input_remote_override(int port, struct test_input_remote *remote)
+{
+	if (port < 0 || port >= WII_PORTS)
+		return FALSE;
+	remote->connected = wii_script.connected[port] - 1;
+	remote->extension = wii_script.extension[port] - 1;
+	remote->battery = wii_script.battery[port] - 1;
+	return wii_script.connected[port] || wii_script.extension[port] || wii_script.battery[port];
+}
+
+BOOL test_input_home_pressed(void)
+{
+	if (wii_script.home_reads <= 0)
+		return FALSE;
+	wii_script.home_reads--;
+	return TRUE;
+}
+
 /* one line into a step: 0 for a blank line or a comment, -1 for a fault */
 static int script_parse_line(char *line, int number, struct script_step *step)
 {
@@ -445,6 +611,10 @@ static int script_parse_line(char *line, int number, struct script_step *step)
 	else if (!strcmp(words[0], "quit") && count == 1)
 	{
 		step->kind = _step_quit;
+	}
+	else if (script_parse_wii(words, count, step))
+	{
+		step->kind = _step_wii;
 	}
 	else
 	{
@@ -779,6 +949,9 @@ static void script_gamepad(XINPUT_GAMEPAD *pad, unsigned long long milliseconds)
 			script_next();
 			platform_request_quit();
 			return;
+		case _step_wii:
+			script_wii_step(step);
+			break;
 		case _step_repeat:
 		case _step_end:
 			break;

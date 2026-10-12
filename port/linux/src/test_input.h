@@ -27,4 +27,22 @@ void test_input_gamepad(XINPUT_GAMEPAD *pad, unsigned long long milliseconds);
 action button held from a second on */
 void test_input_hold_action(int hold);
 
+/* The Wii's verbs (home, remote, extension, battery; test_input.c): what a
+script says of a Wii Remote replaces what the console reports, in the raw
+input before the port reads it (port/wii/src/xinput_wii.c). connected is -1
+as reported, 0 gone, 1 there; extension -1 as reported, else 0 none, 1
+Nunchuk, 2 Classic Controller (WiiLibs' WlRemoteExtension); battery -1 as
+reported, else a percent. The call is TRUE when the script has set any of
+them for that port. */
+struct test_input_remote
+{
+	int connected;
+	int extension;
+	int battery;
+};
+BOOL test_input_remote_override(int port, struct test_input_remote *remote);
+/* the script's HOME press: TRUE for some reads of the controllers after the
+step, as a button held for a moment is */
+BOOL test_input_home_pressed(void);
+
 #endif

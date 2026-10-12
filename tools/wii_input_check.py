@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Builds and runs the host check of the Wii's controller mapping (port/wii/tests/wii_input_check.c): synthetic
-WiiLibs input states through port/wii/src/xinput_wii_map.c, compared with the Xbox gamepad state the README
-("The controllers") says they give. WiiLibs' input_shape.c comes from WiiLibs' checkout: WIILIBS, else ./WiiLibs
-(the CI's), else ../WiiLibs.
+"""Builds and runs the host checks of the Wii's controllers: the mapping (port/wii/tests/wii_input_check.c):
+synthetic WiiLibs input states through port/wii/src/xinput_wii_map.c, compared with the Xbox gamepad state the README
+("The controllers") says they give; the HOME menu's state machine (port/wii/tests/wii_home_check.c) with
+port/wii/src/wii_home.c, against fake controllers, a fake game and a clock; and the script verbs that drive those
+on a run without a person (port/wii/tests/wii_script_check.c, with port/linux/src/test_input.c: home, remote,
+extension, battery, event). WiiLibs' input_shape.c comes from
+WiiLibs' checkout: WIILIBS, else ./WiiLibs (the CI's), else ../WiiLibs.
 
 The check includes a stand-in for the Xbox gamepad's declarations (port/wii/tests/host_input/platform.h); this
 script first compares its values with the XDK stand-ins' (port/include/xdk/xdk_xbox.h).
@@ -12,8 +15,10 @@ usage: tools/wii_input_check.py
 
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -41,15 +46,44 @@ def main() -> int:
         if xdk.get(name) != value:
             sys.exit(f"{name}: the stand-in has {value}, the XDK header {xdk.get(name)}")
 
-    output = ROOT / "build" / "wii" / "tests" / "wii_input_check"
-    output.parent.mkdir(parents=True, exist_ok=True)
     wiilibs = wiilibs_dir()
-    subprocess.run(["cc", "-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Wno-unused-parameter",
-                    f"-I{tests / 'host_input'}", f"-I{ROOT / 'port' / 'wii' / 'src'}", f"-I{wiilibs}",
-                    "-o", str(output), str(tests / "wii_input_check.c"),
-                    str(ROOT / "port" / "wii" / "src" / "xinput_wii_map.c"),
-                    str(wiilibs / "wl" / "platform" / "input_shape.c"), "-lm"], check=True)
-    return subprocess.run([str(output)]).returncode
+    flags = ["cc", "-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Wno-unused-parameter",
+             f"-I{tests / 'host_input'}", f"-I{ROOT / 'port' / 'wii' / 'src'}", f"-I{wiilibs}"]
+    src = ROOT / "port" / "wii" / "src"
+    builds = [
+        ("wii_input_check", [tests / "wii_input_check.c", src / "xinput_wii_map.c",
+                             wiilibs / "wl" / "platform" / "input_shape.c"]),
+        ("wii_home_check", [tests / "wii_home_check.c", src / "wii_home.c"]),
+    ]
+    status = 0
+    for name, sources in builds:
+        output = ROOT / "build" / "wii" / "tests" / name
+        output.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run([*flags, "-o", str(output), *map(str, sources), "-lm"], check=True)
+        status |= subprocess.run([str(output)]).returncode
+    status |= script_check(flags, tests)
+    return status
+
+
+def script_check(flags: list, tests: Path) -> int:
+    """test_input.c's Wii verbs: a script played a read at a time, and lines that must be refused. test_input.c is
+    copied beside the stand-in header first, so that its include of platform.h finds the stand-in's"""
+    build = ROOT / "build" / "wii" / "tests" / "script_check"
+    build.mkdir(parents=True, exist_ok=True)
+    for name in ("test_input.c", "test_input.h"):
+        shutil.copyfile(ROOT / "port" / "linux" / "src" / name, build / name)
+    output = build / "wii_script_check"
+    subprocess.run([*flags, "-DHALO_WII", f"-I{build}", "-Wno-maybe-uninitialized", "-Wno-format-truncation", f"-I{ROOT / 'port' / 'linux' / 'src'}", "-o", str(output),
+                    str(tests / "wii_script_check.c"), str(build / "test_input.c"), "-lm"], check=True)
+    status = 0
+    with tempfile.TemporaryDirectory() as folder:
+        script = os.path.join(folder, "script.txt")
+        runs = [["good"]] + [["bad", line] for line in (
+            "remote 4 off", "remote 0 maybe", "remote off", "extension 0 plaid", "extension 9 none", "battery 0 101",
+            "battery 0 -1", "battery 0 many", "event restart", "event", "home now")]
+        for run in runs:
+            status |= subprocess.run([str(output), script, *run]).returncode
+    return status
 
 
 if __name__ == "__main__":
