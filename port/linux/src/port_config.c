@@ -224,6 +224,12 @@ static const struct config_setting config_settings[] =
 		"The models' detail: the size each model's level of detail is chosen for is\n"
 		"scaled by this (1 as the Xbox; less draws simpler models sooner, the Wii's\n"
 		"0.5 to spare its processor the skinned vertices)." },
+	{ "display.wii_widescreen", _config_string, "\"pillarbox\"", "HALO_WII_WIDESCREEN", _environment_value, _platform_wii,
+		"The Wii, on a console set to a 16:9 TV: \"pillarbox\" narrows the 4:3\n"
+		"picture into the middle three quarters of the screen with black at the\n"
+		"sides, so that circles stay round (the picture is a little softer\n"
+		"sideways); \"stretch\" fills the screen, stretched a third sideways. A\n"
+		"4:3 console setting shows the picture as it is." },
 	{ "display.per_pixel_lighting", _config_boolean, "false", "HALO_PER_PIXEL_LIGHTING", _environment_value,
 		_platform_all,
 		"Light the models (characters, weapons, vehicles, scenery) for each\n"

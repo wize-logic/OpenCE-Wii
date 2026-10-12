@@ -533,6 +533,48 @@ slide's acceleration at 0x338 with `75dfe227` reverted, the AI's charge values a
 placeholders that hold data. It can't follow a tag's pointer kept as `void *` or `byte *`, or an
 index that isn't a constant. `--trace DEFINITION` lists every read it finds into one definition.
 
+## The picture on each TV
+
+The game draws a 640x480 picture for a 4:3 screen, 30 frames a second. WiiLibs
+(`wl/platform/video_mode.h`; `src/wii_video.c` is the port's side) chooses the mode from the
+console's settings and logs it once at the device's creation, as `video: 480i NTSC 59.94 Hz, XFB
+640x480, EFB 640x480, line 640 at 40+0, 4:3 (display.wii_widescreen = "pillarbox")`.
+
+| The console is set to | The video is |
+| --- | --- |
+| NTSC (or MPAL) | 480i at 59.94 Hz |
+| progressive scan on, with a component cable | 480p instead (the cable is looked for; Dolphin always has one) |
+| PAL with EuRGB60 on (most PAL TVs take it) | 480 lines at 59.94 Hz, as NTSC: the game runs as it does anywhere |
+| PAL with EuRGB60 off | 576i at 50 Hz; with progressive scan and a cable, 576p |
+| 16:9 | the 640-wide framebuffer is widened to a line of 704 pixels; the picture is kept 4:3 (below) |
+| a display position (the console's settings) | added to the line's origin by libogc, kept on the 720-pixel line: up to 40 pixels either way on a 4:3 setting, 8 on a 16:9 one |
+
+- **16:9.** The video interface stretches the line it scans over the whole screen, so a 4:3 picture
+  came out a third too wide. `display.wii_widescreen = "pillarbox"` (the default) narrows it: the
+  interface can widen a framebuffer but not narrow one, so at the end of each frame WiiLibs copies
+  the finished picture (the HOME menu included) out of the EFB, clears the EFB to black in the same
+  copy and draws it back as one filtered quad over columns 80 to 560 of 640 (`wl_gx_target_squeeze`);
+  the interface then widens the 640 columns and the 480 of them are three quarters of the screen: 4:3,
+  circles round. The cost is one 640x480 EFB copy and one quad a frame, the picture 25% less sharp
+  sideways, and a 1.2 MB block of memory, the one the render targets park the back buffer's colour
+  in (`efb_park_alloc`, in the contiguous window when there is room; the two share it). With no
+  memory the picture is shown stretched (one warning in the log). `"stretch"` fills the screen as
+  before. A 4:3 console setting is not touched. The game's projection is unchanged: a real
+  anamorphic mode (drawing all 640 columns in a 16:9 picture) would widen the HUD and the field of
+  view, and is left for a third value of the setting.
+- **PAL 50.** The EFB's 480 picture rows are copied to the XFB and scaled to its 576 lines
+  (libogc's `TVPal576IntDfScale` has an EFB of 480 rows; the 48 rows below, to 528, are scratch, the
+  view's sphere maps among them, and are never copied to the screen). A display of 50 Hz cannot show
+  30 frames a second at two retraces each (that is 25), so `wii_video_present_interval` asks the
+  display queue for 30 frames a second as a ratio of retraces: alternately two and one (the 3:2
+  unevenness of film on television), 30.0 a second. The game's clock ticks 30 a second whatever is
+  shown, so its speed is right at 50 Hz, with uneven frame lengths; on EuRGB60 they are even.
+- **Checkpoint runs** (Dolphin, which ignores the line's width, so it shows the pillarbox as the
+  framebuffer has it: black at the sides; a PAL 50 run needs a PAL region): `--wii-aspect 16:9`
+  with `display.wii_widescreen` `"pillarbox"` and then `"stretch"`; `--wii-progressive`;
+  `--wii-eurgb60 off` on a PAL NAND for 50 Hz. `wl_console_tests` prints the mode
+  (`INFO video: ...`) and checks it against the console's settings.
+
 ## Drawing
 
 `src/d3d8_gx.c` is a Direct3D 8 device on GX. It keeps the game's own rasterizer and its vertex
