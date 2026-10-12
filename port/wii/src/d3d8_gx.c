@@ -51,6 +51,7 @@ int: libogc's is renamed while its headers are read) */
 #include "xbox_texture_formats.h"
 #include "wl/codec/gx_tex.h"
 
+#include "wl/platform/gx_target.h"
 #include "wl/platform/heap_overflow.h"
 #include "wl/platform/mem.h"
 #include "wl/platform/platform.h"
@@ -58,6 +59,10 @@ int: libogc's is renamed while its headers are read) */
 void wii_heap_usage(unsigned long *used, unsigned long *free_bytes);
 
 void d3d8_state_defaults(void);
+
+/* where render targets park the back buffer (the EFB's owner, below) */
+static void *efb_park_alloc(size_t bytes);
+static void efb_park_free(void *memory);
 
 /* ---------- constants */
 
@@ -384,6 +389,13 @@ HRESULT WINAPI Direct3D_CreateDevice(UINT adapter, D3DDEVTYPE device_type, void 
 		device.gx_ready = wl_platform_video_init() == WL_OK && wl_gx_init() == WL_OK;
 		if (!device.gx_ready)
 			platform_log("Direct3D: GX did not start (nothing is displayed)");
+		else
+		{
+			/* the back buffer is the Xbox's 640 by 480 of the EFB, which is
+			what render targets park and put back; parked where there is room */
+			wl_gx_target_set_back_buffer_size(SCREEN_WIDTH, SCREEN_HEIGHT);
+			wl_gx_target_set_allocator(efb_park_alloc, efb_park_free);
+		}
 		device.created = TRUE;
 		platform_log("Direct3D: device created, %dx%d", SCREEN_WIDTH, SCREEN_HEIGHT);
 	}
@@ -741,8 +753,6 @@ orthographic projection over the screen's pixels, the vertex format below,
 the colours as the vertices give them. */
 
 static BOOL projection_valid;
-static void efb_frame_begun(void);
-static void fog_ramp_bind(void);
 static void cull_measure(void);
 
 /* whether the last draw left GX transforming the game's own vertices
@@ -790,10 +800,9 @@ static void frame_begin(D3DCOLOR clear_color)
 
 	if (device.frame_open || !device.gx_ready)
 		return;
-	/* ARGB to the RGBA WiiLibs takes */
+	/* ARGB to the RGBA WiiLibs takes (and the back buffer has the EFB) */
 	wl_gx_begin_frame((clear_color << 8) | (clear_color >> 24));
 	device.frame_open = TRUE;
-	efb_frame_begun();
 
 	/* (x and y in pixels from the top left, the depth given as z - 1: GX's
 	clip-space depth runs from -1, near, to 0, far; draw_run loads it) */
@@ -1452,7 +1461,7 @@ static void texture_mark(const D3DBaseTexture *texture, const struct texture_ent
 /* ---------- textures drawn by the device
 
 A render target's pixels are copied out of the EFB into its own memory in
-GX's format (efb_resolve, below), the same size as the Xbox's: its texture
+GX's format (by WiiLibs, at efb_take), the same size as the Xbox's: its texture
 is then bound from there, as GX's, by the record of the copy. */
 
 #define RENDER_TARGET_RECORDS 16
@@ -2217,7 +2226,7 @@ static void tev_setup(unsigned stages)
 	if (D3D__RenderState[D3DRS_FOGENABLE] && !(textures.separate_alpha & 8))
 	{
 		textures.fog = 1;
-		fog_ramp_bind();
+		wl_gx_ramp_bind(GX_TEXMAP7);
 	}
 	/* (padding and all, as the cache compares them) */
 	memcpy(&tev_textures, &textures, sizeof(tev_textures));
@@ -2399,30 +2408,8 @@ alpha the vertex's fog factor, from the program's oFog through the fog
 table (D3DRS_FOGTABLEMODE; Halo's own programs compute the factor, table
 none). GX has no such value, so it is sent as a fifth texture coordinate,
 which reads the fog ramp (texture map 7): an intensity texture whose value
-is its coordinate. The translation (gx_psh.c) reads its alpha. */
-
-static unsigned char fog_ramp[256 * 4] __attribute__((aligned(32)));
-static BOOL fog_ramp_made;
-
-static void fog_ramp_bind(void)
-{
-	GXTexObj ramp;
-
-	if (!fog_ramp_made)
-	{
-		unsigned x, y;
-
-		/* (I8 in 8x4 tiles: a 256x4 texture, each row the same) */
-		for (y = 0; y < 4; y++)
-			for (x = 0; x < 256; x++)
-				fog_ramp[(x / 8) * 32 + y * 8 + (x % 8)] = (unsigned char)x;
-		DCFlushRange(fog_ramp, sizeof(fog_ramp));
-		fog_ramp_made = TRUE;
-	}
-	GX_InitTexObj(&ramp, fog_ramp, 256, 4, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
-	GX_InitTexObjFilterMode(&ramp, GX_NEAR, GX_NEAR);
-	GX_LoadTexObj(&ramp, GX_TEXMAP7);
-}
+is its coordinate (WiiLibs' ramp, wl_gx_ramp_bind). The translation
+(gx_psh.c) reads its alpha. */
 
 static float as_float(DWORD value)
 {
@@ -2435,12 +2422,7 @@ static float as_float(DWORD value)
 /* a fog factor (1 no fog, 0 all fog) as its coordinate on the ramp */
 static inline float fog_ramp_coordinate(float factor)
 {
-	if (!(factor >= 0.0f))
-		factor = 0.0f;
-	if (factor > 1.0f)
-		factor = 1.0f;
-	/* (a power of two: the same as the division) */
-	return (factor * 255.0f + 0.5f) * (1.0f / 256.0f);
+	return wl_gx_ramp_coordinate(factor);
 }
 
 /* the vertex's fog (oFog) through the table (D3DRS_FOGTABLEMODE) as its
@@ -3528,95 +3510,39 @@ static struct nv2a_cpu_program *program_current(void)
 /* ---------- the EFB's owner
 
 GX draws into one frame buffer, the EFB. The back buffer has it for the
-frame; a draw or clear into another render target takes it over:
+frame; a draw or clear into another render target takes it over. WiiLibs
+moves it (wl/platform/gx_target.h): the back buffer, if anything was drawn
+into it, is parked first, its colour and depth copied out; the target is
+drawn at the EFB's origin, within a scissor of its size; when another
+surface takes the EFB, the target's pixels are copied into its own memory
+in GX's format, and the back buffer is put back by a quad that writes the
+parked colour, and the parked depth through a Z texture.
 
-- the back buffer, if anything was drawn into it, is parked first: its
-  colour and depth copied out (efb_park);
-- the target is drawn at the EFB's origin, within a scissor of its size;
-- when another surface takes the EFB, the target's pixels are copied into
-  its own memory in GX's format and recorded (efb_resolve), so that its
-  texture is bound from there;
-- the back buffer is put back (efb_restore) by a quad that writes the
-  parked colour, and the parked depth through a Z texture.
+The device says which surface each draw goes to (efb_take), records the
+targets that were copied (render_target_resolved), so that their textures
+are bound from there, and sets again what the quads leave of its own GX
+state (efb_device_state). A clear once the frame has begun is a quad of its
+colour and depth (efb_clear_quad). */
 
-A clear once the frame has begun is a quad of its colour and depth
-(efb_clear_quad). */
-
-static struct
+/* where the back buffer is parked: in the contiguous window, where there is
+room; else the heap */
+static void *efb_park_alloc(size_t bytes)
 {
-	/* the surface the EFB holds: the back buffer's, or a render target's */
-	D3DSurface *owner;
-	/* the back buffer has had something drawn or cleared this frame */
-	BOOL back_buffer_drawn;
-	/* the back buffer's colour and depth are parked */
-	BOOL parked;
-	void *parked_color, *parked_depth;
-	unsigned long parks, resolves, skipped;
-} efb;
+	void *memory = platform_contiguous_alloc((unsigned long)bytes, 32, PLATFORM_ANY_PHYSICAL_ADDRESS, 0);
 
-static unsigned long efb_buffer_bytes(void)
-{
-	return (unsigned long)SCREEN_WIDTH * SCREEN_HEIGHT * 4;
+	if (!memory)
+		memory = aligned_alloc(32, bytes);
+	if (!memory)
+		platform_log("Direct3D: no memory to park the back buffer: render targets draw over it");
+	return memory;
 }
 
-/* texture copies unfiltered (the display copy's deflicker blurs), and the
-display copy's filter back after */
-static void efb_copy_filter(BOOL display)
+static void efb_park_free(void *memory)
 {
-	GXRModeObj *mode = VIDEO_GetPreferredMode(NULL);
-
-	if (display && mode)
-		GX_SetCopyFilter(mode->aa, mode->sample_pattern, GX_TRUE, mode->vfilter);
+	if (platform_is_contiguous(memory))
+		platform_contiguous_free(memory);
 	else
-		GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
-}
-
-/* a rectangle of the EFB copied out as a texture (colour, or depth) */
-static void efb_copy(void *destination, unsigned long width, unsigned long height, u8 format)
-{
-	unsigned long bytes = wl_gxc_tex_bytes(format == GX_TF_RGB565 ? WL_GXC_RGB565 : WL_GXC_RGBA8, (uint32_t)width,
-		(uint32_t)height);
-
-	DCInvalidateRange(destination, bytes);
-	GX_SetTexCopySrc(0, 0, (u16)width, (u16)height);
-	GX_SetTexCopyDst((u16)width, (u16)height, format, GX_FALSE);
-	GX_CopyTex(destination, GX_FALSE);
-	GX_PixModeSync();
-	/* (GX's texture cache may hold what was there) */
-	texture_memory_changed = TRUE;
-}
-
-static void efb_park(void)
-{
-	if (!efb.parked_color)
-	{
-		/* (in the contiguous window, where there is room; else the heap) */
-		efb.parked_color = platform_contiguous_alloc(efb_buffer_bytes(), 32, PLATFORM_ANY_PHYSICAL_ADDRESS, 0);
-		efb.parked_depth = platform_contiguous_alloc(efb_buffer_bytes(), 32, PLATFORM_ANY_PHYSICAL_ADDRESS, 0);
-		if (!efb.parked_color || !efb.parked_depth)
-		{
-			if (efb.parked_color)
-				platform_contiguous_free(efb.parked_color);
-			if (efb.parked_depth)
-				platform_contiguous_free(efb.parked_depth);
-			efb.parked_color = aligned_alloc(32, efb_buffer_bytes());
-			efb.parked_depth = aligned_alloc(32, efb_buffer_bytes());
-		}
-		if (!efb.parked_color || !efb.parked_depth)
-		{
-			free(efb.parked_color);
-			free(efb.parked_depth);
-			efb.parked_color = efb.parked_depth = NULL;
-			platform_log("Direct3D: no memory to park the back buffer: render targets draw over it");
-			return;
-		}
-	}
-	efb_copy_filter(FALSE);
-	efb_copy(efb.parked_color, SCREEN_WIDTH, SCREEN_HEIGHT, GX_TF_RGBA8);
-	efb_copy(efb.parked_depth, SCREEN_WIDTH, SCREEN_HEIGHT, GX_TF_Z24X8);
-	efb_copy_filter(TRUE);
-	efb.parked = TRUE;
-	efb.parks++;
+		free(memory);
 }
 
 /* GX's format for a render target's texture, of the same size as the
@@ -3631,102 +3557,40 @@ static u8 render_target_gx_format(const D3DSurface *surface)
 	}
 }
 
-static void efb_resolve(D3DSurface *surface)
+/* a render target as WiiLibs takes it: its memory (the texture's, where the
+copy goes), size and GX format, and its Data for the record of the copy; the
+format WiiLibs has none for where GX has none */
+static void render_target_describe(D3DSurface *surface, WlGxTarget *target)
 {
-	struct render_target_record *record;
 	unsigned long width, height;
 	u8 format = render_target_gx_format(surface);
 
 	surface_dimensions(surface, &width, &height);
-	if (!format || !surface->Data || width > SCREEN_WIDTH || height > SCREEN_HEIGHT || (width & 3) || (height & 3))
-	{
-		efb.skipped++;
-		return;
-	}
-	efb_copy_filter(FALSE);
-	efb_copy(PLATFORM_PHYSICAL_TO_VIRTUAL(surface->Data), width, height, format);
-	efb_copy_filter(TRUE);
-	record = render_target_record_find(surface->Data);
+	memset(target, 0, sizeof(*target));
+	target->id = surface;
+	target->memory = surface->Data ? PLATFORM_PHYSICAL_TO_VIRTUAL(surface->Data) : NULL;
+	target->width = (uint16_t)(width < 0xFFFF ? width : 0xFFFF);
+	target->height = (uint16_t)(height < 0xFFFF ? height : 0xFFFF);
+	target->format = format == GX_TF_RGBA8 ? WL_GX_TEX_RGBA8 : format == GX_TF_RGB565 ? WL_GX_TEX_RGB565 :
+		WL_GX_TEX_FORMAT_COUNT;
+	target->user = (uintptr_t)surface->Data;
+}
+
+/* a target whose pixels were copied into its memory is recorded, so that its
+texture is bound from there */
+static void render_target_resolved(const WlGxTarget *target)
+{
+	struct render_target_record *record = render_target_record_find((DWORD)target->user);
+
 	if (!record)
 	{
 		record = &render_target_records[render_target_record_next];
 		render_target_record_next = (render_target_record_next + 1) % RENDER_TARGET_RECORDS;
 	}
-	record->data = surface->Data;
-	record->width = width;
-	record->height = height;
-	record->gx_format = format;
-	efb.resolves++;
-}
-
-/* a quad over a rectangle of the EFB: its colour and alpha from texture
-map 0 or a constant colour, its depth from texture map 1 (a Z texture) or a
-constant depth */
-static void efb_quad(float x0, float y0, float x1, float y1, const GXColor *color, float depth, BOOL textured)
-{
-	Mtx44 matrix;
-	int corner;
-	static const float corners[4][2] = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
-
-	memset(matrix, 0, sizeof(matrix));
-	matrix[0][0] = 2.0f / SCREEN_WIDTH;
-	matrix[0][3] = -1.0f;
-	matrix[1][1] = -2.0f / SCREEN_HEIGHT;
-	matrix[1][3] = 1.0f;
-	matrix[2][2] = 1.0f;
-	matrix[3][3] = 1.0f;
-	GX_LoadProjectionMtx(matrix, GX_ORTHOGRAPHIC);
-	projection_valid = FALSE;
-	GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
-	GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
-	GX_SetCullMode(GX_CULL_NONE);
-	indirect_apply(NULL);
-	GX_SetNumTevStages(textured ? 2 : 1);
-	if (textured)
-	{
-		GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
-		GX_SetTevSwapMode(GX_TEVSTAGE0, GX_TEV_SWAP0, GX_TEV_SWAP0);
-		GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
-		/* (the Z texture is the last stage's texture; the colour passes) */
-		GX_SetTevOrder(GX_TEVSTAGE1, GX_TEXCOORD0, GX_TEXMAP1, GX_COLORNULL);
-		GX_SetTevSwapMode(GX_TEVSTAGE1, GX_TEV_SWAP0, GX_TEV_SWAP0);
-		GX_SetTevColorIn(GX_TEVSTAGE1, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_CPREV);
-		GX_SetTevAlphaIn(GX_TEVSTAGE1, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_APREV);
-		GX_SetTevColorOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
-		GX_SetTevAlphaOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
-		GX_SetZTexture(GX_ZT_REPLACE, GX_TF_Z24X8, 0);
-		GX_SetZCompLoc(GX_FALSE);
-	}
-	else
-	{
-		GX_SetTevColor(GX_TEVREG0, *color);
-		GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLORNULL);
-		GX_SetTevSwapMode(GX_TEVSTAGE0, GX_TEV_SWAP0, GX_TEV_SWAP0);
-		GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_C0);
-		GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_A0);
-		GX_SetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
-		GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
-	}
-	transform_software();
-
-	GX_Begin(GX_QUADS, DEVICE_VERTEX_FORMAT, 4);
-	for (corner = 0; corner < 4; corner++)
-	{
-		int stage;
-
-		GX_Position3f32(x0 + (x1 - x0) * corners[corner][0], y0 + (y1 - y0) * corners[corner][1], depth - 1.0f);
-		GX_Color4u8(255, 255, 255, 255);
-		GX_Color4u8(255, 255, 255, 255);
-		for (stage = 0; stage < 4; stage++)
-			GX_TexCoord2f32(corners[corner][0], corners[corner][1]);
-		GX_TexCoord1f32(1.0f);
-	}
-	GX_End();
-	if (textured)
-	{
-		GX_SetZTexture(GX_ZT_DISABLE, GX_TF_Z8, 0);
-		GX_SetZCompLoc(GX_TRUE);
-	}
+	record->data = (DWORD)target->user;
+	record->width = target->width;
+	record->height = target->height;
+	record->gx_format = target->format == WL_GX_TEX_RGB565 ? GX_TF_RGB565 : GX_TF_RGBA8;
 }
 
 /* what the frame's display copy (wl_gx_end_frame's) reads, as WiiLibs set
@@ -3745,82 +3609,62 @@ static void display_copy_restore(void)
 	GX_SetCopyFilter(mode->aa, mode->sample_pattern, GX_TRUE, mode->vfilter);
 }
 
-static void efb_restore(void)
+/* WiiLibs' quads (the back buffer put back, a clear) set GX for themselves
+and leave the device's state as it found it only in the shadow's sense: the
+projection, the colour channels and texture coordinates the frame began with,
+and the vertices the processor's draws send, are put back */
+static void efb_device_state(void)
 {
-	GXTexObj color, depth;
-
-	GX_SetScissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
-	if (!efb.parked)
-		return;
-	GX_InvalidateTexAll();
-	GX_InitTexObj(&color, efb.parked_color, SCREEN_WIDTH, SCREEN_HEIGHT, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
-	GX_InitTexObjFilterMode(&color, GX_NEAR, GX_NEAR);
-	GX_LoadTexObj(&color, GX_TEXMAP0);
-	GX_InitTexObj(&depth, efb.parked_depth, SCREEN_WIDTH, SCREEN_HEIGHT, GX_TF_Z24X8, GX_CLAMP, GX_CLAMP, GX_FALSE);
-	GX_InitTexObjFilterMode(&depth, GX_NEAR, GX_NEAR);
-	GX_LoadTexObj(&depth, GX_TEXMAP1);
-	GX_SetColorUpdate(GX_TRUE);
-	GX_SetAlphaUpdate(GX_TRUE);
-	GX_SetZMode(GX_TRUE, GX_ALWAYS, GX_TRUE);
-	efb_quad(0.0f, 0.0f, SCREEN_WIDTH, SCREEN_HEIGHT, NULL, 0.0f, TRUE);
-	efb.parked = FALSE;
+	projection_valid = FALSE;
+	GX_SetNumChans(2);
+	GX_SetNumTexGens(5);
+	transform_hardware = TRUE;
+	transform_software();
 }
 
 /* the EFB for the current render target */
 static void efb_take(void)
 {
-	D3DSurface *target = device.render_target;
+	D3DSurface *surface = device.render_target;
+	const WlGxTarget *held = wl_gx_target_current();
+	const void *before = held ? held->id : NULL;
+	const void *after = surface == &device.back_buffer ? NULL : (const void *)surface;
+	const WlGxTarget *resolved;
 
-	if (!efb.owner)
-		efb.owner = &device.back_buffer;
-	if (target == efb.owner)
-		return;
-	/* the one leaving */
-	if (efb.owner == &device.back_buffer)
+	if (surface == &device.back_buffer)
 	{
-		if (efb.back_buffer_drawn && !efb.parked)
-			efb_park();
+		/* (the back buffer put back by a quad: no indirect stage reads) */
+		if (before)
+			indirect_apply(NULL);
+		resolved = wl_gx_target_use(NULL);
 	}
 	else
 	{
-		efb_resolve(efb.owner);
-	}
-	/* the one coming */
-	if (target == &device.back_buffer)
-	{
-		efb_restore();
-	}
-	else
-	{
-		unsigned long width, height;
+		WlGxTarget target;
 
-		surface_dimensions(target, &width, &height);
-		GX_SetScissor(0, 0, (u32)(width < SCREEN_WIDTH ? width : SCREEN_WIDTH),
-			(u32)(height < SCREEN_HEIGHT ? height : SCREEN_HEIGHT));
+		render_target_describe(surface, &target);
+		resolved = wl_gx_target_use(&target);
 	}
-	efb.owner = target;
-}
-
-/* a new frame: the back buffer has the EFB, and nothing drawn */
-static void efb_frame_begun(void)
-{
-	efb.owner = &device.back_buffer;
-	efb.back_buffer_drawn = FALSE;
-	efb.parked = FALSE;
+	if (resolved)
+		render_target_resolved(resolved);
+	if (before != after)
+	{
+		/* (GX's texture cache may hold what was in the memory copied to) */
+		texture_memory_changed = TRUE;
+		efb_device_state();
+	}
 }
 
 /* a clear of the current target's viewport, once the frame has begun */
 static void efb_clear_quad(DWORD flags, D3DCOLOR color, float z)
 {
-	GXColor gx_color = { (u8)(color >> 16), (u8)(color >> 8), (u8)color, (u8)(color >> 24) };
-	float x0 = (float)device.viewport.X, y0 = (float)device.viewport.Y;
+	/* ARGB to the RGBA WiiLibs takes */
+	uint32_t rgba = ((uint32_t)color << 8) | ((uint32_t)color >> 24);
 
-	GX_SetColorUpdate((flags & D3DCLEAR_TARGET) ? GX_TRUE : GX_FALSE);
-	GX_SetAlphaUpdate((flags & D3DCLEAR_TARGET) ? GX_TRUE : GX_FALSE);
-	GX_SetZMode((flags & D3DCLEAR_ZBUFFER) ? GX_TRUE : GX_FALSE, GX_ALWAYS, (flags & D3DCLEAR_ZBUFFER) ? GX_TRUE : GX_FALSE);
-	GX_SetZCompLoc(GX_TRUE);
-	efb_quad(x0, y0, x0 + (float)device.viewport.Width, y0 + (float)device.viewport.Height, &gx_color,
-		z < 0.0f ? 0.0f : z > 1.0f ? 1.0f : z, FALSE);
+	indirect_apply(NULL);
+	wl_gx_target_clear((flags & D3DCLEAR_TARGET) ? true : false, (flags & D3DCLEAR_ZBUFFER) ? true : false, rgba, z,
+		(int)device.viewport.X, (int)device.viewport.Y, (int)device.viewport.Width, (int)device.viewport.Height);
+	efb_device_state();
 }
 
 /* whether a draw goes to the screen now (the frame begun, its state set) */
@@ -3831,7 +3675,7 @@ static BOOL draw_prepare(void)
 	frame_begin(device.clear_color);
 	efb_take();
 	if (device.render_target == &device.back_buffer)
-		efb.back_buffer_drawn = TRUE;
+		wl_gx_target_drawn();
 	else
 		device.draws_elsewhere++;
 	states_apply();
@@ -4527,14 +4371,8 @@ static BOOL sphere_bake(const struct texture_entry *world, const float frame[3][
 			}
 			GX_End();
 		}
-		efb_copy_filter(FALSE);
-		DCInvalidateRange(buffer, SIZE * SIZE * 4);
-		GX_SetTexCopySrc(0, SPHERE_BAKE_ROW, SIZE, SIZE);
-		GX_SetTexCopyDst(SIZE, SIZE, GX_TF_RGBA8, GX_FALSE);
-		GX_CopyTex(buffer, GX_FALSE);
-		GX_PixModeSync();
-		efb_copy_filter(TRUE);
-		GX_InvalidateTexAll();
+		/* (copied unfiltered, and GX's texture cache invalidated) */
+		wl_gx_copy_efb_texture(0, SPHERE_BAKE_ROW, SIZE, SIZE, buffer, WL_GX_TEX_RGBA8, false);
 		/* the draw's own state again */
 		GX_SetViewport(0.0f, 0.0f, SCREEN_WIDTH, SCREEN_HEIGHT, 0.0f, 1.0f);
 		GX_SetScissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
@@ -5676,7 +5514,7 @@ void WINAPI D3DDevice_Clear(DWORD count, CONST D3DRECT *rectangles, DWORD flags,
 	frame_begin(device.clear_color);
 	efb_take();
 	if (device.render_target == &device.back_buffer)
-		efb.back_buffer_drawn = TRUE;
+		wl_gx_target_drawn();
 	if (flags & (D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER))
 		efb_clear_quad(flags, color, z);
 }
@@ -5815,11 +5653,14 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		{
 			static struct gx_psh_cache_counts shaders_last;
 			struct gx_psh_cache_counts shaders;
+			WlGxTargetStats targets;
 
 			gx_psh_cache_counts(&shaders);
+			wl_gx_target_stats(&targets, true);
 			platform_log("Direct3D: pixel shaders: %lu translated, %lu beyond GX; GX FIFO overflows %lu; "
 				"render targets: %lu parks, %lu copies, %lu not copied", shaders.translated, shaders.unusable,
-				(unsigned long)GX_GetOverflowCount(), efb.parks, efb.resolves, efb.skipped);
+				(unsigned long)GX_GetOverflowCount(), (unsigned long)targets.parks, (unsigned long)targets.resolves,
+				(unsigned long)targets.skipped);
 			platform_log("Direct3D: pixel shader programs, the last %d frames: %lu translated, %lu kept, %lu with new "
 				"constants; tests %lu (%lu otherwise, %lu generic), audits %lu (%lu differ)", STATISTICS_FRAMES,
 				shaders.translated - shaders_last.translated, shaders.found - shaders_last.found,
@@ -5830,7 +5671,6 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 				shaders.evicted - shaders_last.evicted, shaders.again - shaders_last.again);
 			shaders_last = shaders;
 		}
-		efb.parks = efb.resolves = efb.skipped = 0;
 		{
 			uint64_t now = wl_platform_time_us();
 
