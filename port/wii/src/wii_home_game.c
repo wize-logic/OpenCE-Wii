@@ -35,6 +35,7 @@ extern unsigned char main_menu_is_active(void);
 extern unsigned char game_time_get_paused(void);
 extern void game_time_set_paused(unsigned char paused);
 extern unsigned char game_in_progress(void);
+extern unsigned char game_time_initialized(void);
 extern void main_goto_main_menu(void);
 extern unsigned char local_player_exists(short controller_index);
 void platform_request_quit(void);
@@ -110,8 +111,13 @@ void wii_home_game_poll(const WlRawInput *raw, uint64_t now_us, unsigned extra_n
 		wii_home_init(&home);
 	}
 	memset(&world, 0, sizeof(world));
-	world.in_play = game_in_progress() && !main_menu_is_active();
-	world.game_paused = game_time_get_paused() ? TRUE : FALSE;
+	/* (the controllers are read from the game's start, before its time exists:
+	game_in_progress and game_time_get_paused assert it does) */
+	if (game_time_initialized())
+	{
+		world.in_play = game_in_progress() && !main_menu_is_active();
+		world.game_paused = game_time_get_paused() ? TRUE : FALSE;
+	}
 	/* (asked of the game only for the Remotes that could be told they have
 	nothing to move with) */
 	for (port = 0; world.in_play && port < WII_HOME_PORTS; port++)
