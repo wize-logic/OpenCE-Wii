@@ -103,6 +103,9 @@ log look 7: the game's controller unplugged message
 remote 0 on
 wait 2
 press start
+# (the game's pause menu is left up, as on the Xbox: B closes it)
+wait 1
+press b
 ticks 30
 
 # the reset button, as the watcher sees it (nothing leaves)
