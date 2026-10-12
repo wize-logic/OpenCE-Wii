@@ -15,6 +15,10 @@ builds, and a file on the SD card once one is mounted.
 #include <stdio.h>
 
 #include "wl/platform/platform.h"
+#include "wl/platform/stop.h"
+
+/* (xinput_wii.c) */
+void wii_rumble_stop(void);
 
 /* ---------- the log
 
@@ -39,16 +43,39 @@ void platform_log(const char *format, ...)
 /* ---------- messages and quitting */
 
 /* (a box of its own on the desktop: the log only, until the Wii has a way
-to show one over the game) */
+to show one over the game. The callers' messages are about multiplayer, which
+the Wii does not play, and none stops the game; one that does is
+wii_stop_no_maps below, on WiiLibs' stop screen) */
 void platform_show_message(const char *title, const char *message)
 {
 	platform_log("%s: %s", title, message);
 }
 
-/* the menus' Quit: back to the loader (the Homebrew Channel) */
+/* the game cannot run without its maps: the stop screen (WiiLibs', on the
+console's text screen) says where to put them and waits for HOME or START,
+then returns to the loader. Does not come back. */
+void wii_stop_no_maps(void)
+{
+	wl_platform_stop_screen(
+		"The game's maps were not found.\n"
+		"\n"
+		"Put the converted Xbox maps in sd:/apps/halo/maps\n"
+		"(or usb:/apps/halo/maps). They are made from the\n"
+		"Xbox's maps by tools/wii_convert_maps.py.\n"
+		"\n"
+		"SD card: %s. USB drive: %s.",
+		wl_platform_fs_mounted(WL_DEVICE_SD) ? "found" : "not found",
+		wl_platform_fs_mounted(WL_DEVICE_USB) ? "found" : "not found");
+}
+
+/* the menus' Quit: back to the loader (the Homebrew Channel). WiiLibs' exit
+winds the game down first (wii_system.c): a save finishes, the audio and the
+motors stop, the log and the SD card are written out. */
 void platform_request_quit(void)
 {
-	wl_platform_log_flush();
+	/* (the controllers' motors stopped first, whatever else is under way) */
+	wii_rumble_stop();
+	wl_platform_input_shutdown();
 	wl_platform_exit(WL_EXIT_LOADER);
 }
 

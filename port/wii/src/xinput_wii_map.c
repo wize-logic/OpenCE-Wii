@@ -164,3 +164,43 @@ void wii_map_pointer_look(float x, float y, float seconds, float yaw_rate, float
 	*yaw = -wl_pointer_turn(x, WII_POINTER_DEAD_ZONE) * yaw_rate * seconds;
 	*pitch = -wl_pointer_turn(y, WII_POINTER_DEAD_ZONE) * pitch_rate * seconds;
 }
+
+/* ---------- the rumble */
+
+unsigned wii_rumble_strength(unsigned left, unsigned right)
+{
+	unsigned strength = left > right ? left : right;
+
+	return strength > WII_RUMBLE_FULL ? WII_RUMBLE_FULL : strength;
+}
+
+BOOL wii_rumble_duty(struct wii_rumble *rumble, unsigned strength, uint64_t now_us)
+{
+	BOOL wanted;
+
+	if (strength == 0)
+	{
+		/* (off at once, whenever the last switch) */
+		rumble->carry = 0;
+		if (rumble->on)
+		{
+			rumble->on = FALSE;
+			rumble->switched_us = now_us;
+		}
+		return FALSE;
+	}
+	if (strength > WII_RUMBLE_FULL)
+		strength = WII_RUMBLE_FULL;
+	rumble->carry += (long)strength;
+	wanted = rumble->carry >= (long)(WII_RUMBLE_FULL / 2 + 1);
+	if (wanted != rumble->on && (!rumble->switched_us || now_us - rumble->switched_us >= WII_RUMBLE_SWITCH_US))
+	{
+		rumble->on = wanted;
+		rumble->switched_us = now_us;
+	}
+	/* (what the motor really did this tick is what is taken off the carry:
+	a switch that had to wait is made up for by the ticks after it) */
+	if (rumble->on)
+		rumble->carry -= (long)WII_RUMBLE_FULL;
+	return rumble->on;
+}
