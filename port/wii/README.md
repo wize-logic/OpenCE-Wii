@@ -13,17 +13,21 @@ This port is in bring-up. In Dolphin, the game boots from the SD card and loads 
 - **Every campaign level** loads and plays with the scripted player, in Dolphin, without a
   fault: a10, a30, a50, b30, b40, c10, c20, c40, d20 and d40 (a tour:
   `debug.network_test = "solo:levels\\a30\\a30,levels\\b30\\b30"` with
-  `debug.network_test_tour` seconds of game time in each). In Dolphin a10's frame takes about
-  116 ms and b30's about 580 ms (the frame's split in the log; the aim is 33 ms, 30 frames a
-  second; measured on 10 October, and not timed since the draw-cost work of the 12th, which
-  cut the processor's work per draw). On the Wii, `display.bumped_highlights` is off by default (bumped specular and bumped
+  `debug.network_test_tour` seconds of game time in each). **Frame times** (the frame's split
+  in the log; the aim is 33 ms, 30 frames a second, on every level; Dolphin's milliseconds are the
+  console's only approximately): on 12 October, after the cache-room merge (the device's kept
+  buffers in a pool of their own), b30's frame takes about 55 ms in Dolphin (the draws about 23
+  ms, the game's own update about 29 ms) and a release build the same, and a10's 35 to 50 ms. The
+  figures before the draw-cost work of the 12th were 116 ms (a10) and 580 ms (b30), measured on 10
+  October, and are not current; no other level has been timed since. On the Wii, `display.bumped_highlights` is off by default (bumped specular and bumped
   reflections: their passes' vertices run on the processor, about two fifths of a10's frame),
   `display.object_shadows` is off by default (each object's shadow draws it again, a pass of
   skinned vertices), `display.model_detail` is 0.5 and `display.environment_reflections` is
   off (two of the environment's five passes over its shiny surfaces). `display.bumped_lightmaps`
   is on, as elsewhere: its cube map's direction is computed once a vertex and kept. "What the frame draws" below has the
   counts.
-- **Loading**: the menu is up within a second of the game's start.
+- **Loading**: the menu is up within a second of the game's start. The first start on a fresh
+  card (the default profiles and variants written once) took 1.1 s in Dolphin on 12 October.
 - **Every map converts**: the 24 Xbox maps (campaign and multiplayer) go through
   `tools/wii_convert_maps.py` with nothing left unconverted.
 
