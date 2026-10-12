@@ -7,7 +7,10 @@ source/bitmaps/bitmaps.c): the lightmap under an object, which lights it
 converter rewrote the bitmaps' pixels in GX's formats and tiles
 (tools/wii_gx_textures.py), so the Xbox's swizzled addressing reads another
 texel of them (on a lightmap, often the black between its pieces: the
-objects were drawn nearly black). This finds the texel in the GX texture:
+objects were drawn nearly black). This finds the texel in the GX texture; where a texel sits in
+GX's tiles and what the hardware makes of it is WiiLibs' (wl_gxc_texel_raw and
+wl_gxc_texel_read, wl/codec/gx_tex.h), and what is left here is the game's: its
+bitmap formats, its levels, the Xbox's word:
 
 - wii_bitmap_gx_levels: the levels of a bitmap the converter rewrote, 0 for
   one it left as it was (tools/wii_convert_maps.py's bitmap_pixels and
@@ -26,6 +29,9 @@ Checked on the host against the Xbox textures it converts
 
 #include "wl/codec/gx_tex.h"
 
+#include <stddef.h>
+#include <stdint.h>
+
 /* the bitmaps' formats (source/bitmaps/bitmaps.c's order) and flags */
 enum
 {
@@ -37,28 +43,23 @@ enum
 	GX_MAXIMUM_DIMENSION = 1024,
 };
 
-struct gx_tile
+/* a bitmap format's GX format (wii_gx_textures.py's GX_TILES: WiiLibs' wl_xbox_gx_format), and how many
+GX levels of that format its bytes are: DXT3 and DXT5 are a CMPR level for the colour and an I4 level of the
+same size for the alpha. FALSE for a format not converted. */
+static int gx_format(int format, WlGxcFormat *gx, int *parts)
 {
-	int width, height, bytes;
-};
-
-/* a format's GX tile (wii_gx_textures.py's GX_TILES), FALSE for one not converted */
-static int gx_tile(int format, struct gx_tile *tile)
-{
+	*parts = 1;
 	switch (format)
 	{
-	case BITMAP_A8R8G8B8: case BITMAP_X8R8G8B8:
-		tile->width = 4; tile->height = 4; tile->bytes = 64; return 1;
-	case BITMAP_R5G6B5: case BITMAP_A1R5G5B5: case BITMAP_A4R4G4B4: case BITMAP_A8Y8:
-		tile->width = 4; tile->height = 4; tile->bytes = 32; return 1;
-	case BITMAP_A8: case BITMAP_Y8: case BITMAP_AY8: case BITMAP_P8:
-		tile->width = 8; tile->height = 4; tile->bytes = 32; return 1;
-	case BITMAP_DXT1:
-		tile->width = 8; tile->height = 8; tile->bytes = 32; return 1;
-	case BITMAP_DXT3: case BITMAP_DXT5:
-		tile->width = 8; tile->height = 8; tile->bytes = 64; return 1;
-	default:
-		return 0;
+	case BITMAP_A8R8G8B8: case BITMAP_X8R8G8B8: *gx = WL_GXC_RGBA8; return 1;
+	case BITMAP_R5G6B5: *gx = WL_GXC_RGB565; return 1;
+	case BITMAP_A1R5G5B5: case BITMAP_A4R4G4B4: *gx = WL_GXC_RGB5A3; return 1;
+	case BITMAP_A8Y8: *gx = WL_GXC_IA8; return 1;
+	case BITMAP_A8: case BITMAP_Y8: case BITMAP_AY8: *gx = WL_GXC_I8; return 1;
+	case BITMAP_P8: *gx = WL_GXC_C8; return 1;
+	case BITMAP_DXT1: *gx = WL_GXC_CMPR; return 1;
+	case BITMAP_DXT3: case BITMAP_DXT5: *gx = WL_GXC_CMPR; *parts = 2; return 1;
+	default: return 0;
 	}
 }
 
@@ -89,31 +90,25 @@ static long xbox_level_bytes(int format, int width, int height, int level)
 	}
 }
 
-/* bytes of a GX level: whole tiles (for DXT3/5, the CMPR level and the I4
-level that both take as many bytes) */
-static long gx_level_bytes(const struct gx_tile *tile, int width, int height, int level)
+/* bytes of a GX level: whole tiles (for DXT3/5, the CMPR level and the I4 level that both take as many bytes) */
+static long gx_level_bytes(WlGxcFormat gx, int parts, int width, int height, int level)
 {
-	int w = level_dimension(width, level), h = level_dimension(height, level);
-
-	return (long)((w + tile->width - 1) / tile->width) * ((h + tile->height - 1) / tile->height) * tile->bytes;
+	return (long)wl_gxc_tex_bytes(gx, level_dimension(width, level), level_dimension(height, level)) * parts;
 }
 
-/* bytes of a level's colour: for DXT3/5 the CMPR half, its alpha's I4
-level coming after all the colour's */
-static long gx_colour_level_bytes(int format, const struct gx_tile *tile, int width, int height, int level)
+/* bytes of a level's colour: for DXT3/5 the CMPR half, its alpha's I4 level coming after all the colour's */
+static long gx_colour_level_bytes(WlGxcFormat gx, int width, int height, int level)
 {
-	long bytes = gx_level_bytes(tile, width, height, level);
-
-	return format == BITMAP_DXT3 || format == BITMAP_DXT5 ? bytes / 2 : bytes;
+	return gx_level_bytes(gx, 1, width, height, level);
 }
 
 int wii_bitmap_gx_levels(int format, int type, int width, int height, int depth, unsigned flags, int mipmap_count)
 {
-	struct gx_tile tile;
-	int levels = 1, level, kept = 0;
+	WlGxcFormat gx;
+	int parts, levels = 1, level, kept = 0;
 	long budget = 0, used = 0;
 
-	if (!gx_tile(format, &tile) || type != BITMAP_TYPE_2D || (flags >> BITMAP_V16U16_BIT & 1) || width <= 0 ||
+	if (!gx_format(format, &gx, &parts) || type != BITMAP_TYPE_2D || (flags >> BITMAP_V16U16_BIT & 1) || width <= 0 ||
 		height <= 0 || (flags >> BITMAP_LINEAR_BIT & 1))
 	{
 		return 0;
@@ -146,17 +141,12 @@ int wii_bitmap_gx_levels(int format, int type, int width, int height, int depth,
 		budget += xbox_level_bytes(format, width, height, level);
 	for (level = 0; level < levels; level++)
 	{
-		used += gx_level_bytes(&tile, width, height, level);
+		used += gx_level_bytes(gx, parts, width, height, level);
 		if (used > budget)
 			break;
 		kept = level + 1;
 	}
 	return kept;
-}
-
-static unsigned big16(const unsigned char *bytes)
-{
-	return (unsigned)bytes[0] << 8 | bytes[1];
 }
 
 /* a GX RGB5A3 texel back to the Xbox's word it was made from (WiiLibs'
@@ -184,76 +174,50 @@ int wii_bitmap_gx_texel(int format, int width, int height, int levels, const voi
 	unsigned long *value)
 {
 	const unsigned char *base = pixels;
-	struct gx_tile tile;
-	int w, h, tiles_per_row, index;
-	long offset = 0, tile_offset;
+	WlGxcFormat gx;
+	int parts, w, h, index;
+	long offset = 0, level_bytes;
+	uint32_t raw;
 
-	if (!pixels || !gx_tile(format, &tile) || level < 0 || level >= levels)
+	if (!pixels || !gx_format(format, &gx, &parts) || level < 0 || level >= levels)
 		return WII_BITMAP_TEXEL_NONE;
 	w = level_dimension(width, level);
 	h = level_dimension(height, level);
 	if (x < 0 || y < 0 || x >= w || y >= h)
 		return WII_BITMAP_TEXEL_NONE;
 	for (index = 0; index < level; index++)
-		offset += gx_colour_level_bytes(format, &tile, width, height, index);
-	tiles_per_row = (w + tile.width - 1) / tile.width;
-	tile_offset = offset + ((long)(y / tile.height) * tiles_per_row + x / tile.width) * (is_dxt(format) ? 32 : tile.bytes);
-	switch (format)
+		offset += gx_colour_level_bytes(gx, width, height, index);
+	level_bytes = gx_colour_level_bytes(gx, width, height, level);
+	if (is_dxt(format))
 	{
-	case BITMAP_A8R8G8B8:
-	case BITMAP_X8R8G8B8:
-	{
-		/* (the tile's 16 A,R pairs, then its 16 G,B pairs) */
-		const unsigned char *texel = base + tile_offset + ((y & 3) * 4 + (x & 3)) * 2;
-
-		*value = (unsigned long)texel[0] << 24 | (unsigned long)texel[1] << 16 | (unsigned long)texel[32] << 8 | texel[33];
-		return WII_BITMAP_TEXEL_XBOX;
-	}
-	case BITMAP_R5G6B5:
-	case BITMAP_A8Y8:
-		/* (the Xbox's word, big-endian; IA8 is the alpha, then the intensity) */
-		*value = big16(base + tile_offset + ((y & 3) * 4 + (x & 3)) * 2);
-		return WII_BITMAP_TEXEL_XBOX;
-	case BITMAP_A1R5G5B5:
-	case BITMAP_A4R4G4B4:
-		*value = xbox_word_from_rgb5a3(format, big16(base + tile_offset + ((y & 3) * 4 + (x & 3)) * 2));
-		return WII_BITMAP_TEXEL_XBOX;
-	case BITMAP_A8:
-	case BITMAP_Y8:
-	case BITMAP_AY8:
-	case BITMAP_P8:
-		*value = base[tile_offset + (y & 3) * 8 + (x & 7)];
-		return WII_BITMAP_TEXEL_XBOX;
-	default:
-	{
-		/* CMPR: an 8x8 tile is four 4x4 blocks, row by row; a block's
-		endpoints are big-endian and its rows bytes, texel 0 in the top two
-		bits */
-		const unsigned char *block = base + tile_offset + ((y & 7) / 4 * 2 + (x & 7) / 4) * 8;
-		unsigned char palette[4][4];
-		unsigned colour_index = block[4 + (y & 3)] >> (6 - 2 * (x & 3)) & 3;
+		/* CMPR: the colour is WiiLibs' (the hardware's blend) */
+		unsigned char colour[4];
 		unsigned alpha;
 
-		wl_gxc_cmpr_palette(big16(block), big16(block + 2), palette);
-		alpha = palette[colour_index][3];
+		if (!wl_gxc_texel_read(gx, base + offset, (size_t)level_bytes, (uint32_t)w, (uint32_t)h, (uint32_t)x, (uint32_t)y,
+			colour))
+			return WII_BITMAP_TEXEL_NONE;
+		alpha = colour[3];
 		if (format != BITMAP_DXT1)
 		{
-			/* (the alpha's I4 levels follow all the colour's: 8x8 tiles of 32
-			bytes, the even texel in the high nibble) */
-			long alpha_offset = 0;
-			unsigned nibble;
+			/* (the alpha's I4 levels follow all the colour's, the same sizes: the level's own comes
+			after the colour's levels and the earlier alpha levels) */
+			long alpha_offset = offset;
 
 			for (index = 0; index < levels; index++)
-				alpha_offset += gx_level_bytes(&tile, width, height, index) / 2;
-			for (index = 0; index < level; index++)
-				alpha_offset += gx_level_bytes(&tile, width, height, index) / 2;
-			nibble = base[alpha_offset + ((long)(y / 8) * tiles_per_row + x / 8) * 32 + (y & 7) * 4 + (x & 7) / 2];
-			nibble = (x & 1) ? nibble & 15 : nibble >> 4;
-			alpha = nibble * 17;
+				alpha_offset += gx_colour_level_bytes(gx, width, height, index);
+			if (!wl_gxc_texel_raw(WL_GXC_I4, base + alpha_offset, (size_t)level_bytes, (uint32_t)w, (uint32_t)h, (uint32_t)x,
+				(uint32_t)y, &raw))
+				return WII_BITMAP_TEXEL_NONE;
+			alpha = raw * 17;
 		}
-		*value = (unsigned long)alpha << 24 | (unsigned long)palette[colour_index][0] << 16 |
-			(unsigned long)palette[colour_index][1] << 8 | palette[colour_index][2];
+		*value = (unsigned long)alpha << 24 | (unsigned long)colour[0] << 16 | (unsigned long)colour[1] << 8 | colour[2];
 		return WII_BITMAP_TEXEL_A8R8G8B8;
 	}
-	}
+	/* the texel as GX stores it: the Xbox's word, unless it is RGB5A3 (re-packed bit for bit by
+	wl_xbox_to_gx, which this undoes) */
+	if (!wl_gxc_texel_raw(gx, base + offset, (size_t)level_bytes, (uint32_t)w, (uint32_t)h, (uint32_t)x, (uint32_t)y, &raw))
+		return WII_BITMAP_TEXEL_NONE;
+	*value = gx == WL_GXC_RGB5A3 ? xbox_word_from_rgb5a3(format, raw) : raw;
+	return WII_BITMAP_TEXEL_XBOX;
 }

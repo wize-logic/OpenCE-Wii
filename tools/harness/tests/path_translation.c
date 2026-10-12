@@ -4,7 +4,8 @@ PATH_TRANSLATION.C (test)
 The Wii's translation of an Xbox path to the card's (port/linux/src/xbox_files.c, append_path with the directories'
 listings): a directory is read once and the spellings of its entries come from what was read, where the look at every
 part of the path (the game's first way, kept below as translate_reference) opens and reads each directory along it at
-every path. test_path_translation.py takes the code from the sources as under_test.inc.
+every path. test_path_translation.py takes the code from the sources as under_test.inc (the listings
+are WiiLibs', dircache.inc).
 
 The answer must be the one the look at every part gives, for paths that are there, files that are not yet, folders
 that are not there, other spellings of the names, names that differ in the case only, and dots; and the directories
@@ -40,6 +41,7 @@ static int counted_find(const char *directory, const char *name, char *result, p
 }
 #define posix_find_entry_case_insensitive counted_find
 
+#include "dircache.inc" /* the listings are WiiLibs' (wl/platform/dircache.c) */
 #include "under_test.inc"
 
 /* the look at every part of the path, as the code did before the listings */
@@ -212,14 +214,14 @@ int main(int argc, char **argv)
 	translate_all();
 
 	/* a directory is read once: a second pass reads none and looks into the too large one only */
-	reads = directory_listing_reads;
+	reads = directory_cache.reads;
 	looks = 0;
 	translate_all();
-	CHECK(directory_listing_reads == reads, "a second pass read %lu directories again", directory_listing_reads - reads);
+	CHECK(directory_cache.reads == reads, "a second pass read %lu directories again", (unsigned long)directory_cache.reads - reads);
 	CHECK(looks == 6, "%d looks into directories (the large one's, six paths), not six", looks);
 
 	/* new files in one folder: no directory is read for them */
-	reads = directory_listing_reads;
+	reads = directory_cache.reads;
 	looks = 0;
 	for (index = 0; index < 16; index++)
 	{
@@ -228,8 +230,8 @@ int main(int argc, char **argv)
 		snprintf(path, sizeof(path), "saved\\playlists\\default_playlist\\00\\file%02d.lst", index);
 		check(path);
 	}
-	CHECK(directory_listing_reads == reads && looks == 0, "16 new files in a listed folder read %lu directories, looked into %d",
-		directory_listing_reads - reads, looks);
+	CHECK(directory_cache.reads == reads && looks == 0, "16 new files in a listed folder read %lu directories, looked into %d",
+		(unsigned long)directory_cache.reads - reads, looks);
 
 	/* a file made since the directory was read is taken as written, a file removed since as it was: the same file
 	on the card, which does not tell the cases apart */
@@ -268,7 +270,7 @@ int main(int argc, char **argv)
 		snprintf(path, sizeof(path), "many\\D%02d\\X\\file", index);
 		check(path);
 	}
-	CHECK(directory_listing_count == 64, "the table holds %lu directories, not 64", directory_listing_count);
+	CHECK(directory_cache.count == 64, "the table holds %lu directories, not 64", (unsigned long)directory_cache.count);
 	for (index = 0; index < 80; index++)
 	{
 		char path[128];
