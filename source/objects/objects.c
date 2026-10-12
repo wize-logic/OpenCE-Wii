@@ -2531,6 +2531,10 @@ void object_compute_node_matrices(
 		short node_count;
 		short node_index;
 		long unknown_var;
+		/* port: the root node's matrix found valid where it was computed: it is
+		not checked again below (nothing changes it in between; a matrix found
+		bad is checked again, as it was) */
+		boolean root_node_matrix_valid = FALSE;
 
 		struct object_type_definition *object_type_definition = object_type_definition_get(object->object.type);
 		
@@ -2810,7 +2814,8 @@ void object_compute_node_matrices(
 					object_nodes[node_stack_index] = node_matrix;
 				}
 
-				if (!valid_real_matrix4x3(&object_nodes[node_stack_index]))
+				root_node_matrix_valid = valid_real_matrix4x3(&object_nodes[node_stack_index]);
+				if (!root_node_matrix_valid)
 				{
 					real_matrix4x3 const *validated_root_node_matrix;
 
@@ -2933,7 +2938,7 @@ void object_compute_node_matrices(
 			if (node_stack_index==0)
 			{
 				real_matrix4x3 *final_matrix = &object_nodes[node_stack_index];
-				if (!valid_real_matrix4x3(final_matrix))
+				if (!root_node_matrix_valid && !valid_real_matrix4x3(final_matrix))
 				{
 					char *name2 = tag_get_name(object->definition_index);
 					char *string = name2;
