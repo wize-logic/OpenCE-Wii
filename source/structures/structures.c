@@ -683,6 +683,32 @@ void render_debug_fog_planes(
 	return;
 }
 
+/* port: structure_clusters_in_sphere's answers for the spheres it was last
+asked about. Every light on an object that keeps its lighting up to date
+leaves its clusters and joins them again each tick (light_reconnect_to_map),
+asking which clusters its sphere reaches, and most such lights stand still:
+on x86, b30's walks of the portals were a fifteenth of the tick. The answer
+depends only on the bsp (the generation: global_structure_bsp_generation),
+the cluster, the sphere and the room given, and is given again only for all
+of those the same, bit for bit. The clusters' marks it leaves are not kept:
+each walk marks afresh (structure_cluster_marker_begin). */
+#define CLUSTERS_IN_SPHERE_CACHE_SIZE 64
+#define CLUSTERS_IN_SPHERE_CACHE_CLUSTERS 64
+
+struct clusters_in_sphere_answer
+{
+	unsigned long generation;
+	struct structure_bsp *structure;
+	unsigned long position[3];
+	unsigned long radius;
+	short cluster_index;
+	short maximum_count;
+	short cluster_count;
+	short cluster_indices[CLUSTERS_IN_SPHERE_CACHE_CLUSTERS];
+};
+
+static struct clusters_in_sphere_answer clusters_in_sphere_answers[CLUSTERS_IN_SPHERE_CACHE_SIZE];
+
 short structure_clusters_in_sphere(
 	short cluster_index,
 	real_point3d const *position,
@@ -691,6 +717,9 @@ short structure_clusters_in_sphere(
 	short *intersected_indices)
 {
 	short cluster_count = 0;
+	/* port: (clusters_in_sphere_answers) */
+	struct clusters_in_sphere_answer *answer = NULL;
+	unsigned long key[4];
 
 	match_assert(
 		"c:\\halo\\SOURCE\\structures\\structures.c",
@@ -717,6 +746,33 @@ short structure_clusters_in_sphere(
 	{
 		if (radius > 0.0f)
 		{
+			/* port: the answer kept for this sphere, if there is one
+			(clusters_in_sphere_answers) */
+			if (maximum_count <= CLUSTERS_IN_SPHERE_CACHE_CLUSTERS)
+			{
+				short index;
+
+				csmemcpy(key, position, sizeof(real_point3d));
+				csmemcpy(&key[3], &radius, sizeof(real));
+				answer = &clusters_in_sphere_answers[
+					((key[0] * 31 + key[1]) * 31 + key[2] + key[3] * 7 + (unsigned long)cluster_index) %
+						CLUSTERS_IN_SPHERE_CACHE_SIZE];
+				if (answer->generation == global_structure_bsp_generation &&
+					answer->structure == global_structure_bsp_get() &&
+					answer->cluster_index == cluster_index &&
+					answer->maximum_count == maximum_count &&
+					answer->position[0] == key[0] &&
+					answer->position[1] == key[1] &&
+					answer->position[2] == key[2] &&
+					answer->radius == key[3])
+				{
+					for (index = 0; index < answer->cluster_count && index < maximum_count; index++)
+					{
+						intersected_indices[index] = answer->cluster_indices[index];
+					}
+					return answer->cluster_count;
+				}
+			}
 			structure_cluster_marker_begin();
 			cluster_count = structure_clusters_in_sphere_recursive(
 				cluster_index,
@@ -725,6 +781,25 @@ short structure_clusters_in_sphere(
 				maximum_count,
 				intersected_indices);
 			structure_cluster_marker_end();
+			/* port: (kept) */
+			if (answer)
+			{
+				short index;
+
+				answer->generation = global_structure_bsp_generation;
+				answer->structure = global_structure_bsp_get();
+				answer->cluster_index = cluster_index;
+				answer->maximum_count = maximum_count;
+				answer->position[0] = key[0];
+				answer->position[1] = key[1];
+				answer->position[2] = key[2];
+				answer->radius = key[3];
+				answer->cluster_count = cluster_count;
+				for (index = 0; index < cluster_count && index < maximum_count; index++)
+				{
+					answer->cluster_indices[index] = intersected_indices[index];
+				}
+			}
 		}
 		else if (maximum_count > 0)
 		{

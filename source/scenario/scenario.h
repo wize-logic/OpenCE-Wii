@@ -156,6 +156,8 @@ void scenario_get_current_from_weather_palette(
 
 extern long global_scenario_index;
 extern short global_structure_bsp_index;
+/* port: scenario.c */
+extern unsigned long global_structure_bsp_generation;
 extern struct scenario_globals *scenario_globals;
 
 extern struct scenario *global_scenario;

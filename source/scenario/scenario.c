@@ -227,6 +227,10 @@ extern boolean debug_sound_environment;
 
 long global_scenario_index = NONE;
 short global_structure_bsp_index = NONE;
+/* port: changed whenever global_structure_bsp is, so what was worked out
+from one bsp is not taken for another loaded at the same address
+(structure_clusters_in_sphere's answers, structures.c) */
+unsigned long global_structure_bsp_generation = 0;
 
 static scenario_structure_bsp_connection_proc scenario_structure_bsp_reconnect_proc_table[] =
 {
@@ -372,6 +376,7 @@ void scenario_unload(
 	scenario_globals->structure_bsp_index = NONE;
 	global_scenario = NULL;
 	global_structure_bsp = NULL;
+	global_structure_bsp_generation++; /* port: (global_structure_bsp_generation) */
 	global_collision_bsp = NULL;
 	global_bsp3d = NULL;
 	global_game_globals = NULL;
@@ -1113,6 +1118,7 @@ boolean scenario_switch_structure_bsp(
 		{
 			error(_error_immediate, "failed to load structure bsp #%d", structure_bsp_index);
 			global_structure_bsp = NULL;
+			global_structure_bsp_generation++; /* port: (global_structure_bsp_generation) */
 			global_collision_bsp = NULL;
 			global_bsp3d = NULL;
 			if (old_structure_bsp_index != NONE)
@@ -1137,6 +1143,7 @@ boolean scenario_switch_structure_bsp(
 		if (loaded)
 		{
 			global_structure_bsp = structure_bsp_definition_get(reference->structure_bsp.index);
+			global_structure_bsp_generation++; /* port: (global_structure_bsp_generation) */
 			global_collision_bsp = TAG_BLOCK_GET_ELEMENT(
 				&global_structure_bsp->collision_bsp,
 				0,
