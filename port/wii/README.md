@@ -869,7 +869,17 @@ and pixel shaders.
       draw into the vertex memo, then sent by a loop made for that combination of what is sent
       (`hardware_emit`), in place of one loop testing every case at every index. The log's
       `the processor's part in hardware's vertices` line lists the combinations (their flags in
-      hex: `HW_KEYED` 1 and so on) with their draws and indices;
+      hex: `HW_KEYED` 1 and so on) with their draws and indices. Each loop reads the draw's
+      fields once, into registers (a store to the FIFO may alias any memory in this build, so a
+      field read at each index was loaded again at each), and sends with as few stores as the
+      bytes allow (the FIFO takes them in order whatever the store's width: two matrix indices
+      in one, the planar fog's colour in one word, two texture coordinates' indices in one).
+      Where a draw computes nothing of a vertex but its blended vertices' positions (b30's
+      marines and Pelican, `33` and `37`: most of the indices it sends), a vertex of a node's
+      own sends its position and normal from its buffer at each index, the memo serving only
+      the processor's vertices. Later frames' `hardware_emit_draw` in the bench: the skinned
+      characters' 11,356 instructions a draw then 7,898, the fogged ones' 14,703 then 8,442,
+      what GX would draw the same (`record --compare`: 0 of 650 draws differ);
     - the pixel engine's state (blend, updates, depth, alpha test, culling), written only where it
       changes (`states_shadow`), and only the texture coordinates and colour channels the
       stages read generated.
@@ -982,8 +992,10 @@ and pixel shaders.
       matrices make E, the projection is multiplied by K, the depth's row is the same. The
       normal matrices are E's rows of each node's matrix.
     - The normal is three floats, from the map's 11:11:10 word as the programs read it, decoded
-      once for each static buffer into an array in the kept buffers' memory (at most 768 KB;
-      an entry refused room asks again only once room may have come), which GX reads by
+      once for each static buffer into an array in the kept buffers' memory (at most 1280 KB:
+      b30 wanted more than 768; where it is full, buffers not drawn in this frame or the last
+      give theirs up, the least recently drawn first; an entry refused room asks again only
+      once room may have come; the log's line says what the level's draws wanted), which GX reads by
       index as it reads the positions (`kept_normals_find`; three floats in the buffer it reads
       where they are). It was decoded and sent for every index of every draw, 58,000 a frame in
       b30. A draw with vertices whose position is the processor's (a blend beyond the draw's
@@ -1262,7 +1274,7 @@ and pixel shaders.
   ```toml
   [debug]
   fixed_ticks = true            # a frame a tick, the same frame on every run
-  draw_log_tick = 300           # the frame drawn after game tick 300; -1 (the default) none
+  draw_log_tick = 300           # a level's first frame at or after game tick 300 (not the menu's); -1 none
   draw_log_points = "320,190;60,90;560,250"   # back buffer pixels (640 by 480), at most 16
   ```
 

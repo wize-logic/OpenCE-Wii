@@ -3195,11 +3195,12 @@ static void inputs_seed(float (*inputs)[4])
 			memcpy(inputs[reg], device.vertex_registers[reg], sizeof(inputs[reg]));
 }
 
-/* the draw log (debug.draw_log_tick, debug.draw_log_points): the frame drawn
-after that game tick (the first that is) has each draw described in the log,
-the processor's and GX's alike, and the given pixels of the back buffer read
-back after each draw, those it changed logged, to name the draws that make a
-pixel what it is. Off, it costs a draw a load and a compare (draw_logging). */
+/* the draw log (debug.draw_log_tick, debug.draw_log_points): the first frame
+of a level (not the main menu's map) drawn at or after that game tick has
+each draw described in the log, the processor's and GX's alike, and the
+given pixels of the back buffer read back after each draw, those it changed
+logged, to name the draws that make a pixel what it is. Off, it costs a draw
+a load and a compare (draw_logging). */
 #define DRAW_LOG_POINTS_MOST 16
 #define DRAW_LOG_WRITERS 8
 static struct
@@ -3220,10 +3221,12 @@ static struct
 	unsigned long writer_count[DRAW_LOG_POINTS_MOST];
 } draw_log_state;
 
-/* the game's clock (source/game/game.h): its byte and long */
+/* the game's clock (source/game/game.h) and whether the main menu's map is
+the one playing (source/interface/ui_widget.h): its byte and long */
 extern unsigned char game_time_initialized(void);
 extern unsigned char game_in_progress(void);
 extern long game_time_get(void);
+extern unsigned char main_menu_is_active(void);
 
 /* the settings: the tick, and the points ("x,y;x,y;...", the back buffer's
 pixels, 640 by 480) */
@@ -3281,12 +3284,12 @@ static void draw_log_frame(void)
 	if (draw_log_state.state == 0)
 		draw_log_settings();
 	if (draw_log_state.state != 1 || draw_log_state.on || !game_time_initialized() || !game_in_progress() ||
-		game_time_get() != draw_log_state.tick)
+		main_menu_is_active() || game_time_get() < draw_log_state.tick)
 		return;
 	draw_log_state.on = TRUE;
 	draw_log_state.draws = 0;
 	memset(draw_log_state.writer_count, 0, sizeof(draw_log_state.writer_count));
-	platform_log("draw log: frame %lu, drawn after tick %ld", device.frames, draw_log_state.tick);
+	platform_log("draw log: frame %lu, drawn after tick %ld", device.frames, (long)game_time_get());
 	if (!draw_log_state.point_count)
 		return;
 	if (device.render_target == &device.back_buffer)
@@ -5861,6 +5864,41 @@ static void lit_state(BOOL keyed, const struct draw_projection *projection, cons
 index) */
 enum { EMIT_NORMALS_NONE, EMIT_NORMALS_SENT, EMIT_NORMALS_INDEXED };
 
+/* GX's FIFO takes a vertex's bytes in order whatever the width of the
+stores that write them: these write a byte, two or four, whatever
+attribute they belong to, through libogc's own writes (which
+tools/wii_draw_bench.py's recording header records) */
+static inline __attribute__((always_inline)) void fifo_u8(u8 value)
+{
+	GX_MatrixIndex1x8(value);
+}
+
+static inline __attribute__((always_inline)) void fifo_u16(u16 value)
+{
+	GX_Position1x16(value);
+}
+
+static inline __attribute__((always_inline)) void fifo_u32(u32 value)
+{
+	GX_Color1u32(value);
+}
+
+/* three words sent as they are (floats' bits: the same bytes in the FIFO as
+GX_Position3f32's or GX_Normal3f32's) */
+static inline __attribute__((always_inline)) void hardware_words_send(const void *values)
+{
+	u32 words[3];
+
+	memcpy(words, values, sizeof(words));
+	fifo_u32(words[0]);
+	fifo_u32(words[1]);
+	fifo_u32(words[2]);
+}
+
+/* emit_indices' keys' matrix indices, a word each as hardware_key_words
+(the plain draws' keys are their matrices', below MATRIX_KEYS) */
+static u32 emit_key_words[256];
+
 /* the vertices of a draw in hardware of which the processor computes nothing:
 each index's matrix indices (keyed: its value's position matrix, and with
 sphere_matrices its normal's sphere map matrix, with fog_post_matrices its
@@ -5916,34 +5954,76 @@ static void emit_indices(const WORD *indices, UINT first, UINT count, unsigned t
 		}
 		return;
 	}
-	EMIT_EACH(
-		unsigned stage;
+	{
+		/* (as hardware_emit's loops: what the loop reads in registers, each
+		key's matrix indices a word, sent in one store or two, and the
+		indices two to a word) */
+		const unsigned char *const keys = draw_key_of;
+		const unsigned matrices = keyed ? 1 + (sphere_matrices ? 1 : 0) + (fog_post_matrices ? 1 : 0) +
+			(fog_matrices ? 1 : 0) : 0;
+		const unsigned pairs = texture_count >> 1, odd = texture_count & 1;
+		const BOOL indexed = normals == EMIT_NORMALS_INDEXED;
+		u32 *const words = emit_key_words;
+		/* (the words made for this layout of matrix indices, until another) */
+		static unsigned words_layout = ~0U;
+		unsigned key, layout = (sphere_matrices ? 1U : 0U) | (fog_post_matrices ? 2U : 0U) | (fog_matrices ? 4U : 0U);
 
-		if (keyed)
+		for (key = 0; keyed && layout != words_layout && key < MATRIX_KEYS; key++)
 		{
-			unsigned key = draw_key_of[vertex];
+			u8 position = (u8)(GX_PNMTX1 + 3 * key), bytes[4] = { 0, 0, 0, 0 };
+			unsigned count_bytes = 1;
 
-			GX_MatrixIndex1x8((u8)(GX_PNMTX1 + 3 * key));
+			bytes[0] = position;
 			if (sphere_matrices)
-				GX_MatrixIndex1x8(lit_sphere_rows[key]);
+				bytes[count_bytes++] = lit_sphere_rows[key];
 			if (fog_post_matrices)
-				GX_MatrixIndex1x8((u8)(GX_PNMTX1 + 3 * key));
+				bytes[count_bytes++] = position;
 			if (fog_matrices)
-				GX_MatrixIndex1x8((u8)(GX_PNMTX1 + 3 * key));
+				bytes[count_bytes++] = position;
+			words[key] = (u32)bytes[0] << 24 | (u32)bytes[1] << 16 | (u32)bytes[2] << 8 | bytes[3];
 		}
-		GX_Position1x16(index);
-		if (normals == EMIT_NORMALS_INDEXED)
-			GX_Normal1x16(index);
-		else if (normals)
-		{
-			float normal[3];
+		if (keyed)
+			words_layout = layout;
+		EMIT_EACH(
+			unsigned stage;
+			u32 pair = (u32)index << 16 | index;
 
-			lit_normal(index, normal);
-			GX_Normal3f32(normal[0], normal[1], normal[2]);
-		}
-		for (stage = 0; stage < texture_count; stage++)
-			GX_TexCoord1x16(index);
-	);
+			if (matrices)
+			{
+				/* (a plain draw's keys are its matrices', none the processor's) */
+				u32 word = words[keys[vertex]];
+
+				if (matrices == 1)
+					fifo_u8((u8)(word >> 24));
+				else if (matrices == 2)
+					fifo_u16((u16)(word >> 16));
+				else if (matrices == 3)
+				{
+					fifo_u16((u16)(word >> 16));
+					fifo_u8((u8)(word >> 8));
+				}
+				else
+					fifo_u32(word);
+			}
+			if (indexed)
+				fifo_u32(pair);
+			else
+			{
+				fifo_u16(index);
+				if (normals)
+				{
+					float normal[3];
+
+					lit_normal(index, normal);
+					hardware_words_send(normal);
+				}
+			}
+			if (odd)
+				fifo_u16(index);
+			for (stage = 0; stage < pairs; stage++)
+				fifo_u32(pair);
+		);
+	}
 #undef EMIT_EACH
 }
 
@@ -6777,10 +6857,16 @@ after it is first seen, its vertices decoded from 0 to the most a draw
 names; at most KEPT_NORMALS_BYTES in all, in the kept buffers' memory (an
 entry refused room is not asked for again while kept_room is the same). An
 entry not drawn for STATIC_OUTPUTS_IDLE frames is freed once GX has drawn
-the frame. Normals of three floats in the buffer GX reads where they are. */
+the frame; where a buffer finds the budget full, entries not drawn in this
+frame or the last (models out of view: GX has drawn them) give theirs up at
+once, the least recently drawn first. Normals of three floats in the buffer
+GX reads where they are. b30 with the Pelican's marines wanted more than
+768 KB (555 draws a second sent their normals), and the pool, 2560 KB, held
+1584 KB: the budget is 1280 KB, the statistics saying what the level's
+draws wanted. */
 #define KEPT_NORMALS_ENTRIES 128
 #define KEPT_NORMALS_WAYS 4
-#define KEPT_NORMALS_BYTES (768UL * 1024UL)
+#define KEPT_NORMALS_BYTES (1280UL * 1024UL)
 
 struct kept_normals
 {
@@ -6793,6 +6879,8 @@ struct kept_normals
 	/* vertices 0 to decoded - 1, three floats each; room for capacity */
 	float *values;
 	unsigned long decoded, capacity;
+	/* (the capacity it was refused: the statistics' wanted) */
+	unsigned long wanted;
 };
 
 static struct kept_normals kept_normals[KEPT_NORMALS_ENTRIES];
@@ -6800,6 +6888,8 @@ static unsigned long kept_normals_bytes;
 /* in the statistics' window: lit draws whose normals GX read by index (from
 the kept, or from their buffer), vertices decoded, draws without room */
 static unsigned long kept_normal_draws, kept_normals_decoded, kept_normals_refused;
+/* (and entries that gave up their room for another's) */
+static unsigned long kept_normals_given;
 
 /* an entry's values freed: once GX has drawn the frame (or now, past room
 to wait) */
@@ -6823,6 +6913,30 @@ static void kept_normals_frame_drawn(void)
 	for (index = 0; index < KEPT_NORMALS_ENTRIES; index++)
 		if (kept_normals[index].buffer && device.frames - kept_normals[index].used_frame > STATIC_OUTPUTS_IDLE)
 			kept_normals_release(&kept_normals[index], TRUE);
+}
+
+/* the budget's room for bytes more, made by the entries not drawn in this
+frame or the last (but keep), the least recently drawn first */
+static void kept_normals_make_room(const struct kept_normals *keep, unsigned long bytes)
+{
+	while (kept_normals_bytes + bytes > KEPT_NORMALS_BYTES)
+	{
+		struct kept_normals *oldest = NULL;
+		unsigned index;
+
+		for (index = 0; index < KEPT_NORMALS_ENTRIES; index++)
+		{
+			struct kept_normals *candidate = &kept_normals[index];
+
+			if (candidate != keep && candidate->values && candidate->used_frame + 2 <= device.frames &&
+				(!oldest || candidate->used_frame < oldest->used_frame))
+				oldest = candidate;
+		}
+		if (!oldest)
+			return;
+		kept_normals_release(oldest, TRUE);
+		kept_normals_given++;
+	}
 }
 
 /* the array GX reads a lit draw's normals from by index, vertices up to
@@ -6896,14 +7010,18 @@ static BOOL kept_normals_find(const struct vertex_shader_object *shader, unsigne
 			kept_normals_refused++;
 			return FALSE;
 		}
+		if (kept_normals_bytes - entry->capacity * 12 + capacity * 12 > KEPT_NORMALS_BYTES)
+			kept_normals_make_room(entry, (capacity - entry->capacity) * 12);
 		if (kept_normals_bytes - entry->capacity * 12 + capacity * 12 <= KEPT_NORMALS_BYTES)
 			values = kept_alloc(capacity * 12);
 		if (!values)
 		{
 			entry->refused = kept_room;
+			entry->wanted = capacity;
 			kept_normals_refused++;
 			return FALSE;
 		}
+		entry->wanted = 0;
 		if (entry->values)
 		{
 			memcpy(values, entry->values, entry->decoded * 12);
@@ -7207,8 +7325,9 @@ struct hardware_vertices
 	int sphere_list[4];
 };
 
-/* each key's matrix indices, in the order the vertex sends them */
-static u8 hardware_key_bytes[256][4];
+/* each key's matrix indices, in the order the vertex sends them: the first
+in the word's top byte, so that one store sends two, or four */
+static u32 hardware_key_words[256];
 static struct hardware_vertices hardware_vertices_draw;
 /* in the statistics' window: the draws and indices of each kind (flags),
 the first HW_KINDS kinds seen */
@@ -7328,35 +7447,61 @@ static struct gx_vertex *hardware_vertex_compute(const struct hardware_vertices 
 }
 
 /* each index's vertex sent: what flags (a constant where this is inlined)
-says it has */
+says it has. What the loop reads of h, the memo and the keys is read once,
+into registers: a store to GX's FIFO may alias any memory (the build has no
+strict aliasing, and a byte's store aliases anything), so a field read at
+each index would be loaded again at each. The FIFO takes bytes in order
+whatever the store's width, so the matrix indices go as one store (two
+bytes, or four), the planar fog's colour as one word, and the texture
+coordinates' indices, all the vertex's own index, two to a word. Where
+nothing of a vertex is computed but the processor's blended vertices'
+positions (HW_OWN_DIRECT: b30's marines and Pelican, most of the indices
+this sends), a vertex of a node's own sends its position and normal from its
+buffer at each index, which costs less than the memo's look-up, copy and
+stamp: the memo serves the processor's vertices alone. */
+#define HW_OWN_DIRECT(flags) (!((flags) & (HW_ALPHA | HW_CPU_COLORS | HW_SPHERES)))
 static inline __attribute__((always_inline)) void hardware_emit(const struct hardware_vertices *h, UINT count,
 	const unsigned flags)
 {
+	const unsigned char *const positions = h->position_stream, *const normals = lit.normals;
+	const UINT position_stride = h->position_stride, normal_stride = lit.normal_stride;
+	const BOOL normal_packed = lit.normal_packed;
+	const float *const elevens = packed_elevens, *const tens = packed_tens;
+	const WORD *const indices = h->indices;
+	const unsigned long base = indices ? h->base : h->first, least = h->least, memo_size = h->memo_size;
+	struct gx_vertex *const memo = vertex_memo;
+	unsigned long *const stamps = vertex_memo_stamps;
+	const unsigned long stamp = vertex_memo_draw;
+	const unsigned char *const keys = draw_key_of;
+	const u32 *const key_words = hardware_key_words;
+	const unsigned texture_pairs = h->texture_count >> 1, texture_odd = h->texture_count & 1;
+	const unsigned sphere_count = (flags & HW_SPHERES) ? h->sphere_count : 0;
 	UINT vertex;
 	unsigned stage;
 
 	for (vertex = 0; vertex < count; vertex++)
 	{
-		unsigned long whole = h->indices ? (unsigned long)h->indices[vertex] + h->base : h->first + vertex;
+		unsigned long whole = (indices ? (unsigned long)indices[vertex] : (unsigned long)vertex) + base;
 		u16 index = (u16)whole;
-		unsigned key = (flags & HW_KEYED) ? draw_key_of[vertex] : 0;
+		u32 pair = (u32)index << 16 | index;
+		unsigned key = (flags & HW_KEYED) ? keys[vertex] : 0;
 		const struct gx_vertex *computed = NULL;
 		struct gx_vertex local;
 
-		if (HW_COMPUTED(flags))
+		if (HW_COMPUTED(flags) && !(HW_OWN_DIRECT(flags) && key != KEY_PROCESSOR))
 		{
-			unsigned long slot = whole - h->least;
+			unsigned long slot = whole - least;
 
-			if (slot < h->memo_size && vertex_memo_stamps[slot] == vertex_memo_draw)
-				computed = &vertex_memo[slot];
+			if (slot < memo_size && stamps[slot] == stamp)
+				computed = &memo[slot];
 			else if (!(flags & (HW_CPU_COLORS | HW_SPHERES)) && key != KEY_PROCESSOR)
 			{
 				/* (the vertex's own alone: here) */
-				struct gx_vertex *own = slot < h->memo_size ? &vertex_memo[slot] : &local;
+				struct gx_vertex *own = slot < memo_size ? &memo[slot] : &local;
 
 				hardware_vertex_own(h, whole, key, own, flags);
 				if (own != &local)
-					vertex_memo_stamps[slot] = vertex_memo_draw;
+					stamps[slot] = stamp;
 				computed = own;
 			}
 			else
@@ -7364,46 +7509,85 @@ static inline __attribute__((always_inline)) void hardware_emit(const struct har
 		}
 		if (flags & HW_KEYED)
 		{
-			const u8 *bytes = hardware_key_bytes[key];
+			u32 word = key_words[key];
 
-			GX_MatrixIndex1x8(bytes[0]);
-			if (flags & HW_MATRIX2)
-				GX_MatrixIndex1x8(bytes[1]);
-			if (flags & HW_MATRIX3)
-				GX_MatrixIndex1x8(bytes[2]);
 			if (flags & HW_MATRIX4)
-				GX_MatrixIndex1x8(bytes[3]);
+				fifo_u32(word);
+			else if (flags & HW_MATRIX3)
+			{
+				fifo_u16((u16)(word >> 16));
+				fifo_u8((u8)(word >> 8));
+			}
+			else if (flags & HW_MATRIX2)
+				fifo_u16((u16)(word >> 16));
+			else
+				fifo_u8((u8)(word >> 24));
 		}
-		if (flags & HW_POSITIONS)
-			GX_Position3f32(computed->position[0], computed->position[1], computed->position[2]);
+		if ((flags & HW_POSITIONS) && HW_OWN_DIRECT(flags) && !computed)
+		{
+			/* (the vertex's own position, from its buffer) */
+			const unsigned char *position = positions + whole * position_stride;
+			u32 words[3];
+
+			memcpy(words, position, sizeof(words));
+			fifo_u32(words[0]);
+			fifo_u32(words[1]);
+			fifo_u32(words[2]);
+		}
+		else if (flags & HW_POSITIONS)
+			hardware_words_send(computed->position);
+		else if ((flags & (HW_LIT | HW_NORMALS_INDEXED)) == (HW_LIT | HW_NORMALS_INDEXED))
+			fifo_u32(pair);
 		else
-			GX_Position1x16(index);
+			fifo_u16(index);
 		if (flags & HW_LIT)
 		{
-			if (flags & HW_NORMALS_INDEXED)
-				GX_Normal1x16(index);
-			else
-				GX_Normal3f32(computed->normal[0], computed->normal[1], computed->normal[2]);
+			if (!(flags & HW_NORMALS_INDEXED) && HW_OWN_DIRECT(flags) && !computed)
+			{
+				/* (the vertex's own normal, as lit_normal reads it) */
+				const unsigned char *source = normals + whole * normal_stride;
+				u32 words[3];
+
+				if (normal_packed)
+				{
+					u32 word;
+					float values[3];
+
+					memcpy(&word, source, sizeof(word));
+					values[0] = elevens[word & 0x7FF];
+					values[1] = elevens[(word >> 11) & 0x7FF];
+					values[2] = tens[word >> 22];
+					memcpy(words, values, sizeof(words));
+				}
+				else
+					memcpy(words, source, sizeof(words));
+				fifo_u32(words[0]);
+				fifo_u32(words[1]);
+				fifo_u32(words[2]);
+			}
+			else if (!(flags & HW_NORMALS_INDEXED))
+				hardware_words_send(computed->normal);
+			else if (flags & HW_POSITIONS)
+				fifo_u16(index);
 			if (flags & HW_ALPHA)
-				GX_Color4u8(255, 255, 255, computed->alpha);
+				fifo_u32(0xFFFFFF00u | computed->alpha);
 		}
 		if (flags & HW_CPU_COLORS)
 		{
 			/* (a colour's four bytes as one word: the same bytes in the FIFO) */
-			GX_Color1u32(color_word(computed->color0));
-			GX_Color1u32(color_word(computed->color1));
+			fifo_u32(color_word(computed->color0));
+			fifo_u32(color_word(computed->color1));
 		}
 		else if (flags & HW_KEPT_COLORS)
-		{
-			GX_Color1x16(index);
-			GX_Color1x16(index);
-		}
+			fifo_u32(pair);
 		else if (flags & HW_PAD)
-			GX_Color1u16(0);
-		for (stage = 0; stage < h->texture_count; stage++)
-			GX_TexCoord1x16(index);
+			fifo_u16(0);
+		if (texture_odd)
+			fifo_u16(index);
+		for (stage = 0; stage < texture_pairs; stage++)
+			fifo_u32(pair);
 		if (flags & HW_SPHERES)
-			for (stage = 0; stage < h->sphere_count; stage++)
+			for (stage = 0; stage < sphere_count; stage++)
 				GX_TexCoord2f32(computed->texcoord[h->sphere_list[stage]][0], computed->texcoord[h->sphere_list[stage]][1]);
 	}
 }
@@ -7433,11 +7617,17 @@ static void hardware_emit_draw(const struct hardware_vertices *h, UINT count)
 	HW_EMIT(HW_KEYED | HW_MATRIX2 | HW_POSITIONS | HW_LIT)
 	HW_EMIT(HW_KEYED | HW_POSITIONS | HW_LIT | HW_ALPHA)
 	HW_EMIT(HW_KEYED | HW_MATRIX2 | HW_POSITIONS | HW_LIT | HW_ALPHA)
+	/* (and with two of the reflection, the fog's and the planar fog
+	ramp's matrices: b30's marines and Pelican) */
+	HW_EMIT(HW_KEYED | HW_MATRIX2 | HW_MATRIX3 | HW_POSITIONS | HW_LIT)
+	HW_EMIT(HW_KEYED | HW_MATRIX2 | HW_MATRIX3 | HW_POSITIONS | HW_LIT | HW_ALPHA)
 	/* (a model lit, its planar fog the processor's) */
 	HW_EMIT(HW_KEYED | HW_LIT | HW_ALPHA)
 	HW_EMIT(HW_KEYED | HW_MATRIX2 | HW_LIT | HW_ALPHA)
+	HW_EMIT(HW_KEYED | HW_MATRIX2 | HW_MATRIX3 | HW_LIT | HW_ALPHA)
 	HW_EMIT(HW_KEYED | HW_LIT | HW_NORMALS_INDEXED | HW_ALPHA)
 	HW_EMIT(HW_KEYED | HW_MATRIX2 | HW_LIT | HW_NORMALS_INDEXED | HW_ALPHA)
+	HW_EMIT(HW_KEYED | HW_MATRIX2 | HW_MATRIX3 | HW_LIT | HW_NORMALS_INDEXED | HW_ALPHA)
 	HW_EMIT(HW_LIT | HW_ALPHA)
 	HW_EMIT(HW_LIT | HW_NORMALS_INDEXED | HW_ALPHA)
 	/* (unlit: the processor's colours, blended vertices, a pad) */
@@ -7984,7 +8174,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 			for (key = 0; key <= draw_keys.count; key++)
 			{
 				unsigned which = key < draw_keys.count ? key : KEY_PROCESSOR;
-				u8 position = (u8)(which == KEY_PROCESSOR ? GX_PNMTX0 : GX_PNMTX1 + 3 * key), *bytes = hardware_key_bytes[which];
+				u8 position = (u8)(which == KEY_PROCESSOR ? GX_PNMTX0 : GX_PNMTX1 + 3 * key), bytes[4] = { 0, 0, 0, 0 };
 				unsigned count_bytes = 1;
 
 				bytes[0] = position;
@@ -7994,6 +8184,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 					bytes[count_bytes++] = position;
 				if (lit_on && lit.fog_ramped)
 					bytes[count_bytes++] = position;
+				hardware_key_words[which] = (u32)bytes[0] << 24 | (u32)bytes[1] << 16 | (u32)bytes[2] << 8 | bytes[3];
 			}
 		}
 		h->flags = flags;
@@ -8451,12 +8642,12 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		hardware_sphere_draws = hardware_sphere_lit_draws = hardware_spheres_run = 0;
 		{
 			/* (the kinds of hardware_emit's draws, most indices first) */
-			char line[200];
+			char line[320];
 			unsigned kind, shown, length;
 
 			length = (unsigned)snprintf(line, sizeof(line), "Direct3D: the processor's part in hardware's vertices "
 				"(kind: draws/indices):");
-			for (shown = 0; shown < 6 && length < sizeof(line) - 24; shown++)
+			for (shown = 0; shown < 8 && length < sizeof(line) - 32; shown++)
 			{
 				unsigned best = HW_KINDS;
 
@@ -8497,13 +8688,21 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			"%lu draws", lit_fog_draws, lit_fog_products, fog_ramps_made, lit_fog_refused, fog_post_draws);
 		{
 			unsigned index, entries = 0;
+			unsigned long wanted = 0;
 
+			/* (wanted: what the entries hold, and what those refused asked for) */
 			for (index = 0; index < KEPT_NORMALS_ENTRIES; index++)
-				entries += kept_normals[index].values ? 1 : 0;
+			{
+				const struct kept_normals *entry = &kept_normals[index];
+
+				entries += entry->values ? 1 : 0;
+				wanted += (entry->wanted > entry->capacity ? entry->wanted : entry->capacity) * 12;
+			}
 			platform_log("Direct3D: lit by GX, the normals read by index in %lu draws; %lu decoded, %u buffers' kept "
-				"(%lu KB), %lu draws without room", kept_normal_draws, kept_normals_decoded, entries,
-				kept_normals_bytes / 1024, kept_normals_refused);
-			kept_normal_draws = kept_normals_decoded = kept_normals_refused = 0;
+				"(%lu KB of %lu, %lu KB wanted), %lu draws without room, %lu buffers gave theirs up", kept_normal_draws,
+				kept_normals_decoded, entries, kept_normals_bytes / 1024, KEPT_NORMALS_BYTES / 1024, wanted / 1024,
+				kept_normals_refused, kept_normals_given);
+			kept_normal_draws = kept_normals_decoded = kept_normals_refused = kept_normals_given = 0;
 		}
 		lit_draws = lit_vertices = lit_refused = sphere_bakes_made = sphere_bakes_borrowed = fog_post_draws = 0;
 		lit_fog_draws = lit_fog_products = fog_ramps_made = lit_fog_refused = 0;

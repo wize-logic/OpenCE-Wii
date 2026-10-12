@@ -70,6 +70,24 @@ int config_boolean(const char *name)
 	return 0;
 }
 
+/* (no draw log: debug.draw_log_tick -1) */
+long config_integer(const char *name)
+{
+	return !strcmp(name, "debug.draw_log_tick") ? -1 : 0;
+}
+
+const char *config_string(const char *name)
+{
+	(void)name;
+	return "";
+}
+
+/* (the game's clock, which the draw log reads: no game) */
+unsigned char game_time_initialized(void) { return 0; }
+unsigned char game_in_progress(void) { return 0; }
+long game_time_get(void) { return 0; }
+unsigned char main_menu_is_active(void) { return 0; }
+
 struct platform_file_reads platform_file_reads;
 void dsound_wii_audio_report(void) {}
 void wii_heap_usage(unsigned long *used, unsigned long *free_bytes) { *used = *free_bytes = 0; }
