@@ -97,6 +97,43 @@ The maps must be the Xbox's (cache version 5), converted by `tools/wii_convert_m
 and Custom Edition's maps don't run. A converted map is uncompressed, about the size the Xbox
 inflated it to, and the Wii reads it where it is.
 
+### Saves
+
+A save survives a reset, a power-off or a pulled card. Each file the game opens for writing under
+`apps/halo/saves` (the profiles, the saved games, each profile's `savegame.bin`, the checkpoint the
+game keeps for Save and Quit) is written beside itself as `<file>.wtmp`, and takes the file's place
+when the game closes it (`xbox_files.c`, "saves that survive a cut"): the data is synced, then the
+copy is renamed over the old file. libfat cannot rename over a file, so there the old one goes
+aside as `<file>.wold` for the moment between the two renames. A cut at any call leaves the old file
+or the new one, whole.
+
+- A file the game writes whole from its start (a profile; the checkpoint) is not copied into its
+  copy first; one written in part (a patch in the middle, an append, a resize) is.
+- The next start sweeps the save folders (`shadow_sweep`): a `.wold` is put back where its file is
+  missing (the cut came between the two renames) and goes where it is not, and a `.wtmp` goes. The
+  game's directory listings never show either. A file with a copy that is still open when the
+  console leaves is not replaced: the old one stays.
+- Not shadowed: `z:\savegame.bin` opened unbuffered and kept open (the game state's revert buffer,
+  of no use after the game ends), and files outside `saves` (`d:\core`).
+- A full card, a read-only card, a card that is gone: the call that fails tells the game with the
+  error it knows (`ERROR_DISK_FULL`, `ERROR_ACCESS_DENIED`, not found), as on the Xbox, and the
+  game's handlers run (`failed to write player profile to file`, `failed to write to persistent
+  storage`, where the game deletes the checkpoint it was writing). The old file stays, whatever the
+  failure, no copy is left, and the log says `save: <file> ...` and why. A write that takes no bytes
+  and sets no error (libfat does that with no room left) is a full disk, not a call to repeat.
+- Writes still go through the gate the shutdown uses (`wii_files_quiesce`): the ones under way
+  finish, the ones that would start wait; so does the replacing at close.
+
+Checked on the host: `python -m pytest -q tools/harness/tests/test_atomic_saves.py` runs the
+game's own sequences (a profile written whole, the checkpoint with its header last, a patch, an
+append, a file made, emptied and written, grown) on a real directory with the card modelled, cut
+before each call that changes it (and half-way through each write), on a card that renames over a
+file and on FAT's, then sweeps and checks that the file is the old one or the new one, no copy
+is left, and that a copy renamed over a file was synced after its last change; and the same
+sequences on a full card (a write that errs, one that takes no bytes), a read-only card, a card that
+is gone and a rename that fails. Ten faults put into the code are each caught. Needs a
+checkpoint on a real card (below): power off during a save, and a card pulled.
+
 ## How the port operates
 
 - **Compiler.** The game is compiled with clang `--target=powerpc-unknown-eabi -mcpu=750` against
@@ -171,8 +208,9 @@ inflated it to, and the Wii reads it where it is.
      switch a motor on again), then the files (xbox_files.c, `wii_files_quiesce`): the game's
      writes under way finish (the wait is at most three seconds), the ones that would start wait,
      and the files open for writing are synced. A save is several writes with the header written
-     last (`game_state_xbox.c`), so one cut between two writes is not valid, and the one before it
-     stays; no single write is cut;
+     last (`game_state_xbox.c`), and a file under `saves` replaces the old one only when it is
+     closed whole (Game data, "Saves"), so a cut leaves the old save or the new, and no single
+     write is cut;
   2. the audio output is stopped (`wl_platform_audio_stop`) and every Remote's and GameCube
      controller's motor (`wl_platform_input_stop_rumble`);
   3. the log is flushed and closed, and the SD card and the USB drive are unmounted, so that
@@ -264,16 +302,38 @@ inflated it to, and the Wii reads it where it is.
     within 0.01 dB to 9.5 kHz with the images 70 dB down, 1.8 dB down at 10.5 kHz; a 44 kHz
     voice exact; a pitched one 0.2 dB down at a fifth of its rate and 2 dB at two fifths, the
     cubic's images 33 dB down at a fifth, above 16 kHz for a voice played near its rate.
-  - Counted (instructions an output frame, the scene of `mixer_wii.c`'s "bench": 12 mono 22 kHz
-    voices in the world, two of them pitched, two stereo 44 kHz and two stereo 22 kHz voices, 8
-    out of earshot, loud enough to be limited): 910 with ADPCM (40 million instructions a
-    second, 5.5% of the processor), 680 with PCM, against 15,100 at 32 kHz (480 million, two
-    thirds of the processor, as in the profile) with every voice resampled and the packets
-    decoded beforehand. Of the 910: 240 decoding ADPCM, 160 making the samples floats, 300 the
-    voices' gains, filters and interpolation, 100 the limiter, 70 the upsampler. A voice out of
-    earshot costs about 1, the mix with nothing playing 50.
-  - `audio.reverb` is `false` on the Wii: the reverb (at the low bus's rate) adds about 480 an
-    output frame to that scene, half as much again.
+  - Counted (instructions an output frame, the scene of `mixer_wii.c`'s "bench 12 2 2 8": 12 mono
+    22 kHz voices in the world, two of them pitched, two stereo 44 kHz and two stereo 22 kHz
+    voices, 8 out of earshot, loud enough to be limited, the reverb off): 861 with ADPCM (38
+    million instructions a second, 5.2% of the processor), 656 with PCM, against 15,100 at 32 kHz
+    (480 million, two thirds of the processor, as in the profile) with every voice resampled and
+    the packets decoded beforehand. Of the 861: 240 decoding ADPCM, 160 making the samples floats,
+    300 the voices' gains, filters and interpolation, 100 the limiter, 70 the upsampler. A voice
+    out of earshot costs about 1, the mix with nothing playing 50.
+  - **The reverb** (`audio.reverb`, on) is the other builds' network (taps, diffusers, a
+    feedback delay network) from the same I3DL2 properties, so a room keeps the decay time, the
+    reflections and the level the game set. Run as they do (22,050 Hz, eight lines) it added 476
+    to that scene, half as much again, and `audio.reverb` was off on the Wii. It now runs at
+    11,025 Hz on four lines ("The Wii's reverb" in `dsound_sdl.c`): the room send is decimated by
+    a 1 2 1 low pass and the reverberation interpolated back up linearly, so the high frequencies
+    of the reverberation end near 5 kHz; while the room holds, a frame uses its one set of
+    parameters (the crossfade between two rooms, over 186 ms, is the other loop); and a voice
+    that sends to the reverb has a loop of its own (the general one made a sending voice cost 12
+    an output frame). It adds 113 with ADPCM and 112 with PCM (`bench 12 2 2 8` with flags 3 and
+    1, against 2 and 0; 0.7% of the processor), and its state is 64 KB, not 276.
+    `python tools/harness/tests/test_mixer_wii.py reverb-figures` prints, for decay times from 0.3
+    to 8 s, the time an impulse takes to fall 60 dB (within 7% of the time asked for; the eight
+    lines at 22,050 Hz: within 12%) and the energy out for low noise in (0.6 to 0.8, the eight
+    lines 0.7 to 0.9, the room level being 0 mB). The harness checks the decay time within 15% and
+    the level; the steady loop against the crossfading one (same output); a change of room (the
+    fade ends, nothing unlike a number); silence; and the voice's loop against its sums in double
+    precision.
+  - **Sound setting.** The console's mono, stereo or surround (SYSCONF `IPL.SND`, WiiLibs'
+    `wl_platform_sound_mode`) is read when the audio starts (the log says `audio: playing in
+    mono|stereo`). Mono plays the mean of the two channels in both, at the end of the mix after
+    the limiter (`mix_mono`: 10 instructions an output frame, 1% of the scene's, when it is on);
+    surround is played as stereo, with no Pro Logic encoding. `audio.speakers` (Wii only)
+    overrides it: `"console"` (default), `"stereo"` or `"mono"`.
 
 ## Memory
 
@@ -318,7 +378,7 @@ debug state, whose layout is asserted), `update_client_globals` 513 and `update_
 (`source/networking/network_server_manager.c`), `game_stack` 512, the distributed netcode's
 damage history (`port/linux/game/network_damage.c`: `damage_trails` 384, `damage_history` 192,
 `damage_explosions` 161) and batches (`network_distributed.c`, `distributed_batches` 151),
-`reverb` 276 (the mixer's delays, `port/linux/src/dsound_sdl.c`), `widget_walk` 256 (the
+`widget_walk` 256 (the
 validator's walk of the menus' widgets, `tag_schema_effects.c`, sized for 65536 tags),
 `local_lens_flare_occlusion_test_results2` 256, libogc's Bluetooth buffers
 (`memb_mem_pool_pbufs`) 200, `custom_edition_maps_globals` 200 (the Custom Edition map list,
@@ -1288,6 +1348,24 @@ Dolphin runs the game, but these need the console:
   (power off)" and the Dolphin run ends there; a save made just before is intact (the next start
   loads it), and the motors are still. The missing-maps screen: start with the SD card without
   `apps/halo/maps`; HOME returns to the loader.
+- **Saves cut short** (Dolphin for the first two, the console for the card): (1) play to a
+  checkpoint, Save and Quit, and in the next run Continue: the checkpoint loads; (2) the same with
+  the run stopped (Dolphin's Stop, or Reset) while the log says the save is being written (`begin
+  player profile write`, the checkpoint's `persistent storage`): the next start's log has `save:
+  ... put back after an interrupted write` or nothing, `apps/halo/saves` holds no `.wtmp` or
+  `.wold`, and Continue loads the old checkpoint or the new; (3) on the console, power off during
+  Save and Quit, and again with the card pulled: the same, and that the card's FAT is clean (the
+  card read on a computer); (4) a card with no room left, and a card with its lock switch on: Save
+  and Quit says it could not save (the profile's and checkpoint's messages in the log, `save: ...`
+  lines naming the cause), the game goes on to the menu, nothing hangs.
+- **The sound setting.** The console set to mono, stereo and surround (Wii Settings, Sound): the
+  log says `audio: playing in mono` only for the first, and a mono game sounds the same in both
+  ears.
+- **The reverb.** Indoors (b30, a30's halls and corridors) and outdoors: the log's `audio:` report
+  (mixing time a block, underruns) with `audio.reverb` on and off, a battle indoors; that the room
+  sounds like a room (a decay that follows the place) and not metallic or muffled; and that going
+  through a door fades to the next room's without a click. The harness counts +113 an output
+  frame in a busy scene (0.7% of the processor).
 - **Rumble.** Whether the duty cycle feels like a strength and not a buzz (the switching is 62 Hz
   at most), that it stops with a pause, a disconnect and a quit, and that Remote vibration off in
   the console's settings means none.

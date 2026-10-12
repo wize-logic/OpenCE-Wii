@@ -19,7 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from harness import CHECK_FAILED, build, mutated, read, run  # noqa: E402
 
 SOURCE = "port/linux/src/dsound_sdl.c"
-CASES = ["native", "sines", "pitched", "silent-voice", "mono", "chunks", "ends", "adpcm"]
+CASES = ["native", "sines", "pitched", "silent-voice", "mono", "chunks", "ends", "adpcm", "reverb", "reverb-steady",
+         "reverb-change", "reverb-silent", "send-voice", "mono-output"]
 
 # a fault in the Wii's mixing, and the case that must catch it
 NEGATIVE_CONTROLS = {
@@ -32,6 +33,20 @@ NEGATIVE_CONTROLS = {
                        "silent-voice"),
     "mix-ahead-lost": (("		wii_mix.ahead_used += count;", "		wii_mix.ahead_used += count + (count > 7);"),
                        "chunks"),
+    "reverb-decay-rate": (("parameters->feedback[index] = powf(10.0f, -3.0f * length / (decay * REVERB_RATE));",
+                           "parameters->feedback[index] = powf(10.0f, -3.0f * length / (decay * LOW_RATE));"), "reverb"),
+    "reverb-input-in-output": (("static const float reverb_input_signs[REVERB_LINES] = { 1, -1, -1, 1 };",
+                                "static const float reverb_input_signs[REVERB_LINES] = { 1, -1, 1, -1 };"), "reverb"),
+    "reverb-steady-level": (("		right = early_right * reflections_gain + late_right * late_gain;",
+                             "		right = early_right * reflections_gain + late_right * late_gain * 0.5f;"), "reverb-steady"),
+    "reverb-fade-stuck": (("		if (reverb.fade && !--reverb.fade)\n			reverb.from = reverb.to;",
+                           "		if (reverb.fade && 0)\n			reverb.from = reverb.to;"), "reverb-change"),
+    "send-voice-state": (("				direct_state = muffled;\n", "				direct_state = sample;\n"), "send-voice"),
+    "send-voice-ramp": (("				room += ramp_room;\n				direct_lowpass += ramp_direct_lowpass;\n				room_lowpass += ramp_room_lowpass;\n			}\n		}\n		else",
+                         "				room += ramp_room;\n				direct_lowpass += ramp_direct_lowpass;\n			}\n		}\n		else"),
+                        "send-voice"),
+    "mono-left-only": (("		float mean = 0.5f * (output[frame * 2] + output[frame * 2 + 1]);",
+                        "		float mean = output[frame * 2];"), "mono-output"),
     "adpcm-clamp": (("		if (predictor > 32767) \\\n			predictor = 32767; \\",
                      "		if (predictor > 32000) \\\n			predictor = 32000; \\"), "adpcm"),
 }

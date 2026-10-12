@@ -35,6 +35,7 @@ matched case-insensitively, like the Xbox's FATX volumes.
 /* port: the Wii's (port/wii/src/wii_system.c): the message that stops the game
 when it has no maps folder, and the files' part of leaving it */
 void wii_stop_no_maps(void);
+static void shadow_sweep(const char *root);
 #endif
 
 /* ---------- paths */
@@ -208,6 +209,10 @@ const char *platform_save_root(void)
 		trim_separators(root);
 		make_directories(root);
 		platform_log("save root: %s", root);
+#ifdef HALO_WII
+		/* port: put back what a cut left of the last run's saves */
+		shadow_sweep(root);
+#endif
 	}
 	return root;
 }
@@ -307,6 +312,12 @@ struct platform_file
 {
 	int descriptor;
 	char path[1024];
+#ifdef HALO_WII
+	int shadow; /* _shadow_* below */
+	BOOL damaged; /* a write or a resize failed: the old file is kept */
+	unsigned long long original_size;
+	char temporary_path[1032];
+#endif
 };
 
 #ifdef HALO_WII
@@ -400,6 +411,301 @@ int wii_files_quiesce(unsigned timeout_ms)
 	pthread_mutex_unlock(&write_lock);
 	return unfinished;
 }
+
+/* ---------- saves that survive a cut
+
+port: a file opened for writing under the save root is written beside itself,
+as <file>.wtmp, and takes the file's place when the game closes it, so that a
+reset, a power-off or a pulled card leaves the old file or the new one and
+never a torn one (a save is several writes, the header last). The data is
+synced before the replacing. FAT cannot rename over a file, so then the old
+one goes aside for a moment (<file>.wold; the sweep at the next start puts it
+back if the cut came between the two renames). A file written whole from its
+start (a profile, the saved game) is not copied into its copy first; one that
+is not, is. A write that fails (the card is full, read-only or gone) leaves the
+old file as it was, and the game gets the error its handlers know. The revert
+buffer (z:\savegame.bin, opened unbuffered and kept open) is not shadowed:
+nothing reads it after the game ends. */
+#define SHADOW_TEMPORARY_SUFFIX ".wtmp"
+#define SHADOW_OLD_SUFFIX ".wold"
+#define SHADOW_COPY_SIZE 32768
+#define SHADOW_SWEEP_DEPTH 8
+
+enum
+{
+	_shadow_none,
+	_shadow_deferred, /* the file is open as it was; the copy is made at the first write */
+	_shadow_active /* every read and write goes to the copy */
+};
+
+static void shadow_name(char *name, unsigned long size, const char *path, const char *suffix)
+{
+	snprintf(name, size, "%s%s", path, suffix);
+}
+
+static BOOL shadow_name_has_suffix(const char *name, const char *suffix)
+{
+	size_t length = strlen(name);
+	size_t suffix_length = strlen(suffix);
+
+	return length > suffix_length && !strcmp(name + length - suffix_length, suffix);
+}
+
+/* whether a host path is under the save root (the Wii's saves folder) */
+static BOOL shadow_wanted(const char *path)
+{
+	const char *root = platform_save_root();
+	size_t length = strlen(root);
+
+	return length && !strncmp(path, root, length) && path[length] == '/';
+}
+
+/* puts the written copy in place of the file: 0, or the errno that stopped it */
+static int shadow_replace(const char *temporary_path, const char *path)
+{
+	char old_path[1032];
+	struct posix_file_information information;
+	int error;
+
+	if (rename(temporary_path, path) == 0)
+		return 0;
+	if (posix_stat(path, &information) != 0 || (information.flags & _posix_file_is_directory))
+		return errno ? errno : EIO;
+	/* FAT: the old file goes aside, the copy takes its name, the old file goes */
+	shadow_name(old_path, sizeof(old_path), path, SHADOW_OLD_SUFFIX);
+	unlink(old_path);
+	if (rename(path, old_path) != 0)
+		return errno ? errno : EIO;
+	if (rename(temporary_path, path) != 0)
+	{
+		error = errno ? errno : EIO;
+		rename(old_path, path);
+		return error;
+	}
+	unlink(old_path);
+	return 0;
+}
+
+static BOOL shadow_busy(const struct platform_file *file, const char *temporary_path)
+{
+	int slot;
+	BOOL busy = FALSE;
+
+	pthread_mutex_lock(&write_lock);
+	for (slot = 0; slot < WRITABLE_FILE_SLOTS; slot++)
+	{
+		if (writable_files[slot] && writable_files[slot] != file &&
+			writable_files[slot]->shadow == _shadow_active &&
+			!strcmp(writable_files[slot]->temporary_path, temporary_path))
+			busy = TRUE;
+	}
+	pthread_mutex_unlock(&write_lock);
+	return busy;
+}
+
+/* the copy, empty: 0 or the errno. (file is the one it is for, if it exists
+yet; two files do not share a copy.) */
+static int shadow_create(const struct platform_file *file, const char *temporary_path, int *descriptor)
+{
+	if (shadow_busy(file, temporary_path))
+		return EBUSY;
+	*descriptor = open(temporary_path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	return *descriptor < 0 ? (errno ? errno : EIO) : 0;
+}
+
+/* opens a file for writing under the save root: the descriptor, or -1 with
+errno. A file that is made new or emptied gets its copy at once; one that
+is kept is opened as it is, and gets its copy at its first write. */
+static int shadow_open(const char *path, int flags, BOOL existed, int *state, unsigned long long *size,
+	char *temporary_path, unsigned long temporary_size)
+{
+	int descriptor;
+	int error;
+	struct posix_file_information information;
+
+	shadow_name(temporary_path, temporary_size, path, SHADOW_TEMPORARY_SUFFIX);
+	if ((flags & O_TRUNC) || !existed)
+	{
+		error = shadow_create(NULL, temporary_path, &descriptor);
+		if (error)
+		{
+			errno = error;
+			return -1;
+		}
+		*state = _shadow_active;
+		return descriptor;
+	}
+	/* (read as well: the old contents are copied from it) */
+	descriptor = open(path, (flags & ~O_ACCMODE) | O_RDWR | O_CLOEXEC, 0644);
+	if (descriptor >= 0)
+	{
+		*state = _shadow_deferred;
+		*size = posix_fstat(descriptor, &information) == 0 ?
+			((unsigned long long)information.size_high << 32) | information.size_low : 0;
+	}
+	return descriptor;
+}
+
+/* the first write to a file that is open as it was: its copy is made, with
+the old contents when the write does not cover them, and every later read and
+write goes to the copy. 0 or the errno */
+static int shadow_activate(struct platform_file *file, BOOL copy_old)
+{
+	int descriptor;
+	int error = shadow_create(file, file->temporary_path, &descriptor);
+	off_t position;
+
+	if (error)
+		return error;
+	position = lseek(file->descriptor, 0, SEEK_CUR);
+	if (copy_old)
+	{
+		char *buffer = malloc(SHADOW_COPY_SIZE);
+		unsigned long long offset = 0;
+
+		if (!buffer)
+			error = ENOMEM;
+		while (!error)
+		{
+			ssize_t count = pread(file->descriptor, buffer, SHADOW_COPY_SIZE, (off_t)offset);
+			ssize_t done = 0;
+
+			if (count < 0 && errno == EINTR)
+				continue;
+			if (count < 0)
+				error = errno ? errno : EIO;
+			if (count <= 0)
+				break;
+			while (done < count && !error)
+			{
+				ssize_t result = write(descriptor, buffer + done, (size_t)(count - done));
+
+				if (result < 0 && errno == EINTR)
+					continue;
+				if (result <= 0)
+					error = (result < 0 && errno) ? errno : ENOSPC;
+				else
+					done += result;
+			}
+			offset += (unsigned long long)count;
+		}
+		free(buffer);
+	}
+	if (!error && lseek(descriptor, position < 0 ? 0 : position, SEEK_SET) < 0)
+		error = errno ? errno : EIO;
+	if (error)
+	{
+		close(descriptor);
+		unlink(file->temporary_path);
+		return error;
+	}
+	close(file->descriptor);
+	file->descriptor = descriptor;
+	file->shadow = _shadow_active;
+	return 0;
+}
+
+/* before a write or a resize: the copy is made if it is time. The write
+starts at offset, or at the file's position when it is not positioned. */
+static BOOL shadow_before_write(struct platform_file *file, BOOL positioned, unsigned long long offset,
+	DWORD count, BOOL resize)
+{
+	int error;
+
+	if (file->shadow != _shadow_deferred)
+		return TRUE;
+	if (!positioned)
+	{
+		unsigned long low, high;
+
+		offset = posix_seek(file->descriptor, 0, 0, SEEK_CUR, &low, &high) == 0 ?
+			((unsigned long long)high << 32) | low : 1;
+	}
+	error = shadow_activate(file, resize || offset != 0 || count < file->original_size);
+	if (error)
+	{
+		platform_log("save: no copy of %s to write to (error %d)", file->path, error);
+		platform_set_last_error_from_errno(error);
+		file->damaged = TRUE;
+		return FALSE;
+	}
+	return TRUE;
+}
+
+/* the game closes a file with a copy: the copy takes the file's place when
+every write went through, and is dropped (the old file stays) when one failed */
+static void shadow_finish(struct platform_file *file)
+{
+	int error = 0;
+
+	write_begin();
+	if (file->damaged)
+		error = -1;
+	else if (fsync(file->descriptor) != 0)
+		error = errno ? errno : EIO;
+	close(file->descriptor);
+	if (!error)
+		error = shadow_replace(file->temporary_path, file->path);
+	if (error)
+	{
+		unlink(file->temporary_path);
+		if (error < 0)
+			platform_log("save: %s was not written (a write failed); the old file stays", file->path);
+		else
+			platform_log("save: %s was not written (error %d); the old file stays", file->path, error);
+	}
+	write_end();
+}
+
+/* what a cut left in the save folders: the file that went aside
+(<file>.wold) comes back where <file> is missing and goes where it is not,
+and a half-written copy (<file>.wtmp) goes. Returns whether it changed
+something (the folder is then read again). */
+static BOOL shadow_sweep_directory(const char *directory, int depth)
+{
+	void *stream = posix_directory_open(directory);
+	char name[256];
+	char path[1400];
+	char target[1400];
+	struct posix_file_information information;
+	BOOL changed = FALSE;
+
+	if (!stream)
+		return FALSE;
+	while (!changed && posix_directory_next(stream, name, sizeof(name)))
+	{
+		snprintf(path, sizeof(path), "%s/%s", directory, name);
+		if (shadow_name_has_suffix(name, SHADOW_OLD_SUFFIX))
+		{
+			snprintf(target, sizeof(target), "%.*s", (int)(strlen(path) - strlen(SHADOW_OLD_SUFFIX)), path);
+			if (posix_stat(target, &information) == 0)
+				changed = unlink(path) == 0;
+			else
+				changed = rename(path, target) == 0;
+			if (changed)
+				platform_log("save: %s put back after an interrupted write", target);
+		}
+		else if (shadow_name_has_suffix(name, SHADOW_TEMPORARY_SUFFIX))
+		{
+			changed = unlink(path) == 0;
+		}
+		else if (depth < SHADOW_SWEEP_DEPTH && posix_stat(path, &information) == 0 &&
+			(information.flags & _posix_file_is_directory))
+		{
+			changed = shadow_sweep_directory(path, depth + 1);
+		}
+	}
+	posix_directory_close(stream);
+	return changed;
+}
+
+static void shadow_sweep(const char *root)
+{
+	int guard;
+
+	for (guard = 0; guard < 1000 && shadow_sweep_directory(root, 0); guard++)
+		;
+}
 #endif
 
 static void file_destroy(struct platform_handle *handle)
@@ -408,6 +714,9 @@ static void file_destroy(struct platform_handle *handle)
 
 #ifdef HALO_WII
 	writable_unregister(file);
+	if (file->shadow == _shadow_active)
+		shadow_finish(file);
+	else
 #endif
 	close(file->descriptor);
 	free(file);
@@ -431,6 +740,11 @@ HANDLE WINAPI CreateFileA(LPCSTR file_name, DWORD desired_access, DWORD share_mo
 	int flags = 0;
 	int existed;
 	int descriptor;
+#ifdef HALO_WII
+	int shadow = _shadow_none;
+	unsigned long long original_size = 0;
+	char temporary_path[1032] = "";
+#endif
 
 	(void)share_mode;
 	(void)security_attributes;
@@ -476,12 +790,30 @@ HANDLE WINAPI CreateFileA(LPCSTR file_name, DWORD desired_access, DWORD share_mo
 		return INVALID_HANDLE_VALUE;
 	}
 
+#ifdef HALO_WII
+	if ((flags & O_ACCMODE) != O_RDONLY && !(flags_and_attributes & FILE_FLAG_NO_BUFFERING) &&
+		(existed || (flags & O_CREAT)) && shadow_wanted(path))
+	{
+		if (existed && creation_disposition == CREATE_NEW)
+		{
+			SetLastError(ERROR_ALREADY_EXISTS);
+			return INVALID_HANDLE_VALUE;
+		}
+		descriptor = shadow_open(path, flags, existed, &shadow, &original_size, temporary_path,
+			sizeof(temporary_path));
+	}
+	else
+#endif
 	descriptor = open(path, flags | O_CLOEXEC, 0644);
 	if (descriptor < 0)
 	{
 		platform_set_last_error_from_errno(errno);
 		if (errno == ENOENT && !existed && (flags & O_CREAT))
 			SetLastError(ERROR_PATH_NOT_FOUND);
+#ifdef HALO_WII
+		if (shadow != _shadow_none || temporary_path[0])
+			platform_log("save: %s could not be opened for writing (error %d)", path, errno);
+#endif
 		return INVALID_HANDLE_VALUE;
 	}
 
@@ -490,6 +822,10 @@ HANDLE WINAPI CreateFileA(LPCSTR file_name, DWORD desired_access, DWORD share_mo
 	if (!handle)
 	{
 		close(descriptor);
+#ifdef HALO_WII
+		if (shadow == _shadow_active)
+			unlink(temporary_path);
+#endif
 		free(file);
 		SetLastError(ERROR_NOT_ENOUGH_MEMORY);
 		return INVALID_HANDLE_VALUE;
@@ -497,6 +833,9 @@ HANDLE WINAPI CreateFileA(LPCSTR file_name, DWORD desired_access, DWORD share_mo
 	file->descriptor = descriptor;
 	snprintf(file->path, sizeof(file->path), "%s", path);
 #ifdef HALO_WII
+	file->shadow = shadow;
+	file->original_size = original_size;
+	snprintf(file->temporary_path, sizeof(file->temporary_path), "%s", temporary_path);
 	if ((flags & O_ACCMODE) != O_RDONLY)
 		writable_register(file);
 #endif
@@ -608,6 +947,17 @@ static BOOL write_at(struct platform_file *file, LPCVOID buffer, DWORD count, LP
 				*bytes_written = total;
 			return FALSE;
 		}
+#ifdef HALO_WII
+		if (result == 0)
+		{
+			/* port: a card with no room left may take no bytes without
+			an error; this is the full disk, not a write to repeat */
+			SetLastError(ERROR_DISK_FULL);
+			if (bytes_written)
+				*bytes_written = total;
+			return FALSE;
+		}
+#endif
 		total += (DWORD)result;
 	}
 	if (bytes_written)
@@ -624,7 +974,21 @@ static BOOL write_at(struct platform_file *file, LPCVOID buffer, DWORD count, LP
 	BOOL result;
 
 	write_begin();
-	result = write_at_ungated(file, buffer, count, bytes_written, positioned, offset);
+	if (shadow_before_write(file, positioned, offset, count, FALSE))
+	{
+		result = write_at_ungated(file, buffer, count, bytes_written, positioned, offset);
+	}
+	else
+	{
+		result = FALSE;
+		if (bytes_written)
+			*bytes_written = 0;
+	}
+	if (!result)
+	{
+		file->damaged = TRUE;
+		platform_log("save: a write to %s failed (error %lu)", file->path, (unsigned long)GetLastError());
+	}
 	write_end();
 	return result;
 }
@@ -786,12 +1150,30 @@ BOOL WINAPI SetEndOfFile(HANDLE handle)
 
 	if (!file)
 		return FALSE;
+#ifdef HALO_WII
+	/* port: the resize goes to the copy of a file saved with one (xbox_files.c, "saves that survive a cut") */
+	write_begin();
+	if (!shadow_before_write(file, FALSE, 0, 0, TRUE))
+	{
+		file->damaged = TRUE;
+		write_end();
+		return FALSE;
+	}
+#endif
 	if (posix_seek(file->descriptor, 0, 0, SEEK_CUR, &low, &high) != 0 ||
 		posix_truncate(file->descriptor, low, high) != 0)
 	{
 		platform_set_last_error_from_errno(errno);
+#ifdef HALO_WII
+		file->damaged = TRUE;
+		platform_log("save: resizing %s failed (error %lu)", file->path, (unsigned long)GetLastError());
+		write_end();
+#endif
 		return FALSE;
 	}
+#ifdef HALO_WII
+	write_end();
+#endif
 	return TRUE;
 }
 
@@ -830,7 +1212,13 @@ BOOL WINAPI SetFileTime(HANDLE handle, CONST FILETIME *creation_time, CONST FILE
 		platform_filetime_to_unix_time(last_access_time, &access_seconds, &access_nanoseconds);
 	if (last_write_time)
 		platform_filetime_to_unix_time(last_write_time, &write_seconds, &write_nanoseconds);
+#ifdef HALO_WII
+	/* port: a file with a copy gets the times on the copy, which becomes the file */
+	if (posix_set_file_times(file->shadow == _shadow_active ? file->temporary_path : file->path,
+		access_seconds, access_nanoseconds, write_seconds, write_nanoseconds) != 0)
+#else
 	if (posix_set_file_times(file->path, access_seconds, access_nanoseconds, write_seconds, write_nanoseconds) != 0)
+#endif
 	{
 		platform_set_last_error_from_errno(errno);
 		return FALSE;
@@ -951,6 +1339,12 @@ BOOL WINAPI CopyFileA(LPCSTR existing_file_name, LPCSTR new_file_name, BOOL fail
 	char buffer[65536];
 	int source, destination;
 	BOOL success = TRUE;
+#ifdef HALO_WII
+	/* port: a copy made under the save root is written beside its name and
+	takes it when whole ("saves that survive a cut") */
+	char temporary[1032] = "";
+	struct posix_file_information information;
+#endif
 
 	platform_translate_path(existing_file_name, from, sizeof(from));
 	platform_translate_path(new_file_name, to, sizeof(to));
@@ -960,6 +1354,20 @@ BOOL WINAPI CopyFileA(LPCSTR existing_file_name, LPCSTR new_file_name, BOOL fail
 		platform_set_last_error_from_errno(errno);
 		return FALSE;
 	}
+#ifdef HALO_WII
+	if (shadow_wanted(to))
+	{
+		if (fail_if_exists && posix_stat(to, &information) == 0)
+		{
+			SetLastError(ERROR_ALREADY_EXISTS);
+			close(source);
+			return FALSE;
+		}
+		shadow_name(temporary, sizeof(temporary), to, SHADOW_TEMPORARY_SUFFIX);
+		destination = open(temporary, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	}
+	else
+#endif
 	destination = open(to, O_WRONLY | O_CREAT | O_CLOEXEC | (fail_if_exists ? O_EXCL : O_TRUNC), 0644);
 	if (destination < 0)
 	{
@@ -984,12 +1392,33 @@ BOOL WINAPI CopyFileA(LPCSTR existing_file_name, LPCSTR new_file_name, BOOL fail
 		}
 		if (write(destination, buffer, (size_t)count) != count)
 		{
-			platform_set_last_error_from_errno(errno);
+			platform_set_last_error_from_errno(errno ? errno : ENOSPC);
 			success = FALSE;
 			break;
 		}
 	}
 	close(source);
+#ifdef HALO_WII
+	if (temporary[0])
+	{
+		int error = 0;
+
+		if (success && fsync(destination) != 0)
+			error = errno ? errno : EIO;
+		close(destination);
+		if (success && !error)
+			error = shadow_replace(temporary, to);
+		if (!success || error)
+		{
+			if (success)
+				platform_set_last_error_from_errno(error);
+			unlink(temporary);
+			platform_log("save: the copy %s was not made; the old file stays", to);
+			return FALSE;
+		}
+		return TRUE;
+	}
+#endif
 	close(destination);
 	return success;
 }
@@ -1111,6 +1540,11 @@ static BOOL find_next_entry(struct platform_find *find, LPWIN32_FIND_DATAA data)
 
 		if (!wildcard_match(find->pattern, name))
 			continue;
+#ifdef HALO_WII
+		/* port: the copies of files being saved are not the game's */
+		if (shadow_name_has_suffix(name, SHADOW_TEMPORARY_SUFFIX) || shadow_name_has_suffix(name, SHADOW_OLD_SUFFIX))
+			continue;
+#endif
 		snprintf(full_path, sizeof(full_path), "%s/%s", find->directory_path, name);
 		if (posix_stat(full_path, &information) != 0)
 			continue;

@@ -55,6 +55,8 @@ enum
 	_platform_windows = 4,
 	/* (the web build, which has the desktop's settings, and these) */
 	_platform_web = 8,
+	/* (the Wii, which has the desktop's settings, and these) */
+	_platform_wii = 16,
 };
 
 struct config_setting
@@ -79,9 +81,6 @@ vertices, and draws simpler ones sooner) */
 #define GX_LIGHTING_DEFAULT "true"
 #define BUMPED_LIGHTMAPS_DEFAULT "true"
 #define ENVIRONMENT_REFLECTIONS_DEFAULT "false"
-/* (audio.reverb's: the reverb would add half again to what the Wii's processor spends
-on a battle's sound, 3% of it; dsound_sdl.c, the Wii's mixing) */
-#define REVERB_DEFAULT "false"
 #else
 #define MODEL_DETAIL_DEFAULT "1.0"
 #define OBJECT_SHADOWS_DEFAULT "true"
@@ -89,7 +88,6 @@ on a battle's sound, 3% of it; dsound_sdl.c, the Wii's mixing) */
 #define GX_LIGHTING_DEFAULT "false"
 #define BUMPED_LIGHTMAPS_DEFAULT "true"
 #define ENVIRONMENT_REFLECTIONS_DEFAULT "true"
-#define REVERB_DEFAULT "true"
 #endif
 
 /* crouching's keys (in a browser C alone: a page cannot keep Ctrl+W, Ctrl+S or
@@ -242,10 +240,14 @@ static const struct config_setting config_settings[] =
 	{ "audio.effects_volume", _config_real, "1.0", "HALO_EFFECTS_VOLUME", _environment_value, _platform_all,
 		"The volume of every other sound (effects and speech), 0.0 to 1.0 (of\n"
 		"audio.volume)." },
-	{ "audio.reverb", _config_boolean, REVERB_DEFAULT, "HALO_REVERB", _environment_value, _platform_all,
+	{ "audio.reverb", _config_boolean, "true", "HALO_REVERB", _environment_value, _platform_all,
 		"Reverberate the world's sounds as the place the player is in does (the\n"
 		"maps' sound environments, as the Xbox's I3DL2 reverb did); false keeps\n"
 		"them dry." },
+	{ "audio.speakers", _config_string, "\"console\"", "HALO_SPEAKERS", _environment_value, _platform_wii,
+		"What the sound is played for: \"console\" (the Wii's sound setting: mono\n"
+		"plays both channels the same; stereo and surround play stereo),\n"
+		"\"stereo\" or \"mono\"." },
 	{ "audio.voice_chat", _config_string, "\"push_to_talk\"", "HALO_VOICE_CHAT", _environment_value, _platform_all,
 		"Talking in network games' voice chat: \"push_to_talk\" (while\n"
 		"controls.push_to_talk is held; the microphone opens the first time),\n"
@@ -707,6 +709,8 @@ static const struct config_setting config_settings[] =
 #define CONFIG_PLATFORM (_platform_desktop | _platform_web)
 #elif defined(_WIN32)
 #define CONFIG_PLATFORM (_platform_desktop | _platform_windows)
+#elif defined(HALO_WII)
+#define CONFIG_PLATFORM (_platform_desktop | _platform_wii)
 #else
 #define CONFIG_PLATFORM _platform_desktop
 #endif

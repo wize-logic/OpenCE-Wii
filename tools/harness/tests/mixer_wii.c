@@ -322,6 +322,97 @@ static void scene(unsigned long mono, unsigned long stereo44, unsigned long ster
 	free(stereos);
 }
 
+/* ---------- the reverb */
+
+#define REVERB_BLOCK 144 /* low bus frames a mix gives it */
+
+static unsigned long reverb_serial;
+
+static double random_number(void)
+{
+	static unsigned long state = 12345;
+
+	state = state * 1664525UL + 1013904223UL;
+	return (double)(state >> 8) / 16777216.0;
+}
+
+/* a room of the given decay time, in a reverb with nothing in it */
+static void reverb_room(float decay, LONG reflections, LONG reverberation)
+{
+	DSI3DL2LISTENER room = { -1000, -100, 0.0f, decay, 0.83f, reflections, 0.007f, reverberation, 0.011f, 100.0f,
+		100.0f, 5000.0f };
+
+	reverb_clear();
+	reverb_update(&room, ++reverb_serial);
+	reverb.level = 1.0f;
+}
+
+/* frames of the low bus through the reverb in the mixer's blocks: stereo output in place of the output. With
+alternate, the level it is moving to is a little over and a little under the level it is at, in turn: the reverb
+does not take its steady path */
+static void reverb_run_blocks(const float *input, float *output, unsigned long frames, float target, BOOL alternate)
+{
+	unsigned long done;
+
+	memset(output, 0, frames * 2 * sizeof(float));
+	for (done = 0; done + REVERB_BLOCK <= frames; done += REVERB_BLOCK)
+	{
+		float level = alternate ? nextafterf(target, (done / REVERB_BLOCK) % 2 ? 0.0f : 2.0f) : target;
+
+		reverb_process(input + done, output + done * 2, REVERB_BLOCK, level);
+	}
+}
+
+/* the time an impulse takes to decay by 60 dB (extrapolated from the fall from -5 to -25 dB of its energy,
+backwards integrated), and the energy that comes out of low noise over the energy that went in (the room level is
+0 mB, a gain of 1, so about 1) */
+static void reverb_figures(float decay, float *rt60, float *ratio)
+{
+	const unsigned long frames = 22050UL * 16;
+	float *input = calloc(frames, sizeof(float)), *output = calloc(frames * 2, sizeof(float));
+	double remaining, total, in_energy = 0.0, out_energy = 0.0, low = 0.0;
+	unsigned long n, t5 = 0, t25 = 0;
+	double *energy = calloc(frames, sizeof(double));
+
+	reverb_room(decay, -10000, 0);
+	input[0] = 1.0f;
+	reverb_run_blocks(input, output, frames, 1.0f, FALSE);
+	for (n = 0; n < frames; n++)
+		energy[n] = (double)output[2 * n] * output[2 * n];
+	total = 0.0;
+	for (n = frames; n-- > 0;)
+	{
+		total += energy[n];
+		energy[n] = total;
+	}
+	for (n = 0; n < frames; n++)
+	{
+		remaining = 10.0 * log10(energy[n] / energy[0] + 1.0e-30);
+		if (!t5 && remaining < -5.0)
+			t5 = n;
+		if (!t25 && remaining < -25.0)
+			t25 = n;
+	}
+	*rt60 = 3.0f * (float)(t25 - t5) / 22050.0f;
+
+	reverb_room(decay, -10000, 0);
+	for (n = 0; n < 22050UL * 3; n++)
+	{
+		low = 0.995 * low + 0.005 * (random_number() - 0.5);
+		input[n] = (float)low;
+		in_energy += (double)input[n] * input[n];
+	}
+	for (; n < frames; n++)
+		input[n] = 0.0f;
+	reverb_run_blocks(input, output, frames, 1.0f, FALSE);
+	for (n = 0; n < frames; n++)
+		out_energy += (double)output[2 * n] * output[2 * n];
+	*ratio = (float)(out_energy / in_energy);
+	free(input);
+	free(output);
+	free(energy);
+}
+
 static void start(void)
 {
 	upsampler_initialize();
@@ -554,6 +645,186 @@ int main(int argc, char **argv)
 			CHECK(fabsf(whole[n] - pieces[n]) < 1.0e-6f, "frame %lu differs (%f, %f)", n / 2, whole[n], pieces[n]);
 		return 0;
 	}
+	/* the reverb (11,025 Hz, four lines): the decay time the room asks for, its
+	level against the room's, the steady path against the crossfading one,
+	a change of room, and nothing from nothing. "reverb-figures" prints them. */
+	CASE("reverb")
+	{
+		static const float decays[] = { 0.6f, 1.49f, 3.0f };
+		unsigned long index;
+
+		for (index = 0; index < 3; index++)
+		{
+			float rt60, ratio;
+
+			reverb_figures(decays[index], &rt60, &ratio);
+			CHECK(fabsf(rt60 - decays[index]) < 0.15f * decays[index], "decay time %.2f s: the reverb decays in %.2f s",
+				decays[index], rt60);
+			/* (the room level is 0 mB, a gain of 1: the energy out is the energy in, less what the
+			high frequencies lose; the eight lines at 22,050 Hz gave 0.7 to 0.9) */
+			CHECK(ratio > 0.45f && ratio < 1.3f, "decay time %.2f s: the energy out is %.2f of the energy in",
+				decays[index], ratio);
+		}
+		return 0;
+	}
+	CASE("reverb-figures")
+	{
+		static const float decays[] = { 0.3f, 0.6f, 1.0f, 1.49f, 3.0f, 8.0f };
+
+		for (n = 0; n < 6; n++)
+		{
+			float rt60, ratio;
+
+			reverb_figures(decays[n], &rt60, &ratio);
+			printf("  decay %.2f s: decays in %.2f s, energy out / in %.2f\n", decays[n], rt60, ratio);
+		}
+		printf("  the reverb's state: %lu bytes\n", (unsigned long)sizeof(reverb));
+		return 0;
+	}
+	CASE("reverb-steady")
+	{
+		/* the steady path is the crossfading one with nothing to crossfade */
+		static float input[REVERB_BLOCK * 40], steady[REVERB_BLOCK * 40 * 2], general[REVERB_BLOCK * 40 * 2];
+		static __typeof__(reverb) saved;
+		unsigned long frame;
+		float worst = 0.0f, loudest = 0.0f;
+
+		reverb_room(1.49f, -1500, -1000);
+		for (frame = 0; frame < sizeof(input) / sizeof(input[0]); frame++)
+			input[frame] = (float)(random_number() - 0.5) * 0.5f;
+		saved = reverb;
+		reverb_run_blocks(input, steady, sizeof(input) / sizeof(input[0]), 1.0f, FALSE);
+		reverb = saved;
+		reverb_run_blocks(input, general, sizeof(input) / sizeof(input[0]), 1.0f, TRUE);
+		for (frame = 0; frame < sizeof(steady) / sizeof(steady[0]); frame++)
+		{
+			worst = fmaxf(worst, fabsf(steady[frame] - general[frame]));
+			loudest = fmaxf(loudest, fabsf(steady[frame]));
+		}
+		CHECK(loudest > 0.01f, "the reverb is silent (%g)", loudest);
+		CHECK(worst < 1.0e-5f * loudest, "the steady path differs from the general one by %g of %g", worst, loudest);
+		return 0;
+	}
+	CASE("reverb-change")
+	{
+		/* a new room is faded to, once; the old one's sound carries on meanwhile */
+		static float input[REVERB_BLOCK * 80], output[REVERB_BLOCK * 80 * 2];
+		DSI3DL2LISTENER other = { -1000, -100, 0.0f, 4.0f, 0.5f, -1500, 0.02f, -500, 0.04f, 80.0f, 60.0f, 3000.0f };
+		unsigned long frame, fade_frames;
+		float loudest = 0.0f;
+
+		reverb_room(1.49f, -1500, -1000);
+		for (frame = 0; frame < sizeof(input) / sizeof(input[0]); frame++)
+			input[frame] = (float)(random_number() - 0.5) * 0.5f;
+		reverb_run_blocks(input, output, sizeof(input) / sizeof(input[0]), 1.0f, FALSE);
+		reverb_update(&other, ++reverb_serial);
+		CHECK(reverb.fade == REVERB_FADE_FRAMES, "no fade to the new room (%lu)", reverb.fade);
+		reverb_run_blocks(input, output, sizeof(input) / sizeof(input[0]), 1.0f, FALSE);
+		fade_frames = 2 * REVERB_FADE_FRAMES; /* (low bus frames) */
+		CHECK(fade_frames < sizeof(input) / sizeof(input[0]), "the test is too short");
+		CHECK(reverb.fade == 0, "the fade to the new room did not end (%lu left)", reverb.fade);
+		for (frame = 0; frame < sizeof(output) / sizeof(output[0]); frame++)
+		{
+			CHECK(isfinite(output[frame]), "frame %lu is not a number", frame);
+			loudest = fmaxf(loudest, fabsf(output[frame]));
+		}
+		CHECK(loudest > 0.01f && loudest < 10.0f, "the reverb is %g loud", loudest);
+		return 0;
+	}
+	/* a mono voice sending to the reverb (voice_apply's own loop for it), its direct path muffled or not, with
+	every gain ramping, against the same sums in double precision */
+	CASE("send-voice")
+	{
+		unsigned long frames = 300, kind, frame;
+
+		for (kind = 0; kind < 2; kind++)
+		{
+			static struct sdl_stream stream;
+			static float input[300], output[300 * 2], send[300];
+			struct voice_ramp ramp = { 0.5f, 0.3f, 0.4f, kind ? 0.5f : 0.0f, 0.6f,
+				0.001f, -0.0005f, -0.0007f, kind ? 0.0001f : 0.0f, 0.0002f, { 0.2f, 0.2f }, 0.1f };
+			double left = ramp.left, right = ramp.right, room = ramp.room, direct = ramp.direct_lowpass;
+			double room_lowpass = ramp.room_lowpass, direct_state = 0.2, room_state = 0.1, worst = 0.0;
+
+			stream.channels = 1;
+			for (frame = 0; frame < frames; frame++)
+				input[frame] = (float)(random_number() - 0.5);
+			memset(output, 0, sizeof(output));
+			memset(send, 0, sizeof(send));
+			voice_apply(&stream, input, input, output, send, frames, &ramp);
+			for (frame = 0; frame < frames; frame++)
+			{
+				double sample = input[frame], muffled = sample, expected_send, error;
+
+				room_state = sample + room_lowpass * (room_state - sample);
+				expected_send = room_state * room;
+				if (kind)
+					muffled = sample + direct * (direct_state - sample);
+				direct_state = muffled;
+				error = fabs(send[frame] - expected_send);
+				worst = error > worst ? error : worst;
+				error = fabs(output[frame * 2] - muffled * left);
+				worst = error > worst ? error : worst;
+				error = fabs(output[frame * 2 + 1] - muffled * right);
+				worst = error > worst ? error : worst;
+				left += 0.001;
+				right += -0.0005;
+				room += -0.0007;
+				direct += kind ? 0.0001 : 0.0;
+				room_lowpass += 0.0002;
+			}
+			CHECK(worst < 1.0e-5, "%s voice sending to the reverb: %g off", kind ? "a muffled" : "an unmuffled", worst);
+			CHECK(fabs(ramp.room_state - room_state) < 1.0e-5 && fabs(ramp.direct_state[0] - direct_state) < 1.0e-5 &&
+				ramp.direct_state[0] == ramp.direct_state[1], "its states are not where they should be");
+			CHECK(fabs(ramp.left - left) < 1.0e-4 && fabs(ramp.room - room) < 1.0e-4 &&
+				fabs(ramp.room_lowpass - room_lowpass) < 1.0e-4 && fabs(ramp.direct_lowpass - direct) < 1.0e-4,
+				"its gains did not ramp to where they should");
+		}
+		return 0;
+	}
+	CASE("mono-output")
+	{
+		/* the console's mono setting: both channels the mean of the mix's, never louder than the louder */
+		static float stereo[1000 * 2], mixed[1000 * 2];
+		unsigned long frame;
+
+		for (frame = 0; frame < 1000; frame++)
+		{
+			stereo[frame * 2] = (float)sin(frame * 0.05) * 0.8f;
+			stereo[frame * 2 + 1] = frame % 3 ? 0.0f : (float)cos(frame * 0.11) * 0.6f;
+		}
+		memcpy(mixed, stereo, sizeof(mixed));
+		mix_mono(mixed, 1000);
+		for (frame = 0; frame < 1000; frame++)
+		{
+			float mean = 0.5f * (stereo[frame * 2] + stereo[frame * 2 + 1]);
+			float louder = fmaxf(fabsf(stereo[frame * 2]), fabsf(stereo[frame * 2 + 1]));
+
+			CHECK(mixed[frame * 2] == mean && mixed[frame * 2 + 1] == mean, "frame %lu is not the mean (%f, %f; %f)",
+				frame, mixed[frame * 2], mixed[frame * 2 + 1], mean);
+			CHECK(fabsf(mixed[frame * 2]) <= louder, "frame %lu is louder than the louder channel", frame);
+		}
+		/* (a mix that is the same in both channels is unchanged) */
+		for (frame = 0; frame < 1000; frame++)
+			stereo[frame * 2 + 1] = stereo[frame * 2];
+		memcpy(mixed, stereo, sizeof(mixed));
+		mix_mono(mixed, 1000);
+		CHECK(!memcmp(mixed, stereo, sizeof(mixed)), "a centred mix moved");
+		return 0;
+	}
+	CASE("reverb-silent")
+	{
+		/* with nothing sent it makes nothing, and stops once it is quiet */
+		static float input[REVERB_BLOCK * 8], output[REVERB_BLOCK * 8 * 2];
+		unsigned long frame;
+
+		reverb_room(1.49f, -1500, -1000);
+		reverb_run_blocks(input, output, sizeof(input) / sizeof(input[0]), 1.0f, FALSE);
+		for (frame = 0; frame < sizeof(output) / sizeof(output[0]); frame++)
+			CHECK(output[frame] == 0.0f, "frame %lu is not silent (%g)", frame, output[frame]);
+		CHECK(reverb.quiet >= sizeof(input) / sizeof(input[0]) / 2, "silence is not counted (%lu)", reverb.quiet);
+		return 0;
+	}
 	/* a voice that runs out of packets stops, and starts over with the next */
 	CASE("ends")
 	{
@@ -660,7 +931,7 @@ int main(int argc, char **argv)
 		return 0;
 	}
 	/* a scene in the Wii's pieces: bench mono stereo44 stereo22 silent flags
-	chunks, flags 1 indoors (the reverb), 2 ADPCM */
+	chunks, flags 1 indoors (the reverb), 2 ADPCM, 4 the reverb off, 8 in mono */
 	CASE("bench")
 	{
 		static float output[CHUNK * 2];
@@ -668,12 +939,14 @@ int main(int argc, char **argv)
 		int flags = atoi(argv[6]);
 		double energy = 0.0;
 
-		reverb_enabled = TRUE;
+		reverb_enabled = (flags & 4) == 0;
 		scene(strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0), strtoul(argv[4], NULL, 0),
 			strtoul(argv[5], NULL, 0), (flags & 1) != 0, (flags & 2) != 0, 120000);
 		for (chunk = 0; chunk < chunks; chunk++)
 		{
 			mix(output, CHUNK);
+			if (flags & 8)
+				mix_mono(output, CHUNK);
 			for (n = 0; n < CHUNK * 2; n++)
 				energy += output[n] * output[n];
 		}
