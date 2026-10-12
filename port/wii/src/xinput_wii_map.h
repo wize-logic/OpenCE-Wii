@@ -19,6 +19,13 @@ width or height from the middle; a turn lost for no longer than the hold
 below is carried on with the last position. */
 #define WII_POINTER_DEAD_ZONE 0.35f
 #define WII_POINTER_HOLD_US 150000u
+/* The pointer's play radius (input.pointer_steadiness): the pointer holds
+still while its reading is within this share of the half screen of the held
+position. wii_pointer_steadiness takes the setting as it is written (a
+number out of range or not a number is the default, 0.03; 0 is none). */
+#define WII_POINTER_STEADINESS_DEFAULT 0.03f
+#define WII_POINTER_STEADINESS_MAX 0.25f
+float wii_pointer_steadiness(double setting);
 /* the fastest turns, at the screen's edge, when the profile's look rates are
 not known: the game's default look sensitivity (player_ui.c) */
 #define WII_POINTER_DEFAULT_YAW_RADIANS_PER_SECOND 2.6f

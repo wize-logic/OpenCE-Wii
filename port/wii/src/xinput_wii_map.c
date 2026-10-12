@@ -165,6 +165,16 @@ void wii_map_pointer_look(float x, float y, float seconds, float yaw_rate, float
 	*pitch = -wl_pointer_turn(y, WII_POINTER_DEAD_ZONE) * pitch_rate * seconds;
 }
 
+/* the play radius the setting asks for: within 0 to the most, else the default */
+float wii_pointer_steadiness(double setting)
+{
+	if (!(setting >= 0.0))
+		return WII_POINTER_STEADINESS_DEFAULT;
+	if (setting > (double)WII_POINTER_STEADINESS_MAX)
+		return WII_POINTER_STEADINESS_MAX;
+	return (float)setting;
+}
+
 /* ---------- the rumble */
 
 unsigned wii_rumble_strength(unsigned left, unsigned right)
