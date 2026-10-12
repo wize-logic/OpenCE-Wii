@@ -2759,6 +2759,16 @@ static void level_run_act(
 			level_run.target_type = _level_run_target_none;
 			break;
 		}
+		/* (a control where it is now: one on a lift goes with it, b40's) */
+		if (level_run.target_type == _level_run_target_control &&
+			object_try_and_get_and_verify_type(level_run.target_object, _object_mask_control))
+		{
+			struct object_datum *control = object_get(level_run.target_object);
+
+			level_run.target_point.x = control->object.position.x + control->object.forward.i * 0.6f;
+			level_run.target_point.y = control->object.position.y + control->object.forward.j * 0.6f;
+			level_run.target_point.z = control->object.position.z;
+		}
 		/* (at a door, near it; at a control, touching it: the game looks for
 		controls where his bounding sphere is) */
 		if (level_run.target_type == _level_run_target_door ?
