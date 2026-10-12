@@ -1207,7 +1207,13 @@ and pixel shaders.
       middle's coordinates lie furthest (over a texel) from its ends' mean, the middle's
       outputs the ends' mixed (its position the edge's middle, exactly) and its coordinates its
       own direction's. An edge is halved by its ends alone, so no crack opens; pieces out of
-      sight are not sent. `tools/wii_draw_bench.py subdivide` checks a sea's triangles: within
+      sight are not sent. A piece's depth, interpolated from its own corners, differs from the
+      whole triangle's by GX's rounding, and the surface's other passes then failed their
+      `LESSEQUAL` test pixel by pixel (a hatching over b30's sea): the pieces are drawn 16
+      units of the 24-bit depth nearer (`SUBDIVIDE_PULL`), and a draw whose depth test is
+      `EQUAL` or `GREATER` is not drawn in pieces. A draw in hardware of up to 64 indices whose
+      sphere map's coordinates the processor computes (the sky's water, whose triangles run
+      from under the eye to the horizon) is the processor's, so that it can be. `tools/wii_draw_bench.py subdivide` checks a sea's triangles: within
       a texel (1.4 in the worst, a triangle from the eye's feet to the horizon), every point in
       sight in exactly one piece, at about 2,000 instructions a piece.
   - (1 - x)p + xq is TEV's lerp, one stage.

@@ -2733,6 +2733,9 @@ struct draw_projection
 static struct draw_projection projection_loaded;
 /* the z bias the loaded projection has (projection_bias) */
 static float projection_loaded_bias;
+/* the depth taken off a perspective draw, in the depth's units (0 but for a
+sphere map's draw in pieces: subdivide_pull), and the loaded projection's */
+static float projection_pull, projection_loaded_pull;
 /* the last fit, for a draw whose vertices are all at one w (any draw's
 whose depth was fitted, on either path: projection_load) */
 static float projection_a, projection_b = 0.0f;
@@ -2793,6 +2796,7 @@ static void projection_load(const struct draw_projection *projection)
 		projection_b = projection->b;
 	}
 	if (projection_valid && projection_loaded.perspective == projection->perspective && projection_loaded_bias == bias &&
+		projection_loaded_pull == projection_pull &&
 		(!projection->perspective || (projection_loaded.a == projection->a && projection_loaded.b == projection->b)))
 		return;
 	memset(matrix, 0, sizeof(matrix));
@@ -2807,7 +2811,8 @@ static void projection_load(const struct draw_projection *projection)
 		matrix[0][2] = 1.0f;
 		matrix[1][1] = -2.0f / SCREEN_HEIGHT;
 		matrix[1][2] = -1.0f;
-		matrix[2][2] = 1.0f - a;
+		/* (depth - pull: projection_pull) */
+		matrix[2][2] = 1.0f - a + projection_pull;
 		/* (b / w nearer by bias / 16384 of itself: projection_bias) */
 		matrix[2][3] = b - fabsf(b) * bias * (1.0f / 16384.0f);
 		matrix[3][2] = -1.0f;
@@ -2829,6 +2834,7 @@ static void projection_load(const struct draw_projection *projection)
 	}
 	projection_loaded = *projection;
 	projection_loaded_bias = bias;
+	projection_loaded_pull = projection_pull;
 	projection_valid = TRUE;
 }
 
@@ -4101,6 +4107,9 @@ feet to the horizon, at about 2,000 instructions a piece. */
 #define SUBDIVIDE_MOST_PIECES 2048
 /* (the most edges looked at in a triangle: their middles' room) */
 #define SUBDIVIDE_POOL 512
+/* (a draw in hardware of at most this many indices, its sphere map's
+coordinates the processor's, is draw_run's: draw_hardware) */
+#define SUBDIVIDE_HARDWARE_MOST 64
 
 struct subdivide_vertex
 {
@@ -4143,6 +4152,32 @@ and the triangles sent for them */
 static unsigned long subdivide_draws, subdivide_halvings, subdivide_triangles;
 /* (the draw bench's check of the pieces: each one sent, as GX takes it) */
 static void (*subdivide_piece_seen)(const struct gx_vertex *corner);
+
+/* The pieces' depth. GX interpolates a piece's depth from its own corners,
+which on the triangle's plane differs from the whole triangle's by the
+rasterizer's rounding, a unit of the 24 bits or a few: another pass of the
+same surface, drawn whole (GX's transform's, or before the pieces), then
+fails or passes its equal depth test from pixel to pixel, a hatching (b30's
+sea: the water's reflection pass in pieces over its opacity pass, which
+writes the depth, LESSEQUAL). So the pieces are drawn SUBDIVIDE_PULL nearer,
+in the depth's units (16 of the 24 bits' 16.7 million: at w 100 a sixth of a
+unit, at w 1000 some 16, where it matters only for something that close
+behind the surface); a draw whose depth test would read that otherwise
+(EQUAL, GREATER, NOT EQUAL) is not drawn in pieces. */
+#define SUBDIVIDE_PULL (16.0f / 16777216.0f)
+
+static BOOL subdivide_depth_test_kept(void)
+{
+	if (!D3D__RenderState[D3DRS_ZENABLE])
+		return TRUE;
+	switch (D3D__RenderState[D3DRS_ZFUNC])
+	{
+	case D3DCMP_LESS: case D3DCMP_LESSEQUAL: case D3DCMP_ALWAYS: case D3DCMP_NEVER:
+		return TRUE;
+	default:
+		return FALSE;
+	}
+}
 
 /* the texture coordinates on a sphere map the draw's vertices carry */
 static unsigned subdivide_coordinates(void)
@@ -4483,7 +4518,7 @@ static BOOL draw_run_subdivided(struct nv2a_cpu_program *program, D3DPRIMITIVETY
 			}
 			subdivide_triangle(corner[0], corner[1], corner[2], projection, position_register >= 0, coordinates);
 		}
-		if (pass == 0 && triangle == triangles)
+		if (pass == 0 && (triangle == triangles || !subdivide_depth_test_kept()))
 		{
 			gx_begin(gx_primitive(primitive_type), DEVICE_VERTEX_FORMAT, (u16)count);
 			for (vertex = 0; vertex < count; vertex++)
@@ -4491,7 +4526,14 @@ static BOOL draw_run_subdivided(struct nv2a_cpu_program *program, D3DPRIMITIVETY
 			GX_End();
 			return TRUE;
 		}
+		if (pass == 0)
+		{
+			/* (the pieces a little nearer: subdivide_pull) */
+			projection_pull = SUBDIVIDE_PULL;
+			projection_load(projection);
+		}
 	}
+	projection_pull = 0.0f;
 	subdivide_draws++;
 	return TRUE;
 }
@@ -8271,6 +8313,12 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 			texture_registers[texture_count++] = reg;
 		stage_source[stage] = index;
 	}
+	/* (a few triangles reading a sphere map at their own directions, which
+	may be big ones, as the sky's water is: the processor's, to draw them in
+	pieces where the map needs it, subdivide_triangle) */
+	if (cpu_spheres && count <= SUBDIVIDE_HARDWARE_MOST && (primitive_type == D3DPT_TRIANGLELIST ||
+		primitive_type == D3DPT_TRIANGLESTRIP || primitive_type == D3DPT_TRIANGLEFAN))
+		return hardware_rejected(program, "a sphere map across a few triangles, drawn in pieces where it needs them");
 	for (component = 0; component < 2; component++)
 	{
 		const unsigned long *color = component ? dependencies->d1 : dependencies->d0;
