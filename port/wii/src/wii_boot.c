@@ -45,6 +45,20 @@ void wii_network_start(void);
 void wii_profile_arm(void);
 int __real_main(void);
 
+/* The log goes to a file on the card (sd:/apps/halo/logs/log-NN.log, NN the
+first number not taken) only when that folder is there: a console has no
+other way to give the log back, and a normal run writes nothing to the card
+for it (as the sampling profiler and the hardware counters, it is asked for
+by the card's contents). The card is mounted after IOS 58 is loaded, so the
+file is opened by a second call of wl_platform_log_init, after the mounts; the
+lines before it are in the ring and on the debug port only. */
+#define WII_LOG_DIRECTORY "sd:/apps/halo/logs"
+
+static const char *wii_log_directory(void)
+{
+	return wl_platform_fs_exists(WII_LOG_DIRECTORY) ? WII_LOG_DIRECTORY : NULL;
+}
+
 /* WiiLibs' heaps. In MEM2: thread stacks (the audio output's 24 KB, the
 system watcher's 16 KB, and 32 KB for an IO thread), the audio output's
 buffers (4 KB in use), the asynchronous reads' buffers (which the port does
@@ -145,6 +159,7 @@ int __wrap_main(void)
 	wl_platform_fs_ios_init(&ios);
 	wl_platform_fs_mount(WL_DEVICE_SD);
 	wl_platform_fs_mount(WL_DEVICE_USB);
+	wl_platform_log_init(wii_log_directory());
 	/* the network, without waiting for it (src/posix_net_wii.c) */
 	wii_network_start();
 	/* the sampling profiler, only if profile.txt is in the game's folder (src/wii_profile.c) */
