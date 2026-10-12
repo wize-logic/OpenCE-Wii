@@ -1426,6 +1426,51 @@ SAVE AND QUIT from the pause menu, the profile's settings, and the saved game lo
   `tools/wii_input_check.py` runs the verbs against the real `test_input.c` on the host.
 - The x86 Linux build plays the same script (`HALO_MENUS=xbox HALO_TEST_INPUT=script:...`, headless
   or on a virtual display with `debug.screenshot_every`) to the same screens and places.
+
+### Every level from start to end
+
+`tests/level_<level>.txt` (a10, a30, a50, b30, b40, c10, c20, c40, d20, d40) play one campaign level
+from its start to the next level's start (d40: to the credits), started by the network test, so
+that the run is the same on the x86 build and on the Wii and can be compared tick by tick (the
+lockstep check). Each waits for the game (`play`), then its `objective` step plays the level as a
+person would (`port/linux/game/level_run.c` says how): it reads what the level's scripts wait on
+(trigger volumes, seats, encounters, devices, things to look at, the tutorial's buttons) and goes
+first where the scripts that moved on most lately want him, walking over the BSP's walkable
+surfaces, turned to where he goes, fighting what he sees on the way; cutscenes play as they are
+and a help screen is dismissed with A. d40's script also names the engine room's manifold
+detectors to shoot (`destroy`). The aids a person would not have, each logged with `level run:
+... aid:` and counted in the level's summary line:
+
+- the game's cheats deathless_player, infinite_ammo and bottomless_clip, for the whole level;
+- the view turned at once to where he walks or aims;
+- no nearer to where he goes for 30 seconds: stood on the floor there (or held in the air in a
+  volume that has no floor, a lift's shaft); fallen out of the level: stood back where he was;
+- an encounter (or a thing to destroy) fought 90 seconds with none of it killed: killed; a seat
+  or control beside him that he cannot use in 10 seconds: seated or used as the action button would.
+
+The level's end is the summary line, `level run: levels\b30\b30 ended at tick 61456 (61455 ticks
+played), 30 checkpoints; ...; aids: 13 teleports, 6 encounters killed, 2 seats taken, ...`, then
+`test_input: the objective's level ended`; a level that does not end within the step's time (3600
+seconds of game time) logs what every script waits on and `not ended`. Every two minutes with
+nothing new the log lists the same (what each script waits on, each volume's BSP).
+
+On the Wii, `apps/halo/config.toml` (the script copied to `apps/halo/level_b30.txt`):
+
+```toml
+[debug]
+network_test = "solo:levels\\b30\\b30"
+fixed_ticks = true
+lockstep_log = 30
+test_input = "script:level_b30.txt"
+```
+
+and on x86, headless, the same with `SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
+HALO_NULL_RENDERER=1 HALO_HIDDEN_WINDOW=1 HALO_NETWORK_TEST='solo:levels\b30\b30' HALO_FIXED_TICKS=1
+HALO_LOCKSTEP_LOG=30 HALO_TEST_INPUT=script:level_b30.txt` and the script in the data folder.
+`tools/lockstep_compare.py x86.log wii.log` then names the first tick that differs. A run on x86
+takes a few minutes per level (the null renderer runs the game at hundreds of ticks a second); on
+the Wii in Dolphin, a level of 50,000 to 90,000 ticks takes as long as the game at the emulated
+frame rate.
 - The Xbox's pause menu has no settings (the PC version's has); the settings are reached from the
   main menu. a10's first checkpoint after its opening comes past the cryo bay's tutorial (the red
   and yellow squares, the panels to look at, the shield test), which the script does not play yet:

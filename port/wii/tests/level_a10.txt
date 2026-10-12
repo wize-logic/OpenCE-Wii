@@ -1,0 +1,11 @@
+# a10, The Pillar of Autumn, from its start to its end, for
+# debug.test_input = "script:level_a10.txt" with
+# debug.network_test = "solo:levels\a10\a10" (port/wii/README.md, "The
+# playthrough check"). The level's opening plays as it is; then the
+# objective (port/linux/game/level_run.c) plays it as a person would, to
+# the next level's (a30) start.
+play 600
+log a10 begins
+objective 3600
+log a10 ended
+quit

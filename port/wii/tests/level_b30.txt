@@ -1,0 +1,11 @@
+# b30, The Silent Cartographer, from its start to its end, for
+# debug.test_input = "script:level_b30.txt" with
+# debug.network_test = "solo:levels\b30\b30" (port/wii/README.md, "The
+# playthrough check"). The level's opening plays as it is; then the
+# objective (port/linux/game/level_run.c) plays it as a person would, to
+# the next level's (b40) start.
+play 600
+log b30 begins
+objective 3600
+log b30 ended
+quit

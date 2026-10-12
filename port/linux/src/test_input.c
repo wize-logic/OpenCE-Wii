@@ -40,6 +40,15 @@ the script with a line in the log saying where it was.
 	                                unit, about 3 metres), without turning
 	bot <seconds> [checkpoint]      the bot's play (bot:1) for that long, or
 	                                until the game saves a checkpoint
+	objective [<seconds>]           the level played to its end, as a person
+	                                would: where its scripts wait for him,
+	                                fighting on the way (level_run.c, which
+	                                lists its aids); until the next level
+	                                begins, or the game ends (3600 seconds of
+	                                the game's time unless given)
+	destroy <name> ...              objects the objective then destroys where
+	                                it finds them, by their names in the level
+	                                (d40's manifolds' detectors), up to 7 a line
 	repeat <count> ... end          the steps between, count times over
 	log <text>                      a line in the log, with where the player
 	                                is and faces in a game
@@ -82,6 +91,22 @@ does the pause after it, so that slow frames see it.
 
 /* the platform's (sdl_platform.c, port/wii/src/wii_platform.c) */
 void platform_request_quit(void);
+/* level_run.c's (port/linux/game): the objective */
+void level_run_begin(void);
+void level_run_stop(void);
+void level_run_destroy(const char *name);
+int level_run_controller(float *sticks, unsigned long *buttons);
+
+/* level_run.c's buttons */
+enum
+{
+	_level_run_button_fire = 1 << 0,
+	_level_run_button_action = 1 << 1,
+	_level_run_button_jump = 1 << 2,
+	_level_run_button_back = 1 << 3,
+	_level_run_button_zoom = 1 << 4,
+	_level_run_button_grenade = 1 << 5,
+};
 
 enum
 {
@@ -187,6 +212,10 @@ static void test_input_bot(XINPUT_GAMEPAD *pad, unsigned long long milliseconds,
 #define SCRIPT_PRESS_POLLS 4
 #define SCRIPT_PRESS_MILLISECONDS 100
 #define SCRIPT_SELECT_MAXIMUM 16
+#define SCRIPT_OBJECTIVE_TIMEOUT 3600.0
+/* (seconds of the script's clock out of a game, the objective's level
+having ended in the menus: the campaign's end) */
+#define SCRIPT_OBJECTIVE_MENU_SECONDS 60.0
 
 enum
 {
@@ -203,6 +232,8 @@ enum
 	_step_stick,
 	_step_walk,
 	_step_bot,
+	_step_objective,
+	_step_destroy,
 	_step_log,
 	_step_quit,
 	/* the Wii's verbs (script_parse_wii) */
@@ -243,6 +274,8 @@ static struct
 	unsigned long long clock, last_read;
 	long started_tick;
 	long started_checkpoints;
+	/* (the objective: when the game was last seen running) */
+	unsigned long long in_game_clock;
 	/* a press: whether held, the reads and time since it changed, and the
 	presses made */
 	int pressed;
@@ -599,6 +632,22 @@ static int script_parse_line(char *line, int number, struct script_step *step)
 		if (count == 3)
 			snprintf(step->argument, sizeof(step->argument), "%s", words[2]);
 	}
+	else if (!strcmp(words[0], "destroy") && count >= 2)
+	{
+		/* (the names, a space between each) */
+		step->kind = _step_destroy;
+		for (index = 1; index < count; index++)
+		{
+			size_t used = strlen(step->argument);
+
+			snprintf(step->argument + used, sizeof(step->argument) - used, "%s%s", index > 1 ? " " : "", words[index]);
+		}
+	}
+	else if (!strcmp(words[0], "objective") && count <= 2)
+	{
+		step->kind = _step_objective;
+		step->number = count == 2 ? atof(words[1]) : SCRIPT_OBJECTIVE_TIMEOUT;
+	}
 	else if (!strcmp(words[0], "repeat") && count == 2 && atoi(words[1]) >= 1)
 	{
 		step->kind = _step_repeat;
@@ -801,6 +850,11 @@ static void script_gamepad(XINPUT_GAMEPAD *pad, unsigned long long milliseconds)
 			script.phase_milliseconds = milliseconds;
 			script.presses = 0;
 			platform_log("test_input: line %d (%.1f s): %s", step->line, (double)script.clock / 1000.0, step->text);
+			if (step->kind == _step_objective)
+			{
+				level_run_begin();
+				script.in_game_clock = script.clock;
+			}
 		}
 		elapsed = (double)(script.clock - script.started_clock) / 1000.0;
 		/* (a menu that takes no input yet, as while the saved games are first
@@ -912,6 +966,65 @@ static void script_gamepad(XINPUT_GAMEPAD *pad, unsigned long long milliseconds)
 				test_input_bot(pad, milliseconds, 1, 0);
 			}
 			return;
+		case _step_objective:
+		{
+			float sticks[4];
+			unsigned long buttons;
+
+			if (!level_run_controller(sticks, &buttons))
+			{
+				platform_log("test_input: the objective's level ended (tick %ld)", script.tick);
+				break;
+			}
+			/* (out of a game for long: the campaign ended in the menus) */
+			if (script.tick < 0)
+			{
+				if ((double)(script.clock - script.in_game_clock) / 1000.0 >= SCRIPT_OBJECTIVE_MENU_SECONDS)
+				{
+					platform_log("test_input: the objective's game ended");
+					level_run_stop();
+					break;
+				}
+				return;
+			}
+			script.in_game_clock = script.clock;
+			if (script.started_tick < 0)
+				script.started_tick = script.tick;
+			/* (a screen over the game, a10's help: A, as a person dismisses it) */
+			if (script.screen[0])
+			{
+				struct script_step accept;
+
+				memset(&accept, 0, sizeof(accept));
+				accept.analog = (unsigned char)(1 << XINPUT_GAMEPAD_A);
+				script_press(pad, &accept, milliseconds);
+				return;
+			}
+			/* (the game's time, as hold's) */
+			if (script.tick >= script.started_tick && (double)(script.tick - script.started_tick) / 30.0 >= step->number)
+			{
+				level_run_stop();
+				script_stop("timed out");
+				return;
+			}
+			pad->sThumbLX = script_stick(sticks[0]);
+			pad->sThumbLY = script_stick(sticks[1]);
+			pad->sThumbRX = script_stick(sticks[2]);
+			pad->sThumbRY = script_stick(sticks[3]);
+			if (buttons & _level_run_button_fire)
+				pad->bAnalogButtons[XINPUT_GAMEPAD_RIGHT_TRIGGER] = 255;
+			if (buttons & _level_run_button_grenade)
+				pad->bAnalogButtons[XINPUT_GAMEPAD_LEFT_TRIGGER] = 255;
+			if (buttons & _level_run_button_action)
+				pad->bAnalogButtons[XINPUT_GAMEPAD_X] = 255;
+			if (buttons & _level_run_button_jump)
+				pad->bAnalogButtons[XINPUT_GAMEPAD_A] = 255;
+			if (buttons & _level_run_button_back)
+				pad->bAnalogButtons[XINPUT_GAMEPAD_B] = 255;
+			if (buttons & _level_run_button_zoom)
+				pad->wButtons |= XINPUT_GAMEPAD_RIGHT_THUMB;
+			return;
+		}
 		case _step_walk:
 		{
 			double dx, dy, distance, forward, right;
@@ -944,6 +1057,16 @@ static void script_gamepad(XINPUT_GAMEPAD *pad, unsigned long long milliseconds)
 			pad->sThumbLY = script_stick(forward);
 			pad->sThumbLX = script_stick(right);
 			return;
+		}
+		case _step_destroy:
+		{
+			char names[SCRIPT_TEXT_SIZE];
+			char *name;
+
+			snprintf(names, sizeof(names), "%s", step->argument);
+			for (name = strtok(names, " "); name; name = strtok(NULL, " "))
+				level_run_destroy(name);
+			break;
 		}
 		case _step_log:
 			if (script.placed)

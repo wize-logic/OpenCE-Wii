@@ -1,0 +1,16 @@
+# d40, The Maw, from its start to its end, for
+# debug.test_input = "script:level_d40.txt" with
+# debug.network_test = "solo:levels\d40\d40" (port/wii/README.md, "The
+# playthrough check"). The level's opening plays as it is; then the
+# objective (port/linux/game/level_run.c) plays it as a person would, to
+# the end cutscene and the credits, back to the menus.
+play 600
+log d40 begins
+# the engine room's manifolds: once a manifold is open, its detectors are
+# shot (the scripts read their health in an if, which the objective does not
+# read as something waited for)
+destroy enc5_1_detector_n1 enc5_1_detector_n1b enc5_1_detector_n3 enc5_1_detector_n3b
+destroy enc5_1_detector_s1 enc5_1_detector_s1b enc5_1_detector_s3 enc5_1_detector_s3b
+objective 3600
+log d40 ended
+quit

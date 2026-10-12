@@ -1,0 +1,11 @@
+# c10, 343 Guilty Spark, from its start to its end, for
+# debug.test_input = "script:level_c10.txt" with
+# debug.network_test = "solo:levels\c10\c10" (port/wii/README.md, "The
+# playthrough check"). The level's opening plays as it is; then the
+# objective (port/linux/game/level_run.c) plays it as a person would, to
+# the next level's (c20) start.
+play 600
+log c10 begins
+objective 3600
+log c10 ended
+quit

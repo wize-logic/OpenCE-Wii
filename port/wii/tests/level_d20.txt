@@ -1,0 +1,11 @@
+# d20, Keyes, from its start to its end, for
+# debug.test_input = "script:level_d20.txt" with
+# debug.network_test = "solo:levels\d20\d20" (port/wii/README.md, "The
+# playthrough check"). The level's opening plays as it is; then the
+# objective (port/linux/game/level_run.c) plays it as a person would, to
+# the next level's (d40) start.
+play 600
+log d20 begins
+objective 3600
+log d20 ended
+quit

@@ -1207,6 +1207,56 @@ void hs_runtime_port_shift_sleep_times(
 	}
 }
 
+/* port: the script threads, at most `maximum`: each one's script, the
+sleep_until it waits in (else NONE), the expression it runs next and the
+tick it sleeps until (-1 for ever, -2 dormant). For debug.level_run, which
+reads what the level's scripts wait on (port/linux/game/level_run.c) */
+long hs_runtime_port_threads(
+	long *script_indices,
+	long *sleep_until_expression_indices,
+	long *expression_indices,
+	long *sleep_until_ticks,
+	long maximum)
+{
+	struct data_iterator iterator;
+	struct hs_thread_datum *thread;
+	long count = 0;
+
+	if (!hs_runtime_globals.initialized)
+		return 0;
+	data_iterator_new(&iterator, hs_thread_data);
+	while ((thread = data_iterator_next(&iterator)) != NULL && count < maximum)
+	{
+		struct hs_stack_frame *frame = thread->stack;
+		short depth;
+
+		if (thread->type == _hs_thread_type_console_command)
+			continue;
+		script_indices[count] = thread->script_index;
+		sleep_until_expression_indices[count] = NONE;
+		expression_indices[count] = frame && frame != (struct hs_stack_frame *)thread->stack_data ?
+			frame->expression_index : NONE;
+		sleep_until_ticks[count] = thread->sleep_until;
+		/* (the sleep_until's frame, or the one above it: its condition's call,
+		pushed to run when the thread wakes) */
+		for (depth = 0; depth < 2 && frame && frame != (struct hs_stack_frame *)thread->stack_data; depth++)
+		{
+			struct hs_syntax_node *call = frame->expression_index != NONE ? hs_syntax_get(frame->expression_index) : NULL;
+
+			if (call && !TEST_FLAG(call->flags, _hs_syntax_node_script_bit) &&
+				!TEST_FLAG(call->flags, _hs_syntax_node_primitive_bit) && call->function_index == _hs_function_sleep_until)
+			{
+				sleep_until_expression_indices[count] = frame->expression_index;
+				break;
+			}
+			frame = frame->previous;
+		}
+		count++;
+	}
+
+	return count;
+}
+
 void hs_runtime_update(
 	void)
 {

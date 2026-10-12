@@ -89,6 +89,8 @@ void test_input_observe_menus_inhibited(int inhibited);
 void ui_widget_port_active_screen(long *screen_tag_index, long *focused_tag_index);
 boolean ui_widgets_processing_is_inhibited(void);
 long game_state_port_checkpoints_saved(void);
+/* level_run.c's (the scripted player's objective) */
+void level_run_update(void);
 
 enum
 {
@@ -848,6 +850,10 @@ void network_test_update(
 
 		network_test_game_tick = game_in_progress() && !main_menu_loaded ? (long)game_time_get() : -1;
 	}
+	/* the scripted player's objective (test_input.c): the level played to
+	its end */
+	if (game_in_progress() && !main_menu_loaded)
+		level_run_update();
 	/* the lockstep log (debug.lockstep_log): the game's state hashed every so
 	many ticks, the same on every machine that plays the same ticks */
 	if (game_in_progress() && !main_menu_loaded && network_test.lockstep_ticks > 0 &&
