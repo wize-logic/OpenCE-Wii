@@ -596,7 +596,14 @@ static v4 nv2a_eval(const DWORD *s, const struct inputs_set *in)
 			}
 			result.c[ch] = clamp01(v[0] * v[1] + (1 - v[0]) * v[2] + v[3]);
 		}
-		result.c[3] = 1;
+		{
+			/* (G: a register's alpha, or its blue) */
+			unsigned g = (efg >> 8) & 0xff;
+			v4 r = reg_value(s, g & 15, -1, regs);
+			float y = clamp01((g & 0x10) ? r.c[3] : r.c[2]);
+
+			result.c[3] = (g & 0x20) ? 1 - y : y;
+		}
 		return result;
 	}
 }
@@ -1059,7 +1066,6 @@ static int model_programs(void)
 			if (ramp)
 				for (int ch = 0; ch < 4; ch++) maps[6].c[ch] = in.v0.c[3];
 			want = nv2a_eval(state, &in);
-			want.c[3] = in.t[0].c[3];
 			got = simulate(&program, &in, maps);
 			for (int ch = 0; ch < 4; ch++)
 			{
@@ -1087,6 +1093,100 @@ static int model_programs(void)
 	fog_on = 0;
 	printf("the models' program: %d variants (at most %d stages), %d not exact or differ; worst %.1f/255, in TEV's "
 		"8 bits (wl_tev_eval) %d/255\n", checked, most_stages, failures, worst * 255.0f, eval_worst_bytes);
+	return failures;
+}
+
+/* the structure's fog pass (rasterizer_xbox_environment_fog.c), made by
+hand (gx_psh.c's environment_fog_recipe): its constants as the game makes
+them (densities in a grey's intensity and alpha, the colours with the eye's
+density in the alpha) and random, with either density texture alone or
+both; exact, and the same as NV2A's combiners, colour and alpha */
+static int environment_fog_programs(void)
+{
+	int failures = 0, checked = 0, eval_worst_bytes = 0;
+	float worst = 0;
+
+	for (unsigned present = 1; present <= 3; present++)
+	for (unsigned trial = 0; trial < 40; trial++)
+	{
+		DWORD state[200];
+		struct gx_psh_textures textures;
+		struct gx_psh_program program;
+		float program_worst = 0;
+
+		memset(state, 0, sizeof(state));
+		state[D3DRS_PSCOMBINERCOUNT] = 0x00011002;
+		state[D3DRS_PSRGBINPUTS0] = 0x11180118;
+		state[D3DRS_PSRGBOUTPUTS0] = 0x00000048;
+		state[D3DRS_PSALPHAINPUTS0] = 0x02191209;
+		state[D3DRS_PSALPHAOUTPUTS0] = 0x00000C00;
+		state[D3DRS_PSRGBINPUTS0 + 1] = 0x0108021C;
+		state[D3DRS_PSRGBOUTPUTS0 + 1] = 0x000000CD;
+		state[D3DRS_PSALPHAINPUTS0 + 1] = 0x283C311C;
+		state[D3DRS_PSALPHAOUTPUTS0 + 1] = 0x000000CD;
+		state[D3DRS_PSFINALCOMBINERINPUTSABCD] = 0x0C3D000F;
+		state[D3DRS_PSFINALCOMBINERINPUTSEFG] = 0x0D243C00;
+		for (unsigned constant = 0; constant < 2; constant++)
+		{
+			DWORD c0 = (DWORD)rand() * 2654435761u, c1 = (DWORD)rand() * 40503u * 65537u;
+
+			/* (the densities' greys, as the game makes them, half the time) */
+			if (constant == 0 && trial % 2 == 0)
+			{
+				c0 = (c0 & 0xFF000000u) | ((c0 >> 8) & 0xFFu) * 0x010101u;
+				c1 = (c1 & 0xFF000000u) | ((c1 >> 8) & 0xFFu) * 0x010101u;
+			}
+			state[D3DRS_PSCONSTANT0_0 + constant] = c0;
+			state[D3DRS_PSCONSTANT1_0 + constant] = c1;
+		}
+		memset(&textures, 0, sizeof(textures));
+		textures.present = present;
+		checked++;
+		if (!gx_psh_translate(state, &textures, &program) || program.approximate || !validate(&program))
+		{
+			printf("the environment's fog (textures %x): not translated exactly (%s)\n", present,
+				program.reason ? program.reason : program.approximate ? "approximate" : "refused by the validator");
+			failures++;
+			continue;
+		}
+		for (int sample = 0; sample < 200; sample++)
+		{
+			struct inputs_set in;
+			v4 maps[8], want, got;
+
+			for (int i = 0; i < 4; i++)
+				in.t[i] = (present & (1u << i)) ? rand4() : (v4){ { 0, 0, 0, 0 } };
+			in.v0 = rand4();
+			in.v1 = rand4();
+			memset(maps, 0, sizeof(maps));
+			for (int i = 0; i < 4; i++) maps[i] = in.t[i];
+			want = nv2a_eval(state, &in);
+			got = simulate(&program, &in, maps);
+			for (int ch = 0; ch < 4; ch++)
+			{
+				float d = fabsf(want.c[ch] - got.c[ch]);
+
+				if (d > program_worst)
+					program_worst = d;
+			}
+			{
+				int e = eval_compare(&program, &in, maps, got);
+
+				if (e > eval_worst_bytes)
+					eval_worst_bytes = e;
+			}
+		}
+		if (program_worst > worst)
+			worst = program_worst;
+		if (program_worst > 0.01f)
+		{
+			printf("the environment's fog (textures %x, trial %u): DIFFERS from NV2A's by %.1f/255\n", present, trial,
+				program_worst * 255.0f);
+			failures++;
+		}
+	}
+	printf("the environment's fog: %d programs, %d not exact or differ; worst %.1f/255, in TEV's 8 bits "
+		"(wl_tev_eval) %d/255\n", checked, failures, worst * 255.0f, eval_worst_bytes);
 	return failures;
 }
 
@@ -1163,7 +1263,7 @@ int main(int argc, char **argv)
 	printf("%lu TEV stages for the %lu translated (%.2f a program)\n", stages_made, programs_made,
 		programs_made ? (double)stages_made / (double)programs_made : 0.0);
 	{
-		int game = only < 0 ? game_programs() + specular_programs() + model_programs() : 0;
+		int game = only < 0 ? game_programs() + specular_programs() + model_programs() + environment_fog_programs() : 0;
 
 		if (only < 0)
 		{
