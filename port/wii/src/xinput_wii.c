@@ -280,7 +280,7 @@ DWORD WINAPI XInputGetState(HANDLE device, PXINPUT_STATE state)
 	}
 	if (port == 0)
 	{
-		test_input_gamepad(&state->Gamepad, wl_platform_time_us() / 1000);
+		test_input_gamepad(&state->Gamepad, wl_platform_time_ms());
 		/* (the scripted controller steers the HOME menu, if it is up) */
 		script_navigation = test_input_active() ? wii_home_pad_navigation(&state->Gamepad) : 0;
 	}
@@ -320,7 +320,7 @@ DWORD WINAPI XInputSetState(HANDLE device, PXINPUT_FEEDBACK feedback)
 	none while a menu is up, as when the game is paused) */
 	motors[port].strength = ui_widgets_active() || wii_home_game_open() ? 0 :
 		wii_rumble_strength(feedback->Rumble.wLeftMotorSpeed, feedback->Rumble.wRightMotorSpeed);
-	motors[port].asked_ms = (unsigned long)(wl_platform_time_us() / 1000);
+	motors[port].asked_ms = (unsigned long)wl_platform_time_ms();
 	return ERROR_SUCCESS;
 }
 

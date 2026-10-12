@@ -70,6 +70,11 @@ into `./WiiLibs`) and keeps it as an artifact.
 - `build/wii/sd` is synced in as the SD card.
 - It prints the game's log (WiiLibs' sink, Dolphin's OSREPORT) and saves a capture of the render
   window to `build/wii/dolphin.png`.
+- The runner copies `build/wii/sd` to a folder of its own for Dolphin, which writes the card back
+  into that copy when the emulation stops; `--sd-out DIR` copies the files that are new or changed
+  there to `DIR` when the run ends (an empty `build/wii/sd/apps/halo/logs` makes the game write
+  its file log, `logs/log-NN.log`, which a checkpoint run otherwise leaves in the copy, out of
+  reach; saves too).
 - `--backtrace build/wii/halo.elf` attaches gdb through Dolphin's stub and prints every thread's
   stack when the run ends.
 - It runs Dolphin on Vulkan, single-core by default (`--dual-core` for speed). Dolphin's
@@ -167,11 +172,23 @@ Smaller changes with the same aim: a copy that nothing was written to (a file ma
 renamed without a sync; a file opened for reading and writing that the game then only reads (the
 listing of the saves opens every one to check its sum) is opened for reading, and gets its copy
 at the first write; `SetFileAttributesA` does not write the read-only bit when it is already as
-asked (the game makes a file ordinary before it deletes it); and a path that is there as it is
-written is translated with one `stat` where it had a look into every directory along it
-(`translate_as_written`: each look opens a directory of the card and reads all its entries, once
-for every part of the path, at every open; the answer is the same, which `tools/harness/tests/test_path_translation.py` checks
-against the look at every part, and it counts the directories looked into).
+asked (the game makes a file ordinary before it deletes it); and the translation of a path no longer
+looks into the card's directories at every open. The look was one opening and reading of a directory
+for every part of every path (libfat searches the path from the root for each entry it reads), and
+for a file that is not there yet, as the saves' new files are, the one `stat` that the first way
+spared did not help. The first start's 250 translations took 1066 ms of the 1.84 s of its start-up
+checks. Now a directory is read once (`xbox_files.c`, "the directories' listings": up to 64
+directories of up to 512 entries) and the spellings of its entries come from the listing; the answer is the
+one the look gives, except in the case of a letter for a file made or removed since the directory was read,
+and the card does not tell cases apart. A directory that was not there when it was first looked into stays so
+(its parts are taken as written), and a drive's directory (`saves/z`) is asked for once. The test
+(`tools/harness/tests/test_path_translation.py`) checks every answer against the look at every part,
+counts the directories read (each once, whatever the number of paths, none by a second pass), and has
+seven faults that must be caught. The model of the first start: of the 250 translations, the paths in
+about thirty directories (the saves' tree, sixteen of them the default playlists' folders) cost one
+read of a directory each, about thirty in all, where they cost two `stat`s and a read of a directory
+for each file to be made. What this saves in milliseconds is for a checkpoint run (the `paths` figure of the
+`files:` line: it was 1066 ms for 250 calls on a fresh card).
 
 What was measured, and what was not: the call counts above are exact (the host test counts the
 calls that change a modelled card). The time is for a checkpoint run: the log now says where the
@@ -187,6 +204,30 @@ files: writes took 83 ms (sd:/apps/halo/saves/z/saved/playlists/default_playlist
 mkdir and the opening of a listing, `attributes` stat, `writes`, `syncs`, `closes`, `replacing` the
 copy's rename over its file, `deleting`). The start-up's cost is the total on the line after the
 last default variant.
+
+### The clock
+
+The game reads the clock thousands of times a frame (`GetTickCount` in `system_milliseconds`,
+`QueryPerformanceCounter` for the frame timing and the file reads, the renderer's timing of its own
+stages). The Wii's time base runs at 60.75 MHz, and the C library's way to microseconds, `ticks *
+8 / 486`, is a 64-bit division, which the 750CL does in a library call (`__udivdi3`, about a hundred
+instructions): in a profile of b30 it was 1.5% of the processor, 93% of it from `wl_platform_time_us`
+(147 of 9999 samples), whose callers were `draw_streams` (105) and `draw_prepare` (31).
+WiiLibs' `wl/platform/timebase.h` converts the count without it (`wl_timebase_us`,
+`wl_timebase_ms`): long division of the count in base 2^16 by a constant under 2^16, as three
+divisions of 32 bits by a constant, each of which the compiler makes a multiplication by a
+reciprocal; exact for every 64-bit count (WiiLibs' `test_platform_timebase` compares it with a
+bit-by-bit division on the host and under qemu on big-endian PowerPC, over the edges of every
+digit, the wrap of the upper half and of the whole count, and 300000 counts of every width). Counted
+under qemu-ppc with WiiLibs' `tools/qemu_icount.py`, a call and its loop were 96 instructions with the
+division and 43 with this, of which about ten are the loop. `wl_platform_time_us`, `_ms` and
+the log sink read the time base with `mftbu`/`mftb` in place, with no call. The port's
+`GetTickCount` and `QueryPerformanceCounter` (`xbox_kernel.c`) use the same (they went through
+newlib's `clock_gettime` and a division of nanoseconds by a million), and so do the files' timing
+(`xbox_files.c`: the counter counts microseconds, so that `card_now` and each read do no
+multiplication and division) and the controllers' (`xinput_wii.c`). What is left is in
+`src/d3d8_gx.c`: its timing of the stages reads the clock about ten times a draw (`draw_streams`,
+`draw_prepare`); with this each read is cheap, but the reads could be fewer.
 
 ### The loading screen
 
@@ -1535,8 +1576,12 @@ misses it loses its time.
    `apps/halo/logs`. With that folder the game writes its log to `apps/halo/logs/log-NN.log` (NN
    the first number not used, 00 to 99, then 00 again; opened by `wii_boot.c` after the SD card and
    the USB drive are mounted, so the first lines, up to the "IOS" line, are on the debug port only;
-   written 4 KB at a time and when the game leaves, stops or reports a crash, so a cut power loses
-   the last lines); without the folder it writes nothing to the card, and a console has no other
+   written and synced to the card when 4 KB are ready, at the first line that comes 2 s after the
+   last sync, and when the game leaves (`wl_platform_exit`: the shutdown hooks, then the log is
+   flushed and closed, then the card is unmounted) or stops (a stop screen), so a cut power or a
+   crash loses the last 2 s of lines and no more; a crash's own report goes to the debug port and the
+   screen, not to the file, which it cannot write safely from the crashed thread, since that thread
+   may hold libfat's lock); without the folder it writes nothing to the card, and a console has no other
    way to give the log back, so every item below that says "the log" needs it. Delete old logs now
    and then. `apps/halo/config.toml` is where the settings go (`port/linux/README.md` has every
    setting and its default).

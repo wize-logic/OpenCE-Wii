@@ -74,11 +74,13 @@ static unsigned long card_last_report_ms;
 
 static unsigned long long card_now(void)
 {
-	LARGE_INTEGER counter, frequency;
+	LARGE_INTEGER counter;
 
+	/* (the port's performance counter counts microseconds, as
+	counter_microseconds below uses: no 64-bit multiplication and division
+	to microseconds at each of the two calls of every card call) */
 	QueryPerformanceCounter(&counter);
-	QueryPerformanceFrequency(&frequency);
-	return (unsigned long long)counter.QuadPart * 1000000ULL / (unsigned long long)frequency.QuadPart;
+	return (unsigned long long)counter.QuadPart;
 }
 
 static void card_report(unsigned long long now)
@@ -126,6 +128,17 @@ static void card_end(int kind, unsigned long long started, const char *path)
 #endif
 
 /* ---------- paths */
+
+/* a count of the performance counter as microseconds: the port's counter
+counts them (xbox_kernel.c), so that this is no 64-bit multiplication and
+division, which cost a library call of a hundred instructions each on the
+Wii, at every read */
+static unsigned long long counter_microseconds(LONGLONG count, LONGLONG frequency)
+{
+	if (frequency == 1000000)
+		return (unsigned long long)count;
+	return (unsigned long long)count * 1000000ULL / (unsigned long long)frequency;
+}
 
 static BOOL directory_exists(const char *path)
 {
@@ -351,6 +364,177 @@ static BOOL next_path_component(const char **cursor, char *component, unsigned l
 	}
 }
 
+/* the spelling a directory has an entry in, found by looking into the
+directory: an entry that is written as it is, else the first that differs in
+the case only, else none (the name as written) */
+static void look_for_entry(const char *directory, const char *component, char *on_disk, unsigned long size)
+{
+	char found[256];
+
+	if (posix_find_entry_case_insensitive(directory, component, found, sizeof(found)))
+	{
+		/* prefer an exact match when several spellings exist */
+		char exact[1100];
+		struct posix_file_information information;
+
+		snprintf(exact, sizeof(exact), "%s/%s", directory, component);
+		if (posix_stat(exact, &information) == 0)
+			snprintf(found, sizeof(found), "%s", component);
+	}
+	else
+	{
+		snprintf(found, sizeof(found), "%s", component);
+	}
+	snprintf(on_disk, size, "%s", found);
+}
+
+#ifdef HALO_WII
+/* ---- the directories' listings (begin)
+
+port: a directory of the card is read once, and the spellings of its entries
+come from what was read. Looking into a directory opens it and reads all of
+its entries (libfat searches the path from the root for each of those), and
+the translation did that for every part of every path that was not there as
+written yet: 250 translations took a second of the first start's two,
+mostly the saves' new directories and files.
+
+The answer can differ from a look into the directory only in the case of a
+letter: a file made since the directory was read is not in the listing (its
+name is taken as written), and one removed since is (its name is taken as it
+was). Both name the same file on the card, which does not tell the cases
+apart. A directory that is not there when it is first looked into stays "not
+there" (its parts are taken as written), and one of more than
+_listing_maximum_entries entries is looked into each time, as before.
+
+The table holds _listing_maximum_directories directories. A translation
+holds the lock while the card is read, which is only for a directory's first
+look. */
+enum
+{
+	_listing_maximum_directories = 64,
+	_listing_maximum_entries = 512,
+	_listing_maximum_bytes = 16384
+};
+
+enum
+{
+	_listing_kept, /* names holds the entries */
+	_listing_missing, /* the directory was not there */
+	_listing_too_large /* there are more entries than are kept: look into the directory each time */
+};
+
+struct directory_listing
+{
+	char *directory;
+	char *names; /* the entries' names in the order the directory gave them, one after another, each with its end */
+	unsigned long count;
+	int state;
+};
+
+static struct directory_listing directory_listings[_listing_maximum_directories];
+static unsigned long directory_listing_count;
+static unsigned long directory_listing_reads; /* the directories read, for the test */
+static char directory_listing_buffer[_listing_maximum_bytes];
+static pthread_mutex_t directory_listing_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* the listing of a directory, read when it is not kept yet; NULL when the table is full. The lock is held. */
+static struct directory_listing *directory_listing_get(const char *directory)
+{
+	struct directory_listing *listing;
+	unsigned long index;
+	unsigned long used = 0;
+	unsigned long count = 0;
+	int state = _listing_kept;
+	char name[256];
+	void *handle;
+
+	for (index = 0; index < directory_listing_count; index++)
+	{
+		if (!strcmp(directory_listings[index].directory, directory))
+			return directory_listings + index;
+	}
+	if (directory_listing_count >= _listing_maximum_directories)
+		return NULL;
+	listing = directory_listings + directory_listing_count;
+	listing->directory = strdup(directory);
+	if (!listing->directory)
+		return NULL;
+	directory_listing_reads++;
+	handle = posix_directory_open(directory);
+	if (!handle)
+	{
+		state = _listing_missing;
+	}
+	else
+	{
+		while (posix_directory_next(handle, name, sizeof(name)))
+		{
+			unsigned long length = strlen(name) + 1;
+
+			if (count >= _listing_maximum_entries || used + length > sizeof(directory_listing_buffer))
+			{
+				state = _listing_too_large;
+				break;
+			}
+			memcpy(directory_listing_buffer + used, name, length);
+			used += length;
+			count++;
+		}
+		posix_directory_close(handle);
+	}
+	listing->names = NULL;
+	if (state == _listing_kept && used)
+	{
+		listing->names = (char *)malloc(used);
+		if (!listing->names)
+		{
+			free(listing->directory);
+			return NULL;
+		}
+		memcpy(listing->names, directory_listing_buffer, used);
+	}
+	listing->count = count;
+	listing->state = state;
+	directory_listing_count++;
+	return listing;
+}
+
+/* the spelling of component in directory from its listing: an entry written
+as it is, else the first that differs in the case only, else as written;
+FALSE when the directory is not kept (the caller looks into it) */
+static BOOL spelling_from_listing(const char *directory, const char *component, char *on_disk, unsigned long size)
+{
+	struct directory_listing *listing;
+	const char *match = NULL;
+	BOOL kept = FALSE;
+
+	pthread_mutex_lock(&directory_listing_lock);
+	listing = directory_listing_get(directory);
+	if (listing && listing->state != _listing_too_large)
+	{
+		unsigned long index;
+		const char *name = listing->names;
+
+		kept = TRUE;
+		for (index = 0; index < listing->count; index++)
+		{
+			if (!strcmp(name, component))
+			{
+				match = name;
+				break;
+			}
+			if (!match && !strcasecmp(name, component))
+				match = name;
+			name += strlen(name) + 1;
+		}
+		snprintf(on_disk, size, "%s", match ? match : component);
+	}
+	pthread_mutex_unlock(&directory_listing_lock);
+	return kept;
+}
+/* ---- the directories' listings (end) */
+#endif
+
 /* adds a component to a host path, in the spelling the directory has it (the
 Xbox's volumes did not tell the cases apart) */
 static void append_path_component(char *resolved, unsigned long size, const char *component)
@@ -358,79 +542,33 @@ static void append_path_component(char *resolved, unsigned long size, const char
 	char on_disk[256];
 	unsigned long length;
 
-	if (posix_find_entry_case_insensitive(resolved, component, on_disk, sizeof(on_disk)))
-	{
-		/* prefer an exact match when several spellings exist */
-		char exact[1100];
-		struct posix_file_information information;
-
-		snprintf(exact, sizeof(exact), "%s/%s", resolved, component);
-		if (posix_stat(exact, &information) == 0)
-			snprintf(on_disk, sizeof(on_disk), "%s", component);
-	}
-	else
-	{
-		snprintf(on_disk, sizeof(on_disk), "%s", component);
-	}
+#ifdef HALO_WII
+	if (!spelling_from_listing(resolved, component, on_disk, sizeof(on_disk)))
+#endif
+		look_for_entry(resolved, component, on_disk, sizeof(on_disk));
 	length = strlen(resolved);
 	snprintf(resolved + length, size - length, "/%s", on_disk);
 }
 
-#ifdef HALO_WII
-/* port: a path that is there as it is written needs no look into the
-directories (each of those opens a directory of the card and reads all of its
-entries, once for every part of the path, at every open): one stat of the
-whole path, or when the file is not there yet (it is to be made) one of its
-folder and one look into that folder for the file's own spelling. The result
-is the same as the look at every part gives, which prefers the spelling as
-written where it exists. Returns whether the host path is made; resolved is
-spoilt when it is not. */
-static BOOL translate_as_written(char *resolved, unsigned long size, const char *cursor, char *host_path,
-	unsigned long host_path_size)
+/* adds the parts of an Xbox path (relative to the drive) to a host path */
+static void append_path(char *resolved, unsigned long size, const char *cursor)
 {
 	char component[256];
-	char last[256];
-	unsigned long parent_length = 0;
-	unsigned long length;
-	struct posix_file_information information;
-	BOOL any = FALSE;
 
-	last[0] = '\0';
 	while (next_path_component(&cursor, component, sizeof(component)))
-	{
-		length = strlen(resolved);
-		if (length + 1 + strlen(component) + 1 > size)
-			return FALSE;
-		parent_length = length;
-		snprintf(resolved + length, size - length, "/%s", component);
-		snprintf(last, sizeof(last), "%s", component);
-		any = TRUE;
-	}
-	if (!any)
-		return FALSE;
-	if (posix_stat(resolved, &information) == 0)
-	{
-		snprintf(host_path, host_path_size, "%s", resolved);
-		return TRUE;
-	}
-	resolved[parent_length] = '\0';
-	if (parent_length && posix_stat(resolved, &information) == 0 && (information.flags & _posix_file_is_directory))
-	{
-		append_path_component(resolved, size, last);
-		snprintf(host_path, host_path_size, "%s", resolved);
-		return TRUE;
-	}
-	return FALSE;
+		append_path_component(resolved, size, component);
 }
+
+#ifdef HALO_WII
+/* port: the drives whose directories are known to be there */
+static unsigned long drives_made;
 #endif
 
 void platform_translate_path(const char *xbox_path, char *host_path, unsigned long host_path_size)
 {
 	char resolved[1024];
-	char component[256];
 	const char *cursor = xbox_path;
 #ifdef HALO_WII
-	char root[1024];
 	unsigned long long started = card_now();
 #endif
 
@@ -445,26 +583,25 @@ void platform_translate_path(const char *xbox_path, char *host_path, unsigned lo
 		}
 		else if (drive != 'd')
 		{
-			struct posix_file_information information;
-
 			snprintf(resolved, sizeof(resolved), "%s/%c", platform_save_root(), drive);
-			/* every Xbox drive always exists; create its directory on first use */
-			if (posix_stat(resolved, &information) != 0)
-				posix_make_directory(resolved);
+#ifdef HALO_WII
+			/* port: once is enough (asking the card for the directory is slow) */
+			if (!(drives_made & (1UL << (drive - 'a'))))
+#endif
+			{
+				struct posix_file_information information;
+
+				/* every Xbox drive always exists; create its directory on first use */
+				if (posix_stat(resolved, &information) != 0)
+					posix_make_directory(resolved);
+#ifdef HALO_WII
+				drives_made |= 1UL << (drive - 'a');
+#endif
+			}
 		}
 		cursor += 2;
 	}
-#ifdef HALO_WII
-	snprintf(root, sizeof(root), "%s", resolved);
-	if (translate_as_written(resolved, sizeof(resolved), cursor, host_path, host_path_size))
-	{
-		card_end(_card_translate, started, NULL);
-		return;
-	}
-	snprintf(resolved, sizeof(resolved), "%s", root);
-#endif
-	while (next_path_component(&cursor, component, sizeof(component)))
-		append_path_component(resolved, sizeof(resolved), component);
+	append_path(resolved, sizeof(resolved), cursor);
 	snprintf(host_path, host_path_size, "%s", resolved);
 #ifdef HALO_WII
 	card_end(_card_translate, started, NULL);
@@ -1351,13 +1488,11 @@ static BOOL read_at(struct platform_file *file, LPVOID buffer, DWORD count, LPDW
 	platform_file_reads.bytes += total;
 	QueryPerformanceCounter(&ended);
 	QueryPerformanceFrequency(&frequency);
-	platform_file_reads.microseconds += (unsigned long long)(ended.QuadPart - started.QuadPart) * 1000000ULL /
-		(unsigned long long)frequency.QuadPart;
+	platform_file_reads.microseconds += counter_microseconds(ended.QuadPart - started.QuadPart, frequency.QuadPart);
 #ifdef HALO_WII
 	read_counted(file, buffer, total, offset, positioned,
-		(unsigned long)((unsigned long long)(ended.QuadPart - started.QuadPart) * 1000000ULL /
-			(unsigned long long)frequency.QuadPart),
-		(unsigned long long)ended.QuadPart * 1000000ULL / (unsigned long long)frequency.QuadPart);
+		(unsigned long)counter_microseconds(ended.QuadPart - started.QuadPart, frequency.QuadPart),
+		counter_microseconds(ended.QuadPart, frequency.QuadPart));
 #endif
 	return TRUE;
 }
