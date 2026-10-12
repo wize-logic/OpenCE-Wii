@@ -80,6 +80,13 @@ void platform_request_quit(void)
 }
 
 /* (port/wii/src/wii_system.c) */
+/* (port/linux/game/level_run.c's, which plays a level for a script's
+objective and destroy steps: not reached by these checks) */
+void level_run_begin(void) {}
+void level_run_stop(void) {}
+void level_run_destroy(const char *name) { (void)name; }
+int level_run_controller(float *sticks, unsigned long *buttons) { (void)sticks; (void)buttons; return 0; }
+
 int wii_system_simulate(int power);
 int wii_system_simulate(int power)
 {
