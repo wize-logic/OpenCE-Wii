@@ -30,6 +30,8 @@ matched case-insensitively, like the Xbox's FATX volumes.
 #ifdef HALO_WII
 #include <pthread.h>
 #include "wl/platform/posix.h"
+#include "wl/platform/dircache.h"
+#include "wl/platform/file_replace.h"
 #endif
 
 #ifdef HALO_WII
@@ -392,145 +394,21 @@ static void look_for_entry(const char *directory, const char *component, char *o
 /* ---- the directories' listings (begin)
 
 port: a directory of the card is read once, and the spellings of its entries
-come from what was read. Looking into a directory opens it and reads all of
-its entries (libfat searches the path from the root for each of those), and
-the translation did that for every part of every path that was not there as
-written yet: 250 translations took a second of the first start's two,
-mostly the saves' new directories and files.
+come from what was read (WiiLibs' wl_dircache, wl/platform/dircache.h, which
+says what the answer can differ in and what it keeps). Looking into a
+directory opens it and reads all of its entries (libfat searches the path from
+the root for each of those), and the translation did that for every part of
+every path that was not there as written yet: 250 translations took a second
+of the first start's two, mostly the saves' new directories and files. A
+directory that is not kept (more entries than the cache holds, or the table
+full) is looked into each time, as before. */
+static WlDirCache directory_cache = WL_DIRCACHE_INIT;
 
-The answer can differ from a look into the directory only in the case of a
-letter: a file made since the directory was read is not in the listing (its
-name is taken as written), and one removed since is (its name is taken as it
-was). Both name the same file on the card, which does not tell the cases
-apart. A directory that is not there when it is first looked into stays "not
-there" (its parts are taken as written), and one of more than
-_listing_maximum_entries entries is looked into each time, as before.
-
-The table holds _listing_maximum_directories directories. A translation
-holds the lock while the card is read, which is only for a directory's first
-look. */
-enum
-{
-	_listing_maximum_directories = 64,
-	_listing_maximum_entries = 512,
-	_listing_maximum_bytes = 16384
-};
-
-enum
-{
-	_listing_kept, /* names holds the entries */
-	_listing_missing, /* the directory was not there */
-	_listing_too_large /* there are more entries than are kept: look into the directory each time */
-};
-
-struct directory_listing
-{
-	char *directory;
-	char *names; /* the entries' names in the order the directory gave them, one after another, each with its end */
-	unsigned long count;
-	int state;
-};
-
-static struct directory_listing directory_listings[_listing_maximum_directories];
-static unsigned long directory_listing_count;
-static unsigned long directory_listing_reads; /* the directories read, for the test */
-static char directory_listing_buffer[_listing_maximum_bytes];
-static pthread_mutex_t directory_listing_lock = PTHREAD_MUTEX_INITIALIZER;
-
-/* the listing of a directory, read when it is not kept yet; NULL when the table is full. The lock is held. */
-static struct directory_listing *directory_listing_get(const char *directory)
-{
-	struct directory_listing *listing;
-	unsigned long index;
-	unsigned long used = 0;
-	unsigned long count = 0;
-	int state = _listing_kept;
-	char name[256];
-	void *handle;
-
-	for (index = 0; index < directory_listing_count; index++)
-	{
-		if (!strcmp(directory_listings[index].directory, directory))
-			return directory_listings + index;
-	}
-	if (directory_listing_count >= _listing_maximum_directories)
-		return NULL;
-	listing = directory_listings + directory_listing_count;
-	listing->directory = strdup(directory);
-	if (!listing->directory)
-		return NULL;
-	directory_listing_reads++;
-	handle = posix_directory_open(directory);
-	if (!handle)
-	{
-		state = _listing_missing;
-	}
-	else
-	{
-		while (posix_directory_next(handle, name, sizeof(name)))
-		{
-			unsigned long length = strlen(name) + 1;
-
-			if (count >= _listing_maximum_entries || used + length > sizeof(directory_listing_buffer))
-			{
-				state = _listing_too_large;
-				break;
-			}
-			memcpy(directory_listing_buffer + used, name, length);
-			used += length;
-			count++;
-		}
-		posix_directory_close(handle);
-	}
-	listing->names = NULL;
-	if (state == _listing_kept && used)
-	{
-		listing->names = (char *)malloc(used);
-		if (!listing->names)
-		{
-			free(listing->directory);
-			return NULL;
-		}
-		memcpy(listing->names, directory_listing_buffer, used);
-	}
-	listing->count = count;
-	listing->state = state;
-	directory_listing_count++;
-	return listing;
-}
-
-/* the spelling of component in directory from its listing: an entry written
-as it is, else the first that differs in the case only, else as written;
-FALSE when the directory is not kept (the caller looks into it) */
+/* the spelling of component in directory from its listing; FALSE when the
+directory is not kept (the caller looks into it) */
 static BOOL spelling_from_listing(const char *directory, const char *component, char *on_disk, unsigned long size)
 {
-	struct directory_listing *listing;
-	const char *match = NULL;
-	BOOL kept = FALSE;
-
-	pthread_mutex_lock(&directory_listing_lock);
-	listing = directory_listing_get(directory);
-	if (listing && listing->state != _listing_too_large)
-	{
-		unsigned long index;
-		const char *name = listing->names;
-
-		kept = TRUE;
-		for (index = 0; index < listing->count; index++)
-		{
-			if (!strcmp(name, component))
-			{
-				match = name;
-				break;
-			}
-			if (!match && !strcasecmp(name, component))
-				match = name;
-			name += strlen(name) + 1;
-		}
-		snprintf(on_disk, size, "%s", match ? match : component);
-	}
-	pthread_mutex_unlock(&directory_listing_lock);
-	return kept;
+	return wl_dircache_spelling(&directory_cache, directory, component, on_disk, size) ? TRUE : FALSE;
 }
 /* ---- the directories' listings (end) */
 #endif
@@ -741,8 +619,8 @@ is not, is. A write that fails (the card is full, read-only or gone) leaves the
 old file as it was, and the game gets the error its handlers know. The revert
 buffer (z:\savegame.bin, opened unbuffered and kept open) is not shadowed:
 nothing reads it after the game ends. */
-#define SHADOW_TEMPORARY_SUFFIX ".wtmp"
-#define SHADOW_OLD_SUFFIX ".wold"
+#define SHADOW_TEMPORARY_SUFFIX WL_FILE_TEMPORARY_SUFFIX
+#define SHADOW_OLD_SUFFIX WL_FILE_OLD_SUFFIX
 #define SHADOW_COPY_SIZE 32768
 #define SHADOW_SWEEP_DEPTH 8
 
@@ -775,30 +653,12 @@ static BOOL shadow_wanted(const char *path)
 	return length && !strncmp(path, root, length) && path[length] == '/';
 }
 
-/* puts the written copy in place of the file: 0, or the errno that stopped it */
+/* puts the written copy in place of the file: 0, or the errno that stopped it
+(WiiLibs' wl_file_replace, wl/platform/file_replace.h: the rename, and on FAT
+the old file's going aside) */
 static int shadow_replace(const char *temporary_path, const char *path)
 {
-	char old_path[1032];
-	struct posix_file_information information;
-	int error;
-
-	if (rename(temporary_path, path) == 0)
-		return 0;
-	if (posix_stat(path, &information) != 0 || (information.flags & _posix_file_is_directory))
-		return errno ? errno : EIO;
-	/* FAT: the old file goes aside, the copy takes its name, the old file goes */
-	shadow_name(old_path, sizeof(old_path), path, SHADOW_OLD_SUFFIX);
-	unlink(old_path);
-	if (rename(path, old_path) != 0)
-		return errno ? errno : EIO;
-	if (rename(temporary_path, path) != 0)
-	{
-		error = errno ? errno : EIO;
-		rename(old_path, path);
-		return error;
-	}
-	unlink(old_path);
-	return 0;
+	return wl_file_replace(temporary_path, path);
 }
 
 static BOOL shadow_busy(const struct platform_file *file, const char *temporary_path)
@@ -990,54 +850,19 @@ static void shadow_finish(struct platform_file *file)
 	write_end();
 }
 
-/* what a cut left in the save folders: the file that went aside
-(<file>.wold) comes back where <file> is missing and goes where it is not,
-and a half-written copy (<file>.wtmp) goes. Returns whether it changed
-something (the folder is then read again). */
-static BOOL shadow_sweep_directory(const char *directory, int depth)
+/* what a cut left in the save folders (WiiLibs' wl_file_recover): the file
+that went aside (<file>.wold) comes back where <file> is missing and goes where
+it is not, and a half-written copy (<file>.wtmp) goes */
+static void shadow_sweep_report(const char *path, int restored, void *user)
 {
-	void *stream = posix_directory_open(directory);
-	char name[256];
-	char path[1400];
-	char target[1400];
-	struct posix_file_information information;
-	BOOL changed = FALSE;
-
-	if (!stream)
-		return FALSE;
-	while (!changed && posix_directory_next(stream, name, sizeof(name)))
-	{
-		snprintf(path, sizeof(path), "%s/%s", directory, name);
-		if (shadow_name_has_suffix(name, SHADOW_OLD_SUFFIX))
-		{
-			snprintf(target, sizeof(target), "%.*s", (int)(strlen(path) - strlen(SHADOW_OLD_SUFFIX)), path);
-			if (posix_stat(target, &information) == 0)
-				changed = unlink(path) == 0;
-			else
-				changed = rename(path, target) == 0;
-			if (changed)
-				platform_log("save: %s put back after an interrupted write", target);
-		}
-		else if (shadow_name_has_suffix(name, SHADOW_TEMPORARY_SUFFIX))
-		{
-			changed = unlink(path) == 0;
-		}
-		else if (depth < SHADOW_SWEEP_DEPTH && posix_stat(path, &information) == 0 &&
-			(information.flags & _posix_file_is_directory))
-		{
-			changed = shadow_sweep_directory(path, depth + 1);
-		}
-	}
-	posix_directory_close(stream);
-	return changed;
+	(void)user;
+	if (restored)
+		platform_log("save: %s put back after an interrupted write", path);
 }
 
 static void shadow_sweep(const char *root)
 {
-	int guard;
-
-	for (guard = 0; guard < 1000 && shadow_sweep_directory(root, 0); guard++)
-		;
+	wl_file_recover(root, SHADOW_SWEEP_DEPTH, shadow_sweep_report, NULL);
 }
 
 /* ---------- files made again

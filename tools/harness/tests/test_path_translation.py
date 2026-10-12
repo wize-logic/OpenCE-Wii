@@ -7,28 +7,30 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from harness import build, function, mutated, read, run  # noqa: E402
+from harness import build, function, mutated, read, read_wiilibs, run, wiilibs  # noqa: E402
 
 FILES = "port/linux/src/xbox_files.c"
 LISTINGS_BEGIN = "/* ---- the directories' listings (begin)"
 LISTINGS_END = "/* ---- the directories' listings (end) */"
 
-# a fault in the translation, and the check that must catch it (the program's exit status is not 0)
+# a fault in the translation, and the check that must catch it (the program's exit status is not 0); the listings
+# are WiiLibs' (wl/platform/dircache.c), whose own tests (tests/platform/test_platform_dircache.c) see these as well
 NEGATIVE_CONTROLS = {
-    "listing-never-kept": (("		if (!strcmp(directory_listings[index].directory, directory))",
-                            "		if (0)"), "listings"),
-    "exact-spelling-not-preferred": (("			if (!strcmp(name, component))\n			{\n				match = name;\n				break;\n			}\n",
-                                      ""), "listings"),
-    "first-spelling-not-kept": (("			if (!match && !strcasecmp(name, component))", "			if (!strcasecmp(name, component))"),
-                                "listings"),
-    "large-directory-cut": (("				state = _listing_too_large;\n				break;", "				break;"), "listings"),
-    "not-found-without-the-name": (("		snprintf(on_disk, size, \"%s\", match ? match : component);",
-                                    "		snprintf(on_disk, size, \"%s\", match ? match : \"\");"), "listings"),
-    "listing-not-counted": (("	listing->state = state;\n	directory_listing_count++;",
-                                          "	listing->state = state;"), "listings"),
+    "listing-never-kept": (("        if (strcmp(cache->lists[i]->directory, directory) == 0) {\n            return cache->lists[i];",
+                            "        if (0) {\n            return cache->lists[i];"), "dircache"),
+    "exact-spelling-not-preferred": (("            if (strcmp(name, component) == 0) {\n                match = name;\n                break;\n            }\n",
+                                      ""), "dircache"),
+    "first-spelling-not-kept": (("            if (match == NULL && strcasecmp(name, component) == 0) {",
+                                 "            if (strcasecmp(name, component) == 0) {"), "dircache"),
+    "large-directory-cut": (("        r->too_large = true;\n        return false;", "        return false;"), "dircache"),
+    "not-found-without-the-name": (("match != NULL ? match : component", "match != NULL ? match : \"\""), "dircache"),
+    "listing-not-counted": (("    cache->lists[cache->count++] = list;", "    cache->lists[cache->count] = list;"), "dircache"),
     "dots-kept": (("		if (length && strspn(component, \". \") != length)", "		if (length)"),
                   "next_path_component"),
 }
+
+
+pytestmark = pytest.mark.skipif(wiilibs() is None, reason="WiiLibs not found (WIILIBS, ./WiiLibs or ../WiiLibs)")
 
 
 def listings(source):
@@ -43,13 +45,13 @@ def generated(fault=None, faulty=None):
         if fault and name == faulty:
             text = mutated(text, *fault)
         code += text + "\n"
-    text = listings(source)
-    if fault and faulty == "listings":
-        text = mutated(text, *fault)
-    code += text + "\n"
+    code += listings(source) + "\n"
     for name in ("append_path_component", "append_path"):
         code += function(source, name) + "\n"
-    return (("under_test.inc", "#define HALO_WII 1\n" + code), ("posix.h", read("port/linux/src/posix.h")),
+    dircache = read_wiilibs("wl/platform/dircache.c")
+    if fault and faulty == "dircache":
+        dircache = mutated(dircache, *fault)
+    return (("under_test.inc", "#define HALO_WII 1\n" + code), ("dircache.inc", dircache), ("posix.h", read("port/linux/src/posix.h")),
             ("posix_files.inc", read("port/linux/src/posix_files.c")))
 
 

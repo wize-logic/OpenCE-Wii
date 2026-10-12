@@ -8,6 +8,10 @@ graphics, so a fix can carry a test that CI runs.
 They need `clang` (or `CC`) and a 32-bit C runtime (`lib32-glibc`, `gcc-multilib`), as the Linux build does. pytest
 finds every `tests/test_*.py`, so a new test needs no change to CI.
 
+The Wii port's tests of code that has moved to WiiLibs (the saves' replacing and sweeping, the directories'
+listings: `test_atomic_saves.py`, `test_path_translation.py`) take it from WiiLibs' sources, found in `WIILIBS`,
+`./WiiLibs` or `../WiiLibs`; without a checkout they are skipped.
+
 ## A test
 
 - `tests/<name>.c`: the fake world, only what the code reads, with what it calls stubbed as macros that name only the
