@@ -217,7 +217,8 @@ inflated it to, and the Wii reads it where it is.
   - the halves of `LARGE_INTEGER`
   - the recorded animations' bitfield header byte (rewritten by the converter)
   - the compressed animations' floats, read a byte at a time (the 750 can trap on a misaligned
-    float load)
+    float load), and the script stack's values, each started at a multiple of 4 for the same
+    reason
   - values written at one width and read at another: a profile count passed as a `word *` to a
     function that writes a word, a chicago shader's `extra_flags` (the tag's long), a fog's
     `flags` (the tag's word, read as a byte), the server's read of the pregame start request (a
@@ -1114,8 +1115,21 @@ Dolphin runs the game, but these need the console:
   "The hardware counters"), on the console.
 - **Alignment exceptions.** The PowerPC 750 can trap a floating-point load
   from an address that is not a multiple of 4; Dolphin does not. The
-  compressed animations' floats are read a byte at a time for this; any
-  other crash report ("CRASH: alignment exception") names the place.
+  compressed animations' floats are read a byte at a time for this, and the
+  script stack's values start at a multiple of 4 (`HS_STACK_PADDING`,
+  `source/hs/hs_runtime.c`). The rest was audited with an x86 build compiled
+  with clang's `-fsanitize=alignment` (a handler that logs each site), played
+  by the bot through every campaign level and the 13 multiplayer maps
+  (25,000 to 470,000 ticks each): of the misaligned accesses it reported,
+  only the script stack's are floating-point loads or stores in the Wii's
+  objects (the others are integer loads and stores, which the 750 completes
+  without a trap: the script stack's frames and longs, the debug allocator's
+  headers, the recorded animations' shorts, the breakable surfaces' flags and
+  the tag validator's read of compressed animations), and the game's objects
+  have no `lmw` or `stmw` (their one `lwarx` is on an aligned pointer). Code
+  the bot did not reach,
+  the menus past the title, saved games and network play were not covered;
+  any other crash report ("CRASH: alignment exception") names the place.
 - **The square root's estimate.** The vertex programs' square root starts
   from `frsqrte`, checked on the host for estimates as coarse as the 750's
   documented 1/32; Broadway's own is not documented.
