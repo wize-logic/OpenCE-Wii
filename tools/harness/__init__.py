@@ -11,9 +11,23 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 HARNESS = Path(__file__).resolve().parent
 
 
+def wiilibs():
+    """WiiLibs' checkout (WIILIBS, else ./WiiLibs, else ../WiiLibs), or None: the Wii port's tests of code that
+    lives there (the saves' replacing, the directories' listings) take it from its sources."""
+    for candidate in (os.environ.get("WIILIBS"), ROOT / "WiiLibs", ROOT.parent / "WiiLibs"):
+        if candidate and (Path(candidate) / "wl" / "platform" / "file_replace.c").is_file():
+            return Path(candidate)
+    return None
+
+
 def read(relative):
     """A source file of the repository, as the compiler reads it."""
     return (ROOT / relative).read_text(encoding="latin-1")
+
+
+def read_wiilibs(relative):
+    """A source file of WiiLibs, as the compiler reads it."""
+    return (wiilibs() / relative).read_text(encoding="latin-1")
 
 
 def function(source, name):
@@ -88,7 +102,8 @@ def build(test, generated):
         (work / name).write_text(text)
     executable = work / test
     command = [os.environ.get("CC", "clang"), "-m32", "-std=gnu99", "-O2", "-Wall", "-Werror", "-Wno-unused-function",
-               "-Wno-unused-variable", "-I", str(HARNESS / "include"), "-I", str(work),
+               "-Wno-unused-variable", "-I", str(HARNESS / "include"), "-I", str(work)] + \
+        (["-I", str(wiilibs())] if wiilibs() else []) + [
                str(HARNESS / "tests" / f"{test}.c"), "-o", str(executable), "-lm"]
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode:

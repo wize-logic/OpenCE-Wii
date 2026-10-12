@@ -296,6 +296,7 @@ static int truncate_descriptor(int descriptor, posix_ulong size_low, posix_ulong
 
 /* ---------- the code under test */
 
+#include "file_replace.inc" /* WiiLibs' wl/platform/file_replace.c, which the saves replace and sweep with, cut and failing like the rest */
 #include "under_test.inc"
 
 /* ---------- files */

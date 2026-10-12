@@ -112,14 +112,15 @@ A save survives a reset, a power-off or a pulled card. Each file the game opens 
 `apps/halo/saves` (the profiles, the saved games, each profile's `savegame.bin`, the checkpoint the
 game keeps for Save and Quit) is written beside itself as `<file>.wtmp`, and takes the file's place
 when the game closes it (`xbox_files.c`, "saves that survive a cut"): the data is synced, then the
-copy is renamed over the old file. libfat cannot rename over a file, so there the old one goes
-aside as `<file>.wold` for the moment between the two renames. A cut at any call leaves the old file
-or the new one, whole.
+copy is renamed over the old file (WiiLibs' `wl_file_replace`, `wl/platform/file_replace.h`). libfat
+cannot rename over a file, so there the old one goes aside as `<file>.wold` for the moment between
+the two renames. A cut at any call leaves the old file or the new one, whole.
 
 - A file the game writes whole from its start (a profile; the checkpoint) is not copied into its
   copy first; one written in part (a patch in the middle, an append, a resize) is.
-- The next start sweeps the save folders (`shadow_sweep`): a `.wold` is put back where its file is
-  missing (the cut came between the two renames) and goes where it is not, and a `.wtmp` goes. The
+- The next start sweeps the save folders (`shadow_sweep`, WiiLibs' `wl_file_recover`): a `.wold` is
+  put back where its file is missing (the cut came between the two renames) and goes where it is not,
+  and a `.wtmp` goes. The
   game's directory listings never show either. A file with a copy that is still open when the
   console leaves is not replaced: the old one stays.
 - Not shadowed: `z:\savegame.bin` opened unbuffered and kept open (the game state's revert buffer,
@@ -133,7 +134,9 @@ or the new one, whole.
 - Writes still go through the gate the shutdown uses (`wii_files_quiesce`): the ones under way
   finish, the ones that would start wait; so does the replacing at close.
 
-Checked on the host: `python -m pytest -q tools/harness/tests/test_atomic_saves.py` runs the
+Checked on the host: `python -m pytest -q tools/harness/tests/test_atomic_saves.py` (with WiiLibs'
+`wl/platform/file_replace.c`, from `WIILIBS`, `./WiiLibs` or `../WiiLibs`; the tests are skipped without
+it, and WiiLibs has its own, `tests/platform/test_platform_file_replace.c`) runs the
 game's own sequences (a profile written whole, the checkpoint with its header last, a patch, an
 append, a file made, emptied and written, grown) on a real directory with the card modelled, cut
 before each call that changes it (and half-way through each write), on a card that renames over a
@@ -177,8 +180,9 @@ looks into the card's directories at every open. The look was one opening and re
 for every part of every path (libfat searches the path from the root for each entry it reads), and
 for a file that is not there yet, as the saves' new files are, the one `stat` that the first way
 spared did not help. The first start's 250 translations took 1066 ms of the 1.84 s of its start-up
-checks. Now a directory is read once (`xbox_files.c`, "the directories' listings": up to 64
-directories of up to 512 entries) and the spellings of its entries come from the listing; the answer is the
+checks. Now a directory is read once (`xbox_files.c`, "the directories' listings", WiiLibs'
+`wl_dircache`, `wl/platform/dircache.h`: up to 64 directories of up to 512 entries) and the spellings
+of its entries come from the listing; the answer is the
 one the look gives, except in the case of a letter for a file made or removed since the directory was read,
 and the card does not tell cases apart. A directory that was not there when it was first looked into stays so
 (its parts are taken as written), and a drive's directory (`saves/z`) is asked for once. The test
@@ -1222,8 +1226,10 @@ and pixel shaders.
   consoles nearly black), so on the Wii `bitmap_2d_get_pixel` asks
   `port/wii/src/wii_bitmap_texel.c` which levels the converter rewrote and reads the texel from
   GX's tiles: the Xbox's texel value for the game's own conversion, or for DXT the CMPR block as
-  the GPU decodes it, with DXT3/5's alpha from the I4 levels. `tools/wii_gx_texel_check.py`
-  checks it on the host against WiiLibs' conversions of every format.
+  the GPU decodes it, with DXT3/5's alpha from the I4 levels. Where a texel sits in GX's tiles and what
+  the hardware makes of it is WiiLibs' (`wl_gxc_texel_raw` and `wl_gxc_texel_read`, `wl/codec/gx_tex.h`);
+  the file keeps the game's part: its bitmap formats, its levels, the Xbox's word.
+  `tools/wii_gx_texel_check.py` checks it on the host against WiiLibs' conversions of every format.
 - **Depth.** A program's position matrix and its depth's a + b/w come from its constants alone,
   from two points along w's gradient. Both vertex paths take them, so a surface's passes meet
   their equal-depth tests whichever path each pass took. A draw whose vertices are all at one w
