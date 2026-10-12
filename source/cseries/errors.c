@@ -193,6 +193,10 @@ static void write_to_debug_file(
 			platform_log("debug.txt: %s", line);
 	}
 #endif
+#ifdef HALO_WEB
+	/* port: and to the page's log (port/web/README.md) */
+	fputs(string, stderr);
+#endif
 }
 
 void write_to_error_file(

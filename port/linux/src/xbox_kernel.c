@@ -23,6 +23,9 @@ int wii_thread_priority(pthread_t thread, int win32_priority);
 #endif
 #include <time.h>
 #include <unistd.h>
+#ifdef HALO_WEB
+#include <emscripten.h>
+#endif
 
 #define PLATFORM_HANDLE_SIGNATURE 0x686e646cUL /* 'hndl' */
 
@@ -685,11 +688,17 @@ is by the time the game runs. */
 static unsigned long long platform_clock_nanoseconds(void)
 {
 	static unsigned long long start;
-	struct timespec now;
 	unsigned long long value, expected = 0;
+#ifdef HALO_WEB
+	/* (the browser's clock, in milliseconds, which clock_gettime reads too,
+	without the 64-bit conversions of its way there) */
+	value = (unsigned long long)(emscripten_get_now() * 1000000.0);
+#else
+	struct timespec now;
 
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	value = (unsigned long long)now.tv_sec * 1000000000ULL + (unsigned long long)now.tv_nsec;
+#endif
 	__atomic_compare_exchange_n(&start, &expected, value - 10000000000ULL, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
 	return value - __atomic_load_n(&start, __ATOMIC_RELAXED);
 }

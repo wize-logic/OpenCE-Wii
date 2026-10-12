@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 # root build script: writes build.ninja for the native ports (Linux, Windows,
-# Android, Wii)
+# Android, Wii) and the web port
 
 import argparse
 import io
@@ -14,6 +14,7 @@ from tools import ninja_syntax
 from tools.android_build import android_configure_inputs, generate_android_build
 from tools.linux_build import check_profile_options, generate_linux_build, linux_configure_inputs
 from tools.wii_build import generate_wii_build, wii_configure_inputs
+from tools.web_build import generate_web_build, web_configure_inputs
 from tools.windows_build import generate_windows_build, windows_configure_inputs
 
 # arguments
@@ -32,7 +33,7 @@ parser.add_argument(
 parser.add_argument(
     "--release",
     action="store_true",
-    help="release builds (Linux, Windows, Android): assertions are not checked",
+    help="release builds (Linux, Windows, Android, web): assertions are not checked",
 )
 parser.add_argument(
     "--profile",
@@ -94,6 +95,11 @@ parser.add_argument(
     metavar="DIR",
     help="WiiLibs' checkout for `ninja wii` (default: ../WiiLibs)",
 )
+parser.add_argument(
+    "--web-emcc",
+    type=str,
+    help="Emscripten's emcc for `ninja web` (default: emcc on the PATH, then EMSDK's or ~/emsdk's)",
+)
 args = parser.parse_args()
 try:
     check_profile_options(args.profile, args.pgo)
@@ -115,6 +121,7 @@ sln = SimpleNamespace(
     android_guest_cc=args.android_guest_cc,
     devkitpro=args.devkitpro,
     wiilibs=args.wiilibs,
+    web_emcc=args.web_emcc,
 )
 
 
@@ -141,6 +148,7 @@ generate_linux_build(n, sln)
 generate_android_build(n, sln)
 generate_windows_build(n, sln)
 generate_wii_build(n, sln)
+generate_web_build(n, sln)
 
 n.comment("Reconfigure on change")
 n.rule(
@@ -159,6 +167,7 @@ n.build(
         *android_configure_inputs(),
         *windows_configure_inputs(),
         *wii_configure_inputs(),
+        *web_configure_inputs(),
     ],
 )
 n.newline()

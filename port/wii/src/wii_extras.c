@@ -12,7 +12,9 @@ answering as its interface says it does when there is none:
 - Halo Custom Edition's texel channels (xbox_textures.c): those maps do not
   run on the Wii (src/wii_memory.c);
 - voice chat (voice_audio.c): no microphone, nothing to hear;
-- internet play (p2p*.c): system link only.
+- internet play (p2p*.c): system link only;
+- write tracking of guest memory (memory_watch.c): none, so a write needs no
+  preparing.
 */
 
 #include "platform.h"
@@ -53,6 +55,12 @@ void text_hires_register_atlas(const unsigned long *texture, unsigned long width
 	(void)texture;
 	(void)width;
 	(void)height;
+}
+
+/* (no atlas, so it never starts over and the hook is never called) */
+void text_hires_set_reset_hook(void (*hook)(void))
+{
+	(void)hook;
 }
 
 long hud_hires_asset_count(void)
@@ -355,6 +363,35 @@ void p2p_set_hosting_public(int public)
 	(void)public;
 }
 
+/* (map sharing's, port/linux/game/map_share.c: no internet player to reach
+or answer; its hashing, p2p_blake2b_256, is reached only for a Custom Edition
+map, which the Wii does not run, and is left to the link's stubs) */
+int p2p_peer_key_hash(unsigned long virtual_address, unsigned char *identifier, unsigned char *key_hash)
+{
+	(void)virtual_address;
+	(void)identifier;
+	(void)key_hash;
+	return 0;
+}
+
+void p2p_set_answering_players(int on)
+{
+	(void)on;
+}
+
+int p2p_reach_player(const unsigned char *key_hash)
+{
+	(void)key_hash;
+	return 0;
+}
+
+int p2p_peer_reached(const unsigned char *identifier, unsigned long *address)
+{
+	(void)identifier;
+	(void)address;
+	return 0;
+}
+
 /* ---------- MSVC's compiler barrier, an intrinsic clang has only for x86
 (source/scenario/scenario.c) */
 
@@ -455,4 +492,12 @@ void voice_audio_mix(float *output, unsigned long frames)
 {
 	(void)output;
 	(void)frames;
+}
+
+/* ---------- guest memory write tracking (memory_watch.c) */
+
+void memory_watch_prepare_write(void *address, unsigned long size)
+{
+	(void)address;
+	(void)size;
 }
