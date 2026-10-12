@@ -3226,14 +3226,26 @@ static void inputs_seed(float (*inputs)[4])
 			memcpy(inputs[reg], device.vertex_registers[reg], sizeof(inputs[reg]));
 }
 
-/* the draw log (debug.draw_log_tick, debug.draw_log_points): the first frame
-of a level (not the main menu's map) drawn at or after that game tick has
-each draw described in the log, the processor's and GX's alike, and the
-given pixels of the back buffer read back after each draw, those it changed
-logged, to name the draws that make a pixel what it is. Off, it costs a draw
-a load and a compare (draw_logging). */
-#define DRAW_LOG_POINTS_MOST 16
+/* the draw log (debug.draw_log_tick, debug.draw_log_points,
+debug.draw_log_vertices): the first frame of a level (not the main menu's
+map) drawn at or after that game tick has each draw described in the log,
+the processor's and GX's alike, and the given pixels of the back buffer read
+back after each draw, colour and depth, those it changed logged, to name the
+draws that make a pixel what it is. The frame's picture and depth are
+written to the game's folder when it is shown (draw_log.tga,
+draw_log_depth.tga), so that the points can be chosen on the frame the log
+describes. Off, it costs a draw a load and a compare (draw_logging). */
+#define DRAW_LOG_POINTS_MOST 512
 #define DRAW_LOG_WRITERS 8
+struct draw_log_point
+{
+	u16 x, y;
+	GXColor last;
+	u32 depth;
+	/* its last writers (draw numbers), and how many there were */
+	unsigned long writers[DRAW_LOG_WRITERS];
+	unsigned long writer_count;
+};
 static struct
 {
 	/* 0 the settings not read yet, 1 waiting for its tick, 2 off or done */
@@ -3244,12 +3256,11 @@ static struct
 	unsigned long frame;
 	/* the logged frame's draws so far (the number of each in the log) */
 	unsigned long draws;
+	/* the draws of at most this many vertices have each vertex logged */
+	unsigned long vertices;
+	/* (allocated when the log is on: draw_log_settings) */
 	unsigned point_count;
-	u16 points[DRAW_LOG_POINTS_MOST][2];
-	GXColor last[DRAW_LOG_POINTS_MOST];
-	/* each point's last writers (draw numbers), and how many there were */
-	unsigned long writers[DRAW_LOG_POINTS_MOST][DRAW_LOG_WRITERS];
-	unsigned long writer_count[DRAW_LOG_POINTS_MOST];
+	struct draw_log_point *points;
 } draw_log_state;
 
 /* the game's clock (source/game/game.h) and whether the main menu's map is
@@ -3258,9 +3269,25 @@ extern unsigned char game_time_initialized(void);
 extern unsigned char game_in_progress(void);
 extern long game_time_get(void);
 extern unsigned char main_menu_is_active(void);
+/* (port/wii/src/wii_posix.c) */
+extern const char *wii_game_folder(void);
 
-/* the settings: the tick, and the points ("x,y;x,y;...", the back buffer's
-pixels, 640 by 480) */
+/* a point of the settings', if there is room */
+static void draw_log_point_add(long x, long y)
+{
+	struct draw_log_point *point;
+
+	if (x < 0 || x >= SCREEN_WIDTH || y < 0 || y >= SCREEN_HEIGHT || draw_log_state.point_count >= DRAW_LOG_POINTS_MOST)
+		return;
+	point = &draw_log_state.points[draw_log_state.point_count++];
+	memset(point, 0, sizeof(*point));
+	point->x = (u16)x;
+	point->y = (u16)y;
+}
+
+/* the settings: the tick, the vertices, and the points ("x,y;x,y;...", the
+back buffer's pixels, 640 by 480; "x,y0-y1" each pixel of a column from y0
+to y1) */
 static void draw_log_settings(void)
 {
 	const char *text = config_string("debug.draw_log_points");
@@ -3268,10 +3295,16 @@ static void draw_log_settings(void)
 	draw_log_state.tick = config_integer("debug.draw_log_tick");
 	draw_log_state.state = draw_log_state.tick >= 0 ? 1 : 2;
 	draw_log_state.point_count = 0;
-	while (text && *text && draw_log_state.point_count < DRAW_LOG_POINTS_MOST)
+	if (draw_log_state.state != 1)
+		return;
+	draw_log_state.vertices = (unsigned long)(config_integer("debug.draw_log_vertices") > 0 ?
+		config_integer("debug.draw_log_vertices") : 0);
+	if (text && *text)
+		draw_log_state.points = malloc(DRAW_LOG_POINTS_MOST * sizeof(*draw_log_state.points));
+	while (draw_log_state.points && text && *text)
 	{
 		char *end;
-		long x = strtol(text, &end, 10), y;
+		long x = strtol(text, &end, 10), y, last;
 
 		if (end == text || *end != ',')
 			break;
@@ -3279,36 +3312,46 @@ static void draw_log_settings(void)
 		y = strtol(text, &end, 10);
 		if (end == text)
 			break;
-		if (x >= 0 && x < SCREEN_WIDTH && y >= 0 && y < SCREEN_HEIGHT)
+		last = y;
+		if (*end == '-')
 		{
-			draw_log_state.points[draw_log_state.point_count][0] = (u16)x;
-			draw_log_state.points[draw_log_state.point_count][1] = (u16)y;
-			draw_log_state.point_count++;
+			text = end + 1;
+			last = strtol(text, &end, 10);
+			if (end == text)
+				break;
 		}
+		for (; y <= last; y++)
+			draw_log_point_add(x, y);
 		while (*end == ' ' || *end == ';')
 			end++;
 		text = end;
 	}
-	if (draw_log_state.state == 1)
-		platform_log("Direct3D: the draw log: the frame after tick %ld, %u points", draw_log_state.tick,
-			draw_log_state.point_count);
+	platform_log("Direct3D: the draw log: the frame after tick %ld, %u points, the vertices of draws of up to %lu",
+		draw_log_state.tick, draw_log_state.point_count, draw_log_state.vertices);
 }
 
-/* the back buffer's pixels at the points, once GX has drawn what it was sent */
-static void draw_log_peek(GXColor *pixels)
+/* the back buffer's pixels and depths at the points, once GX has drawn what
+it was sent */
+static void draw_log_peek(GXColor *pixels, u32 *depths)
 {
 	unsigned point;
 
 	GX_DrawDone();
 	xf_flush_after();
 	for (point = 0; point < draw_log_state.point_count; point++)
-		GX_PeekARGB(draw_log_state.points[point][0], draw_log_state.points[point][1], &pixels[point]);
+	{
+		GX_PeekARGB(draw_log_state.points[point].x, draw_log_state.points[point].y, &pixels[point]);
+		GX_PeekZ(draw_log_state.points[point].x, draw_log_state.points[point].y, &depths[point]);
+		depths[point] &= 0xFFFFFF;
+	}
 }
 
 /* (a new frame: whether it is the one logged, and if so its points' pixels
 before its first draw) */
 static void draw_log_frame(void)
 {
+	static GXColor pixels[DRAW_LOG_POINTS_MOST];
+	static u32 depths[DRAW_LOG_POINTS_MOST];
 	unsigned point;
 
 	draw_log_state.frame = device.frames;
@@ -3319,18 +3362,26 @@ static void draw_log_frame(void)
 		return;
 	draw_log_state.on = TRUE;
 	draw_log_state.draws = 0;
-	memset(draw_log_state.writer_count, 0, sizeof(draw_log_state.writer_count));
 	platform_log("draw log: frame %lu, drawn after tick %ld", device.frames, (long)game_time_get());
 	if (!draw_log_state.point_count)
 		return;
 	if (device.render_target == &device.back_buffer)
-		draw_log_peek(draw_log_state.last);
+		draw_log_peek(pixels, depths);
 	else
-		memset(draw_log_state.last, 0, sizeof(draw_log_state.last));
+	{
+		memset(pixels, 0, sizeof(pixels));
+		memset(depths, 0, sizeof(depths));
+	}
 	for (point = 0; point < draw_log_state.point_count; point++)
-		platform_log("  pixel (%u, %u) before the frame's draws: %u %u %u %u", draw_log_state.points[point][0],
-			draw_log_state.points[point][1], draw_log_state.last[point].r, draw_log_state.last[point].g,
-			draw_log_state.last[point].b, draw_log_state.last[point].a);
+	{
+		struct draw_log_point *p = &draw_log_state.points[point];
+
+		p->last = pixels[point];
+		p->depth = depths[point];
+		p->writer_count = 0;
+		platform_log("  pixel (%u, %u) before the frame's draws: %u %u %u %u z %06lx", p->x, p->y, p->last.r, p->last.g,
+			p->last.b, p->last.a, (unsigned long)p->depth);
+	}
 }
 
 /* whether this draw is described in the log (and then its number counted) */
@@ -3357,6 +3408,76 @@ static void draw_log_target(void)
 	}
 }
 
+/* the logged frame's picture, its colour and alpha (draw_log.tga, BGRA) and
+its depth (draw_log_depth.tga, the 24 bits as BGR, red the top byte), read
+back from the EFB before the copy to the display; top row first */
+static void draw_log_picture(void)
+{
+	static const char *const names[2] = { "draw_log.tga", "draw_log_depth.tga" };
+	unsigned char row[SCREEN_WIDTH * 4];
+	char path[300];
+	int which;
+
+	if (!draw_log_state.on)
+		return;
+	GX_DrawDone();
+	xf_flush_after();
+	for (which = 0; which < 2; which++)
+	{
+		unsigned char header[18];
+		unsigned x, y, bytes = which ? 3 : 4;
+		FILE *file;
+
+		snprintf(path, sizeof(path), "%s/%s", wii_game_folder(), names[which]);
+		file = fopen(path, "wb");
+		if (!file)
+		{
+			platform_log("draw log: %s not written", path);
+			continue;
+		}
+		memset(header, 0, sizeof(header));
+		header[2] = 2;
+		header[12] = SCREEN_WIDTH & 0xff;
+		header[13] = SCREEN_WIDTH >> 8;
+		header[14] = SCREEN_HEIGHT & 0xff;
+		header[15] = SCREEN_HEIGHT >> 8;
+		header[16] = (unsigned char)(bytes * 8);
+		/* (the top row first, and an alpha's eight bits) */
+		header[17] = (unsigned char)(0x20 | (which ? 0 : 8));
+		fwrite(header, 1, sizeof(header), file);
+		for (y = 0; y < SCREEN_HEIGHT; y++)
+		{
+			for (x = 0; x < SCREEN_WIDTH; x++)
+			{
+				unsigned char *out = row + x * bytes;
+
+				if (which)
+				{
+					u32 depth;
+
+					GX_PeekZ((u16)x, (u16)y, &depth);
+					out[0] = (unsigned char)depth;
+					out[1] = (unsigned char)(depth >> 8);
+					out[2] = (unsigned char)(depth >> 16);
+				}
+				else
+				{
+					GXColor color;
+
+					GX_PeekARGB((u16)x, (u16)y, &color);
+					out[0] = color.b;
+					out[1] = color.g;
+					out[2] = color.r;
+					out[3] = color.a;
+				}
+			}
+			fwrite(row, 1, SCREEN_WIDTH * bytes, file);
+		}
+		fclose(file);
+		platform_log("draw log: the frame's %s in %s", which ? "depth" : "picture", path);
+	}
+}
+
 /* (the logged frame presented: each point's writers, and the log off) */
 static void draw_log_frame_end(void)
 {
@@ -3367,43 +3488,50 @@ static void draw_log_frame_end(void)
 	platform_log("draw log: frame %lu: %lu draws", device.frames, draw_log_state.draws);
 	for (point = 0; point < draw_log_state.point_count; point++)
 	{
+		const struct draw_log_point *p = &draw_log_state.points[point];
 		char line[200];
-		unsigned long count = draw_log_state.writer_count[point], first, which;
-		int length = snprintf(line, sizeof(line), "  pixel (%u, %u): %lu draws changed it",
-			draw_log_state.points[point][0], draw_log_state.points[point][1], count);
+		unsigned long count = p->writer_count, first, which;
+		int length = snprintf(line, sizeof(line), "  pixel (%u, %u): %lu draws changed it", p->x, p->y, count);
 
 		first = count > DRAW_LOG_WRITERS ? count - DRAW_LOG_WRITERS : 0;
 		for (which = first; which < count && length < (int)sizeof(line) - 16; which++)
 			length += snprintf(line + length, sizeof(line) - (size_t)length, "%s %lu",
-				which == first ? (first ? ", the last:" : ":") : "", draw_log_state.writers[point][which % DRAW_LOG_WRITERS]);
-		platform_log("%s; at the end %u %u %u %u", line, draw_log_state.last[point].r, draw_log_state.last[point].g,
-			draw_log_state.last[point].b, draw_log_state.last[point].a);
+				which == first ? (first ? ", the last:" : ":") : "", p->writers[which % DRAW_LOG_WRITERS]);
+		platform_log("%s; at the end %u %u %u %u z %06lx", line, p->last.r, p->last.g, p->last.b, p->last.a,
+			(unsigned long)p->depth);
 	}
 	draw_log_state.on = FALSE;
 	draw_log_state.state = 2;
+	free(draw_log_state.points);
+	draw_log_state.points = NULL;
+	draw_log_state.point_count = 0;
 }
 
-/* the logged frame's pixels after a draw to the back buffer: those it changed */
+/* the logged frame's pixels after a draw to the back buffer: those whose
+colour or depth it changed */
 static void draw_log_pixels(void)
 {
-	GXColor pixels[DRAW_LOG_POINTS_MOST];
+	static GXColor pixels[DRAW_LOG_POINTS_MOST];
+	static u32 depths[DRAW_LOG_POINTS_MOST];
 	unsigned point;
 
 	if (device.render_target != &device.back_buffer || !draw_log_state.point_count)
 		return;
-	draw_log_peek(pixels);
+	draw_log_peek(pixels, depths);
 	for (point = 0; point < draw_log_state.point_count; point++)
 	{
-		GXColor *was = &draw_log_state.last[point];
+		struct draw_log_point *p = &draw_log_state.points[point];
 		const GXColor *now = &pixels[point];
 
-		if (was->r == now->r && was->g == now->g && was->b == now->b && was->a == now->a)
+		if (p->last.r == now->r && p->last.g == now->g && p->last.b == now->b && p->last.a == now->a &&
+			p->depth == depths[point])
 			continue;
-		platform_log("  pixel (%u, %u) changed by draw %lu: %u %u %u %u, was %u %u %u %u",
-			draw_log_state.points[point][0], draw_log_state.points[point][1], draw_log_state.draws,
-			now->r, now->g, now->b, now->a, was->r, was->g, was->b, was->a);
-		draw_log_state.writers[point][draw_log_state.writer_count[point]++ % DRAW_LOG_WRITERS] = draw_log_state.draws;
-		*was = *now;
+		platform_log("  pixel (%u, %u) changed by draw %lu: %u %u %u %u z %06lx, was %u %u %u %u z %06lx", p->x, p->y,
+			draw_log_state.draws, now->r, now->g, now->b, now->a, (unsigned long)depths[point], p->last.r, p->last.g,
+			p->last.b, p->last.a, (unsigned long)p->depth);
+		p->writers[p->writer_count++ % DRAW_LOG_WRITERS] = draw_log_state.draws;
+		p->last = *now;
+		p->depth = depths[point];
 	}
 }
 
@@ -3411,7 +3539,7 @@ static void draw_log_pixels(void)
 processor's) */
 static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct draw_projection *projection,
 	void (*fetch)(void *, UINT, float (*)[4]), void *context, struct nv2a_cpu_program *program, float point_size,
-	BOOL hardware)
+	BOOL hardware, const WORD *indices)
 {
 	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
 	struct nv2a_cpu_output out;
@@ -3491,6 +3619,22 @@ static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct d
 	platform_log("  a vertex: t0 %.3f %.3f %.3f %.3f t1 %.3f %.3f t2 %.3f %.3f t3 %.3f %.3f d1 %.2f %.2f %.2f %.2f fog %.2f",
 		out.t[0][0], out.t[0][1], out.t[0][2], out.t[0][3], out.t[1][0], out.t[1][1], out.t[2][0], out.t[2][1],
 		out.t[3][0], out.t[3][1], out.d1[0], out.d1[1], out.d1[2], out.d1[3], out.fog);
+	/* each vertex, in the draw's order (its index, for an indexed draw of
+	the streams), where the draw has few enough: its clip-space position,
+	screen position (depth scaled by the viewport), texture coordinates,
+	D0 and fog, as the processor computes them, on two lines */
+	if (count <= draw_log_state.vertices)
+		for (vertex = 0; vertex < count; vertex++)
+		{
+			fetch(context, vertex, inputs);
+			nv2a_cpu_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size, &out);
+			platform_log("  v%u i%ld c %.7g %.7g %.7g %.7g s %.3f %.3f %.1f", vertex,
+				indices ? (long)indices[vertex] + (long)device.base_vertex_index : -1L, out.clip[0], out.clip[1],
+				out.clip[2], out.clip[3], out.position[0], out.position[1], out.position[2]);
+			platform_log("   t %.5g %.5g %.5g, %.5g %.5g %.5g, %.5g %.5g %.5g, %.5g %.5g %.5g d0 %.3f %.3f %.3f %.3f f %.4f",
+				out.t[0][0], out.t[0][1], out.t[0][2], out.t[1][0], out.t[1][1], out.t[1][2], out.t[2][0], out.t[2][1],
+				out.t[2][2], out.t[3][0], out.t[3][1], out.t[3][2], out.d0[0], out.d0[1], out.d0[2], out.d0[3], out.fog);
+		}
 	platform_log("  ps %lx fin %08lx %08lx modes %05lx |%s", (unsigned long)D3D__RenderState[D3DRS_PSCOMBINERCOUNT],
 		(unsigned long)D3D__RenderState[D3DRS_PSFINALCOMBINERINPUTSABCD],
 		(unsigned long)D3D__RenderState[D3DRS_PSFINALCOMBINERINPUTSEFG], (unsigned long)D3D__RenderState[D3DRS_PSTEXTUREMODES],
@@ -4096,7 +4240,7 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 		projection = projection_fit(program, count, fetch, context, point_size);
 	projection_load(&projection);
 	if (logged)
-		draw_log(primitive_type, count, &projection, fetch, context, program, point_size, FALSE);
+		draw_log(primitive_type, count, &projection, fetch, context, program, point_size, FALSE, indices);
 	if (indices && count > 3 && !vertex_memo)
 	{
 		vertex_memo = malloc(VERTEX_MEMO_SIZE * sizeof(*vertex_memo));
@@ -8414,7 +8558,8 @@ static void draw_streams(D3DPRIMITIVETYPE primitive_type, UINT count, const WORD
 				float point_size;
 
 				memcpy(&point_size, &D3D__RenderState[D3DRS_POINTSIZE], sizeof(point_size));
-				draw_log(primitive_type, count, &projection_loaded, stream_fetch, &fetch, program, point_size, TRUE);
+				draw_log(primitive_type, count, &projection_loaded, stream_fetch, &fetch, program, point_size, TRUE,
+					indices);
 				draw_log_pixels();
 			}
 			return;
@@ -8595,6 +8740,8 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		if (!wl_gx_sync())
 			gx_stall_log("the frame's draws");
 		timing.present_gx += timing_now() - started;
+		/* (the logged frame's picture, before the copy clears the EFB) */
+		draw_log_picture();
 		/* the display copy's own state, whatever the frame's copies to
 		textures and drawing below the back buffer (sphere_bake) left */
 		display_copy_restore();

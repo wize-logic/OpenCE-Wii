@@ -1292,7 +1292,8 @@ and pixel shaders.
   [debug]
   fixed_ticks = true            # a frame a tick, the same frame on every run
   draw_log_tick = 300           # a level's first frame at or after game tick 300 (not the menu's); -1 none
-  draw_log_points = "320,190;60,90;560,250"   # back buffer pixels (640 by 480), at most 16
+  draw_log_points = "320,190;60,90;560,170-200"   # back buffer pixels (640 by 480); x,y0-y1 a column
+  draw_log_vertices = 200       # the draws of at most 200 vertices: each vertex logged; 0 none
   ```
 
   Each draw, the processor's and GX's alike, and each clear, is numbered and described: `draw N
@@ -1302,9 +1303,16 @@ and pixel shaders.
   how many lie before the near plane and past the far), the last vertex's outputs, the pixel shader's
   combiners and constants and each texture (`t0 256x256/14d@<its data's address>`). After each
   draw to the back buffer the points are read back (GX drawn to that point first, so the frame
-  is slow), and each change is logged, `pixel (x, y) changed by draw N: r g b a, was r g b a`;
-  render target changes are logged too. When the frame is shown, `draw log: frame F: N draws`
-  and each point's last eight writers close it. Off, a draw pays a load and a compare.
+  is slow), colour and depth, and each change is logged, `pixel (x, y) changed by draw N: r g b
+  a z 7ffe12, was r g b a z ...` (the depth's 24 bits); render target changes are logged too. A
+  draw of at most `draw_log_vertices` vertices has each vertex logged, in the draw's order, on
+  two lines: `v3 i17 c x y z w s x y depth` (its index, clip-space and screen position) and its
+  texture coordinates, D0 and fog, as the processor computes them, which is enough to rebuild
+  the draw on the host. Before the frame is copied to the display, its picture and depth are
+  written to the game's folder, `draw_log.tga` (BGRA, top row first) and `draw_log_depth.tga`
+  (the depth's bytes as BGR), the frame the log describes, whatever the screenshot shows. When
+  the frame is shown, `draw log: frame F: N draws` and each point's last eight writers close
+  it. Off, a draw pays a load and a compare.
 
 ### What the frame draws
 

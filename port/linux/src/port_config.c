@@ -695,8 +695,12 @@ static const struct config_setting config_settings[] =
 		"in the log; -1 none." },
 	{ "debug.draw_log_points", _config_string, "\"\"", "HALO_DRAW_LOG_POINTS", _environment_value, _platform_wii,
 		"The Wii: with draw_log_tick, pixels of the back buffer (640 by 480), \"x,y;x,y\",\n"
-		"read back after each draw of that frame, each change logged with the draw\n"
-		"that made it (at most 16)." },
+		"read back after each draw of that frame, colour and depth, each change logged\n"
+		"with the draw that made it; \"x,y0-y1\" each pixel of a column (at most 512)." },
+	{ "debug.draw_log_vertices", _config_integer, "0", "HALO_DRAW_LOG_VERTICES", _environment_value, _platform_wii,
+		"The Wii: with draw_log_tick, the draws of at most this many vertices have\n"
+		"each vertex logged (its clip-space and screen position, texture coordinates,\n"
+		"D0 and fog); 0 none." },
 	{ "debug.gpu_xf_flush_safe", _config_boolean, "true", "HALO_GPU_XF_FLUSH_SAFE", _environment_value, _platform_all,
 		"The Wii: after an EFB copy, a draw-sync token or a draw-done, the next\n"
 		"primitive is preceded by a few vertices that draw nothing, which flush\n"
