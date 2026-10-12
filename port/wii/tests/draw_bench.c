@@ -90,6 +90,8 @@ unsigned char game_time_initialized(void) { return 1; }
 unsigned char game_in_progress(void) { return 1; }
 long game_time_get(void) { return 0; }
 unsigned char main_menu_is_active(void) { return 0; }
+/* (the time the game's main loop waited for the frame, which the frame's report reads) */
+unsigned long long main_frame_wait_time;
 
 struct platform_file_reads platform_file_reads;
 void dsound_wii_audio_report(void) {}
