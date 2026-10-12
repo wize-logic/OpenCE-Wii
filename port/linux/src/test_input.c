@@ -773,6 +773,9 @@ static SHORT script_stick(double value)
 	return (SHORT)(value * 32767.0);
 }
 
+/* (test_input_observe_menus_inhibited's) */
+static int script_menus_inhibited;
+
 static void script_gamepad(XINPUT_GAMEPAD *pad, unsigned long long milliseconds)
 {
 	struct script_step const *step;
@@ -800,6 +803,16 @@ static void script_gamepad(XINPUT_GAMEPAD *pad, unsigned long long milliseconds)
 			platform_log("test_input: line %d (%.1f s): %s", step->line, (double)script.clock / 1000.0, step->text);
 		}
 		elapsed = (double)(script.clock - script.started_clock) / 1000.0;
+		/* (a menu that takes no input yet, as while the saved games are first
+		enumerated, gets no presses: a person would press again) */
+		if ((step->kind == _step_press || step->kind == _step_select || step->kind == _step_hold ||
+				step->kind == _step_stick) &&
+			script.screen[0] && script_menus_inhibited)
+		{
+			if (elapsed >= 60.0)
+				script_stop("the menus took no input for a minute");
+			return;
+		}
 		switch (step->kind)
 		{
 		case _step_wait:
@@ -958,6 +971,13 @@ static void script_gamepad(XINPUT_GAMEPAD *pad, unsigned long long milliseconds)
 		}
 		script_next();
 	}
+}
+
+/* (the game's word on whether its menus take input: network_test.c, from
+ui_widget.c's processing_inhibited) */
+void test_input_observe_menus_inhibited(int inhibited)
+{
+	script_menus_inhibited = inhibited;
 }
 
 void test_input_observe(const char *screen, const char *focus, long tick, long checkpoints, const float *place)

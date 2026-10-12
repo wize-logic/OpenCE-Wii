@@ -1669,6 +1669,15 @@ void ui_widgets_inhibit_processing(
 	return;
 }
 
+/* port: whether the menus take input (not while the saved games are first
+enumerated, ui_widget.c's filesystem_initialization_thread_proc), for the
+scripted controller (port/linux/src/test_input.c) */
+boolean ui_widgets_processing_is_inhibited(
+	void)
+{
+	return widget_globals.initialized && widget_globals.processing_inhibited;
+}
+
 static __inline real compute_offset_coordinate(
 	long time,
 	real delta_per_second)

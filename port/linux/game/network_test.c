@@ -84,8 +84,10 @@ void network_damage_statistics(long *sent_reports, long *dealt_reports, long *re
 void test_input_hold_action(int hold);
 int test_input_scripted(void);
 void test_input_observe(const char *screen, const char *focus, long tick, long checkpoints, const float *place);
+void test_input_observe_menus_inhibited(int inhibited);
 /* ui_widget.c's, game_state.c's */
 void ui_widget_port_active_screen(long *screen_tag_index, long *focused_tag_index);
+boolean ui_widgets_processing_is_inhibited(void);
 long game_state_port_checkpoints_saved(void);
 
 enum
@@ -829,6 +831,7 @@ void network_test_update(
 				}
 			}
 		}
+		test_input_observe_menus_inhibited(ui_widgets_processing_is_inhibited() ? 1 : 0);
 		test_input_observe(screen != NONE ? tag_get_name(screen) : "", focused != NONE ? tag_get_name(focused) : "",
 			in_game ? (long)game_time_get() : -1, game_state_port_checkpoints_saved(), placed ? place : NULL);
 	}
