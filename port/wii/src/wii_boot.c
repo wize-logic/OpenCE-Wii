@@ -9,6 +9,8 @@ __wrap_main here, which then calls the game's:
   allocate there (port/wii/src/wii_memory.c);
 - WiiLibs: the reset and power buttons, the log, its heaps (sized for what
   the port uses it for), IOS 58 for USB 2.0, the SD card and a USB drive;
+- the thread that serves those buttons, and the motors' rumble, once the
+  heaps are up (src/wii_system.c);
 - for the bring-up, a text console on the screen, in one of WiiLibs' video
   framebuffers (wl_platform_console_start);
 - the sampling profiler's watcher, when the game's folder holds profile.txt
@@ -38,29 +40,33 @@ says why on the console and waits for HOME.
 #include "wii_memory.h"
 
 int wii_memory_claim(void);
+void wii_system_start(void);
 void wii_network_start(void);
 void wii_profile_arm(void);
 int __real_main(void);
 
-/* WiiLibs' heaps, all in MEM2: thread stacks (the audio output's 24 KB, and
-32 KB for an IO thread), the audio output's buffers (4 KB in use), the GX
-command FIFO, the asynchronous reads' buffers (which the port does not use),
-and the game's malloc once MEM1's is full (WiiLibs' heap overflow, enabled
-in __wrap_main). MEM1 holds the game, its game state, and libogc's malloc
-heap below them. Its own scene graph, network, asset and sample bank heaps
-the port has no use for. port/wii/README.md, "Memory", has the whole
-budget. */
+/* WiiLibs' heaps. In MEM2: thread stacks (the audio output's 24 KB, the
+system watcher's 16 KB, and 32 KB for an IO thread), the audio output's
+buffers (4 KB in use), the asynchronous reads' buffers (which the port does
+not use), and the game's malloc once MEM1's is full (WiiLibs' heap overflow,
+enabled in __wrap_main). In MEM1, the GX command FIFO, 512 KB: the GP reads
+it from there (libogc's examples allocate it in MEM1, and a FIFO in MEM2 is
+not supported on the console). It is taken from the top of what libogc's
+malloc heap would have, below the game state (src/wii_memory.c). MEM1 holds
+the game, its game state, the FIFO, and libogc's malloc heap below them.
+Its own scene graph, network, asset and sample bank heaps the port has no
+use for. port/wii/README.md, "Memory", has the whole budget. */
 static const WlMemTagDef wii_memory_tags[WII_MEMORY_TAG_COUNT] =
 {
 	[WL_TAG_STACK] = { "stack", WL_MEM2, 64u * 1024u },
-	[WL_TAG_GXFIFO] = { "gxfifo", WL_MEM2, 1024u * 1024u },
+	[WL_TAG_GXFIFO] = { "gxfifo", WL_MEM1, 512u * 1024u },
 	[WL_TAG_HOT] = { "hot", WL_MEM1, 0 },
 	[WL_TAG_AUDIO] = { "audio", WL_MEM2, 64u * 1024u },
 	[WL_TAG_NET] = { "net", WL_MEM1, 0 },
 	[WL_TAG_ASSET] = { "asset", WL_MEM2, 0 },
 	[WL_TAG_AUDIO_BANK] = { "audio_bank", WL_MEM2, 0 },
 	[WL_TAG_IO] = { "io", WL_MEM2, 64u * 1024u },
-	[WII_MEMORY_TAG_GAME] = { "game", WL_MEM2, 5120u * 1024u },
+	[WII_MEMORY_TAG_GAME] = { "game", WL_MEM2, 6144u * 1024u },
 };
 
 /* the accounting of the heaps by call site (the memory report's "heap"
@@ -114,8 +120,13 @@ int __wrap_main(void)
 	memory.tag_count = WII_MEMORY_TAG_COUNT;
 	memory.frame_arena_size = 0;
 	memory.scene_stack_size = 0;
+	/* MEM1: only the FIFO (the rest of it stays libogc's, for malloc) */
+	memory.claim[WL_MEM1] = WL_MEM_CLAIM_NEEDED;
 	if (wl_mem_init(&memory) != WL_OK)
 		wl_platform_stop_screen("WiiLibs' heaps could not be made (see the log).");
+	/* the reset and power buttons are served from here on, a map's loading
+	included (src/wii_system.c) */
+	wii_system_start();
 	/* what MEM1's malloc cannot hold comes from the game's heap in MEM2
 	(the link wraps malloc and the rest: tools/wii_build.py) */
 	if (wl_heap_overflow_enable(WII_MEMORY_TAG_GAME) != WL_OK)

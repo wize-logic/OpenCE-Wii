@@ -9,6 +9,13 @@ connected there. The buttons are mapped in xinput_wii_map.c (and listed in
 port/wii/README.md, "The controllers"); this file is the XAPI around them,
 the pointer's aim and the desktop's controls a Wii has none of.
 
+The rumble is a service of its own (wii_rumble_tick, run by WiiLibs' system
+watcher thread, port/wii/src/wii_system.c): the game says how strongly each
+motor is to run (XInputSetState), and the service switches the controller's
+one motor on and off by a duty cycle (xinput_wii_map.c), keeps the console's
+rumble setting, and stops it when the game stops asking, a menu is up, the
+controller goes, or the game quits.
+
 The Wii Remote's pointer aims (halo_linux_mouse_look): the view turns while
 it points outside a box at the screen's centre, faster nearer the edge, at the
 rates of the player's look sensitivity. It keeps turning for a moment when the
@@ -45,12 +52,34 @@ struct controller
 	XINPUT_GAMEPAD previous;
 };
 
+/* a controller's motors: what the game asked for, and when, and the service's
+own state (the watcher thread's) */
+struct motor
+{
+	volatile unsigned strength;
+	volatile unsigned long asked_ms;
+	struct wii_rumble duty;
+	BOOL sent;
+};
+
+/* a motor not asked for within this time is stopped: the game stops asking
+while it loads (and halts), with the last strength still set */
+#define RUMBLE_STALE_MS 250
+
 static struct controller controllers[PORT_COUNT];
 static DWORD reported_gamepads;
 static WlRawInput input;
 static uint64_t input_polled_us;
 static uint64_t look_us[PORT_COUNT];
 static WlPointer pointers[PORT_COUNT];
+static struct motor motors[PORT_COUNT];
+/* which controllers the last poll found (a bit a port), for the rumble
+service, which must not read the poll's state while it is being filled */
+static volatile unsigned remotes_connected;
+static volatile unsigned pads_connected;
+static WlPlatformMutex motor_lock;
+static BOOL motor_lock_made;
+static BOOL motors_stopped;
 
 /* the controllers once a frame at most (every port reads them each tick) */
 static const WlRawInput *input_read(void)
@@ -60,17 +89,25 @@ static const WlRawInput *input_read(void)
 	if (!input_polled_us || now - input_polled_us > 4000)
 	{
 		int port;
+		unsigned remote_bits = 0;
+		unsigned pad_bits = 0;
 
 		wl_platform_input_poll(&input);
 		input_polled_us = now;
 		for (port = 0; port < PORT_COUNT; port++)
 		{
+			if (input.remotes[port].connected)
+				remote_bits |= 1u << port;
+			if (input.pads[port].connected)
+				pad_bits |= 1u << port;
 			/* (the Classic Controller has the sticks to look with, not the pointer) */
 			if (input.remotes[port].extension == WL_EXT_CLASSIC)
 				memset(&pointers[port], 0, sizeof(pointers[port]));
 			else
 				wl_pointer_update(&pointers[port], &input.remotes[port], now, WII_POINTER_HOLD_US);
 		}
+		remotes_connected = remote_bits;
+		pads_connected = pad_bits;
 	}
 	return &input;
 }
@@ -147,7 +184,10 @@ VOID WINAPI XInputClose(HANDLE device)
 	struct controller *controller = (struct controller *)device;
 
 	if (controller)
+	{
 		controller->open = FALSE;
+		motors[controller - controllers].strength = 0;
+	}
 }
 
 static int controller_port(HANDLE device)
@@ -184,6 +224,8 @@ DWORD WINAPI XInputGetState(HANDLE device, PXINPUT_STATE state)
 	}
 	else if (!(port == 0 && test_input_active()))
 	{
+		/* (a controller that has gone does not keep its motor running) */
+		motors[port].strength = 0;
 		return ERROR_DEVICE_NOT_CONNECTED;
 	}
 	if (port == 0)
@@ -210,20 +252,88 @@ DWORD WINAPI XInputGetState(HANDLE device, PXINPUT_STATE state)
 DWORD WINAPI XInputSetState(HANDLE device, PXINPUT_FEEDBACK feedback)
 {
 	int port = controller_port(device);
-	BOOL on;
 
 	if (!feedback)
 		return ERROR_INVALID_PARAMETER;
 	feedback->Header.dwStatus = ERROR_SUCCESS;
 	if (port < 0)
 		return ERROR_DEVICE_NOT_CONNECTED;
-	/* (the Wii's motors are on or off) */
-	on = feedback->Rumble.wLeftMotorSpeed > 0x4000 || feedback->Rumble.wRightMotorSpeed > 0x4000;
-	if (input.remotes[port].connected)
-		wl_platform_rumble((uint8_t)port, on);
-	else if (input.pads[port].connected)
-		wl_platform_pad_rumble((uint8_t)port, on);
+	/* (the service switches the motor: the strength and when it was asked, and
+	none while a menu is up, as when the game is paused) */
+	motors[port].strength = ui_widgets_active() ? 0 :
+		wii_rumble_strength(feedback->Rumble.wLeftMotorSpeed, feedback->Rumble.wRightMotorSpeed);
+	motors[port].asked_ms = (unsigned long)(wl_platform_time_us() / 1000);
 	return ERROR_SUCCESS;
+}
+
+/* ---------- the rumble service (port/wii/src/wii_system.c runs it) */
+
+void wii_rumble_start(void)
+{
+	if (!motor_lock_made && wl_platform_mutex_create(&motor_lock) == WL_OK)
+		motor_lock_made = TRUE;
+}
+
+/* every motor to its duty cycle's state, on the watcher thread's schedule */
+void wii_rumble_tick(void *unused)
+{
+	uint64_t now = wl_platform_time_us();
+	unsigned long now_ms = (unsigned long)(now / 1000);
+	int port;
+
+	(void)unused;
+	if (!motor_lock_made)
+		return;
+	wl_platform_mutex_lock(motor_lock);
+	if (!motors_stopped)
+	{
+		for (port = 0; port < PORT_COUNT; port++)
+		{
+			struct motor *motor = &motors[port];
+			BOOL remote = (remotes_connected >> port) & 1;
+			BOOL pad = !remote && ((pads_connected >> port) & 1);
+			unsigned strength = motor->strength;
+			BOOL on;
+
+			if (now_ms - motor->asked_ms > RUMBLE_STALE_MS)
+				strength = 0;
+			if (!remote && !pad)
+			{
+				/* (nothing to run: the next one that connects starts still) */
+				strength = 0;
+				motor->sent = FALSE;
+			}
+			on = wii_rumble_duty(&motor->duty, strength, now);
+			if (on != motor->sent && (remote || pad))
+			{
+				motor->sent = on;
+				if (remote)
+					wl_platform_rumble((uint8_t)port, on);
+				else
+					wl_platform_pad_rumble((uint8_t)port, on);
+			}
+		}
+	}
+	wl_platform_mutex_unlock(motor_lock);
+}
+
+/* every motor off, and the service off: before the game quits (WiiLibs' exit
+does it too, but a tick must not turn one on again after) */
+void wii_rumble_stop(void)
+{
+	int port;
+
+	if (motor_lock_made)
+		wl_platform_mutex_lock(motor_lock);
+	motors_stopped = TRUE;
+	for (port = 0; port < PORT_COUNT; port++)
+	{
+		motors[port].strength = 0;
+		motors[port].sent = FALSE;
+	}
+	wl_platform_input_stop_rumble();
+	if (motor_lock_made)
+		wl_platform_mutex_unlock(motor_lock);
 }
 
 DWORD WINAPI XInputDebugInitKeyboardQueue(PXINPUT_DEBUG_KEYQUEUE_PARAMETERS parameters)

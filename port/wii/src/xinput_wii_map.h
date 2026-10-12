@@ -40,4 +40,27 @@ above the middle looks up). */
 void wii_map_pointer_look(float x, float y, float seconds, float yaw_rate, float pitch_rate, float *yaw,
 	float *pitch);
 
+/* The rumble. The game gives each Xbox controller two motors, each 0 to
+65535; a Wii controller's has one, on or off. The strength is the stronger of
+the two, and the motor is switched on and off from tick to tick so that it
+is on for a fraction of the ticks equal to the strength (the part of the
+strength the motor has not yet been given carries from one tick to the next,
+so half strength is on one tick in two and nine tenths on nine in ten). Zero switches it off at once. Otherwise it
+is not switched again within WII_RUMBLE_SWITCH_US of its last switch, so
+that it takes at most a hundred switches a second whatever the ticks' rate:
+the Remote is sent a report for each. */
+#define WII_RUMBLE_FULL 65535u
+#define WII_RUMBLE_SWITCH_US 10000u
+
+struct wii_rumble
+{
+	long carry;
+	BOOL on;
+	uint64_t switched_us;
+};
+
+unsigned wii_rumble_strength(unsigned left, unsigned right);
+/* one tick at now_us with the strength wanted: whether the motor is on */
+BOOL wii_rumble_duty(struct wii_rumble *rumble, unsigned strength, uint64_t now_us);
+
 #endif

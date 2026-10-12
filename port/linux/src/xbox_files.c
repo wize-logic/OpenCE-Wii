@@ -27,6 +27,15 @@ matched case-insensitively, like the Xbox's FATX volumes.
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifdef HALO_WII
+#include <pthread.h>
+#endif
+
+#ifdef HALO_WII
+/* port: the Wii's (port/wii/src/wii_system.c): the message that stops the game
+when it has no maps folder, and the files' part of leaving it */
+void wii_stop_no_maps(void);
+#endif
 
 /* ---------- paths */
 
@@ -71,7 +80,12 @@ const char *platform_data_root(void)
 		{
 			snprintf(root, sizeof(root), "%s", wii_game_folder());
 			if (!has_maps(root))
+			{
 				platform_log("no maps/ folder in sd:/apps/halo or usb:/apps/halo");
+				/* port: the screen says so, and waits for HOME (it does not
+				come back) */
+				wii_stop_no_maps();
+			}
 		}
 #else
 		else if (has_maps("."))
@@ -295,10 +309,106 @@ struct platform_file
 	char path[1024];
 };
 
+#ifdef HALO_WII
+/* port: what the Wii's leaving (a reset or power button, a quit from the menu:
+wii_files_quiesce, called from the shutdown hook in port/wii/src/wii_system.c)
+needs of the files: no write cut in the middle, and the data written to the
+files that stay open (the saved game's) on the card. Writes in flight are
+counted, a write that starts after the gate closes waits for the end, and the
+files open for writing are synced. */
+#define WRITABLE_FILE_SLOTS 32
+
+static pthread_mutex_t write_lock = PTHREAD_MUTEX_INITIALIZER;
+static int writes_in_flight;
+static BOOL writes_closed;
+static struct platform_file *writable_files[WRITABLE_FILE_SLOTS];
+
+static void write_begin(void)
+{
+	pthread_mutex_lock(&write_lock);
+	while (writes_closed)
+	{
+		/* (the game is leaving: this write is not made) */
+		pthread_mutex_unlock(&write_lock);
+		usleep(10000);
+		pthread_mutex_lock(&write_lock);
+	}
+	writes_in_flight++;
+	pthread_mutex_unlock(&write_lock);
+}
+
+static void write_end(void)
+{
+	pthread_mutex_lock(&write_lock);
+	writes_in_flight--;
+	pthread_mutex_unlock(&write_lock);
+}
+
+static void writable_register(struct platform_file *file)
+{
+	int slot;
+
+	pthread_mutex_lock(&write_lock);
+	for (slot = 0; slot < WRITABLE_FILE_SLOTS; slot++)
+	{
+		if (!writable_files[slot])
+		{
+			writable_files[slot] = file;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&write_lock);
+}
+
+static void writable_unregister(struct platform_file *file)
+{
+	int slot;
+
+	pthread_mutex_lock(&write_lock);
+	for (slot = 0; slot < WRITABLE_FILE_SLOTS; slot++)
+	{
+		if (writable_files[slot] == file)
+			writable_files[slot] = NULL;
+	}
+	pthread_mutex_unlock(&write_lock);
+}
+
+/* no more writes start; those under way finish (for at most timeout_ms); the
+files open for writing are synced. Returns how many writes were still under
+way at the end of the wait. */
+int wii_files_quiesce(unsigned timeout_ms)
+{
+	unsigned waited_ms = 0;
+	int unfinished;
+	int slot;
+
+	pthread_mutex_lock(&write_lock);
+	writes_closed = TRUE;
+	while (writes_in_flight > 0 && waited_ms < timeout_ms)
+	{
+		pthread_mutex_unlock(&write_lock);
+		usleep(5000);
+		waited_ms += 5;
+		pthread_mutex_lock(&write_lock);
+	}
+	unfinished = writes_in_flight;
+	for (slot = 0; slot < WRITABLE_FILE_SLOTS; slot++)
+	{
+		if (writable_files[slot])
+			fsync(writable_files[slot]->descriptor);
+	}
+	pthread_mutex_unlock(&write_lock);
+	return unfinished;
+}
+#endif
+
 static void file_destroy(struct platform_handle *handle)
 {
 	struct platform_file *file = handle->data;
 
+#ifdef HALO_WII
+	writable_unregister(file);
+#endif
 	close(file->descriptor);
 	free(file);
 }
@@ -386,6 +496,10 @@ HANDLE WINAPI CreateFileA(LPCSTR file_name, DWORD desired_access, DWORD share_mo
 	}
 	file->descriptor = descriptor;
 	snprintf(file->path, sizeof(file->path), "%s", path);
+#ifdef HALO_WII
+	if ((flags & O_ACCMODE) != O_RDONLY)
+		writable_register(file);
+#endif
 
 	/* Win32 reports whether an OPEN_ALWAYS/CREATE_ALWAYS target existed */
 	SetLastError((existed && (creation_disposition == OPEN_ALWAYS || creation_disposition == CREATE_ALWAYS)) ?
@@ -471,6 +585,9 @@ static BOOL read_at(struct platform_file *file, LPVOID buffer, DWORD count, LPDW
 	return TRUE;
 }
 
+#ifdef HALO_WII
+#define write_at write_at_ungated
+#endif
 static BOOL write_at(struct platform_file *file, LPCVOID buffer, DWORD count, LPDWORD bytes_written,
 	BOOL positioned, unsigned long long offset)
 {
@@ -497,6 +614,21 @@ static BOOL write_at(struct platform_file *file, LPCVOID buffer, DWORD count, LP
 		*bytes_written = total;
 	return TRUE;
 }
+
+#ifdef HALO_WII
+#undef write_at
+/* port: a write is made whole before the Wii leaves, or not begun */
+static BOOL write_at(struct platform_file *file, LPCVOID buffer, DWORD count, LPDWORD bytes_written,
+	BOOL positioned, unsigned long long offset)
+{
+	BOOL result;
+
+	write_begin();
+	result = write_at_ungated(file, buffer, count, bytes_written, positioned, offset);
+	write_end();
+	return result;
+}
+#endif
 
 static unsigned long long overlapped_offset(LPOVERLAPPED overlapped)
 {

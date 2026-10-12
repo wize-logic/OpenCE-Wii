@@ -400,6 +400,126 @@ static void check_pointer_loss(void)
 		"a long loss ends the tracking");
 }
 
+/* the rumble's duty cycle: the fraction of ticks the motor is on, the
+switches a second, and that zero stops it at once */
+
+struct rumble_run
+{
+	unsigned on_ticks;
+	unsigned switches;
+	unsigned most_switches_in_a_second;
+	unsigned ticks;
+};
+
+/* `seconds` of ticks every tick_us at one strength, counting from a motor
+that is off */
+static struct rumble_run run_rumble(unsigned strength, unsigned tick_us, unsigned seconds)
+{
+	struct wii_rumble rumble;
+	struct rumble_run run;
+	uint64_t now = 5000000;
+	uint64_t end = now + (uint64_t)seconds * 1000000;
+	/* the times of the last switches, to count those in a second */
+	uint64_t switch_times[4096];
+	unsigned recent_first = 0;
+	BOOL previous = FALSE;
+
+	memset(&rumble, 0, sizeof(rumble));
+	memset(&run, 0, sizeof(run));
+	for (; now < end; now += tick_us)
+	{
+		BOOL on = wii_rumble_duty(&rumble, strength, now);
+
+		run.ticks++;
+		if (on)
+			run.on_ticks++;
+		if (on != previous)
+		{
+			unsigned count;
+
+			previous = on;
+			switch_times[run.switches % 4096] = now;
+			run.switches++;
+			while (now - switch_times[recent_first % 4096] >= 1000000)
+				recent_first++;
+			count = run.switches - recent_first;
+			if (count > run.most_switches_in_a_second)
+				run.most_switches_in_a_second = count;
+		}
+	}
+	return run;
+}
+
+static void check_rumble(void)
+{
+	static const unsigned strengths[] = { 1000, 6554, 16384, 32768, 40000, 49152, 58982, 64000, 65535 };
+	unsigned index;
+	struct wii_rumble rumble;
+	struct rumble_run run;
+
+	CHECK(wii_rumble_strength(0, 0) == 0, "no strength");
+	CHECK(wii_rumble_strength(30000, 5000) == 30000, "the left motor is the stronger");
+	CHECK(wii_rumble_strength(5000, 30000) == 30000, "the right motor is the stronger");
+	CHECK(wii_rumble_strength(70000, 0) == WII_RUMBLE_FULL, "clamped to the full strength");
+
+	/* on for a fraction of the ticks equal to the strength: at the frame rate
+	of 60 a second, and at the game's 30 */
+	for (index = 0; index < COUNT(strengths); index++)
+	{
+		unsigned tick_us;
+
+		for (tick_us = 16667; tick_us <= 33333; tick_us += 16666)
+		{
+			double wanted = (double)strengths[index] / WII_RUMBLE_FULL;
+			double got;
+
+			run = run_rumble(strengths[index], tick_us, 20);
+			got = (double)run.on_ticks / run.ticks;
+			CHECK(fabs(got - wanted) < 0.01, "strength %u at %u us: on %.4f of the ticks, wanted %.4f",
+				strengths[index], tick_us, got, wanted);
+			CHECK(run.most_switches_in_a_second <= 100, "strength %u at %u us: %u switches in a second",
+				strengths[index], tick_us, run.most_switches_in_a_second);
+		}
+	}
+
+	/* full is on for every tick, none is off for every tick */
+	run = run_rumble(WII_RUMBLE_FULL, 16667, 2);
+	CHECK(run.on_ticks == run.ticks && run.switches == 1, "full strength: on from the first tick, never switched again");
+	run = run_rumble(0, 16667, 2);
+	CHECK(run.on_ticks == 0 && run.switches == 0, "no strength: never on");
+
+	/* half a strength every tick of 60 a second switches every tick, 60 a second */
+	run = run_rumble(32768, 16667, 10);
+	CHECK(run.most_switches_in_a_second >= 55 && run.most_switches_in_a_second <= 100,
+		"half strength at 60 ticks a second: %u switches in a second", run.most_switches_in_a_second);
+
+	/* however fast the ticks come (a millisecond apart, a thousand a second),
+	not more than a hundred switches a second, and still about the fraction */
+	for (index = 0; index < COUNT(strengths); index++)
+	{
+		double wanted = (double)strengths[index] / WII_RUMBLE_FULL;
+		double got;
+
+		run = run_rumble(strengths[index], 1000, 10);
+		got = (double)run.on_ticks / run.ticks;
+		CHECK(run.most_switches_in_a_second <= 100, "strength %u every millisecond: %u switches in a second",
+			strengths[index], run.most_switches_in_a_second);
+		CHECK(fabs(got - wanted) < 0.12, "strength %u every millisecond: on %.3f, wanted %.3f", strengths[index],
+			got, wanted);
+	}
+
+	/* zero stops the motor at once, 1 ms after it switched on, and the carry
+	is forgotten: the next strength starts afresh */
+	memset(&rumble, 0, sizeof(rumble));
+	CHECK(wii_rumble_duty(&rumble, WII_RUMBLE_FULL, 9000000), "full strength turns it on");
+	CHECK(!wii_rumble_duty(&rumble, 0, 9001000), "zero turns it off within the switch interval");
+	CHECK(rumble.carry == 0, "the carry is forgotten");
+	CHECK(!wii_rumble_duty(&rumble, 0, 9002000), "and it stays off");
+	/* a switch wanted within the interval of the last waits for it */
+	CHECK(!wii_rumble_duty(&rumble, WII_RUMBLE_FULL, 9003000), "not switched on again within the interval");
+	CHECK(wii_rumble_duty(&rumble, WII_RUMBLE_FULL, 9001000 + WII_RUMBLE_SWITCH_US), "switched on once it has passed");
+}
+
 int main(void)
 {
 	unsigned reached;
@@ -419,6 +539,7 @@ int main(void)
 	check_combined();
 	check_pointer_look();
 	check_pointer_loss();
+	check_rumble();
 	printf("wii_input_check: %d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

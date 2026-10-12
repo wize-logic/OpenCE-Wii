@@ -87,6 +87,11 @@ The game reads its data from `apps/halo` on the SD card, or from a USB drive whe
 `maps` folder there (`platform_data_root`, `port/linux/src/xbox_files.c`). Saves go to
 `apps/halo/saves`, and the settings to `apps/halo/config.toml`.
 
+With no `maps` folder in either place the game does not start: WiiLibs' stop screen says so on
+the console's text screen, where to put the converted maps, and whether the SD card and the USB
+drive were found, and waits for HOME (or START on a GameCube controller) to return to the loader
+(`wii_stop_no_maps`, `src/wii_platform.c`; called from `platform_data_root`).
+
 The maps must be the Xbox's (cache version 5), converted by `tools/wii_convert_maps.py`. Halo PC's
 and Custom Edition's maps don't run. A converted map is uncompressed, about the size the Xbox
 inflated it to, and the Wii reads it where it is.
@@ -117,7 +122,7 @@ inflated it to, and the Wii reads it where it is.
   calls the game's `main` (`source/shell/shell_xbox.c`):
   - claims the fixed memory
   - starts WiiLibs: system buttons, log, crash report, the text console (`wl_platform_console_start`),
-    heaps, IOS 58, SD and USB
+    heaps, then the buttons' watcher thread (`src/wii_system.c`), IOS 58, SD and USB
   - turns on the game's heap in MEM2 (the overflow of MEM1's malloc)
   - starts the network in the background
 
@@ -129,7 +134,8 @@ inflated it to, and the Wii reads it where it is.
 
   | File | What it does |
   | --- | --- |
-  | `wii_platform.c` | log, messages and quitting |
+  | `wii_platform.c` | log, messages (the stop screen when the maps are missing) and quitting |
+  | `wii_system.c` | the reset and power buttons, and leaving the game properly: a watcher thread, the shutdown hooks |
   | `wii_posix.c` | names for the shared files over WiiLibs: where the game's folder is (`wl_platform_fs_find_app_dir`), random bytes (`wl_platform_random_bytes`), thread priorities (`wl_posix_thread_set_relative_priority`), the heap report |
   | `xinput_wii.c` | XInput over the Wii Remote with Nunchuk or Classic Controller, and the GameCube controller; the pointer's aim |
   | `xinput_wii_map.c` | what each button and stick of those controllers is as the Xbox gamepad (checked on the host) |
@@ -151,6 +157,33 @@ inflated it to, and the Wii reads it where it is.
   ends says how and from where. A failed assertion (`display_assert` and `cseries_assert` in
   `source/cseries/cseries.c`, under `HALO_WII`) logs "assert from ..." the same way, through
   `wl_platform_log_backtrace`.
+- **Reset, Power and quitting.** WiiLibs latches the console's reset and power buttons and a Wii
+  Remote's power button, and `wii_system_start` (`src/wii_system.c`) starts WiiLibs' watcher
+  thread (`wl_platform_system_watch_start`: every 16 ms, 16 KB of stack, above the game's threads
+  in priority), so they work while a map loads for tens of seconds as in play. Reset returns to
+  the loader (the Homebrew Channel); power, or the Remote's power button, powers the console off.
+  Both, and the menus' Quit (`platform_request_quit`) and the stop screen's HOME, go through
+  WiiLibs' `wl_platform_exit`, which winds the game down in this order before it leaves:
+  1. the shutdown hooks, newest first: the rumble service is stopped (xinput_wii.c: it cannot
+     switch a motor on again), then the files (xbox_files.c, `wii_files_quiesce`): the game's
+     writes under way finish (the wait is at most three seconds), the ones that would start wait,
+     and the files open for writing are synced. A save is several writes with the header written
+     last (`game_state_xbox.c`), so one cut between two writes is not valid, and the one before it
+     stays; no single write is cut;
+  2. the audio output is stopped (`wl_platform_audio_stop`) and every Remote's and GameCube
+     controller's motor (`wl_platform_input_stop_rumble`);
+  3. the log is flushed and closed, and the SD card and the USB drive are unmounted, so that
+     libfat's caches are written out;
+  4. `exit(0)` (the loader) or `STM_ShutdownToStandby` (power off).
+
+  The log says "leaving (loader)" or "leaving (power off)" (tag `system`) when it starts. A second
+  way out, from another thread, waits for the first. The game's own `debug.txt` and other C
+  `FILE`s are not covered (the port keeps its log in WiiLibs').
+- **Start-up failures.** A failure before the game runs (the fixed memory, WiiLibs' heaps, the
+  game's heap, its thread, missing maps) stops with WiiLibs' stop screen: the message on the
+  console's text screen and in the log, and a wait for HOME, START, reset or power
+  (`platform_show_message` stays a log line: its callers' messages are about multiplayer, which
+  the Wii does not play, and none ends the game).
 - **Network.** `src/posix_net_wii.c` is the platform layer's sockets (`posix.h`) over WiiLibs'
   `wl/platform/net.h`; the Winsock layer above it is the Linux build's `xnet.c`, whose byte-order
   functions are the identity on this big-endian machine. The network comes up in the background
@@ -259,7 +292,8 @@ its largest symbols are `llvm-nm -S --size-sort -r build/wii/halo.elf`.
 | from `0x80003F00` | the code (`.init`, `.text`) | 3677 | 3614 |
 | then | read-only data and data: `.rodata` 380, `.eh_frame` 73 (unwind tables nothing reads), `.data` 502 | 965 | 967 |
 | then | zeroed data (`.sbss`, `.bss`): below | 12571 | 7896 |
-| to `0x813C0000` | libogc's arena: newlib's heap (the "MEM1 heap": all the game mallocs first, WiiLibs' two video framebuffers among it, 600 KB each at 480 lines and 718 at 574) and libogc's own (about 64 KB) | 2996 | 7732 |
+| to `0x81340000` | libogc's arena: newlib's heap (the "MEM1 heap": all the game mallocs first, WiiLibs' two video framebuffers among it, 600 KB each at 480 lines and 718 at 574) and libogc's own (about 64 KB) | 2996 | 7220 |
+| `0x81340000`–`0x813C0000` | the GX command FIFO (WiiLibs' `WL_TAG_GXFIFO`, 524,256 bytes in a 512 KB heap): the GP reads it from MEM1, where libogc's examples put it; on the console a FIFO in MEM2 is not supported. It was 1 MB in MEM2 | 0 | 512 |
 | `0x813C0000`–`0x81800000` | the game state: 4 MB for the CPU's part (the Xbox's 3,165,260 bytes of pools and the port's additions), 256 KB for the GPU's | 4352 | 4352 |
 
 What changed in MEM1:
@@ -296,15 +330,26 @@ the game's thread starts) 128.
 | `0x90100000`–`0x91700000` | the tag cache (22528 KB), at the window's bottom: a map's tags (at most 16.2 MB, b40) and the structure bsp loaded at its top (at most 8.6 MB, c20) | 22528 | 22528 |
 | top-down from the window's top | the texture cache (12288 KB, the game's own cache of the map's bitmaps, converted to GX's formats), the sound cache (4096 KB), Direct3D's resources (vertex and index buffers, textures the game makes, render targets: b30 1.4 to 3.8 MB) and what is free | 22528 | 23040 and the pages below |
 | window, in all | `0x90100000`–`0x92D00000`, now from libogc's arena to `0x92D80000` | 45056 | 45568 and about 1000 |
-| above the window | WiiLibs' heaps: the GX FIFO 1024, the game's heap (the MEM1 heap's overflow) 5120, thread stacks 256 then 64 (24 in use: the audio thread's), the audio output's buffers 256 then 64 (4 in use), asynchronous reads 256 then 64 (none in use); the rest WiiLibs' reserve | 7040 | 6528 |
+| above the window | WiiLibs' heaps: the game's heap (the MEM1 heap's overflow) 5120 then 6144 (it took the GX FIFO's 1024 when that moved to MEM1), thread stacks 256 then 64 (40 in use: the audio thread's 24 and the buttons' watcher's 16), the audio output's buffers 256 then 64 (4 in use), asynchronous reads 256 then 64 (none in use); the rest WiiLibs' reserve (192) | 7040 | 6528 |
 
 So the game's malloc has the MEM1 heap and the game's heap together: about 8 MB before (2.9 and
-5.1), about 12.6 MB now (7.7, of which the two framebuffers take 1.2, and 5.1 less the 64 KB of
-the accounting's tables).
+5.1), about 13 MB now (7.05, of which the two framebuffers take 1.2, and 6.0 less the 64 KB of
+the accounting's tables). Moving the GX FIFO into MEM1 took 512 KB from the first and gave the
+second 1024: 512 KB more in all. MEM1's table still adds up to its 24576 KB (16 + 3614 + 967 +
+7896 + 7220 + 512 + 4352).
+
+**The GX FIFO** is `WL_TAG_GXFIFO` in MEM1 (`src/wii_boot.c`: the tag's region and 512 KB budget,
+and `memory.claim[WL_MEM1] = WL_MEM_CLAIM_NEEDED`, so that WiiLibs takes only the FIFO's 512 KB
+from the top of libogc's MEM1 arena, below the game state, and leaves the rest to malloc).
+`wl_gx_init` sizes the FIFO by the heap (`wl_gx_fifo_bytes`). WiiLibs samples the FIFO's fill at
+each frame's end and the log says each new peak by 64 KB steps ("FIFO fill peaked at N of M
+bytes", tag `GX`) and at shutdown; the Direct3D device logs the FIFO overflows (`GX FIFO
+overflows so far`). A frame that fills it makes the processor wait, so a peak near 512 KB, or
+overflows, are the sign to look at.
 
 **How malloc works.** The game's heap is newlib's, in what MEM1 leaves. WiiLibs' heap overflow
 (`wl/platform/heap_overflow.h`, its `wii/heap_wrap_wii.c`) wraps the allocators, newlib's
-internal ones included, so that what MEM1 cannot hold comes from a 5 MB heap in MEM2
+internal ones included, so that what MEM1 cannot hold comes from a 6 MB heap in MEM2
 (`WII_MEMORY_TAG_GAME`). The link wraps the names in WiiLibs' `WL_HEAP_OVERFLOW_WRAPS`
 (`cmake/WiiLibs.cmake`, which `tools/wii_build.py` reads) and pulls the wrappers in with
 `-u __wrap_malloc`; `__wrap_main` turns the overflow on with `wl_heap_overflow_enable` once
@@ -878,7 +923,9 @@ that a menu's left, right, up and down never also mean Back, a click or a weapon
 | Start (pause) | + | + | Start |
 | D-pad (menus) | D-pad | D-pad | D-pad |
 
-The Home button does nothing in the game (the menus' Quit returns to the loader). The Remote
+The Home button does nothing in the game (the menus' Quit returns to the loader); the console's
+reset and power buttons, and a Remote's power button, are served by the watcher thread ("Reset,
+Power and quitting", above). The Remote
 without a Nunchuk has no way to move (its buttons and pointer work); the Classic Controller's
 pointer is not used; the Wii U Pro Controller is not supported (its stick clicks are not read).
 
@@ -891,10 +938,28 @@ above the middle looks up. Aim magnetism is off while the pointer is turning the
 within the box, where it helps to hold a target. When the sensor bar is lost the last position
 carries on for 150 ms, then the view stops. The profile's inverted look does not apply to it.
 
+**Rumble.** The Xbox controller has two motors, each given a strength from 0 to 65535 (the game
+sets them every tick: `input_flush_rumble` in `input_xbox.c`, which sends zero while paused, in the
+console or out of a game); a Remote's and a GameCube controller's has one that is on or off. The
+game's call (`XInputSetState`) only records the stronger of the two strengths and when it was asked,
+and zero while any menu is up. The motor is switched by a service on WiiLibs' watcher thread
+(`wii_rumble_tick`, every 16 ms, 62 times a second) with a duty cycle (`wii_rumble_duty`,
+`xinput_wii_map.c`): the motor is on for a fraction of the ticks equal to the strength (an error
+that carries from tick to tick: half strength is on one tick in two, nine tenths on nine in ten),
+off at once for strength zero, and not switched again within 10 ms of its last switch, so at most a
+hundred switches a second go to the Remote whatever the rate. It stops when the game has not asked
+for 250 ms (a map loading, a halt), when the controller is gone (its strength is cleared and the
+motor's state forgotten, so that one that comes back starts still), when the game quits or the
+console is reset or powered off. The console's setting (the Wii's Remote vibration, `BT.MOT` in
+SYSCONF, read by libogc's `CONF_GetPadMotorMode`, through WiiLibs' `wl_platform_rumble_enabled`)
+is kept: with it off no motor, GameCube controllers' included, is switched on.
+
 Checking the mapping: `tools/wii_input_check.py` builds `tests/wii_input_check.c` for the host
 with WiiLibs' `input_shape.c` and maps synthetic input states, comparing the Xbox gamepad with
 this table (each button on its own in play and in the menus, every Xbox control reachable from
-each controller, the sticks' signs and extremes, the triggers, the pointer's turn and its loss).
+each controller, the sticks' signs and extremes, the triggers, the pointer's turn and its loss) and the rumble's duty cycle (the fraction of ticks
+on for nine strengths at 60 and 30 ticks a second, at most a hundred switches a second at ticks a
+millisecond apart, zero stopping the motor at once).
 WiiLibs' own tests cover the reading (`test_platform_input_wii`: the backend against stand-ins
 for libogc's, with the sticks' and triggers' ranges and a Remote's drop-out) and the shaping
 (`test_platform_input_shape`). On a run (Dolphin or the console) `debug.input_log = true`
@@ -922,6 +987,17 @@ Dolphin runs the game, but these need the console:
   and triggers' real ranges are the ones read, a Remote's drop-outs, the pointer's feel and
   look speed, the Classic Controller Pro's triggers, whether the Wii U Pro Controller and the
   Home button need handling; `debug.input_log` writes each state to the log).
+- **Reset, Power and the Remote's power button** (needs a checkpoint run in Dolphin, which has
+  emulated Reset and Power buttons on its menu and a Remote that can be disconnected, and the
+  console): each while a map loads and in play; the log ends with "leaving (loader)" or "leaving
+  (power off)" and the Dolphin run ends there; a save made just before is intact (the next start
+  loads it), and the motors are still. The missing-maps screen: start with the SD card without
+  `apps/halo/maps`; HOME returns to the loader.
+- **Rumble.** Whether the duty cycle feels like a strength and not a buzz (the switching is 62 Hz
+  at most), that it stops with a pause, a disconnect and a quit, and that Remote vibration off in
+  the console's settings means none.
+- **The GX FIFO in MEM1.** That the peak fill and the overflows count are as on Dolphin; Dolphin
+  does not mind a FIFO in either memory.
 - **Memory.** MEM1 and MEM2 as the console's IOS leaves them, with the
   Homebrew Channel's loader: the memory report's window line says where libogc's MEM2 began
   (the window reaches down to it), and WiiLibs' `[mem]` lines what its heaps were given.
