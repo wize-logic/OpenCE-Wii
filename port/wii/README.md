@@ -184,6 +184,39 @@ mkdir and the opening of a listing, `attributes` stat, `writes`, `syncs`, `close
 copy's rename over its file, `deleting`). The start-up's cost is the total on the line after the
 last default variant.
 
+### The loading screen
+
+The game's loading screen is its progress bar (`source/interface/progress_bar.c`: a blue swirl
+made from noise textures and the 320 by 240 `loading.tga` that has the word LOADING in it, with a
+chant behind it). It is drawn by `render_frame_pregame` only while `game_precache_new_map`'s loop
+runs, and that loop runs as long as `cache_files_precache_map_status` says the map is still being
+copied to the Xbox's hard drive, which was most of a level's load there. On the Wii:
+
+- The precache is done at once (`cache_files_precache_map_begin` opens the map where it is, and
+  `cache_files_precache_map_status` says success with progress 1.0 at its first call), so the loop
+  runs once: one frame, with progress 1.0. `progress_bar_display` takes the first progress it is
+  given as its starting point and draws `(progress - start) / (1 - start)`, which is 0/0 here.
+  Then `progress_bar_end`, and the whole load (`game_load`, `game_initialize_for_new_map`: tags,
+  structure, objects, sounds) runs on the main thread with no frame presented, so the TV holds the
+  last picture presented, still, for the whole load (the log's one long frame, "frame N took 1243
+  ms"). It is not the animation, and not black on purpose.
+- `maps/loading.tga` is not on the SD card: the disc's maps folder has it, the player's copy of the
+  maps does not (24 files, no `loading.tga`), and the converter copies none. The word LOADING is
+  then missing from the picture (the texture is made and left as it was).
+
+What the animation needs, which is not the platform's: (1) the progress bar kept active and
+`map_load_in_progress` set until `main_new_map` has finished, not until the precache says done;
+(2) a pump, `loading_pump()`, that draws only the progress bar (not the widgets, whose tags the
+load is replacing) and presents, at most every 33 ms, called from where the main thread waits for
+the card (`cache_file_block_until_not_busy`, `cached_map_block_on_async_request` and the
+`SleepEx(0, TRUE)` loops of `cache_files_windows.c`: the cache thread reads while the main thread
+spins, which is where the console spends most of a level's load) and between the calls of
+`game_initialize_for_new_map`; (3) a progress that rises with the load (the bytes read of the map
+over a size the load is expected to read, rounded off as 1 - 1/(1 + bytes/8 MB)); (4)
+`loading.tga` from the disc in the maps folder and copied by the converter; (5) a checkpoint
+that shows `progress_bar_render`'s draws (render targets copied to textures, immediate vertices)
+come out on the GX device. None of this is done; it is listed for the game and renderer.
+
 ### Reading the maps
 
 A level load reads the map through `ReadFile` and `ReadFileEx` with an offset; the Xbox's overlapped
@@ -191,8 +224,9 @@ reads finish where they are issued here (there is no read in flight to wait for)
 asynchronous read to add. Two things are the platform's:
 
 - A handle opened for reading only with `FILE_FLAG_OVERLAPPED` (the maps) keeps its place: a read
-  that starts where the last one ended is a `read` and nothing else. Before, each was WiiLibs'
-  `pread`, which is a seek to the offset, the read and a seek back to where the handle stood; on
+  that starts where the last one ended is a `read` and nothing else (WiiLibs'
+  `WlPlacedReader`, `wl/platform/posix.h`). Before, each was WiiLibs' `pread`, which is a seek to
+  the offset, the read and a seek back to where the handle stood; on
   FAT a seek walks the file's chain of clusters from the cluster it stands at (or from the start,
   when it goes backwards), and the one back to the handle's old place made every read walk the
   chain from the start. The handle's own position is put back when something that uses it comes

@@ -29,6 +29,7 @@ matched case-insensitively, like the Xbox's FATX volumes.
 #include <unistd.h>
 #ifdef HALO_WII
 #include <pthread.h>
+#include "wl/platform/posix.h"
 #endif
 
 #ifdef HALO_WII
@@ -488,10 +489,8 @@ struct platform_file
 	BOOL truncate_pending; /* it was to be emptied (CREATE_ALWAYS): cut to what is written at the close */
 	unsigned long long written_end;
 	/* a handle only read at offsets (a map's) keeps its place, so that the next read in line needs no seek */
-	BOOL positioned_only;
-	BOOL place_lock_ready;
-	long long place; /* where the descriptor stands, -1: not known */
-	pthread_mutex_t place_lock;
+	BOOL positioned_only; /* the reader has the descriptor */
+	WlPlacedReader reader;
 	/* what it has been read for, logged when it closes */
 	unsigned long reads;
 	unsigned long long read_bytes;
@@ -1068,6 +1067,7 @@ static void file_destroy(struct platform_handle *handle)
 
 #ifdef HALO_WII
 	writable_unregister(file);
+	wl_posix_placed_close(&file->reader); /* (before the descriptor goes: it puts the position back) */
 	if (file->shadow == _shadow_active)
 	{
 		shadow_finish(file);
@@ -1082,8 +1082,6 @@ static void file_destroy(struct platform_handle *handle)
 		close(file->descriptor);
 		card_end(_card_close, started, file->path);
 	}
-	if (file->place_lock_ready)
-		pthread_mutex_destroy(&file->place_lock);
 #else
 	close(file->descriptor);
 #endif
@@ -1227,14 +1225,10 @@ HANDLE WINAPI CreateFileA(LPCSTR file_name, DWORD desired_access, DWORD share_mo
 	file->regenerated = regenerated;
 	file->regenerated_for_write = regenerated_for_write;
 	file->truncate_pending = truncate_pending;
-	file->place = -1;
 	/* a map and the like: read at offsets only, from a handle opened for it */
 	if ((flags & O_ACCMODE) == O_RDONLY && (flags_and_attributes & FILE_FLAG_OVERLAPPED) &&
-		pthread_mutex_init(&file->place_lock, NULL) == 0)
-	{
-		file->place_lock_ready = TRUE;
+		wl_posix_placed_open(&file->reader, descriptor) == WL_OK)
 		file->positioned_only = TRUE;
-	}
 	if ((flags & O_ACCMODE) != O_RDONLY)
 		writable_register(file);
 	card_end(_card_open, started, path);
@@ -1253,29 +1247,15 @@ HANDLE WINAPI CreateFileA(LPCSTR file_name, DWORD desired_access, DWORD share_mo
 the last ended (the map's tags, then its bitmaps in the order they were asked
 for) is a read and nothing else, where pread (WiiLibs' wl_posix_pread) is a
 seek to the offset, the read, and a seek back to where the handle stood, each
-of them a walk along the file's chain of clusters on FAT. The handle's own
-position is put back when something that uses it comes (file_end_positioned). */
+of them a walk along the file's chain of clusters on FAT. WiiLibs' reader
+(WlPlacedReader) does it; the handle's own position is put back when something
+that uses it comes (file_end_positioned). */
 static ssize_t read_at_place(struct platform_file *file, void *buffer, size_t count, unsigned long long offset)
 {
-	ssize_t result;
+	uint32_t seeks = file->reader.seeks;
+	ssize_t result = wl_posix_placed_pread(&file->reader, buffer, count, (int64_t)offset);
 
-	pthread_mutex_lock(&file->place_lock);
-	if (file->place != (long long)offset)
-	{
-		if (lseek(file->descriptor, (off_t)offset, SEEK_SET) == (off_t)-1)
-		{
-			int error = errno;
-
-			file->place = -1;
-			pthread_mutex_unlock(&file->place_lock);
-			errno = error;
-			return -1;
-		}
-		__sync_fetch_and_add(&read_window.seeks, 1);
-	}
-	result = read(file->descriptor, buffer, count);
-	file->place = result > 0 ? (long long)offset + result : -1;
-	pthread_mutex_unlock(&file->place_lock);
+	__sync_fetch_and_add(&read_window.seeks, file->reader.seeks - seeks);
 	return result;
 }
 
@@ -1284,12 +1264,8 @@ static void file_end_positioned(struct platform_file *file)
 {
 	if (!file->positioned_only)
 		return;
-	pthread_mutex_lock(&file->place_lock);
 	file->positioned_only = FALSE;
-	if (file->place >= 0)
-		lseek(file->descriptor, 0, SEEK_SET);
-	file->place = -1;
-	pthread_mutex_unlock(&file->place_lock);
+	wl_posix_placed_release(&file->reader);
 }
 #endif
 

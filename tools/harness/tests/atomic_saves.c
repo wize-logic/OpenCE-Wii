@@ -124,6 +124,12 @@ enum { _card_translate, _card_open, _card_directory, _card_attributes, _card_wri
 static unsigned long long card_now(void) { return 0; }
 static void card_end(int kind, unsigned long long started, const char *path) { (void)kind; (void)started; (void)path; }
 
+/* WiiLibs' reader of a descriptor by offsets (the maps'): not what is tested here */
+typedef struct WlPlacedReader { int taken; } WlPlacedReader;
+static void wl_posix_placed_close(WlPlacedReader *reader) { (void)reader; }
+#define WL_OK 0
+static int wl_posix_placed_open(WlPlacedReader *reader, int descriptor) { (void)reader; (void)descriptor; return WL_OK; }
+
 static char save_root[512];
 static char data_root[512];
 static const char *platform_save_root(void) { return save_root; }
