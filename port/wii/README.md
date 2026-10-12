@@ -559,7 +559,7 @@ the game's thread starts) 128.
 | Range | Holds | Before | Now |
 | --- | --- | ---: | ---: |
 | `0x90000000` to libogc's MEM2 arena | libogc's IOS buffers (the memory report's window line says where the arena began) | a few | a few |
-| from there to `0x90100000` | before, no one's; now the window's lowest pages, which only its top-down blocks reach | about 1000 | in the window |
+| from there to `0x90100000` | before, no one's; now the window's lowest pages, which its top-down blocks reach last and the Direct3D device's kept buffers first ("The kept buffers' memory") | about 1000 | in the window |
 | `0x90100000`–`0x91700000` | the tag cache (22528 KB), at the window's bottom: a map's tags (at most 16.2 MB, b40) and the structure bsp loaded at its top (at most 8.6 MB, c20) | 22528 | 22528 |
 | top-down from the window's top | the texture cache (12288 KB, the game's own cache of the map's bitmaps, converted to GX's formats), the sound cache (4096 KB), Direct3D's resources (vertex and index buffers, textures the game makes, render targets: b30 1.4 to 3.8 MB) and what is free | 22528 | 23040 and the pages below |
 | window, in all | `0x90100000`–`0x92D00000`, now from libogc's arena to `0x92D80000` | 45056 | 45568 and about 1000 |
@@ -816,9 +816,14 @@ and pixel shaders.
       same twice, as a GX display list of its primitive and indices, written once and called
       (`index_list_draw`; libogc's `GX_BeginDispList`, since WiiLibs' `wl_gx_dl_*` records only
       its own layouts). GX's state stays outside the list, so one list serves every pass of the
-      same primitive and number of attributes (four a record), at most 512 KB in all, with the
-      kept outputs' reserve. The log's `the structure's indices as display lists` line counts
-      the calls, the lists written and those without room; `debug.gx_display_lists = false`
+      same primitive and number of attributes (four a record), at most 768 KB in all, in the
+      kept buffers' memory (below). A record refused room for a list does not ask again until
+      room may have come, so its draws cost what they did before the lists (the bench with no
+      room at all: 115 instructions more in a structure's draw of 82,000, 71 in a rigid
+      model's of 25,000). With room, the later frames' structure draws take 38,043
+      instructions against 43,675 with `debug.gx_display_lists = false`, the rigid models'
+      16,715 against 21,100. The log's `the structure's indices as display lists` line counts
+      the calls, the lists written and the draws refused one; `debug.gx_display_lists = false`
       sends the indices again;
     - a draw the processor has a part in (a blended vertex's position, the colours, a sphere map's
       coordinates, the planar fog's alpha, a normal sent): each vertex's part computed once a
@@ -866,13 +871,41 @@ and pixel shaders.
     `10c30c53`) were nearly all the CPU's vertices. The program itself saves little (1110 to 1108
     instructions a vertex for `8f831b43`: its skinning and lighting are most of it); each index
     sends 7 words to the FIFO in place of 14.
+  - **The kept buffers' memory.** What the device keeps for GX to read (the static buffers'
+    outputs, the lit models' normals, the structure's display lists, a fog ramp of more than 32
+    rows) took the contiguous window's pages top-down, as the game's blocks do, a page at least
+    each (a display list of 1.5 KB took four), and only while the window kept 1 MB more free in
+    one run. The game's blocks and the device's lay between one another: once a level was
+    loaded, the largest free run was the 1016 KB below the tag cache (b30: 2,996 KB free in
+    all), and every kept buffer was refused (b30: 846 lists, 5,323 lit draws' normals and 305
+    draws' outputs every 3 seconds). They now have a pool of their own (`kept_alloc`):
+    - pages from the window's bottom (`wii_memory_window_alloc_low`), in the smallest free run
+      they fit, where the game's top-down blocks reach last; refused where the window's largest
+      free run would be left below 512 KB (unless it is not the run they take);
+    - a buffer of 16 KB or less cut from a slab of 64 KB in 32-byte granules (a bit each), a
+      larger one in pages of its own (GX reads each draw's arrays and lists from one block); at
+      most 2.5 MB in all, each kind within its own budget;
+    - freed once GX has drawn what reads it; an empty slab's pages go back to the window;
+    - the game's blocks first: where one finds no room in the window, `wii_memory.c` calls the
+      device back (`kept_reclaim`, on the device's thread and not while a draw reads them),
+      which waits for GX, frees every kept buffer, and the block is looked for again (the log:
+      `contiguous memory: the Direct3D device's kept buffers given back`). The 512 KB margin
+      keeps that rare: the blocks made once a level is loaded are the loading screen's texture
+      (320 by 240, 300 KB) and the device's own (sphere maps of 9 KB; the back buffer's
+      parking, two of 1,200 KB made once, which go to the heap where the window has no room);
+    - a buffer refused is not asked for again (by the entry or index record that wanted it)
+      until room may have come: a free of the window's pages or of a slab's granules, seen once
+      a frame is drawn; within that, a window block as large as one refused is refused without
+      a look.
+    The log's `the kept buffers' memory` line gives the window's KB the pool holds, its slabs
+    and the KB of them in use, the blocks of their own, the window blocks refused and the times
+    they were given back.
   - **Static buffers' outputs kept.** An output that reads no constant is, for a vertex, the
     same whatever the draw's constants (`nv2a_cpu_analyze_constants`; the generated programs
     list them as "the vertex's alone"). Where what the processor computes for such a draw (a
     sphere-mapped stage's coordinates, or both colours) reads no constant and the streams it
-    reads are static, it is computed once a vertex, kept beside the buffers in the contiguous
-    window (at most 1 MB, and only while the window keeps 1 MB more free in one run), and GX
-    reads it by index as it reads the buffers (`static_outputs_find`).
+    reads are static, it is computed once a vertex, kept in the kept buffers' memory (below; at
+    most 1 MB), and GX reads it by index as it reads the buffers (`static_outputs_find`).
     - A vertex buffer is static while the game does not lock it: its header's `Lock` holds a
       serial the device gives it, which `D3DVertexBuffer_Lock` clears. The kept outputs are
       keyed by each stream's header, data, stride and serial, the program, the shader and the
@@ -910,8 +943,8 @@ and pixel shaders.
       matrices make E, the projection is multiplied by K, the depth's row is the same. The
       normal matrices are E's rows of each node's matrix.
     - The normal is three floats, from the map's 11:11:10 word as the programs read it, decoded
-      once for each static buffer into an array beside it in the contiguous window (at most
-      768 KB, and only while the window keeps 1 MB more free in one run), which GX reads by
+      once for each static buffer into an array in the kept buffers' memory (at most 768 KB;
+      an entry refused room asks again only once room may have come), which GX reads by
       index as it reads the positions (`kept_normals_find`; three floats in the buffer it reads
       where they are). It was decoded and sent for every index of every draw, 58,000 a frame in
       b30. A draw with vertices whose position is the processor's (a blend beyond the draw's
@@ -920,7 +953,8 @@ and pixel shaders.
       one opposite for a translucent shader's back side), and each point light. COLOR1A1 is
       D1, the Fresnel colour c-80 + c-81 (n.e): two lights at the eye, signed
       (`GX_DF_SIGNED`), one for the channels where c-81 is positive and one, with a negative
-      attenuation, for those where it is negative. D0's alpha is 0, or the planar fog's.
+      attenuation, for those where it is negative. D0's alpha is 0, the planar fog's, or its
+      product with the atmospheric fog's.
     - The planar fog's alpha (`8f831b43`: the Pelican, the first-person weapon, b30's
       scenery at sea level) is a function of two values affine in the world position, the
       depth below the fog's plane (c-87) and the distance ahead (c-86), constant beyond 0 and
@@ -930,10 +964,22 @@ and pixel shaders.
       (`GX_DTTMTX0`, E to the ramp's coordinates). The pixel shader is translated again with
       D0's alpha that texture's (`gx_psh_textures.d0_alpha_map`, a map of 4 to 7 the stages
       leave free), so the vertices send no alpha. The fog is then the fog's at each pixel,
-      where the Xbox interpolates the vertices'. The product with the atmospheric fog
-      (`1d3f5b13`, `e6e006c7`), a draw with no map free or whose coordinates at its centre
-      are more than 256 ramps from it, and a pixel shader beyond GX with it keep the
-      processor's alpha, computed from the world position.
+      where the Xbox interpolates the vertices'.
+    - The product with the atmospheric fog (`1d3f5b13`, `e6e006c7`: lit characters in fog),
+      (1 - r' f)(1 - a), r' the atmospheric distance c-88 p clamped to [0, 1] and f its
+      density, is a ramp too: the game makes c-88 of c-86's direction (the camera's forward,
+      `_rasterizer_window_set_fog`), so r = alpha t + beta and the product is a function of s
+      and t, constant beyond [0, 1] in s and beyond both [0, 1] and r's [0, 1] in t. Its ramp
+      spans that t, 32 rows a unit of t (16 or 8 where 256 rows hold no more; a longer one is
+      refused), with r's 0 and 1 each on a row, so that the atmospheric fog's, linear between
+      them, is the filter's (`gx_lighting_fog_form`). A ramp of more than 32 rows is held in the
+      kept buffers' memory. `tests/gx_lighting_check.c` compares it with the programs: within
+      2/255 at the vertices, 1.5 halfway between two (the planar fog's alone: 1, 1.5). In the
+      bench's later frames the fogged scene's draws take 97,698 instructions against 104,302,
+      the skinned scene's (a third of whose characters have the product) 92,286 against 98,154.
+    - A draw with no map free or whose coordinates at its centre are more than 256 ramps from
+      it, a product of fogs whose distances are not of one direction, and a pixel shader beyond
+      GX with it keep the processor's alpha, computed from the world position.
     - A point light's fall-off, max(1 - d^2/r^2, 0), is not a form GX has: its reciprocal's
       second-order expansion about the draw's distance gives GX's k0 + k1 d + k2 d^2. Its spot,
       clamp(cos s + o, 0, 1), is a parabola through the same cut-off, 1 on its axis.

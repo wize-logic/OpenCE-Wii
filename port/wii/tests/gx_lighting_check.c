@@ -12,11 +12,13 @@ gx_lighting_evaluate) is compared with the program's outputs:
   lights and ambient are the programs' but for GX's unit normal and 8-bit
   colours; a point light's fall-off and spot are fitted);
 - D1, the reflection's Fresnel colour;
-- D0's alpha, the planar fog's (the processor's, per vertex), and the
-  planar fog's from GX's ramp (gx_lighting_fog_ramp, read at the
-  coordinates the post-transform matrix makes of the position in E, filtered
-  as GX filters it), at the vertices and halfway between two (where the
-  programs' is the mean of the two, GX's the fog's there);
+- D0's alpha, the planar fog's or its product with the atmospheric fog's
+  (the processor's, per vertex), and the same from GX's ramp
+  (gx_lighting_fog_ramp, read at the coordinates the post-transform matrix
+  makes of the position in E, filtered as GX filters it), at the vertices
+  and halfway between two (where the programs' is the mean of the two, GX's
+  the fog's there); the product's atmospheric distance (c-88) is of the
+  planar fog's distance's direction (c-86), as the game makes it;
 - the reflection's direction: the program's, against the one the view's
   sphere map holds at the texture coordinates GX makes of the normal (the
   eye taken straight ahead), in degrees;
@@ -204,7 +206,7 @@ struct results
 	/* the ramp's alpha at the vertices, halfway between two, and its error
 	against the fog's own there */
 	struct statistic ramp, ramp_between, ramp_exact;
-	unsigned long scenes, refused, ramp_refused;
+	unsigned long scenes, refused, ramp_refused, ramp_rows;
 };
 
 static void check_program(const struct nv2a_cpu_program *program, struct results *results)
@@ -225,7 +227,8 @@ static void check_program(const struct nv2a_cpu_program *program, struct results
 		struct gx_lighting lighting;
 		float projection[4][4];
 		int has_points;
-		static unsigned char ramp[GX_LIGHTING_FOG_SIZE][GX_LIGHTING_FOG_SIZE];
+		static unsigned char ramp[GX_LIGHTING_FOG_ROWS * GX_LIGHTING_FOG_SIZE];
+		struct gx_lighting_fog_form form;
 		float ramp_matrix[3][4], last_coordinates[2] = { 0.0f, 0.0f }, last_world[3] = { 0.0f, 0.0f, 0.0f };
 		float last_alpha = 0.0f;
 		int ramped = 0;
@@ -363,6 +366,17 @@ static void check_program(const struct nv2a_cpu_program *program, struct results
 		c[-85][0] = uniform(0.0f, 1.0f);
 		c[-85][1] = uniform(0.0f, 1.0f);
 		c[-85][2] = uniform(0.0f, 1.0f);
+		if (program->hash == 0x1d3f5b13UL || program->hash == 0xe6e006c7UL)
+		{
+			/* (the atmospheric fog's distance along the planar fog's: the
+			camera's forward over each one's range, r = alpha t + beta, beta
+			the atmospheric fog's least distance over its range, negated) */
+			float alpha = uniform(0.2f, 4.0f), beta = uniform(-3.0f, 0.5f);
+
+			for (column = 0; column < 3; column++)
+				c[-88][column] = alpha * c[-86][column];
+			c[-88][3] = beta + alpha * c[-86][3];
+		}
 
 		results->scenes++;
 		if (!gx_lighting_space_make((const float (*)[4])c, &space))
@@ -385,11 +399,16 @@ static void check_program(const struct nv2a_cpu_program *program, struct results
 			results->refused++;
 			continue;
 		}
-		if (gx_lighting_fog_ramped(&lighting))
+		if (lighting.alpha != _gx_lighting_alpha_zero)
 		{
-			ramped = gx_lighting_fog_matrix(&lighting, &space, center_e, ramp_matrix);
+			ramped = gx_lighting_fog_form(&lighting, &form) &&
+				gx_lighting_fog_matrix(&lighting, &form, &space, center_e, ramp_matrix);
 			results->ramp_refused += !ramped;
-			gx_lighting_fog_ramp(&lighting, ramp);
+			if (ramped)
+			{
+				gx_lighting_fog_ramp(&form, 0, form.rows, ramp);
+				results->ramp_rows += form.rows;
+			}
 		}
 		gx_lighting_space_projection(&space, 640.0f, 480.0f, 0.0f, 1.0f, projection);
 		{
@@ -477,8 +496,8 @@ static void check_program(const struct nv2a_cpu_program *program, struct results
 
 				for (row = 0; row < 2; row++)
 					coordinates[row] = dot3(ramp_matrix[row], position_e) + ramp_matrix[row][3];
-				add(&results->ramp, (double)gx_lighting_fog_sample((const unsigned char (*)[GX_LIGHTING_FOG_SIZE])ramp,
-					coordinates[0], coordinates[1]) - color_byte(out.d0[3]));
+				add(&results->ramp, (double)gx_lighting_fog_sample(ramp, form.rows, coordinates[0], coordinates[1]) -
+					color_byte(out.d0[3]));
 				if (vertex)
 				{
 					/* (halfway to the vertex before: the programs' interpolated, GX's
@@ -492,7 +511,7 @@ static void check_program(const struct nv2a_cpu_program *program, struct results
 						half[k] = 0.5f * (coordinates[k] + last_coordinates[k]);
 					for (k = 0; k < 3; k++)
 						world_half[k] = 0.5f * (world[k] + last_world[k]);
-					sampled = gx_lighting_fog_sample((const unsigned char (*)[GX_LIGHTING_FOG_SIZE])ramp, half[0], half[1]);
+					sampled = gx_lighting_fog_sample(ramp, form.rows, half[0], half[1]);
 					add(&results->ramp_between, (double)sampled - 255.0 * 0.5 * (last_alpha + clamp_unit(out.d0[3])));
 					add(&results->ramp_exact, (double)sampled - 255.0 * gx_lighting_planar_fog(&lighting, world_half));
 				}
@@ -642,6 +661,7 @@ int main(int argc, char **argv)
 			report("D0 alpha, GX's ramp, halfway (programs: mean)", &results.ramp_between, "/255");
 			report("D0 alpha, GX's ramp, halfway (the fog's there)", &results.ramp_exact, "/255");
 			printf("  %-46s %lu of %lu scenes\n", "the ramp's range refused", results.ramp_refused, results.scenes);
+			printf("  %-46s %lu\n", "the ramp's rows (mean)", results.ramp_rows / (results.scenes - results.ramp_refused));
 		}
 		if (results.reflection[0].count)
 		{

@@ -429,6 +429,8 @@ void WINAPI Direct3D_SetPushBufferSize(DWORD push_buffer_size, DWORD segment_cou
 	(void)segment_count;
 }
 
+static void kept_start(void);
+
 HRESULT WINAPI Direct3D_CreateDevice(UINT adapter, D3DDEVTYPE device_type, void *unused, DWORD behavior_flags,
 	D3DPRESENT_PARAMETERS *presentation_parameters, D3DDevice **returned_device)
 {
@@ -477,6 +479,8 @@ HRESULT WINAPI Direct3D_CreateDevice(UINT adapter, D3DDEVTYPE device_type, void 
 			what render targets park and put back; parked where there is room */
 			wl_gx_target_set_back_buffer_size(SCREEN_WIDTH, SCREEN_HEIGHT);
 			wl_gx_target_set_allocator(efb_park_alloc, efb_park_free);
+			/* (the kept buffers give their memory back to the game's blocks) */
+			kept_start();
 			/* (the transform unit's flush: gx_begin) */
 			xf_flush_on = config_boolean("debug.gpu_xf_flush_safe") ? TRUE : FALSE;
 			GX_SetMisc(GX_MT_XF_FLUSH, xf_flush_on ? GX_XF_FLUSH_SAFE : GX_XF_FLUSH_NONE);
@@ -4599,9 +4603,11 @@ struct index_record
 	struct index_list
 	{
 		void *data;
-		u32 size;
+		u32 size, capacity;
 		u8 primitive, attributes;
 	} lists[INDEX_LISTS];
+	/* (the kept_room a list was refused in: index_list_draw) */
+	unsigned long lists_refused;
 };
 
 static struct index_record index_records[INDEX_RECORDS];
@@ -4723,6 +4729,7 @@ static void draw_range_find(const struct stream_fetch *fetch, UINT count)
 	if (record->block)
 		index_record_keys_free(record);
 	index_record_lists_release(record, FALSE);
+	record->lists_refused = 0;
 	record->indices = fetch->indices;
 	record->count = count;
 	record->base = device.base_vertex_index;
@@ -5480,25 +5487,33 @@ static BOOL lit_prepare(const struct vertex_shader_object *shader, struct stream
 	return lit.colors || lit.reflection;
 }
 
-/* the planar fog's ramps, each of one fog (c-85's y and z), kept while it
-is the same: one is written again only when no draw of this frame has read
-it (the frames before are drawn: GX_DrawDone at Present) */
+/* the fogs' ramps, each of one form (gx_lighting_fog_form: the fog's c-85
+y and z, and the product's atmospheric fog), kept while it is the same:
+one is written again only when no draw of this frame has read it (the
+frames before are drawn: GX_DrawDone at Present). A ramp of
+GX_LIGHTING_FOG_SIZE rows is held here, a longer one (the product's, over
+the atmospheric fog's distance too) in the kept buffers' memory. */
 #define FOG_RAMPS 4
+static void *kept_alloc(unsigned long bytes);
+static void kept_free_later(void *data, unsigned long bytes);
 static struct
 {
-	unsigned char texels[GX_LIGHTING_FOG_SIZE * GX_LIGHTING_FOG_SIZE] __attribute__((aligned(32)));
-	float fog[2];
+	unsigned char small[GX_LIGHTING_FOG_SIZE * GX_LIGHTING_FOG_SIZE] __attribute__((aligned(32)));
+	/* (small, or the kept buffer of bytes) */
+	unsigned char *texels;
+	unsigned long bytes;
+	struct gx_lighting_fog_form form;
 	unsigned long frame_number;
 	BOOL made;
 } fog_ramps[FOG_RAMPS];
 static unsigned fog_ramps_next;
-/* in the statistics' window: draws whose fog GX made, ramps written, and
-draws whose fog stayed the processor's (the product with the atmospheric
-fog, no map free, no ramp, beyond the ramp's range, a pixel shader beyond
-GX with it) */
-static unsigned long lit_fog_draws, fog_ramps_made, lit_fog_refused;
+/* in the statistics' window: draws whose fog GX made (of them, the
+product's), ramps written, and draws whose fog stayed the processor's (a
+product of fogs of other directions or too long, no map free, no room for
+the ramp, beyond the ramp's range, a pixel shader beyond GX with it) */
+static unsigned long lit_fog_draws, lit_fog_products, fog_ramps_made, lit_fog_refused;
 
-/* D0's alpha the planar fog's ramp (lit.fog_ramped): the ramp bound to a
+/* D0's alpha the fog's ramp (lit.fog_ramped): the ramp bound to a
 texture map the pixel shader leaves free, the pixel shader translated again
 to read its alpha there for D0's, and texture coordinate 5 made of the
 position through the vertex's own matrix (to E) and the post-transform
@@ -5514,8 +5529,9 @@ static BOOL lit_fog_ramp(BOOL keyed)
 	unsigned which, slot;
 	int map;
 	GXTexObj object;
+	struct gx_lighting_fog_form form;
 
-	if (!gx_lighting_fog_ramped(&lit.lighting) || !pixel_shader_usable)
+	if (!pixel_shader_usable || !gx_lighting_fog_form(&lit.lighting, &form))
 		return FALSE;
 	/* (a map of 4 to 7 that the stages' separate alphas, the fog's ramp
 	and a bumped lookup leave free) */
@@ -5523,15 +5539,16 @@ static BOOL lit_fog_ramp(BOOL keyed)
 		if (!(textures->separate_alpha & (1U << (map - 4))) && !(map == GX_PSH_FOG_TEXMAP && textures->fog) &&
 			!(map == GX_PSH_BUMP_TEXMAP && (textures->bumped || textures->vertex_color)))
 			break;
-	if (map < 4 || !gx_lighting_fog_matrix(&lit.lighting, &lit.space, lit.center, matrix))
+	if (map < 4 || !gx_lighting_fog_matrix(&lit.lighting, &form, &lit.space, lit.center, matrix))
 		return FALSE;
 	for (which = 0; which < FOG_RAMPS; which++)
-		if (fog_ramps[which].made && fog_ramps[which].fog[0] == lit.lighting.fog[1] &&
-			fog_ramps[which].fog[1] == lit.lighting.fog[2])
+		if (fog_ramps[which].made && !memcmp(&fog_ramps[which].form, &form, sizeof(form)))
 			break;
 	if (which == FOG_RAMPS)
 	{
-		static unsigned char texels[GX_LIGHTING_FOG_SIZE][GX_LIGHTING_FOG_SIZE];
+		unsigned char band[4][GX_LIGHTING_FOG_SIZE];
+		unsigned long bytes = (unsigned long)form.rows * GX_LIGHTING_FOG_SIZE;
+		unsigned char *texels;
 		unsigned row, column;
 
 		for (slot = 0; slot < FOG_RAMPS; slot++)
@@ -5542,18 +5559,37 @@ static BOOL lit_fog_ramp(BOOL keyed)
 		}
 		if (slot == FOG_RAMPS)
 			return FALSE;
+		/* (the slot's memory: its own, or a kept buffer of the ramp's rows;
+		the one it had freed once GX has drawn the frame) */
+		texels = form.rows == GX_LIGHTING_FOG_SIZE ? fog_ramps[which].small :
+			fog_ramps[which].bytes == bytes ? fog_ramps[which].texels : kept_alloc(bytes);
+		if (!texels)
+			return FALSE;
+		if (fog_ramps[which].bytes && texels != fog_ramps[which].texels)
+		{
+			kept_free_later(fog_ramps[which].texels, fog_ramps[which].bytes);
+			fog_ramps[which].bytes = 0;
+		}
 		fog_ramps_next = which + 1;
-		/* (I8 in 8x4 tiles) */
-		gx_lighting_fog_ramp(&lit.lighting, texels);
-		for (row = 0; row < GX_LIGHTING_FOG_SIZE; row++)
+		/* (I8 in 8x4 tiles, a band of four rows at a time) */
+		for (row = 0; row < form.rows; row += 4)
+		{
+			gx_lighting_fog_ramp(&form, row, 4, &band[0][0]);
 			for (column = 0; column < GX_LIGHTING_FOG_SIZE; column++)
-				fog_ramps[which].texels[((row / 4) * (GX_LIGHTING_FOG_SIZE / 8) + column / 8) * 32 + (row % 4) * 8 +
-					column % 8] = texels[row][column];
-		DCFlushRange(fog_ramps[which].texels, sizeof(fog_ramps[which].texels));
+			{
+				unsigned line;
+
+				for (line = 0; line < 4; line++)
+					texels[((row / 4) * (GX_LIGHTING_FOG_SIZE / 8) + column / 8) * 32 + line * 8 + column % 8] =
+						band[line][column];
+			}
+		}
+		DCFlushRange(texels, bytes);
 		/* (GX's texture cache may hold the texels it had) */
 		GX_InvalidateTexAll();
-		fog_ramps[which].fog[0] = lit.lighting.fog[1];
-		fog_ramps[which].fog[1] = lit.lighting.fog[2];
+		fog_ramps[which].texels = texels;
+		fog_ramps[which].bytes = texels == fog_ramps[which].small ? 0 : bytes;
+		fog_ramps[which].form = form;
 		fog_ramps[which].made = TRUE;
 		fog_ramps_made++;
 	}
@@ -5570,7 +5606,9 @@ static BOOL lit_fog_ramp(BOOL keyed)
 	pixel_shader_program = program;
 	gx_psh_apply(program);
 	indirect_apply(program);
-	GX_InitTexObj(&object, fog_ramps[which].texels, GX_LIGHTING_FOG_SIZE, GX_LIGHTING_FOG_SIZE, GX_TF_I8, GX_CLAMP,
+	if (form.product)
+		lit_fog_products++;
+	GX_InitTexObj(&object, fog_ramps[which].texels, GX_LIGHTING_FOG_SIZE, (u16)form.rows, GX_TF_I8, GX_CLAMP,
 		GX_CLAMP, GX_FALSE);
 	GX_InitTexObjFilterMode(&object, GX_LINEAR, GX_LINEAR);
 	GX_LoadTexObj(&object, (u8)map);
@@ -5857,6 +5895,272 @@ static BOOL hardware_rejected(const struct nv2a_cpu_program *program, const char
 	return FALSE;
 }
 
+/* ---------- the kept buffers' memory
+
+What the device keeps for GX to read (the static buffers' outputs, the lit
+models' normals, the structure's indices as display lists) took pages of
+the contiguous window, top-down as the game's blocks are, a page at least
+each (a display list of 1.5 KB took 4), and only while the window kept a
+megabyte free in one run besides. The game's blocks and the device's then
+lay between one another; once the level was loaded the window's largest
+free run was the 1016 KB below the tag cache (b30: 2996 KB free in all), and
+every kept buffer was refused.
+
+Now they come from a pool of their own:
+- Pages from the window's bottom (wii_memory_window_alloc_low): the
+  smallest free run a block fits, at its bottom, where the game's top-down
+  blocks reach last; the holes the game's blocks left between them first.
+  A block is refused where it would leave the window's largest free run
+  below KEPT_MARGIN (unless that run was not the one it took).
+- A buffer of KEPT_SLAB_LARGEST or less is cut from a slab of
+  KEPT_SLAB_BYTES (32-byte granules, a bit each); a larger one has pages of
+  its own, as GX reads each draw's arrays and lists from one block.
+- At most KEPT_POOL_BYTES in all (each kind keeps its own budget within).
+- A buffer is freed only once GX has drawn what reads it: at the end of the
+  frame (kept_free_later), or at once after GX_DrawDone.
+- The game's blocks come first: where one finds no room in the window,
+  wii_memory.c calls kept_reclaim, which (on the device's thread, outside a
+  draw's use of the kept) waits for GX and frees every kept buffer, and the
+  block is looked for again. KEPT_MARGIN keeps that rare: the blocks made
+  once a level is loaded are the loading screen's (320 by 240, 300 KB) and
+  the device's own (a sphere map's 9 KB, and the back buffer's parking,
+  two of 1200 KB made once, which go to the heap where the window has no
+  room).
+- A buffer refused (a draw's) is not asked for again until room may have
+  come: kept_room changes, once a frame is drawn, only where a block was
+  freed (the window's pages, or a slab's granules); and within one, a
+  window block as large as one refused is refused without a look. */
+#define KEPT_SLAB_BYTES (64UL * 1024UL)
+#define KEPT_SLAB_GRANULE 32UL
+#define KEPT_SLAB_GRANULES (KEPT_SLAB_BYTES / KEPT_SLAB_GRANULE)
+#define KEPT_SLAB_LARGEST (16UL * 1024UL)
+#define KEPT_SLABS 32
+#define KEPT_POOL_BYTES (2560UL * 1024UL)
+#define KEPT_MARGIN (512UL * 1024UL)
+#define KEPT_FREES 512
+
+static struct kept_slab
+{
+	unsigned char *base;
+	u32 used[KEPT_SLAB_GRANULES / 32];
+	unsigned long granules;
+	/* (no free run is longer: a request of more passes the slab by;
+	KEPT_SLAB_GRANULES again once granules are freed) */
+	unsigned long longest;
+} kept_slabs[KEPT_SLABS];
+/* the window's bytes the pool holds (slabs whole, blocks by their pages),
+the slabs' granules in use, and the blocks of their own */
+static unsigned long kept_pool_bytes, kept_slab_granules, kept_blocks;
+/* the buffers to free once GX has drawn the frame */
+static struct
+{
+	void *data;
+	unsigned long bytes;
+} kept_frees[KEPT_FREES];
+static unsigned kept_free_count;
+/* (changes when room may be had again: kept_frees_flush) */
+static unsigned long kept_room = 1, kept_room_frees, kept_slab_frees;
+/* (the smallest window block refused while kept_room was this) */
+static unsigned long kept_refused_room, kept_refused_bytes;
+/* (a draw reads the kept buffers: kept_reclaim leaves them; and the
+device's thread, the only one that may free them) */
+static BOOL kept_pinned;
+static pthread_t kept_thread;
+/* in the statistics' window: window blocks refused, and reclaims */
+static unsigned long kept_window_refused, kept_reclaims;
+
+/* the window's pages for the pool (NULL: none, or not without taking the
+game's margin) */
+static void *kept_window_alloc(unsigned long bytes)
+{
+	void *data;
+
+	if ((kept_refused_room == kept_room && bytes >= kept_refused_bytes) || kept_pool_bytes + bytes > KEPT_POOL_BYTES)
+		return NULL;
+	data = wii_memory_window_alloc_low(bytes, KEPT_MARGIN);
+	if (!data)
+	{
+		if (kept_refused_room != kept_room || bytes < kept_refused_bytes)
+			kept_refused_bytes = bytes;
+		kept_refused_room = kept_room;
+		kept_window_refused++;
+		return NULL;
+	}
+	kept_pool_bytes += bytes;
+	return data;
+}
+
+/* a run of count free granules of the slab, marked used: its first; -1
+where it has none */
+static long kept_slab_take(struct kept_slab *slab, unsigned long count)
+{
+	unsigned long granule = 0, run = 0, start = 0, longest = 0;
+
+	while (granule < KEPT_SLAB_GRANULES)
+	{
+		u32 word = slab->used[granule >> 5];
+
+		if (!(granule & 31) && word == 0xFFFFFFFFU)
+		{
+			run = 0;
+			granule += 32;
+			continue;
+		}
+		if (word & (1U << (granule & 31)))
+		{
+			run = 0;
+			granule++;
+			continue;
+		}
+		if (!run)
+			start = granule;
+		if (!(granule & 31) && !word)
+		{
+			run += 32;
+			granule += 32;
+		}
+		else
+		{
+			run++;
+			granule++;
+		}
+		if (run > longest)
+			longest = run;
+		if (run >= count)
+		{
+			for (granule = start; granule < start + count; granule++)
+				slab->used[granule >> 5] |= 1U << (granule & 31);
+			slab->granules += count;
+			return (long)start;
+		}
+	}
+	slab->longest = longest;
+	return -1;
+}
+
+/* a kept buffer of bytes, 32-byte aligned: NULL where there is no room */
+static void *kept_alloc(unsigned long bytes)
+{
+	unsigned long count = (bytes + KEPT_SLAB_GRANULE - 1) / KEPT_SLAB_GRANULE;
+	struct kept_slab *empty = NULL;
+	unsigned index;
+
+	if (!bytes)
+		return NULL;
+	if (bytes > KEPT_SLAB_LARGEST)
+	{
+		void *data = kept_window_alloc((bytes + 4095) & ~4095UL);
+
+		if (data)
+			kept_blocks++;
+		return data;
+	}
+	for (index = 0; index < KEPT_SLABS; index++)
+	{
+		struct kept_slab *slab = &kept_slabs[index];
+		long start;
+
+		if (!slab->base)
+		{
+			if (!empty)
+				empty = slab;
+			continue;
+		}
+		if (count > slab->longest)
+			continue;
+		start = kept_slab_take(slab, count);
+		if (start >= 0)
+		{
+			kept_slab_granules += count;
+			return slab->base + (unsigned long)start * KEPT_SLAB_GRANULE;
+		}
+	}
+	if (!empty || !(empty->base = kept_window_alloc(KEPT_SLAB_BYTES)))
+		return NULL;
+	memset(empty->used, 0, sizeof(empty->used));
+	empty->granules = 0;
+	empty->longest = KEPT_SLAB_GRANULES;
+	kept_slab_take(empty, count);
+	kept_slab_granules += count;
+	return empty->base;
+}
+
+/* a kept buffer of bytes freed now (GX has drawn what reads it) */
+static void kept_free(void *data, unsigned long bytes)
+{
+	unsigned long count = (bytes + KEPT_SLAB_GRANULE - 1) / KEPT_SLAB_GRANULE, granule, start;
+	unsigned index;
+
+	if (!data)
+		return;
+	if (bytes > KEPT_SLAB_LARGEST)
+	{
+		platform_contiguous_free(data);
+		kept_pool_bytes -= (bytes + 4095) & ~4095UL;
+		kept_blocks--;
+		return;
+	}
+	for (index = 0; index < KEPT_SLABS; index++)
+	{
+		struct kept_slab *slab = &kept_slabs[index];
+
+		if (!slab->base || (unsigned char *)data < slab->base || (unsigned char *)data >= slab->base + KEPT_SLAB_BYTES)
+			continue;
+		start = (unsigned long)((unsigned char *)data - slab->base) / KEPT_SLAB_GRANULE;
+		for (granule = start; granule < start + count; granule++)
+			slab->used[granule >> 5] &= ~(1U << (granule & 31));
+		slab->granules -= count;
+		slab->longest = KEPT_SLAB_GRANULES;
+		kept_slab_granules -= count;
+		kept_slab_frees++;
+		if (!slab->granules)
+		{
+			/* (an empty slab's pages back to the window) */
+			platform_contiguous_free(slab->base);
+			kept_pool_bytes -= KEPT_SLAB_BYTES;
+			slab->base = NULL;
+		}
+		return;
+	}
+}
+
+/* a kept buffer freed once GX has drawn the frame (or now, once GX has
+drawn what it was given, past room to wait) */
+static void kept_free_later(void *data, unsigned long bytes)
+{
+	if (!data)
+		return;
+	if (kept_free_count < KEPT_FREES)
+	{
+		kept_frees[kept_free_count].data = data;
+		kept_frees[kept_free_count].bytes = bytes;
+		kept_free_count++;
+		return;
+	}
+	GX_DrawDone();
+	xf_flush_after();
+	kept_free(data, bytes);
+}
+
+/* once GX has drawn the frame: the buffers pushed out freed, and whether
+room may be had again */
+static void kept_frees_flush(void)
+{
+	unsigned long frees;
+
+	while (kept_free_count)
+	{
+		kept_free_count--;
+		kept_free(kept_frees[kept_free_count].data, kept_frees[kept_free_count].bytes);
+	}
+	frees = wii_memory_window_frees() + kept_slab_frees;
+	if (frees != kept_room_frees)
+	{
+		kept_room_frees = frees;
+		kept_room++;
+	}
+}
+
 /* ---------- the outputs of static vertex buffers, kept
 
 An output of a program that reads no constant (nv2a_cpu_analyze_constants)
@@ -5882,14 +6186,14 @@ window, and read by GX by index as the buffers are (draw_hardware).
   draw_hardware computes it, nv2a_cpu_run_live for those outputs alone (the
   same to the bit: tests/nv2a_native_check.c), and what is new flushed from
   the processor's cache before GX reads it.
-- At most STATIC_OUTPUTS_BYTES in all, and only while the window keeps
-  STATIC_OUTPUTS_RESERVE free in one run besides (the game's own buffers
-  and textures come first). An entry not drawn for STATIC_OUTPUTS_IDLE
-  frames is freed, and one pushed out once GX has drawn the frame. */
+- At most STATIC_OUTPUTS_BYTES in all, in the kept buffers' memory (the
+  game's own buffers and textures come first). An entry not drawn for
+  STATIC_OUTPUTS_IDLE frames is freed, and one pushed out once GX has drawn
+  the frame. An entry refused room is not asked for again while kept_room
+  is the same. */
 #define STATIC_OUTPUTS_ENTRIES 32
 #define STATIC_OUTPUTS_STREAMS 4
 #define STATIC_OUTPUTS_BYTES (1024UL * 1024UL)
-#define STATIC_OUTPUTS_RESERVE (1024UL * 1024UL)
 #define STATIC_OUTPUTS_IDLE 120
 
 struct static_outputs
@@ -5910,9 +6214,11 @@ struct static_outputs
 	} streams[STATIC_OUTPUTS_STREAMS];
 	unsigned stream_count;
 	unsigned long seen_frame, used_frame;
+	/* (the kept_room its values were refused in) */
+	unsigned long refused;
 	/* each vertex's (stride bytes): the kept stages' sphere map coordinates,
 	two floats each in the stages' order, then the colours' bytes, D0's and
-	D1's; in the contiguous window */
+	D1's; in the kept buffers' memory */
 	unsigned char *values;
 	unsigned stride;
 	unsigned long capacity;
@@ -5924,9 +6230,6 @@ static struct static_outputs static_outputs[STATIC_OUTPUTS_ENTRIES];
 static unsigned long static_outputs_generation;
 static unsigned long static_outputs_bytes;
 static DWORD vertex_buffer_serial;
-/* (values pushed out during a frame, freed once GX has drawn it) */
-static unsigned char *static_outputs_frees[STATIC_OUTPUTS_ENTRIES];
-static unsigned static_outputs_free_count;
 /* the log's: draws that read kept outputs, their vertices, the vertices
 computed for them, and draws whose outputs could not be kept for want of
 memory */
@@ -5939,16 +6242,9 @@ static void static_outputs_release_values(struct static_outputs *entry, BOOL dra
 	if (!entry->values)
 		return;
 	if (drawn)
-		platform_contiguous_free(entry->values);
-	else if (static_outputs_free_count < STATIC_OUTPUTS_ENTRIES)
-		static_outputs_frees[static_outputs_free_count++] = entry->values;
+		kept_free(entry->values, entry->capacity * entry->stride);
 	else
-	{
-		/* (no room to wait: GX finishes first) */
-		GX_DrawDone();
-		xf_flush_after();
-		platform_contiguous_free(entry->values);
-	}
+		kept_free_later(entry->values, entry->capacity * entry->stride);
 	static_outputs_bytes -= entry->capacity * entry->stride;
 	entry->values = NULL;
 }
@@ -5960,14 +6256,11 @@ static void static_outputs_release(struct static_outputs *entry, BOOL drawn)
 	memset(entry, 0, sizeof(*entry));
 }
 
-/* once GX has drawn the frame (Present): the values pushed out, and the
-entries not drawn for a while */
+/* once GX has drawn the frame (Present): the entries not drawn for a while */
 static void static_outputs_frame_drawn(void)
 {
 	unsigned index;
 
-	while (static_outputs_free_count)
-		platform_contiguous_free(static_outputs_frees[--static_outputs_free_count]);
 	for (index = 0; index < STATIC_OUTPUTS_ENTRIES; index++)
 		if (static_outputs[index].used && device.frames - static_outputs[index].used_frame > STATIC_OUTPUTS_IDLE)
 			static_outputs_release(&static_outputs[index], TRUE);
@@ -6200,27 +6493,34 @@ static struct static_outputs *static_outputs_find(struct nv2a_cpu_program *progr
 	/* (not static yet: seen this frame only) */
 	if (entry->seen_frame == device.frames)
 		return NULL;
-	for (stage = 0; stage < 4; stage++)
-		if (entry->stages & (1U << stage))
-			stage_count++;
 	if (most >= entry->capacity)
 	{
 		/* (room for the vertices up to most, in steps of 1024) */
-		unsigned long capacity = (most + 1024) & ~1023UL, largest = 0;
-		unsigned stride = 8 * stage_count + (entry->colors ? 8 : 0);
-		unsigned long bytes = capacity * stride;
+		unsigned long capacity = (most + 1024) & ~1023UL;
+		unsigned stride;
+		unsigned long bytes;
 		unsigned char *values = NULL;
 		unsigned long *computed;
 
-		wii_memory_window_usage(NULL, NULL, &largest);
-		if (static_outputs_bytes - entry->capacity * entry->stride + bytes <= STATIC_OUTPUTS_BYTES &&
-			largest >= bytes + STATIC_OUTPUTS_RESERVE)
-			values = platform_contiguous_alloc(bytes, 32, PLATFORM_ANY_PHYSICAL_ADDRESS, 0);
+		/* (refused, and no room has come since) */
+		if (entry->refused == kept_room)
+		{
+			kept_refused++;
+			return NULL;
+		}
+		for (stage = 0; stage < 4; stage++)
+			if (entry->stages & (1U << stage))
+				stage_count++;
+		stride = 8 * stage_count + (entry->colors ? 8 : 0);
+		bytes = capacity * stride;
+		if (static_outputs_bytes - entry->capacity * entry->stride + bytes <= STATIC_OUTPUTS_BYTES)
+			values = kept_alloc(bytes);
 		computed = values ? calloc((capacity + 31) / 32, sizeof(*computed)) : NULL;
 		if (!values || !computed)
 		{
 			if (values)
-				platform_contiguous_free(values);
+				kept_free(values, bytes);
+			entry->refused = kept_room;
 			kept_refused++;
 			return NULL;
 		}
@@ -6314,10 +6614,10 @@ the contiguous window, and GX reads them by index as it reads the
 positions. A buffer is keyed as the kept outputs key theirs (its header,
 data, stride and serial, the normal's offset), and kept from the frame
 after it is first seen, its vertices decoded from 0 to the most a draw
-names; at most KEPT_NORMALS_BYTES in all, and only while the window keeps
-STATIC_OUTPUTS_RESERVE free in one run besides. An entry not drawn for
-STATIC_OUTPUTS_IDLE frames is freed once GX has drawn the frame. Normals of
-three floats in the buffer GX reads where they are. */
+names; at most KEPT_NORMALS_BYTES in all, in the kept buffers' memory (an
+entry refused room is not asked for again while kept_room is the same). An
+entry not drawn for STATIC_OUTPUTS_IDLE frames is freed once GX has drawn
+the frame. Normals of three floats in the buffer GX reads where they are. */
 #define KEPT_NORMALS_ENTRIES 128
 #define KEPT_NORMALS_WAYS 4
 #define KEPT_NORMALS_BYTES (768UL * 1024UL)
@@ -6328,6 +6628,8 @@ struct kept_normals
 	DWORD data, serial;
 	UINT stride, offset;
 	unsigned long seen_frame, used_frame;
+	/* (the kept_room its values were refused in) */
+	unsigned long refused;
 	/* vertices 0 to decoded - 1, three floats each; room for capacity */
 	float *values;
 	unsigned long decoded, capacity;
@@ -6335,8 +6637,6 @@ struct kept_normals
 
 static struct kept_normals kept_normals[KEPT_NORMALS_ENTRIES];
 static unsigned long kept_normals_bytes;
-static float *kept_normals_frees[KEPT_NORMALS_ENTRIES];
-static unsigned kept_normals_free_count;
 /* in the statistics' window: lit draws whose normals GX read by index (from
 the kept, or from their buffer), vertices decoded, draws without room */
 static unsigned long kept_normal_draws, kept_normals_decoded, kept_normals_refused;
@@ -6348,15 +6648,9 @@ static void kept_normals_release(struct kept_normals *entry, BOOL drawn)
 	if (entry->values)
 	{
 		if (drawn)
-			platform_contiguous_free(entry->values);
-		else if (kept_normals_free_count < KEPT_NORMALS_ENTRIES)
-			kept_normals_frees[kept_normals_free_count++] = entry->values;
+			kept_free(entry->values, entry->capacity * 12);
 		else
-		{
-			GX_DrawDone();
-			xf_flush_after();
-			platform_contiguous_free(entry->values);
-		}
+			kept_free_later(entry->values, entry->capacity * 12);
 		kept_normals_bytes -= entry->capacity * 12;
 	}
 	memset(entry, 0, sizeof(*entry));
@@ -6366,8 +6660,6 @@ static void kept_normals_frame_drawn(void)
 {
 	unsigned index;
 
-	while (kept_normals_free_count)
-		platform_contiguous_free(kept_normals_frees[--kept_normals_free_count]);
 	for (index = 0; index < KEPT_NORMALS_ENTRIES; index++)
 		if (kept_normals[index].buffer && device.frames - kept_normals[index].used_frame > STATIC_OUTPUTS_IDLE)
 			kept_normals_release(&kept_normals[index], TRUE);
@@ -6435,15 +6727,20 @@ static BOOL kept_normals_find(const struct vertex_shader_object *shader, unsigne
 		return FALSE;
 	if (most >= entry->capacity)
 	{
-		unsigned long capacity = (most + 1024) & ~1023UL, largest = 0;
+		unsigned long capacity = (most + 1024) & ~1023UL;
 		float *values = NULL;
 
-		wii_memory_window_usage(NULL, NULL, &largest);
-		if (kept_normals_bytes - entry->capacity * 12 + capacity * 12 <= KEPT_NORMALS_BYTES &&
-			largest >= capacity * 12 + STATIC_OUTPUTS_RESERVE)
-			values = platform_contiguous_alloc(capacity * 12, 32, PLATFORM_ANY_PHYSICAL_ADDRESS, 0);
+		/* (refused, and no room has come since) */
+		if (entry->refused == kept_room)
+		{
+			kept_normals_refused++;
+			return FALSE;
+		}
+		if (kept_normals_bytes - entry->capacity * 12 + capacity * 12 <= KEPT_NORMALS_BYTES)
+			values = kept_alloc(capacity * 12);
 		if (!values)
 		{
+			entry->refused = kept_room;
 			kept_normals_refused++;
 			return FALSE;
 		}
@@ -6451,14 +6748,7 @@ static BOOL kept_normals_find(const struct vertex_shader_object *shader, unsigne
 		{
 			memcpy(values, entry->values, entry->decoded * 12);
 			DCFlushRange(values, entry->decoded * 12);
-			if (kept_normals_free_count < KEPT_NORMALS_ENTRIES)
-				kept_normals_frees[kept_normals_free_count++] = entry->values;
-			else
-			{
-				GX_DrawDone();
-				xf_flush_after();
-				platform_contiguous_free(entry->values);
-			}
+			kept_free_later(entry->values, entry->capacity * 12);
 			kept_normals_bytes -= entry->capacity * 12;
 		}
 		entry->values = values;
@@ -6487,7 +6777,7 @@ a normal and texture coordinates each read by index, the same index for
 each (emit_indices' first loop). Such a draw's indices, once its index record
 has hashed the same in two draws (draw_range.kept), are written once into a
 GX display list (GX_BeginDispList: the commands as they would go into the
-FIFO, in the contiguous window), and the draws call it: three words in the
+FIFO, in the kept buffers' memory), and the draws call it: three words in the
 FIFO for the draw, the processor's work of its indices gone. GX's state
 (the vertex descriptor and formats, the arrays, the matrices) is set
 outside the list as for any draw: the list holds only the primitive and its
@@ -6496,37 +6786,46 @@ attributes. A record keeps INDEX_LISTS lists (a section's passes differ in
 their texture coordinates); they are freed with the record's indices (a
 hash that differs, the record's place taken) and when not drawn for
 STATIC_OUTPUTS_IDLE frames, once GX has drawn the frame; at most
-INDEX_LISTS_BYTES in all, and only while the window keeps
-STATIC_OUTPUTS_RESERVE free in one run besides. WiiLibs' wl_gx_dl_* records
+INDEX_LISTS_BYTES in all. A record refused room for a list does not ask
+again while kept_room is the same: its draws send their indices, as they
+did before the lists. WiiLibs' wl_gx_dl_* records
 its own layouts (one texture coordinate) through wl_gx_draw_indexed, so the
 device records with libogc's calls, as WiiLibs does. */
-#define INDEX_LISTS_BYTES (512UL * 1024UL)
+#define INDEX_LISTS_BYTES (768UL * 1024UL)
 /* (the lists' memory: draw_bench.c gives its own, outside the window whose
 addresses its digests keep) */
 #ifndef INDEX_LIST_ALLOCATE
-#define INDEX_LIST_ALLOCATE(bytes) platform_contiguous_alloc((bytes), 32, PLATFORM_ANY_PHYSICAL_ADDRESS, 0)
-#define INDEX_LIST_FREE(data) platform_contiguous_free(data)
+#define INDEX_LIST_ALLOCATE(bytes) kept_alloc(bytes)
+#define INDEX_LIST_FREE(data, bytes) kept_free((data), (bytes))
 #endif
 
 static unsigned long index_lists_bytes;
-static void *index_lists_frees[INDEX_RECORDS];
+static struct
+{
+	void *data;
+	unsigned long bytes;
+} index_lists_frees[INDEX_RECORDS];
 static unsigned index_lists_free_count;
 /* in the statistics' window: draws by a list, lists written, and draws that
 found no room for theirs */
 static unsigned long index_list_calls, index_lists_made, index_lists_refused;
 
-static void index_list_free(void *data, BOOL drawn)
+static void index_list_free(void *data, unsigned long bytes, BOOL drawn)
 {
 	if (drawn)
-		INDEX_LIST_FREE(data);
+		INDEX_LIST_FREE(data, bytes);
 	else if (index_lists_free_count < INDEX_RECORDS)
-		index_lists_frees[index_lists_free_count++] = data;
+	{
+		index_lists_frees[index_lists_free_count].data = data;
+		index_lists_frees[index_lists_free_count].bytes = bytes;
+		index_lists_free_count++;
+	}
 	else
 	{
 		/* (no room to wait: GX finishes first) */
 		GX_DrawDone();
 		xf_flush_after();
-		INDEX_LIST_FREE(data);
+		INDEX_LIST_FREE(data, bytes);
 	}
 }
 
@@ -6540,8 +6839,8 @@ static void index_record_lists_release(struct index_record *record, BOOL drawn)
 
 		if (!list->data)
 			continue;
-		index_list_free(list->data, drawn);
-		index_lists_bytes -= (list->size + 31) & ~31UL;
+		index_list_free(list->data, list->capacity, drawn);
+		index_lists_bytes -= list->capacity;
 		memset(list, 0, sizeof(*list));
 	}
 }
@@ -6553,7 +6852,10 @@ static void index_lists_frame_drawn(void)
 	unsigned index, which;
 
 	while (index_lists_free_count)
-		INDEX_LIST_FREE(index_lists_frees[--index_lists_free_count]);
+	{
+		index_lists_free_count--;
+		INDEX_LIST_FREE(index_lists_frees[index_lists_free_count].data, index_lists_frees[index_lists_free_count].bytes);
+	}
 	if (!index_lists_bytes)
 		return;
 	for (index = 0; index < INDEX_RECORDS; index++)
@@ -6574,7 +6876,7 @@ static BOOL index_list_draw(struct index_record *record, u8 primitive, unsigned 
 {
 	struct index_list *list = NULL, *empty = NULL;
 	unsigned which;
-	unsigned long capacity, largest = 0;
+	unsigned long capacity;
 	void *data;
 	u32 size;
 
@@ -6597,21 +6899,19 @@ static BOOL index_list_draw(struct index_record *record, u8 primitive, unsigned 
 		index_list_calls++;
 		return TRUE;
 	}
-	if (!empty)
-		return FALSE;
-	/* (the primitive's command and count, the indices, GX_EndDispList's
-	padding to 32 bytes, and room for a flush GX_Begin may send first) */
-	capacity = (3 + (unsigned long)count * attributes * 2 + 64 + 31) & ~31UL;
-	if (index_lists_bytes + capacity > INDEX_LISTS_BYTES)
+	/* (no room for another, or refused room and none has come since) */
+	if (!empty || record->lists_refused == kept_room)
 	{
 		index_lists_refused++;
 		return FALSE;
 	}
-	wii_memory_window_usage(NULL, NULL, &largest);
-	data = largest >= capacity + STATIC_OUTPUTS_RESERVE ?
-		INDEX_LIST_ALLOCATE(capacity) : NULL;
+	/* (the primitive's command and count, the indices, GX_EndDispList's
+	padding to 32 bytes, and room for a flush GX_Begin may send first) */
+	capacity = (3 + (unsigned long)count * attributes * 2 + 64 + 31) & ~31UL;
+	data = index_lists_bytes + capacity <= INDEX_LISTS_BYTES ? INDEX_LIST_ALLOCATE(capacity) : NULL;
 	if (!data)
 	{
+		record->lists_refused = kept_room;
 		index_lists_refused++;
 		return FALSE;
 	}
@@ -6626,19 +6926,68 @@ static BOOL index_list_draw(struct index_record *record, u8 primitive, unsigned 
 	size = GX_EndDispList();
 	if (!size)
 	{
-		INDEX_LIST_FREE(data);
+		INDEX_LIST_FREE(data, capacity);
 		index_lists_refused++;
 		return FALSE;
 	}
 	empty->data = data;
 	empty->size = size;
+	empty->capacity = (u32)capacity;
 	empty->primitive = primitive;
 	empty->attributes = (u8)attributes;
-	index_lists_bytes += (size + 31) & ~31UL;
+	index_lists_bytes += capacity;
 	index_lists_made++;
 	GX_CallDispList(data, size);
 	index_list_calls++;
 	return TRUE;
+}
+
+/* every kept buffer freed, for a block of the game's or the device's own
+that found no room in the window (wii_memory.c calls it): on the device's
+thread, and not while a draw reads them (kept_pinned); nonzero where
+anything was freed */
+static int kept_reclaim(void)
+{
+	unsigned index;
+	unsigned long before = kept_pool_bytes;
+
+	if (kept_pinned || !pthread_equal(pthread_self(), kept_thread) || !kept_pool_bytes)
+		return 0;
+	GX_DrawDone();
+	xf_flush_after();
+	while (kept_free_count)
+	{
+		kept_free_count--;
+		kept_free(kept_frees[kept_free_count].data, kept_frees[kept_free_count].bytes);
+	}
+	for (index = 0; index < STATIC_OUTPUTS_ENTRIES; index++)
+		if (static_outputs[index].used)
+			static_outputs_release(&static_outputs[index], TRUE);
+	for (index = 0; index < KEPT_NORMALS_ENTRIES; index++)
+		if (kept_normals[index].buffer)
+			kept_normals_release(&kept_normals[index], TRUE);
+	while (index_lists_free_count)
+	{
+		index_lists_free_count--;
+		INDEX_LIST_FREE(index_lists_frees[index_lists_free_count].data, index_lists_frees[index_lists_free_count].bytes);
+	}
+	for (index = 0; index < INDEX_RECORDS; index++)
+	{
+		index_record_lists_release(&index_records[index], TRUE);
+		index_records[index].lists_refused = 0;
+		index_records[index].kept_generation = 0;
+		index_records[index].kept_values = NULL;
+	}
+	kept_room++;
+	kept_reclaims++;
+	return kept_pool_bytes < before;
+}
+
+/* (at the device's creation, on its thread) */
+static void kept_start(void)
+{
+	kept_thread = pthread_self();
+	wii_memory_window_set_reclaim(kept_reclaim);
 }
 
 /* ---------- the vertices of a draw in hardware the processor has a part in
@@ -7256,6 +7605,8 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	}
 	/* (the normals by index, where no vertex sends its own: the processor's
 	blended ones) */
+	/* (from here the draw reads the kept buffers: kept_reclaim leaves them) */
+	kept_pinned = TRUE;
 	lit.normals_indexed = lit_on && !draw_keys.processor && kept_normals_find(shader, least, most);
 	lit_done = timing_now();
 	if (lit_on)
@@ -7621,7 +7972,10 @@ static void draw_streams(D3DPRIMITIVETYPE primitive_type, UINT count, const WORD
 	{
 		uint64_t started = timing_now();
 
-		if (draw_hardware(program, primitive_type, count, indices, first, &fetch))
+		BOOL drawn = draw_hardware(program, primitive_type, count, indices, first, &fetch);
+
+		kept_pinned = FALSE;
+		if (drawn)
 		{
 			timing.draws += timing_now() - started;
 			if (DRAW_LOG_FRAME && device.frames == DRAW_LOG_FRAME)
@@ -7841,6 +8195,7 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		static_outputs_frame_drawn();
 		kept_normals_frame_drawn();
 		index_lists_frame_drawn();
+		kept_frees_flush();
 		/* (GX's texture cache emptied once a frame, whatever was written) */
 		texture_memory_changed = TRUE;
 		timing.present += timing_now() - started;
@@ -7912,6 +8267,17 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		platform_log("Direct3D: the structure's indices as display lists: %lu draws called one, %lu written (%lu KB "
 			"kept), %lu without room", index_list_calls, index_lists_made, index_lists_bytes / 1024, index_lists_refused);
 		index_list_calls = index_lists_made = index_lists_refused = 0;
+		{
+			unsigned index, slabs = 0;
+
+			for (index = 0; index < KEPT_SLABS; index++)
+				if (kept_slabs[index].base)
+					slabs++;
+			platform_log("Direct3D: the kept buffers' memory: %lu KB of the window (%u slabs, %lu KB of them in use; "
+				"%lu blocks of their own); %lu blocks refused, given back %lu times", kept_pool_bytes / 1024, slabs,
+				kept_slab_granules * KEPT_SLAB_GRANULE / 1024, kept_blocks, kept_window_refused, kept_reclaims);
+			kept_window_refused = 0;
+		}
 		platform_log("Direct3D: in hardware with the processor's sphere map coordinates: %lu draws (%lu lit by GX), "
 			"%lu vertices run", hardware_sphere_draws, hardware_sphere_lit_draws, hardware_spheres_run);
 		hardware_sphere_draws = hardware_sphere_lit_draws = hardware_spheres_run = 0;
@@ -7958,9 +8324,9 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		platform_log("Direct3D: lit by GX (display.gx_lighting): %lu draws, %lu vertices, %lu refused; view sphere maps: "
 			"%lu drawn, %lu draws took a near one", lit_draws, lit_vertices, lit_refused, sphere_bakes_made,
 			sphere_bakes_borrowed);
-		platform_log("Direct3D: lit by GX, the planar fog by GX's ramp in %lu draws (%lu ramps written), the processor's "
-			"in %lu; a model's fog through its nodes' matrices in %lu draws", lit_fog_draws, fog_ramps_made,
-			lit_fog_refused, fog_post_draws);
+		platform_log("Direct3D: lit by GX, the planar fog by GX's ramp in %lu draws (%lu its product with the "
+			"atmospheric fog; %lu ramps written), the processor's in %lu; a model's fog through its nodes' matrices in "
+			"%lu draws", lit_fog_draws, lit_fog_products, fog_ramps_made, lit_fog_refused, fog_post_draws);
 		{
 			unsigned index, entries = 0;
 
@@ -7972,7 +8338,7 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			kept_normal_draws = kept_normals_decoded = kept_normals_refused = 0;
 		}
 		lit_draws = lit_vertices = lit_refused = sphere_bakes_made = sphere_bakes_borrowed = fog_post_draws = 0;
-		lit_fog_draws = fog_ramps_made = lit_fog_refused = 0;
+		lit_fog_draws = lit_fog_products = fog_ramps_made = lit_fog_refused = 0;
 		platform_log("Direct3D: textures not drawn: %lu without data, %lu of a shape, %lu of a format, "
 			"%lu without memory, %lu not decoded; %lu converted bitmaps found", texture_failures[_failure_no_data],
 			texture_failures[_failure_shape],
