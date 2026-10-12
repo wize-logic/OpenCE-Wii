@@ -23,6 +23,11 @@ usage: nv2a_codegen microcode.inc output.c
 
 static const char components[] = "xyzw";
 
+static char components_name(int component, int count)
+{
+	return count > 1 ? components[component] : ' ';
+}
+
 /* an operand's source, as read_operand chooses it */
 static void source(char *text, size_t size, const struct nv2a_cpu_instruction *instruction,
 	const struct nv2a_cpu_operand *operand)
@@ -374,6 +379,43 @@ static void dependencies_comment(FILE *out, const struct nv2a_cpu_program *progr
 	fprintf(out, " */\n");
 }
 
+/* one output's components that depend on the vertex and read no constant
+(nv2a_cpu_analyze_constants): the same for a vertex whatever the draw's
+constants, which port/wii/src/d3d8_gx.c keeps for a static vertex buffer */
+static int constant_free_text(FILE *out, const char *name, const unsigned long *components, int count)
+{
+	char text[8];
+	int component, length = 0;
+
+	for (component = 0; component < count; component++)
+		if ((components[component] & 0xFFFF) && !(components[component] & NV2A_CPU_READS_CONSTANT))
+			text[length++] = components_name(component, count);
+	if (!length)
+		return 0;
+	text[length] = '\0';
+	fprintf(out, " %s%s%s", name, count > 1 ? "." : "", count > 1 ? text : "");
+	return 1;
+}
+
+static void constant_free_comment(FILE *out, const struct nv2a_cpu_program *program)
+{
+	struct nv2a_cpu_dependencies reads;
+	char name[8];
+	int stage, any = 0;
+
+	nv2a_cpu_analyze_constants(program, &reads);
+	fprintf(out, "/* the vertex's alone (no constant read):");
+	any |= constant_free_text(out, "d0", reads.d0, 4);
+	any |= constant_free_text(out, "d1", reads.d1, 4);
+	for (stage = 0; stage < 4; stage++)
+	{
+		snprintf(name, sizeof(name), "t%d", stage);
+		any |= constant_free_text(out, name, reads.t[stage], 4);
+	}
+	any |= constant_free_text(out, "fog", &reads.fog, 1);
+	fprintf(out, "%s */\n", any ? "" : " none");
+}
+
 int main(int argc, char **argv)
 {
 	static DWORD words[MAXIMUM_WORDS];
@@ -467,6 +509,7 @@ int main(int argc, char **argv)
 		program_count++;
 		nv2a_cpu_compile(instructions, count, &program);
 		dependencies_comment(out, &program);
+		constant_free_comment(out, &program);
 		/* (its colours and fog alone) */
 		fprintf(out, "static void program_%08lx_colors(const float (*c)[4], const float (*v)[4], struct nv2a_cpu_output *o)\n"
 			"{\n\tfloat r[12][4] = { { 0.0f } };\n\tfloat p[4] = { 0.0f, 0.0f, 0.0f, 1.0f };\n"

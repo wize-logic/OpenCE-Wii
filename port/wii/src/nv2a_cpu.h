@@ -100,6 +100,10 @@ two inputs, a reciprocal, a minimum, a lookup by an input's index, ...).
 An affine output is A x + b for the draw's constants, which GX's matrices
 can compute (d3d8_gx.c's draws in hardware). */
 enum { NV2A_CPU_NOT_AFFINE = 1 << 16 };
+/* (nv2a_cpu_analyze_constants: a component that reads a constant register,
+c[n] or c[a0 + n], on the way; one without it is the vertex's alone, the
+same for any constants) */
+enum { NV2A_CPU_READS_CONSTANT = 1 << 17 };
 
 struct nv2a_cpu_dependencies
 {
@@ -121,6 +125,9 @@ void nv2a_cpu_run_colors(const struct nv2a_cpu_program *program, const float (*c
 void nv2a_cpu_analyze(const struct nv2a_cpu_program *program, struct nv2a_cpu_dependencies *dependencies);
 void nv2a_cpu_analyze_uniform(const struct nv2a_cpu_program *program, unsigned long uniform,
 	struct nv2a_cpu_dependencies *dependencies);
+/* nv2a_cpu_analyze, with NV2A_CPU_READS_CONSTANT in each component that
+reads a constant register */
+void nv2a_cpu_analyze_constants(const struct nv2a_cpu_program *program, struct nv2a_cpu_dependencies *dependencies);
 
 void nv2a_cpu_compile(const DWORD *instructions, unsigned long instruction_count, struct nv2a_cpu_program *program);
 void nv2a_cpu_run(const struct nv2a_cpu_program *program, const float (*constants)[4], const float (*inputs)[4],

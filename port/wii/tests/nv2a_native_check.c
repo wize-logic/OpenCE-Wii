@@ -10,7 +10,12 @@ outputs a draw reads (nv2a_cpu_run_live), in those outputs, for random sets
 of them. A model's vertex on one node (weight 1 on its first index, or 0
 on its second) must give every output that the node with weight 1 alone
 does, whatever the other index (port/wii/src/d3d8_gx.c keys such vertices
-by their node). Then the functions' own arithmetic: nv2a_sqrtf (WiiLibs'
+by their node). An output component the analysis finds reads no constant
+(nv2a_cpu_analyze_constants) must be the same, bit for bit, for other
+random constants, on the interpreter and as its function computes the
+outputs that hold such components alone (port/wii/src/d3d8_gx.c keeps
+those of a static vertex buffer, computed once, for its later draws,
+whatever their constants). Then the functions' own arithmetic: nv2a_sqrtf (WiiLibs'
 wl_sqrtf_exact, which WiiLibs' own tests cover) with its refinement,
 wl_sqrtf_refine, from estimates as coarse as frsqrte's, against sqrtf, and
 nv2a_floor_index against floorf.
@@ -57,6 +62,66 @@ static int live_same(const struct nv2a_cpu_output *a, const struct nv2a_cpu_outp
 	if ((live & NV2A_CPU_LIVE_FOG) && memcmp(&a->fog, &b->fog, sizeof(a->fog)))
 		return 0;
 	return 1;
+}
+
+/* a component of an output in live that reads no constant (reads:
+nv2a_cpu_analyze_constants) the same in both; checked counts them */
+static int constant_free_same(const struct nv2a_cpu_dependencies *reads, const struct nv2a_cpu_output *a,
+	const struct nv2a_cpu_output *b, unsigned live, unsigned long *checked)
+{
+	int stage, component;
+
+	for (component = 0; component < 4; component++)
+	{
+		if ((live & NV2A_CPU_LIVE_D0) && !(reads->d0[component] & NV2A_CPU_READS_CONSTANT))
+		{
+			++*checked;
+			if (memcmp(&a->d0[component], &b->d0[component], sizeof(float)))
+				return 0;
+		}
+		if ((live & NV2A_CPU_LIVE_D1) && !(reads->d1[component] & NV2A_CPU_READS_CONSTANT))
+		{
+			++*checked;
+			if (memcmp(&a->d1[component], &b->d1[component], sizeof(float)))
+				return 0;
+		}
+		for (stage = 0; stage < 4; stage++)
+			if ((live & (NV2A_CPU_LIVE_T0 << stage)) && !(reads->t[stage][component] & NV2A_CPU_READS_CONSTANT))
+			{
+				++*checked;
+				if (memcmp(&a->t[stage][component], &b->t[stage][component], sizeof(float)))
+					return 0;
+			}
+	}
+	if ((live & NV2A_CPU_LIVE_FOG) && !(reads->fog & NV2A_CPU_READS_CONSTANT))
+	{
+		++*checked;
+		if (memcmp(&a->fog, &b->fog, sizeof(float)))
+			return 0;
+	}
+	return 1;
+}
+
+/* the outputs (NV2A_CPU_LIVE_...) with a component that depends on the
+vertex and reads no constant */
+static unsigned constant_free_outputs(const struct nv2a_cpu_dependencies *reads)
+{
+	unsigned live = 0;
+	int stage, component;
+
+	for (component = 0; component < 4; component++)
+	{
+		if ((reads->d0[component] & 0xFFFF) && !(reads->d0[component] & NV2A_CPU_READS_CONSTANT))
+			live |= NV2A_CPU_LIVE_D0;
+		if ((reads->d1[component] & 0xFFFF) && !(reads->d1[component] & NV2A_CPU_READS_CONSTANT))
+			live |= NV2A_CPU_LIVE_D1;
+		for (stage = 0; stage < 4; stage++)
+			if ((reads->t[stage][component] & 0xFFFF) && !(reads->t[stage][component] & NV2A_CPU_READS_CONSTANT))
+				live |= NV2A_CPU_LIVE_T0 << stage;
+	}
+	if ((reads->fog & 0xFFFF) && !(reads->fog & NV2A_CPU_READS_CONSTANT))
+		live |= NV2A_CPU_LIVE_FOG;
+	return live;
 }
 
 /* an estimate of 1 / sqrt(x) to 5 bits (frsqrte's worst), and off by 1/32
@@ -135,9 +200,11 @@ static unsigned long arithmetic_check(void)
 int main(int argc, char **argv)
 {
 	static DWORD words[65536];
-	static float constants[NV2A_CPU_CONSTANT_COUNT][4], inputs[NV2A_CPU_INPUT_COUNT][4];
+	static float constants[NV2A_CPU_CONSTANT_COUNT][4], other_constants[NV2A_CPU_CONSTANT_COUNT][4],
+		inputs[NV2A_CPU_INPUT_COUNT][4];
 	static struct nv2a_cpu_program program;
 	unsigned long count = 0, position, checked = 0, differ = 0, native = 0, one_node_checked = 0;
+	unsigned long constant_free_programs = 0, constant_free_checked = 0;
 	char line[512];
 	int in_comment = 0;
 	FILE *in;
@@ -182,6 +249,8 @@ int main(int argc, char **argv)
 	{
 		unsigned long instruction_count = words[position] >> 16;
 		const DWORD *instructions = words + position + 1;
+		struct nv2a_cpu_dependencies reads;
+		unsigned free_outputs;
 		int trial;
 
 		position += 1 + instruction_count * 4;
@@ -195,6 +264,14 @@ int main(int argc, char **argv)
 			continue;
 		}
 		native++;
+		nv2a_cpu_analyze_constants(&program, &reads);
+		free_outputs = constant_free_outputs(&reads);
+		if (free_outputs)
+		{
+			constant_free_programs++;
+			printf("program %08lx: outputs the vertex's alone %03x\n", nv2a_cpu_hash(instructions, instruction_count),
+				free_outputs);
+		}
 		for (trial = 0; trial < 64; trial++)
 		{
 			struct nv2a_cpu_output compiled, interpreted;
@@ -237,6 +314,32 @@ int main(int argc, char **argv)
 				{
 					printf("program %08lx: its function for the outputs %03x differs\n",
 						nv2a_cpu_hash(instructions, instruction_count), live);
+					differ++;
+					break;
+				}
+			}
+			/* the components that read no constant: the same for other
+			constants, on the interpreter and as its function computes the
+			outputs that hold them alone (as d3d8_gx.c keeps them) */
+			{
+				struct nv2a_cpu_output other, alone;
+
+				for (row = 0; row < NV2A_CPU_CONSTANT_COUNT; row++)
+					for (component = 0; component < 4; component++)
+						other_constants[row][component] = random_float();
+				for (row = 0; row < NV2A_CPU_CONSTANT_COUNT; row += 5)
+					other_constants[row][0] = (float)(rand() % 64);
+				program.native = NULL;
+				nv2a_cpu_run(&program, (const float (*)[4])other_constants, (const float (*)[4])inputs, 1.0f, &other);
+				program.native = run;
+				memset(&alone, 0x5A + trial, sizeof(alone));
+				nv2a_cpu_run_live(&program, (const float (*)[4])other_constants, (const float (*)[4])inputs, 1.0f,
+					&alone, free_outputs);
+				if (!constant_free_same(&reads, &interpreted, &other, NV2A_CPU_LIVE_ALL, &constant_free_checked) ||
+					!constant_free_same(&reads, &interpreted, &alone, free_outputs, &constant_free_checked))
+				{
+					printf("program %08lx: an output that reads no constant differs with other constants\n",
+						nv2a_cpu_hash(instructions, instruction_count));
 					differ++;
 					break;
 				}
@@ -293,6 +396,8 @@ int main(int argc, char **argv)
 	}
 	printf("%lu programs with functions, %lu runs compared, %lu vertices on one node, %lu differ\n", native, checked,
 		one_node_checked, differ);
+	printf("%lu programs with outputs the vertex's alone; %lu components that read no constant compared with other "
+		"constants\n", constant_free_programs, constant_free_checked);
 	differ += arithmetic_check();
 	return differ != 0;
 }

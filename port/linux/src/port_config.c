@@ -77,7 +77,7 @@ vertices, and draws simpler ones sooner) */
 #define OBJECT_SHADOWS_DEFAULT "false"
 #define BUMPED_HIGHLIGHTS_DEFAULT "false"
 #define GX_LIGHTING_DEFAULT "true"
-#define BUMPED_LIGHTMAPS_DEFAULT "false"
+#define BUMPED_LIGHTMAPS_DEFAULT "true"
 #define ENVIRONMENT_REFLECTIONS_DEFAULT "false"
 /* (audio.reverb's: the reverb would add half again to what the Wii's processor spends
 on a battle's sound, 3% of it; dsound_sdl.c, the Wii's mixing) */
@@ -208,8 +208,8 @@ static const struct config_setting config_settings[] =
 		_platform_all,
 		"The environment's bump maps in its light: each surface's lightmap\n"
 		"shaded by its bump map along the light's direction, as on the Xbox;\n"
-		"false draws the lightmap flat (the Wii's default: the bump's direction\n"
-		"is a cube map lookup, each vertex's on the processor)." },
+		"false draws the lightmap flat, without the pass's cube map lookup (on\n"
+		"the Wii, its direction is computed once a vertex and kept)." },
 	{ "display.environment_reflections", _config_boolean, ENVIRONMENT_REFLECTIONS_DEFAULT,
 		"HALO_ENVIRONMENT_REFLECTIONS", _environment_value, _platform_all,
 		"The environment's reflections (shiny floors and walls: a cube map\n"
@@ -656,6 +656,11 @@ static const struct config_setting config_settings[] =
 	{ "debug.gpu_transform", _config_boolean, "true", "HALO_GPU_TRANSFORM", _environment_value, _platform_all,
 		"The Wii: draws whose vertex programs GX's own transform can compute go to it;\n"
 		"false runs every program on the processor." },
+	{ "debug.gpu_xf_flush_safe", _config_boolean, "true", "HALO_GPU_XF_FLUSH_SAFE", _environment_value, _platform_all,
+		"The Wii: after an EFB copy, a draw-sync token or a draw-done, the next\n"
+		"primitive is preceded by a few vertices that draw nothing, which flush\n"
+		"GX's transform unit (it can hang on a clipped primitive there); false\n"
+		"sends none." },
 	{ "debug.input_log", _config_boolean, "false", "HALO_INPUT_LOG", _environment_set_is_true, _platform_all,
 		"The Wii: each controller's gamepad state (buttons, triggers and sticks) is logged\n"
 		"whenever it changes, to check the mapping." },

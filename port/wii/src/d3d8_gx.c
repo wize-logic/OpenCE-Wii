@@ -63,6 +63,8 @@ void d3d8_state_defaults(void);
 /* where render targets park the back buffer (the EFB's owner, below) */
 static void *efb_park_alloc(size_t bytes);
 static void efb_park_free(void *memory);
+/* (debug.gpu_xf_flush_safe, read at the device's creation: gx_begin) */
+static BOOL xf_flush_on;
 
 /* ---------- constants */
 
@@ -118,6 +120,9 @@ struct vertex_shader_object
 	struct nv2a_cpu_program *program;
 	/* what its outputs depend on (nv2a_cpu_analyze), with the program */
 	struct nv2a_cpu_dependencies dependencies;
+	/* ... and which components read a constant (nv2a_cpu_analyze_constants:
+	the others a static vertex buffer's outputs can keep) */
+	struct nv2a_cpu_dependencies constant_reads;
 	/* ... and with the inputs a draw held the same taken as constants
 	(draw_dependencies) */
 	struct
@@ -395,6 +400,11 @@ HRESULT WINAPI Direct3D_CreateDevice(UINT adapter, D3DDEVTYPE device_type, void 
 			what render targets park and put back; parked where there is room */
 			wl_gx_target_set_back_buffer_size(SCREEN_WIDTH, SCREEN_HEIGHT);
 			wl_gx_target_set_allocator(efb_park_alloc, efb_park_free);
+			/* (the transform unit's flush: gx_begin) */
+			xf_flush_on = config_boolean("debug.gpu_xf_flush_safe") ? TRUE : FALSE;
+			GX_SetMisc(GX_MT_XF_FLUSH, xf_flush_on ? GX_XF_FLUSH_SAFE : GX_XF_FLUSH_NONE);
+			platform_log("Direct3D: the transform unit flushed after copies and tokens: %s",
+				xf_flush_on ? "yes" : "no (debug.gpu_xf_flush_safe)");
 		}
 		device.created = TRUE;
 		platform_log("Direct3D: device created, %dx%d", SCREEN_WIDTH, SCREEN_HEIGHT);
@@ -744,6 +754,180 @@ void WINAPI D3DDevice_SetVertexShaderConstant(INT reg, CONST void *constant_data
 	constants_generation++;
 }
 
+/* ---------- GX's transform unit kept from hanging
+
+GX's transform unit can hang (and GX_DrawDone, or the frame's token, never
+comes) when a primitive it clips follows a change of the raster state such
+as an EFB copy, a draw-sync token or a draw-done. libogc names the remedy,
+GX_SetMisc(GX_MT_XF_FLUSH, GX_XF_FLUSH_SAFE), which the device sets, but its
+GX_Begin does nothing with it: GX_SetMisc keeps the value and marks the
+vertex descriptor to be sent again, and GX_Begin only sends that dirty state
+and the primitive's opcode and count (libogc.a's gx.o, disassembled). So
+the device sends the flush itself (debug.gpu_xf_flush_safe, on by default):
+after one of those changes (xf_flush_after), its next primitive (gx_begin)
+is first given a strip of XF_FLUSH_VERTICES vertices of zeros in the
+primitive's own format, which are all one point and draw nothing. A vertex's
+size is libogc's vertex descriptor (GX_GetVtxDescv, what GX_Begin sends) and
+the bytes of each direct attribute as the device set its format
+(vertex_format); where an attribute's format is unknown, no flush is sent
+and the log says so once. */
+
+#define XF_FLUSH_VERTICES 8
+
+/* the bytes of each attribute sent directly, by vertex format, as the
+device set them (0: not set by it) */
+static unsigned char vertex_format_bytes[8][GX_VA_MAXATTR];
+/* (whether a flush is due; how many were sent) */
+static BOOL xf_flush_due;
+static unsigned long xf_flushes;
+
+static void vertex_format(u8 format, u32 attribute, u32 count, u32 type, u32 fraction)
+{
+	/* (GX_U8, GX_S8, GX_U16, GX_S16, GX_F32; GX_RGB565 to GX_RGBA8) */
+	static const unsigned char component_bytes[5] = { 1, 1, 2, 2, 4 };
+	static const unsigned char color_bytes_of[6] = { 2, 3, 4, 2, 3, 4 };
+	unsigned bytes = 0;
+
+	GX_SetVtxAttrFmt(format, attribute, count, type, fraction);
+	if (attribute == GX_VA_CLR0 || attribute == GX_VA_CLR1)
+		bytes = type < 6 ? color_bytes_of[type] : 0;
+	else if (type < 5)
+	{
+		if (attribute == GX_VA_POS)
+			bytes = (count == GX_POS_XY ? 2 : 3) * component_bytes[type];
+		else if (attribute == GX_VA_NRM)
+			bytes = count == GX_NRM_XYZ ? 3 * component_bytes[type] : 0;
+		else if (attribute >= GX_VA_TEX0 && attribute <= GX_VA_TEX7)
+			bytes = (count == GX_TEX_S ? 1 : 2) * component_bytes[type];
+	}
+	if (attribute < GX_VA_MAXATTR)
+		vertex_format_bytes[format & 7][attribute] = (unsigned char)bytes;
+}
+
+/* the bytes of a vertex of format as GX_Begin will send them; 0 where an
+attribute's size is not known */
+static unsigned vertex_bytes(u8 format)
+{
+	GXVtxDesc descriptor[GX_MAX_VTXDESC_LISTSIZE];
+	unsigned index, bytes = 0;
+
+	GX_GetVtxDescv(descriptor);
+	for (index = 0; index < GX_MAX_VTXDESC_LISTSIZE && descriptor[index].attr != GX_VA_NULL; index++)
+	{
+		u8 attribute = descriptor[index].attr, type = descriptor[index].type;
+
+		if (type == GX_NONE)
+			continue;
+		/* (a matrix index is a byte; an index one or two) */
+		if (attribute <= GX_VA_TEX7MTXIDX || type == GX_INDEX8)
+			bytes += 1;
+		else if (type == GX_INDEX16)
+			bytes += 2;
+		else if (attribute < GX_VA_MAXATTR && vertex_format_bytes[format & 7][attribute])
+			bytes += vertex_format_bytes[format & 7][attribute];
+		else
+			return 0;
+	}
+	return bytes;
+}
+
+/* a raster state change (an EFB copy, a token, a draw-done): the next
+primitive is flushed first */
+static void xf_flush_after(void)
+{
+	xf_flush_due = TRUE;
+}
+
+/* GX misreads a vertex whose descriptor holds only its position (indexed)
+and matrix indices: a draw of the device whose vertices carry a matrix
+index sends another attribute with it, a colour no channel reads where it
+needs none (draw_hardware's pad_color, draw_run's EMIT_PAD; a skinned
+model's pass whose stages read no texture coordinate from its vertices and
+whose colours are constant). Checked before each primitive in a build with
+assertions, whether the position is indexed or direct. */
+#ifndef HALO_RELEASE
+static void vertex_shape_check(void)
+{
+	GXVtxDesc descriptor[GX_MAX_VTXDESC_LISTSIZE];
+	unsigned index, others = 0;
+	BOOL position = FALSE, matrices = FALSE;
+
+	GX_GetVtxDescv(descriptor);
+	for (index = 0; index < GX_MAX_VTXDESC_LISTSIZE && descriptor[index].attr != GX_VA_NULL; index++)
+	{
+		if (descriptor[index].type == GX_NONE)
+			continue;
+		if (descriptor[index].attr <= GX_VA_TEX7MTXIDX)
+			matrices = TRUE;
+		else if (descriptor[index].attr == GX_VA_POS)
+			position = TRUE;
+		else
+			others++;
+	}
+	if (position && matrices && !others)
+		platform_log("Direct3D: a vertex of its position and matrix indices alone, which GX misreads");
+	WL_ASSERT(!position || !matrices || others);
+}
+#endif
+
+/* GX_Begin, after the flush if one is due */
+static void gx_begin(u8 primitive, u8 format, u16 count)
+{
+#ifndef HALO_RELEASE
+	vertex_shape_check();
+#endif
+	if (xf_flush_due && xf_flush_on)
+	{
+		unsigned long bytes = (unsigned long)vertex_bytes(format) * XF_FLUSH_VERTICES;
+
+		if (bytes)
+		{
+			GX_Begin(GX_TRIANGLESTRIP, format, XF_FLUSH_VERTICES);
+			for (; bytes >= 4; bytes -= 4)
+				wgPipe->U32 = 0;
+			for (; bytes; bytes--)
+				wgPipe->U8 = 0;
+			GX_End();
+			xf_flushes++;
+		}
+		else
+		{
+			static BOOL logged;
+
+			if (!logged)
+			{
+				logged = TRUE;
+				platform_log("Direct3D: no flush before a primitive of format %u: an attribute's size is not known",
+					(unsigned)format);
+			}
+		}
+	}
+	xf_flush_due = FALSE;
+	GX_Begin(primitive, format, count);
+}
+
+/* where GX stood when it did not finish in time (WiiLibs' 250 ms wait): its
+status flags, the FIFO's read and write pointers and fill, and the last
+token it passed, written out at once (a hung console may not log again) */
+static void gx_stall_log(const char *where)
+{
+	GXFifoObj gp, cpu;
+	void *gp_read = NULL, *gp_write = NULL, *cpu_read = NULL, *cpu_write = NULL;
+	u8 over_high, under_low, read_idle, command_idle, breakpoint;
+
+	GX_GetGPStatus(&over_high, &under_low, &read_idle, &command_idle, &breakpoint);
+	GX_GetGPFifo(&gp);
+	GX_GetCPUFifo(&cpu);
+	GX_GetFifoPtrs(&gp, &gp_read, &gp_write);
+	GX_GetFifoPtrs(&cpu, &cpu_read, &cpu_write);
+	platform_log("Direct3D: frame %lu: GX did not finish in time (%s): over the high mark %u, under the low mark %u, "
+		"reading idle %u, commands idle %u, at a breakpoint %u; the GP's FIFO read %p, write %p, %lu bytes in it; the "
+		"CPU's FIFO write %p; the last token passed %u; %lu flushes sent",
+		device.frames, where, over_high, under_low, read_idle, command_idle, breakpoint, gp_read, gp_write,
+		(unsigned long)GX_GetFifoCount(&gp), cpu_write, (unsigned)GX_GetDrawSync(), xf_flushes);
+	wl_platform_log_flush();
+}
+
 /* ---------- the frame on GX
 
 A frame is begun on GX by the first clear or draw after a Present (cleared
@@ -764,8 +948,10 @@ static BOOL transform_hardware;
 static BOOL emit_matrix_index;
 /* the attributes a processor's draw sends (emit_attributes_set): bit 0 and 1
 the colours, 2 to 5 the texture coordinates, 6 the fog; all of them unless
-a draw says fewer */
+a draw says fewer; EMIT_PAD, where it sends none of them but a matrix index,
+a colour of 0 in their place, which no channel reads (vertex_shape_check) */
 #define EMIT_ALL 0x7F
+#define EMIT_PAD 0x80
 static unsigned emit_attributes = EMIT_ALL;
 
 static void transform_software(void)
@@ -803,6 +989,9 @@ static void frame_begin(D3DCOLOR clear_color)
 	/* ARGB to the RGBA WiiLibs takes (and the back buffer has the EFB) */
 	wl_gx_begin_frame((clear_color << 8) | (clear_color >> 24));
 	device.frame_open = TRUE;
+	/* (the last frame's display copy, token and draw-done, and this one's
+	clearing copy) */
+	xf_flush_after();
 
 	/* (x and y in pixels from the top left, the depth given as z - 1: GX's
 	clip-space depth runs from -1, near, to 0, far; draw_run loads it) */
@@ -815,15 +1004,15 @@ static void frame_begin(D3DCOLOR clear_color)
 	but a frame begins with it right whatever did) */
 	GX_LoadTexMtxImm(identity, GX_IDENTITY, GX_MTX3x4);
 
-	GX_SetVtxAttrFmt(DEVICE_VERTEX_FORMAT, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
-	GX_SetVtxAttrFmt(DEVICE_VERTEX_FORMAT, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
-	GX_SetVtxAttrFmt(DEVICE_VERTEX_FORMAT, GX_VA_CLR1, GX_CLR_RGBA, GX_RGBA8, 0);
-	GX_SetVtxAttrFmt(DEVICE_VERTEX_FORMAT, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
-	GX_SetVtxAttrFmt(DEVICE_VERTEX_FORMAT, GX_VA_TEX1, GX_TEX_ST, GX_F32, 0);
-	GX_SetVtxAttrFmt(DEVICE_VERTEX_FORMAT, GX_VA_TEX2, GX_TEX_ST, GX_F32, 0);
-	GX_SetVtxAttrFmt(DEVICE_VERTEX_FORMAT, GX_VA_TEX3, GX_TEX_ST, GX_F32, 0);
+	vertex_format(DEVICE_VERTEX_FORMAT, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	vertex_format(DEVICE_VERTEX_FORMAT, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+	vertex_format(DEVICE_VERTEX_FORMAT, GX_VA_CLR1, GX_CLR_RGBA, GX_RGBA8, 0);
+	vertex_format(DEVICE_VERTEX_FORMAT, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+	vertex_format(DEVICE_VERTEX_FORMAT, GX_VA_TEX1, GX_TEX_ST, GX_F32, 0);
+	vertex_format(DEVICE_VERTEX_FORMAT, GX_VA_TEX2, GX_TEX_ST, GX_F32, 0);
+	vertex_format(DEVICE_VERTEX_FORMAT, GX_VA_TEX3, GX_TEX_ST, GX_F32, 0);
 	/* (the fog factor, on the fog ramp: fog_coordinate) */
-	GX_SetVtxAttrFmt(DEVICE_VERTEX_FORMAT, GX_VA_TEX4, GX_TEX_S, GX_F32, 0);
+	vertex_format(DEVICE_VERTEX_FORMAT, GX_VA_TEX4, GX_TEX_S, GX_F32, 0);
 	GX_SetNumChans(2);
 	GX_SetNumTexGens(5);
 	transform_hardware = TRUE;
@@ -880,7 +1069,7 @@ static void cull_measure(void)
 		GX_SetCullMode(pass ? GX_CULL_FRONT : GX_CULL_NONE);
 		transform_software();
 
-		GX_Begin(GX_TRIANGLES, DEVICE_VERTEX_FORMAT, 3);
+		gx_begin(GX_TRIANGLES, DEVICE_VERTEX_FORMAT, 3);
 		for (vertex = 0; vertex < 3; vertex++)
 		{
 			u8 value = pass ? 255 : 0;
@@ -896,6 +1085,7 @@ static void cull_measure(void)
 	}
 	GX_SetCullMode(GX_CULL_NONE);
 	GX_DrawDone();
+	xf_flush_after();
 	GX_PeekARGB(2, 2, &read);
 	gx_cull_clockwise = read.r > 128 ? GX_CULL_BACK : GX_CULL_FRONT;
 	platform_log("Direct3D: GX_CULL_FRONT %s clockwise triangles (read back %u): clockwise is culled by %s",
@@ -1359,6 +1549,7 @@ static void texture_evict(struct texture_entry *entry)
 			if (pending_texture_free_count == PENDING_TEXTURE_FREES)
 			{
 				GX_DrawDone();
+				xf_flush_after();
 				texture_frees_flush();
 			}
 			pending_texture_frees[pending_texture_free_count++] = entry->texels;
@@ -1401,7 +1592,10 @@ static BOOL texture_cache_reclaim(unsigned long bytes, const struct texture_entr
 	if (any)
 	{
 		if (device.frame_open)
+		{
 			GX_DrawDone();
+			xf_flush_after();
+		}
 		texture_frees_flush();
 	}
 	return any;
@@ -2730,6 +2924,8 @@ static inline void vertex_emit(const struct gx_vertex *vertex)
 	}
 	if (emit_attributes & 1)
 		GX_Color1u32(color_word(vertex->color0));
+	else if (emit_attributes & EMIT_PAD)
+		GX_Color1u32(0);
 	if (emit_attributes & 2)
 		GX_Color1u32(color_word(vertex->color1));
 	for (stage = 0; stage < 4; stage++)
@@ -2749,8 +2945,12 @@ static void emit_attributes_set(void)
 
 	if (wanted == EMIT_ALL)
 		return;
+	/* (never the position and its matrix index alone: the first colour
+	stays, sent as 0) */
+	if (!wanted && emit_matrix_index)
+		wanted = EMIT_PAD;
 	for (index = 0; index < 7; index++)
-		if (!(wanted & (1U << index)))
+		if (!(wanted & (1U << index)) && !(index == 0 && (wanted & EMIT_PAD)))
 			GX_SetVtxDesc(attributes[index], GX_NONE);
 	emit_attributes = wanted;
 	transform_hardware = TRUE;
@@ -3383,7 +3583,7 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 			store_plan_set();
 			live_gx = position_register >= 0 ? store_plan.live & ~NV2A_CPU_LIVE_POSITION : store_plan.live;
 
-			GX_Begin(gx_primitive(primitive_type), DEVICE_VERTEX_FORMAT, (u16)count);
+			gx_begin(gx_primitive(primitive_type), DEVICE_VERTEX_FORMAT, (u16)count);
 			for (vertex = 0; vertex < count; vertex++)
 			{
 				unsigned slot = indices[vertex] - least;
@@ -3434,7 +3634,7 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 		store_plan_set();
 		live_gx = position_register >= 0 ? store_plan.live & ~NV2A_CPU_LIVE_POSITION : store_plan.live;
 
-		GX_Begin(gx_primitive(primitive_type), DEVICE_VERTEX_FORMAT, (u16)count);
+		gx_begin(gx_primitive(primitive_type), DEVICE_VERTEX_FORMAT, (u16)count);
 		for (vertex = 0; vertex < count; vertex++)
 		{
 			struct gx_vertex sent;
@@ -3460,6 +3660,7 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 		GXColor pixel;
 
 		GX_DrawDone();
+		xf_flush_after();
 		GX_PeekARGB(DRAW_LOG_X, DRAW_LOG_Y, &pixel);
 		platform_log("  pixel (%d, %d) after: %u %u %u %u", DRAW_LOG_X, DRAW_LOG_Y, pixel.r, pixel.g, pixel.b, pixel.a);
 	}
@@ -3503,6 +3704,7 @@ static struct nv2a_cpu_program *program_current(void)
 			return NULL;
 		nv2a_cpu_compile(shader->instructions, shader->instruction_count, shader->program);
 		nv2a_cpu_analyze(shader->program, &shader->dependencies);
+		nv2a_cpu_analyze_constants(shader->program, &shader->constant_reads);
 	}
 	return shader->program;
 }
@@ -3647,6 +3849,9 @@ static void efb_take(void)
 	}
 	if (resolved)
 		render_target_resolved(resolved);
+	/* (a target's copy out of the EFB, the back buffer's parked or put back) */
+	if (resolved || before != after)
+		xf_flush_after();
 	if (before != after)
 	{
 		/* (GX's texture cache may hold what was in the memory copied to) */
@@ -3664,6 +3869,7 @@ static void efb_clear_quad(DWORD flags, D3DCOLOR color, float z)
 	indirect_apply(NULL);
 	wl_gx_target_clear((flags & D3DCLEAR_TARGET) ? true : false, (flags & D3DCLEAR_ZBUFFER) ? true : false, rgba, z,
 		(int)device.viewport.X, (int)device.viewport.Y, (int)device.viewport.Width, (int)device.viewport.Height);
+	xf_flush_after();
 	efb_device_state();
 }
 
@@ -4354,14 +4560,14 @@ static BOOL sphere_bake(const struct texture_entry *world, const float frame[3][
 		GX_ClearVtxDesc();
 		GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
 		GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
-		GX_SetVtxAttrFmt(SPHERE_BAKE_VERTEX_FORMAT, GX_VA_POS, GX_POS_XY, GX_F32, 0);
-		GX_SetVtxAttrFmt(SPHERE_BAKE_VERTEX_FORMAT, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+		vertex_format(SPHERE_BAKE_VERTEX_FORMAT, GX_VA_POS, GX_POS_XY, GX_F32, 0);
+		vertex_format(SPHERE_BAKE_VERTEX_FORMAT, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
 		GX_SetCurrentMtx(GX_PNMTX0);
 		GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
 		transform_hardware = TRUE;
 		for (row = 0; row < GRID; row++)
 		{
-			GX_Begin(GX_TRIANGLESTRIP, SPHERE_BAKE_VERTEX_FORMAT, 2 * (GRID + 1));
+			gx_begin(GX_TRIANGLESTRIP, SPHERE_BAKE_VERTEX_FORMAT, 2 * (GRID + 1));
 			for (column = 0; column <= GRID; column++)
 			{
 				GX_Position2f32((f32)column / GRID, (f32)row / GRID);
@@ -4373,6 +4579,7 @@ static BOOL sphere_bake(const struct texture_entry *world, const float frame[3][
 		}
 		/* (copied unfiltered, and GX's texture cache invalidated) */
 		wl_gx_copy_efb_texture(0, SPHERE_BAKE_ROW, SIZE, SIZE, buffer, WL_GX_TEX_RGBA8, false);
+		xf_flush_after();
 		/* the draw's own state again */
 		GX_SetViewport(0.0f, 0.0f, SCREEN_WIDTH, SCREEN_HEIGHT, 0.0f, 1.0f);
 		GX_SetScissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
@@ -4725,7 +4932,7 @@ static void lit_state(BOOL keyed, const struct draw_projection *projection, cons
 		GX_LoadNrmMtxImm(turn, GX_PNMTX0);
 	}
 	GX_SetVtxDesc(GX_VA_NRM, GX_DIRECT);
-	GX_SetVtxAttrFmt(HARDWARE_VERTEX_FORMAT, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
+	vertex_format(HARDWARE_VERTEX_FORMAT, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
 	if (lit.colors)
 	{
 		if (lit.alpha && lit_fog_ramp(keyed))
@@ -4740,7 +4947,7 @@ static void lit_state(BOOL keyed, const struct draw_projection *projection, cons
 		if (lit.alpha)
 		{
 			GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
-			GX_SetVtxAttrFmt(HARDWARE_VERTEX_FORMAT, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+			vertex_format(HARDWARE_VERTEX_FORMAT, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
 		}
 	}
 	if (lit.reflection)
@@ -4781,6 +4988,346 @@ static BOOL hardware_rejected(const struct nv2a_cpu_program *program, const char
 	return FALSE;
 }
 
+/* ---------- the outputs of static vertex buffers, kept
+
+An output of a program that reads no constant (nv2a_cpu_analyze_constants)
+is, for a vertex, the same whatever the draw's constants: a function of the
+vertex buffers alone. The environment's bumped lightmap pass (10c30c53)
+writes one: its texture coordinate 3, the incoming light's direction (v7)
+in the surface's tangent frame (v1 to v3), a cube map's direction whose
+sphere map coordinates the processor computed for each vertex, 33,000 a
+frame in a10. Where what a draw has the processor compute is such an output
+(a sphere-mapped stage whose direction's x, y and z read no constant, or
+both colours, every component), and the streams it reads are static, it is
+computed once for each vertex, kept beside the buffers in the contiguous
+window, and read by GX by index as the buffers are (draw_hardware).
+- A vertex buffer is static while the game does not lock it: its header's
+  Lock, D3D's own field, holds a serial the device gives it when it first
+  keys outputs by it, and d3d8_resources.c's D3DVertexBuffer_Lock clears it
+  (as it does a texture's mark). Kept outputs are keyed by each stream they
+  read (its header, data, stride and serial), the program, the shader (its
+  declaration) and the stages and colours kept.
+- An entry's outputs are computed only from the frame after it was first
+  seen: a buffer locked each frame (the dynamic ones) is never kept.
+- A vertex is computed when a draw first names it (a bit a vertex) as
+  draw_hardware computes it, nv2a_cpu_run_live for those outputs alone (the
+  same to the bit: tests/nv2a_native_check.c), and what is new flushed from
+  the processor's cache before GX reads it.
+- At most STATIC_OUTPUTS_BYTES in all, and only while the window keeps
+  STATIC_OUTPUTS_RESERVE free in one run besides (the game's own buffers
+  and textures come first). An entry not drawn for STATIC_OUTPUTS_IDLE
+  frames is freed, and one pushed out once GX has drawn the frame. */
+#define STATIC_OUTPUTS_ENTRIES 32
+#define STATIC_OUTPUTS_STREAMS 4
+#define STATIC_OUTPUTS_BYTES (1024UL * 1024UL)
+#define STATIC_OUTPUTS_RESERVE (1024UL * 1024UL)
+#define STATIC_OUTPUTS_IDLE 120
+
+struct static_outputs
+{
+	BOOL used;
+	unsigned long program_hash, shader_id;
+	/* the sphere-mapped stages kept (bit n: stage n), and the colours */
+	unsigned stages;
+	BOOL colors;
+	struct
+	{
+		const D3DVertexBuffer *buffer;
+		DWORD data, serial;
+		UINT stride;
+	} streams[STATIC_OUTPUTS_STREAMS];
+	unsigned stream_count;
+	unsigned long seen_frame, used_frame;
+	/* each vertex's (stride bytes): the kept stages' sphere map coordinates,
+	two floats each in the stages' order, then the colours' bytes, D0's and
+	D1's; in the contiguous window */
+	unsigned char *values;
+	unsigned stride;
+	unsigned long capacity;
+	/* (a bit a vertex: computed) */
+	unsigned long *computed;
+};
+
+static struct static_outputs static_outputs[STATIC_OUTPUTS_ENTRIES];
+static unsigned long static_outputs_bytes;
+static DWORD vertex_buffer_serial;
+/* (values pushed out during a frame, freed once GX has drawn it) */
+static unsigned char *static_outputs_frees[STATIC_OUTPUTS_ENTRIES];
+static unsigned static_outputs_free_count;
+/* the log's: draws that read kept outputs, their vertices, the vertices
+computed for them, and draws whose outputs could not be kept for want of
+memory */
+static unsigned long kept_draws, kept_vertices, kept_computed, kept_refused;
+
+/* an entry's values freed: at once where GX has drawn the frame, else once
+it has */
+static void static_outputs_release_values(struct static_outputs *entry, BOOL drawn)
+{
+	if (!entry->values)
+		return;
+	if (drawn)
+		platform_contiguous_free(entry->values);
+	else if (static_outputs_free_count < STATIC_OUTPUTS_ENTRIES)
+		static_outputs_frees[static_outputs_free_count++] = entry->values;
+	else
+	{
+		/* (no room to wait: GX finishes first) */
+		GX_DrawDone();
+		xf_flush_after();
+		platform_contiguous_free(entry->values);
+	}
+	static_outputs_bytes -= entry->capacity * entry->stride;
+	entry->values = NULL;
+}
+
+static void static_outputs_release(struct static_outputs *entry, BOOL drawn)
+{
+	static_outputs_release_values(entry, drawn);
+	free(entry->computed);
+	memset(entry, 0, sizeof(*entry));
+}
+
+/* once GX has drawn the frame (Present): the values pushed out, and the
+entries not drawn for a while */
+static void static_outputs_frame_drawn(void)
+{
+	unsigned index;
+
+	while (static_outputs_free_count)
+		platform_contiguous_free(static_outputs_frees[--static_outputs_free_count]);
+	for (index = 0; index < STATIC_OUTPUTS_ENTRIES; index++)
+		if (static_outputs[index].used && device.frames - static_outputs[index].used_frame > STATIC_OUTPUTS_IDLE)
+			static_outputs_release(&static_outputs[index], TRUE);
+}
+
+/* the stages and colours of what the processor computes for a draw
+(spheres, colors) whose outputs read no constant and depend only on
+registers of bound streams; the streams in *streams */
+static unsigned static_outputs_wanted(const struct vertex_shader_object *shader, const struct stream_fetch *fetch,
+	unsigned spheres, BOOL colors, BOOL *colors_kept, unsigned *streams)
+{
+	const struct nv2a_cpu_dependencies *reads = &shader->constant_reads;
+	unsigned long registers = 0, mask;
+	unsigned stages = 0, stage;
+	int reg, component;
+
+	*colors_kept = FALSE;
+	*streams = 0;
+	for (stage = 0; stage < 4; stage++)
+	{
+		if (!(spheres & (1U << stage)))
+			continue;
+		mask = reads->t[stage][0] | reads->t[stage][1] | reads->t[stage][2];
+		if (!(mask & NV2A_CPU_READS_CONSTANT))
+		{
+			stages |= 1U << stage;
+			registers |= mask & 0xFFFF;
+		}
+	}
+	if (colors)
+	{
+		mask = 0;
+		for (component = 0; component < 4; component++)
+			mask |= reads->d0[component] | reads->d1[component];
+		if (!(mask & NV2A_CPU_READS_CONSTANT))
+		{
+			*colors_kept = TRUE;
+			registers |= mask & 0xFFFF;
+		}
+	}
+	for (reg = 0; reg < NV2A_CPU_INPUT_COUNT; reg++)
+	{
+		const struct vertex_element *element;
+		unsigned stream;
+
+		if (!(registers & (1UL << reg)))
+			continue;
+		element = element_of(shader, reg);
+		stream = element ? element->stream & (MAXIMUM_STREAMS - 1) : 0;
+		if (!element || !fetch->streams[stream] || !device.streams[stream].buffer)
+		{
+			*colors_kept = FALSE;
+			return 0;
+		}
+		*streams |= 1U << stream;
+	}
+	return stages;
+}
+
+/* the kept outputs for a draw (draw_hardware's, of vertices least to most,
+none past 16 bits), every vertex it names computed; NULL where they are not
+kept (not static yet, or no memory) */
+static struct static_outputs *static_outputs_find(struct nv2a_cpu_program *program,
+	const struct vertex_shader_object *shader, struct stream_fetch *fetch, UINT count, const WORD *indices,
+	UINT first, unsigned long most, unsigned spheres, BOOL colors, float point_size)
+{
+	static unsigned last;
+	struct static_outputs key, *entry = NULL;
+	unsigned streams, stream, index, stage, stage_count = 0;
+	BOOL colors_kept;
+	unsigned long vertex, written_least = 0xFFFFFFFFUL, written_most = 0;
+
+	memset(&key, 0, sizeof(key));
+	key.stages = static_outputs_wanted(shader, fetch, spheres, colors, &colors_kept, &streams);
+	key.colors = colors_kept;
+	if (!key.stages && !key.colors)
+		return NULL;
+	key.program_hash = program->hash;
+	key.shader_id = shader->id;
+	for (stream = 0; stream < MAXIMUM_STREAMS; stream++)
+	{
+		D3DVertexBuffer *buffer = device.streams[stream].buffer;
+
+		if (!(streams & (1U << stream)))
+			continue;
+		if (key.stream_count == STATIC_OUTPUTS_STREAMS)
+			return NULL;
+		/* (a buffer's serial: given at first sight, cleared by a lock) */
+		if (!buffer->Lock)
+		{
+			if (!++vertex_buffer_serial)
+				vertex_buffer_serial++;
+			buffer->Lock = vertex_buffer_serial;
+		}
+		key.streams[key.stream_count].buffer = buffer;
+		key.streams[key.stream_count].data = buffer->Data;
+		key.streams[key.stream_count].serial = buffer->Lock;
+		key.streams[key.stream_count].stride = device.streams[stream].stride;
+		key.stream_count++;
+	}
+	/* (consecutive draws are mostly of one buffer) */
+	for (index = 0; index < STATIC_OUTPUTS_ENTRIES; index++)
+	{
+		struct static_outputs *candidate = &static_outputs[(last + index) % STATIC_OUTPUTS_ENTRIES];
+
+		if (candidate->used && candidate->program_hash == key.program_hash && candidate->shader_id == key.shader_id &&
+			candidate->stages == key.stages && candidate->colors == key.colors &&
+			candidate->stream_count == key.stream_count &&
+			!memcmp(candidate->streams, key.streams, sizeof(key.streams)))
+		{
+			entry = candidate;
+			last = (last + index) % STATIC_OUTPUTS_ENTRIES;
+			break;
+		}
+	}
+	if (!entry)
+	{
+		/* a new entry, in place of a free one, else one with no values, else
+		the least recently drawn */
+		struct static_outputs *victim = NULL;
+
+		for (index = 0; index < STATIC_OUTPUTS_ENTRIES; index++)
+		{
+			struct static_outputs *candidate = &static_outputs[index];
+
+			if (!candidate->used)
+			{
+				victim = candidate;
+				break;
+			}
+			if (!victim || (!candidate->values && victim->values) ||
+				(!candidate->values == !victim->values && candidate->used_frame < victim->used_frame))
+				victim = candidate;
+		}
+		static_outputs_release(victim, FALSE);
+		*victim = key;
+		victim->used = TRUE;
+		victim->seen_frame = victim->used_frame = device.frames;
+		return NULL;
+	}
+	entry->used_frame = device.frames;
+	/* (not static yet: seen this frame only) */
+	if (entry->seen_frame == device.frames)
+		return NULL;
+	for (stage = 0; stage < 4; stage++)
+		if (entry->stages & (1U << stage))
+			stage_count++;
+	if (most >= entry->capacity)
+	{
+		/* (room for the vertices up to most, in steps of 1024) */
+		unsigned long capacity = (most + 1024) & ~1023UL, largest = 0;
+		unsigned stride = 8 * stage_count + (entry->colors ? 8 : 0);
+		unsigned long bytes = capacity * stride;
+		unsigned char *values = NULL;
+		unsigned long *computed;
+
+		wii_memory_window_usage(NULL, NULL, &largest);
+		if (static_outputs_bytes - entry->capacity * entry->stride + bytes <= STATIC_OUTPUTS_BYTES &&
+			largest >= bytes + STATIC_OUTPUTS_RESERVE)
+			values = platform_contiguous_alloc(bytes, 32, PLATFORM_ANY_PHYSICAL_ADDRESS, 0);
+		computed = values ? calloc((capacity + 31) / 32, sizeof(*computed)) : NULL;
+		if (!values || !computed)
+		{
+			if (values)
+				platform_contiguous_free(values);
+			kept_refused++;
+			return NULL;
+		}
+		if (entry->values)
+		{
+			/* (what was computed, kept; the old values freed once GX has
+			drawn the frame) */
+			memcpy(values, entry->values, (size_t)entry->capacity * stride);
+			memcpy(computed, entry->computed, (entry->capacity + 31) / 32 * sizeof(*computed));
+			written_least = 0;
+			written_most = entry->capacity - 1;
+			static_outputs_release_values(entry, FALSE);
+		}
+		free(entry->computed);
+		entry->values = values;
+		entry->computed = computed;
+		entry->capacity = capacity;
+		entry->stride = stride;
+		static_outputs_bytes += bytes;
+	}
+	/* the vertices the draw names that are not computed yet */
+	for (vertex = 0; vertex < count; vertex++)
+	{
+		unsigned long whole = indices ? (unsigned long)indices[vertex] + device.base_vertex_index : first + vertex;
+		float inputs[NV2A_CPU_INPUT_COUNT][4];
+		struct nv2a_cpu_output out;
+		unsigned char *values;
+
+		if (entry->computed[whole >> 5] & (1UL << (whole & 31)))
+			continue;
+		memset(inputs, 0, sizeof(inputs));
+		stream_fetch(fetch, vertex, inputs);
+		nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
+			&out, entry->stages * NV2A_CPU_LIVE_T0 | (entry->colors ? NV2A_CPU_LIVE_D0 | NV2A_CPU_LIVE_D1 : 0));
+		values = entry->values + whole * entry->stride;
+		for (stage = 0; stage < 4; stage++)
+			if (entry->stages & (1U << stage))
+			{
+				float point[2];
+
+				sphere_coordinates(out.t[stage], point);
+				memcpy(values, point, sizeof(point));
+				values += sizeof(point);
+			}
+		if (entry->colors)
+		{
+			int component;
+
+			for (component = 0; component < 4; component++)
+			{
+				values[component] = color_byte(out.d0[component]);
+				values[4 + component] = color_byte(out.d1[component]);
+			}
+		}
+		entry->computed[whole >> 5] |= 1UL << (whole & 31);
+		if (whole < written_least)
+			written_least = whole;
+		if (whole > written_most)
+			written_most = whole;
+		kept_computed++;
+	}
+	if (written_least <= written_most)
+		DCFlushRange(entry->values + written_least * entry->stride, (written_most - written_least + 1) * entry->stride);
+	kept_draws++;
+	kept_vertices += count;
+	return entry;
+}
+
 static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitive_type, UINT count,
 	const WORD *indices, UINT first, struct stream_fetch *fetch)
 {
@@ -4800,7 +5347,12 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	struct draw_projection projection;
 	/* (position_read: a stage reads a coordinate GX makes from the position,
 	which a vertex the processor transforms does not give it) */
-	BOOL fogged = FALSE, cpu_colors = FALSE, position_read = FALSE, keyed, lit_on;
+	BOOL fogged = FALSE, cpu_colors = FALSE, position_read = FALSE, keyed, lit_on, pad_color = FALSE;
+	/* (what a static buffer's kept outputs give of what the processor would
+	compute: static_outputs_find) */
+	struct static_outputs *kept = NULL;
+	unsigned kept_spheres = 0, kept_count = 0;
+	BOOL kept_colors = FALSE;
 	const unsigned char *position_stream;
 	UINT position_stride;
 	unsigned long long key;
@@ -5071,13 +5623,29 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		if (lit.reflection)
 			cpu_spheres &= ~8U;
 	}
+	if (!keyed && !lit_on && (cpu_spheres || cpu_colors))
+	{
+		kept = static_outputs_find(program, shader, fetch, count, indices, first, most, cpu_spheres, cpu_colors,
+			point_size);
+		if (kept)
+		{
+			kept_spheres = kept->stages;
+			kept_colors = kept->colors;
+			cpu_spheres &= ~kept_spheres;
+			if (kept_colors)
+				cpu_colors = FALSE;
+			for (stage = 0; stage < 4; stage++)
+				if (kept_spheres & (1U << stage))
+					kept_count++;
+		}
+	}
 	position_stream = fetch->streams[position_element->stream & (MAXIMUM_STREAMS - 1)] + position_element->offset;
 	position_stride = device.streams[position_element->stream & (MAXIMUM_STREAMS - 1)].stride;
 	if (position_stride > 255)
 		return FALSE;
 	GX_ClearVtxDesc();
 	position_matrix_load();
-	GX_SetVtxAttrFmt(HARDWARE_VERTEX_FORMAT, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	vertex_format(HARDWARE_VERTEX_FORMAT, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
 	if (draw_keys.processor)
 	{
 		/* (each vertex's position sent: the processor's, or the vertex's own
@@ -5101,20 +5669,29 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 			return FALSE;
 		GX_SetVtxDesc(GX_VA_TEX0 + component, GX_INDEX16);
 		if (element->type == D3DVSDT_NORMSHORT2)
-			GX_SetVtxAttrFmt(HARDWARE_VERTEX_FORMAT, GX_VA_TEX0 + component, GX_TEX_ST, GX_S16, 15);
+			vertex_format(HARDWARE_VERTEX_FORMAT, GX_VA_TEX0 + component, GX_TEX_ST, GX_S16, 15);
 		else
-			GX_SetVtxAttrFmt(HARDWARE_VERTEX_FORMAT, GX_VA_TEX0 + component, GX_TEX_ST, GX_F32, 0);
+			vertex_format(HARDWARE_VERTEX_FORMAT, GX_VA_TEX0 + component, GX_TEX_ST, GX_F32, 0);
 		GX_SetArray(GX_VA_TEX0 + component, (void *)(stream + element->offset), (u8)stride);
 		DCFlushRange((void *)(stream + least * stride), (most - least + 1) * stride);
 	}
-	/* (the processor's sphere map coordinates: the attributes after those
-	read by index) */
+	/* (the kept sphere map coordinates, read by index from the kept values,
+	then the processor's, sent with each vertex) */
 	for (stage = 0, component = texture_count; stage < 4; stage++)
+	{
+		if (!(kept_spheres & (1U << stage)))
+			continue;
+		GX_SetVtxDesc(GX_VA_TEX0 + component, GX_INDEX16);
+		vertex_format(HARDWARE_VERTEX_FORMAT, GX_VA_TEX0 + component, GX_TEX_ST, GX_F32, 0);
+		GX_SetArray(GX_VA_TEX0 + component, kept->values + 8 * (component - texture_count), (u8)kept->stride);
+		component++;
+	}
+	for (stage = 0; stage < 4; stage++)
 	{
 		if (!(cpu_spheres & (1U << stage)))
 			continue;
 		GX_SetVtxDesc(GX_VA_TEX0 + component, GX_DIRECT);
-		GX_SetVtxAttrFmt(HARDWARE_VERTEX_FORMAT, GX_VA_TEX0 + component, GX_TEX_ST, GX_F32, 0);
+		vertex_format(HARDWARE_VERTEX_FORMAT, GX_VA_TEX0 + component, GX_TEX_ST, GX_F32, 0);
 		component++;
 	}
 	GX_InvVtxCache();
@@ -5128,8 +5705,16 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		GX_SetTexCoordGen(GX_TEXCOORD0 + stage, GX_TG_MTX2x4,
 			stage < 4 && stage_source[stage] >= 0 ? GX_TG_TEX0 + stage_source[stage] : GX_TG_POS, GX_TEXMTX0 + 3 * stage);
 	}
-	/* (as transform_software sends the processor's coordinates) */
+	/* (as transform_software sends the processor's coordinates; the kept
+	ones first, as their attributes are) */
 	for (stage = 0, component = texture_count; stage < 4; stage++)
+	{
+		if (!(kept_spheres & (1U << stage)))
+			continue;
+		GX_SetTexCoordGen(GX_TEXCOORD0 + stage, GX_TG_MTX2x4, GX_TG_TEX0 + component, GX_IDENTITY);
+		component++;
+	}
+	for (stage = 0; stage < 4; stage++)
 	{
 		if (!(cpu_spheres & (1U << stage)))
 			continue;
@@ -5149,14 +5734,34 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		/* the colours: the processor's, sent with each vertex */
 		GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
 		GX_SetVtxDesc(GX_VA_CLR1, GX_DIRECT);
-		GX_SetVtxAttrFmt(HARDWARE_VERTEX_FORMAT, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
-		GX_SetVtxAttrFmt(HARDWARE_VERTEX_FORMAT, GX_VA_CLR1, GX_CLR_RGBA, GX_RGBA8, 0);
+		vertex_format(HARDWARE_VERTEX_FORMAT, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+		vertex_format(HARDWARE_VERTEX_FORMAT, GX_VA_CLR1, GX_CLR_RGBA, GX_RGBA8, 0);
+		GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+		GX_SetChanCtrl(GX_COLOR1A1, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+	}
+	else if (kept_colors)
+	{
+		/* the colours: kept, read by index (after the kept coordinates) */
+		GX_SetVtxDesc(GX_VA_CLR0, GX_INDEX16);
+		GX_SetVtxDesc(GX_VA_CLR1, GX_INDEX16);
+		vertex_format(HARDWARE_VERTEX_FORMAT, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+		vertex_format(HARDWARE_VERTEX_FORMAT, GX_VA_CLR1, GX_CLR_RGBA, GX_RGBA8, 0);
+		GX_SetArray(GX_VA_CLR0, kept->values + 8 * kept_count, (u8)kept->stride);
+		GX_SetArray(GX_VA_CLR1, kept->values + 8 * kept_count + 4, (u8)kept->stride);
 		GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
 		GX_SetChanCtrl(GX_COLOR1A1, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
 	}
 	else
 	{
-		/* the colours: constant */
+		/* the colours: constant (and where the vertex would otherwise be its
+		position and matrix indices alone, which GX misreads, a colour of 0
+		that neither channel reads goes with it: vertex_shape_check) */
+		pad_color = keyed && !texture_count && !cpu_spheres && !kept_spheres && !lit_on;
+		if (pad_color)
+		{
+			GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+			vertex_format(HARDWARE_VERTEX_FORMAT, GX_VA_CLR0, GX_CLR_RGB, GX_RGB565, 0);
+		}
 		GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_REG, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
 		GX_SetChanCtrl(GX_COLOR1A1, GX_DISABLE, GX_SRC_REG, GX_SRC_REG, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
 		GX_SetChanMatColor(GX_COLOR0A0, (GXColor){ color_byte(base.d0[0]), color_byte(base.d0[1]),
@@ -5184,7 +5789,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	}
 
 	emitting = wl_platform_time_us();
-	GX_Begin(gx_primitive(primitive_type), HARDWARE_VERTEX_FORMAT, (u16)count);
+	gx_begin(gx_primitive(primitive_type), HARDWARE_VERTEX_FORMAT, (u16)count);
 	for (vertex = 0; vertex < count; vertex++)
 	{
 		unsigned long whole = indices ? (unsigned long)indices[vertex] + device.base_vertex_index : first + vertex;
@@ -5319,7 +5924,14 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 			GX_Color1u32(color_word(computed->color0));
 			GX_Color1u32(color_word(computed->color1));
 		}
-		for (component = 0; component < texture_count; component++)
+		else if (kept_colors)
+		{
+			GX_Color1x16(index);
+			GX_Color1x16(index);
+		}
+		else if (pad_color)
+			GX_Color1u16(0);
+		for (component = 0; component < texture_count + (int)kept_count; component++)
 			GX_TexCoord1x16(index);
 		for (stage = 0; stage < 4; stage++)
 			if (cpu_spheres & (1U << stage))
@@ -5544,7 +6156,8 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		/* (GX's draws finished first, timed apart from the copy to the
 		display, which wl_gx_end_frame makes: it waits for a free display
 		buffer, not for the retrace; the retrace interrupt shows the frame) */
-		(void)wl_gx_sync();
+		if (!wl_gx_sync())
+			gx_stall_log("the frame's draws");
 		timing.present_gx += wl_platform_time_us() - started;
 		/* the display copy's own state, whatever the frame's copies to
 		textures and drawing below the back buffer (sphere_bake) left */
@@ -5566,11 +6179,21 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 				interval = wanted;
 			}
 		}
-		wl_gx_end_frame();
+		{
+			WlGxStats before, after;
+
+			wl_gx_stats(&before);
+			wl_gx_end_frame();
+			wl_gx_stats(&after);
+			if (after.gpu_timeouts != before.gpu_timeouts)
+				gx_stall_log("the display copy");
+		}
 		device.frame_open = FALSE;
 		/* (the frame drawn: the textures evicted during it can go) */
 		GX_DrawDone();
+		xf_flush_after();
 		texture_frees_flush();
+		static_outputs_frame_drawn();
 		/* (GX's texture cache emptied once a frame, whatever was written) */
 		texture_memory_changed = TRUE;
 		timing.present += wl_platform_time_us() - started;
@@ -5633,6 +6256,19 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		platform_log("Direct3D: in hardware with the processor's sphere map coordinates: %lu draws, %lu vertices run",
 			hardware_sphere_draws, hardware_spheres_run);
 		hardware_sphere_draws = hardware_spheres_run = 0;
+		{
+			unsigned index, entries = 0, kept_entries = 0;
+
+			for (index = 0; index < STATIC_OUTPUTS_ENTRIES; index++)
+			{
+				entries += static_outputs[index].used ? 1 : 0;
+				kept_entries += static_outputs[index].values ? 1 : 0;
+			}
+			platform_log("Direct3D: static buffers' outputs kept: %lu draws read them, %lu vertices, %lu computed; "
+				"%u buffers seen, %u kept, %lu KB; %lu draws without room", kept_draws, kept_vertices, kept_computed,
+				entries, kept_entries, static_outputs_bytes / 1024, kept_refused);
+			kept_draws = kept_vertices = kept_computed = kept_refused = 0;
+		}
 		platform_log("Direct3D: lit by GX (display.gx_lighting): %lu draws, %lu vertices, %lu refused; %lu view sphere "
 			"maps drawn; the planar fog by GX's ramp in %lu draws (%lu ramps written), the processor's in %lu",
 			lit_draws, lit_vertices, lit_refused, sphere_bakes_made, lit_fog_draws, fog_ramps_made, lit_fog_refused);

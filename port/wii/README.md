@@ -18,10 +18,9 @@ This port is in bring-up. In Dolphin, the game boots from the SD card and loads 
   second). On the Wii, `display.bumped_highlights` is off by default (bumped specular and bumped
   reflections: their passes' vertices run on the processor, about two fifths of a10's frame),
   `display.object_shadows` is off by default (each object's shadow draws it again, a pass of
-  skinned vertices), `display.model_detail` is 0.5, `display.bumped_lightmaps` is off (the
-  environment's lightmap pass drawn flat, without the cube map lookup whose direction each
-  vertex gives on the processor) and `display.environment_reflections` is off (two of the
-  environment's five passes over its shiny surfaces). "What the frame draws" below has the
+  skinned vertices), `display.model_detail` is 0.5 and `display.environment_reflections` is
+  off (two of the environment's five passes over its shiny surfaces). `display.bumped_lightmaps`
+  is on, as elsewhere: its cube map's direction is computed once a vertex and kept. "What the frame draws" below has the
   counts.
 - **Loading**: the menu is up within a second of the game's start.
 - **Every map converts**: the 24 Xbox maps (campaign and multiplayer) go through
@@ -529,6 +528,37 @@ and pixel shaders.
     `10c30c53`) were nearly all the CPU's vertices. The program itself saves little (1110 to 1108
     instructions a vertex for `8f831b43`: its skinning and lighting are most of it); each index
     sends 7 words to the FIFO in place of 14.
+  - **Static buffers' outputs kept.** An output that reads no constant is, for a vertex, the
+    same whatever the draw's constants (`nv2a_cpu_analyze_constants`; the generated programs
+    list them as "the vertex's alone"). Where what the processor computes for such a draw (a
+    sphere-mapped stage's coordinates, or both colours) reads no constant and the streams it
+    reads are static, it is computed once a vertex, kept beside the buffers in the contiguous
+    window (at most 1 MB, and only while the window keeps 1 MB more free in one run), and GX
+    reads it by index as it reads the buffers (`static_outputs_find`).
+    - A vertex buffer is static while the game does not lock it: its header's `Lock` holds a
+      serial the device gives it, which `D3DVertexBuffer_Lock` clears. The kept outputs are
+      keyed by each stream's header, data, stride and serial, the program, the shader and the
+      stages and colours kept, and computed only from the frame after they were first seen (a
+      buffer locked every frame is never kept). Entries not drawn for 120 frames are freed.
+    - The environment's bumped lightmap pass (`10c30c53`) is what it is for: its texture
+      coordinate 3, the incoming light's direction (v7) in the tangent frame (v1 to v3), was the
+      processor's for every vertex, every frame (a10: 33,000). Its colours read the lights'
+      constants and stay the processor's, as they are with `display.bumped_lightmaps = false`.
+    - Of the 67 programs, 34 have an output of the vertex's alone; those the processor computes
+      in GX's draws and that can be kept, where their buffers are static: a cube map's direction
+      (`10c30c53` t3, `e44b4813` t1 and t2, `918a94c8` t3, `67d0128c` t1, `4f0f94bd` t0 to t2,
+      the normal in t2 of `693a1023`, `77aa0f41`, `cb99676b` and `ff0b9366`, where those stages
+      are cube maps) and the colours of `9c72fc7c`, `af3b677a` and `9a8643d5` (the vertex's own,
+      v9). Not kept: a colour of the vertex's beside one that reads constants (D1 of `27f6eaae`,
+      `d7379dd1`, `ddbd4abe`, `6b9ad0b3`, D0 of `63152d86`), single components of a colour (D0's
+      alpha of the lit models' programs), the bumped reflections' and specular lights' frames
+      (`3f6a2f54`, `dc6482ca`, `16128183`, `6e1e2f91`: the processor's draws, `draw_run`, which
+      also send the eye, a constant), and coordinates that are affine and not a cube map's (GX's
+      texture matrices already).
+    - `tests/nv2a_native_check.c` checks that every component the analysis finds reads no
+      constant is the same, to the bit, for other constants, on the interpreter and in the
+      program's function for those outputs alone. The log's `static buffers' outputs kept` line
+      counts the draws that read them, their vertices and those computed, and the memory.
   - In the menu, the draws take 10 ms a frame compiled, against 58 ms interpreted.
   - **The models' lighting on GX's lights** (`display.gx_lighting`, on by default on the Wii;
     `src/gx_lighting.c`). The models' lit programs (`cfc6f3a4`, `9d2757d2`, `8f831b43`: the
@@ -727,6 +757,22 @@ and pixel shaders.
   their equal-depth tests whichever path each pass took.
 - **Frame buffer.** The EFB has an alpha channel (RGBA6_Z24), because the game blends by
   destination alpha.
+- **GX kept from hanging.** GX's transform unit can hang on a clipped primitive that follows an
+  EFB copy, a draw-sync token or a draw-done. libogc's `GX_SetMisc(GX_MT_XF_FLUSH,
+  GX_XF_FLUSH_SAFE)` names the remedy, and the device sets it, but libogc's `GX_Begin` sends
+  nothing for it (its `gx.o`, disassembled: the value is only kept). So after each of those the
+  device's next primitive is preceded by eight vertices of zeros in its own vertex format (its
+  size from libogc's vertex descriptor and the formats the device set), which are one point and
+  draw nothing (`gx_begin`; `debug.gpu_xf_flush_safe`, on by default). Where WiiLibs' GX wait (250
+  ms) runs out, at the frame's draws or its display copy, the log says where GX stood: its status
+  flags, the GP FIFO's read and write pointers and fill, the CPU FIFO's write pointer, the last
+  token passed and the flushes sent (`GX did not finish in time`).
+- **No vertex of a position and matrix indices alone.** GX misreads a vertex whose descriptor
+  holds only its indexed position and matrix indices, which a skinned model's pass whose stages
+  read no texture coordinate from its vertices and whose colours are constant would be. Such a
+  draw sends a colour of 0 (RGB565, two bytes) that neither channel reads; the processor's draws
+  of a matrix index and nothing else read send their first colour as 0. A build with assertions
+  checks every primitive's descriptor (`vertex_shape_check`).
 - **Debugging.** The desktop ports' `debug.gpu_debug_flat` and `debug.gpu_debug_texture0` (in
   `config.toml`) show the diffuse colour, or the first texture, alone. One frame's draws are
   described in the log (`DRAW_LOG_FRAME`).
@@ -752,7 +798,9 @@ the Wii's other defaults (`display.model_detail = 0.5`, no object shadows).
 - `display.environment_reflections = false` leaves out two of a10's five passes over its
   environment: 178,000 vertices a frame become 113,000. `display.bumped_lightmaps = false`
   takes the cube map's direction out of the first pass, so GX transforms it and the processor
-  computes only its colours.
+  computes only its colours; with it on, the direction is the static buffers' kept outputs
+  (computed once a vertex, then read by GX by index), so the processor computes only its
+  colours too.
 - `display.model_detail` changes almost nothing here (b30: 89,700 vertices at 1.0, 91,800 at
   0.5, 91,200 at 0.25). The grunts, elites and jackals far away are already at their lowest
   level of detail (about 450 vertices a grunt), and the trees, shrubs and rocks have only one.
