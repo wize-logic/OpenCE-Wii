@@ -772,8 +772,8 @@ console's settings and logs it once at the device's creation, as `video: 480i NT
   copy and draws it back as one filtered quad over columns 80 to 560 of 640 (`wl_gx_target_squeeze`);
   the interface then widens the 640 columns and the 480 of them are three quarters of the screen: 4:3,
   circles round. The cost is one 640x480 EFB copy and one quad a frame, the picture 25% less sharp
-  sideways, and a 1.2 MB block of memory, the one the render targets park the back buffer's colour
-  in (`efb_park_alloc`, in the contiguous window when there is room; the two share it). With no
+  sideways, and a 1.2 MB block of memory, which the render targets then park the back buffer's
+  colour in (`efb_park_alloc`, in the contiguous window when there is room; the two share it). With no
   memory the picture is shown stretched (one warning in the log). `"stretch"` fills the screen as
   before. A 4:3 console setting is not touched. The game's projection is unchanged: a real
   anamorphic mode (drawing all 640 columns in a 16:9 picture) would widen the HUD and the field of
@@ -949,7 +949,8 @@ and pixel shaders.
       `contiguous memory: the Direct3D device's kept buffers given back`). The 512 KB margin
       keeps that rare: the blocks made once a level is loaded are the loading screen's texture
       (320 by 240, 300 KB) and the device's own (sphere maps of 9 KB; the back buffer's
-      parking, two of 1,200 KB made once, which go to the heap where the window has no room);
+      parking, two blocks of the largest target's size, 64 KB each for b30's water, which go to
+      the heap where the window has no room);
     - a buffer refused is not asked for again (by the entry or index record that wanted it)
       until room may have come: a free of the window's pages or of a slab's granules, seen once
       a frame is drawn; within that, a window block as large as one refused is refused without
@@ -1215,9 +1216,15 @@ and pixel shaders.
   each draw goes to, records the targets that were copied, and sets its own vertex and texture
   coordinate state again after a quad:
   - The back buffer's colour and depth are parked (in the contiguous window where there is room,
-    else the heap).
-  - The target is drawn at the EFB's origin and copied into its own memory in GX's format, where
-    its texture is bound from.
+    else the heap): only the part a target can draw over, its scissor from the EFB's origin
+    (WiiLibs parks again, larger, for a larger target). b30's water builds its ripples into four
+    targets, 128 to 16 pixels square, every frame: the park is 128 by 128, 128 KB copied out and
+    written back, where the whole back buffer was 2.4 MB each way (and 2.4 MB of memory), and
+    the processor's invalidation of the blocks, 2% of a frame's time in Dolphin, as much smaller.
+  - The target is drawn at the EFB's origin, within its scissor, and copied into its own memory
+    in GX's format, where its texture is bound from. Nothing the device draws while a target has
+    the EFB may leave the scissor: the world's sphere map, baked below the back buffer, sets the
+    owner's scissor again after it (`sphere_bake`).
   - The back buffer returns through a quad that writes the parked colour, and the parked depth
     through a Z texture.
   - A clear once the frame has begun is a quad.

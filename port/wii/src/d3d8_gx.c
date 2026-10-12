@@ -5630,9 +5630,18 @@ static BOOL sphere_bake(const struct texture_entry *world, const float frame[3][
 		/* (copied unfiltered, and GX's texture cache invalidated) */
 		wl_gx_copy_efb_texture(0, SPHERE_BAKE_ROW, SIZE, SIZE, buffer, WL_GX_TEX_RGBA8, false);
 		xf_flush_after();
-		/* the draw's own state again */
+		/* the draw's own state again: the scissor of the EFB's owner, which a
+		render target's draws must keep (WiiLibs parks only the part of the
+		back buffer within it) */
 		GX_SetViewport(0.0f, 0.0f, SCREEN_WIDTH, SCREEN_HEIGHT, 0.0f, 1.0f);
-		GX_SetScissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+		{
+			const WlGxTarget *owner = wl_gx_target_current();
+			uint32_t width = SCREEN_WIDTH, height = SCREEN_HEIGHT;
+
+			if (owner)
+				wl_gx_target_scissor_size(owner, SCREEN_WIDTH, SCREEN_HEIGHT, &width, &height);
+			GX_SetScissor(0, 0, width, height);
+		}
 		states_apply();
 		gx_psh_apply(pixel_shader_program);
 		indirect_apply(pixel_shader_program);
