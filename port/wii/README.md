@@ -45,6 +45,7 @@ tools/wii_dolphin.py --seconds 300 --until "frame 360:"            # run it in D
 tools/wii_gx_psh_check.py                   # the combiner translation, checked on the host (WIILIBS=DIR)
 tools/wii_nv2a_check.py                     # the compiled vertex programs against the interpreter
 tools/wii_input_check.py                    # the controllers' mapping to the Xbox gamepad (WIILIBS=DIR)
+tools/wii_gx_texel_check.py                 # the processor's texel reads of the GX textures (WIILIBS=DIR)
 tools/wii_animation_check.py --converted DIR XBOX/maps/*.map   # the converted maps against the Xbox's (map conversion, below)
 tools/wii_data_check.py --converted DIR XBOX/maps/*.map
 tools/wii_placeholder_check.py XBOX/maps/*.map    # the game reads none of the tag bytes left as they are
@@ -909,6 +910,15 @@ and pixel shaders.
   frame's start, not before every draw. A cube map is bound as its sphere
   map, and each vertex's direction is mapped onto it (on the CPU): the normalization cube map's
   too, whose texel is the direction a bump map's dot product takes.
+- **Texels the processor reads.** The game reads some texels itself: an object is lit by the
+  lightmap under it, and by the diffuse texture there (`object_lights.c`'s `sample_lightmap`,
+  through `bitmap_2d_get_pixel`). The Xbox's swizzled or DXT addressing finds another texel of a
+  GX texture (on a lightmap, often the black between its pieces, which drew a10's crewmen and
+  consoles nearly black), so on the Wii `bitmap_2d_get_pixel` asks
+  `port/wii/src/wii_bitmap_texel.c` which levels the converter rewrote and reads the texel from
+  GX's tiles: the Xbox's texel value for the game's own conversion, or for DXT the CMPR block as
+  the GPU decodes it, with DXT3/5's alpha from the I4 levels. `tools/wii_gx_texel_check.py`
+  checks it on the host against WiiLibs' conversions of every format.
 - **Depth.** A program's position matrix and its depth's a + b/w come from its constants alone,
   from two points along w's gradient. Both vertex paths take them, so a surface's passes meet
   their equal-depth tests whichever path each pass took. A draw whose vertices are all at one w

@@ -237,6 +237,20 @@ symbols in this file:
 #include "rasterizer/rasterizer_swizzle.h"
 #include "rasterizer/xbox/rasterizer_xbox_hardware_bitmaps.h"
 
+#ifdef HALO_WII
+/* port: the Wii's bitmaps are in GX's formats (port/wii/src/wii_bitmap_texel.c,
+wii_bitmap_texel.h) */
+int wii_bitmap_gx_levels(int format, int type, int width, int height, int depth, unsigned flags, int mipmap_count);
+int wii_bitmap_gx_texel(int format, int width, int height, int levels, const void *pixels, int level, int x, int y,
+	unsigned long *value);
+enum
+{
+	_wii_bitmap_texel_none,
+	_wii_bitmap_texel_xbox,
+	_wii_bitmap_texel_a8r8g8b8,
+};
+#endif
+
 /* ---------- constants */
 
 enum
@@ -1079,6 +1093,9 @@ pixel32 bitmap_2d_get_pixel(
 	void *mipmap_address;
 	long offset;
 	pixel32 pixel;
+#ifdef HALO_WII
+	int gx_levels;
+#endif
 
 	match_assert("c:\\halo\\SOURCE\\bitmaps\\bitmaps.c", 0x261, bitmap);
 	match_assert("c:\\halo\\SOURCE\\bitmaps\\bitmaps.c", 0x262, bitmap->type==_bitmap_type_2d);
@@ -1097,6 +1114,14 @@ pixel32 bitmap_2d_get_pixel(
 		{
 			mipmap_index = 0;
 		}
+#ifdef HALO_WII
+		/* port: a bitmap the map converter rewrote in GX's formats keeps
+		fewer levels (port/wii/src/wii_bitmap_texel.c) */
+		gx_levels = wii_bitmap_gx_levels(bitmap->format, bitmap->type, bitmap->width, bitmap->height, bitmap->depth,
+			bitmap->flags, bitmap->mipmap_count);
+		if (gx_levels > 0 && mipmap_index >= gx_levels)
+			mipmap_index = (short)(gx_levels - 1);
+#endif
 
 		width = bitmap_mipmap_get_width(bitmap, mipmap_index);
 		height = bitmap_mipmap_get_height(bitmap, mipmap_index);
@@ -1117,6 +1142,35 @@ pixel32 bitmap_2d_get_pixel(
 			y = (short)(((fast_ftol((real)height * point->y - 0.5f) % height) + height) % height);
 		}
 
+#ifdef HALO_WII
+		/* port: the texel where the converter put it in the GX texture, as
+		the Xbox's swizzled or DXT addressing would read another (the lightmap
+		under an object, object_lights.c's sample_lightmap, read so lit it
+		nearly black) */
+		if (gx_levels > 0)
+		{
+			unsigned long value;
+
+			switch (wii_bitmap_gx_texel(bitmap->format, bitmap->width, bitmap->height, gx_levels, bitmap->base_address,
+				mipmap_index, x, y, &value))
+			{
+			case _wii_bitmap_texel_a8r8g8b8:
+				return (pixel32)value;
+			case _wii_bitmap_texel_xbox:
+			{
+				byte texel8 = (byte)value;
+				word texel16 = (word)value;
+				pixel32 texel32 = (pixel32)value;
+				short bits = bitmap_format_get_bits_per_pixel(bitmap->format);
+
+				return bitmap_format_to_a8r8g8b8(bitmap->format, bits == 8 ? (void const *)&texel8 :
+					bits == 16 ? (void const *)&texel16 : (void const *)&texel32, 0);
+			}
+			default:
+				return (pixel32)NONE;
+			}
+		}
+#endif
 		mipmap_address = bitmap_mipmap_address(bitmap, mipmap_index);
 		if (TEST_FLAG(bitmap->flags, _bitmap_compressed_bit))
 		{

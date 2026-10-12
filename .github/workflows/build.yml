@@ -295,6 +295,7 @@ jobs:
           python3 tools/wii_gx_psh_check.py
           python3 tools/wii_nv2a_check.py
           python3 tools/wii_input_check.py
+          python3 tools/wii_gx_texel_check.py
 
       - name: Build
         run: |
