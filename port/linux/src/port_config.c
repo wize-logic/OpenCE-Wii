@@ -664,6 +664,9 @@ static const struct config_setting config_settings[] =
 	{ "debug.gpu_transform", _config_boolean, "true", "HALO_GPU_TRANSFORM", _environment_value, _platform_all,
 		"The Wii: draws whose vertex programs GX's own transform can compute go to it;\n"
 		"false runs every program on the processor." },
+	{ "debug.gx_display_lists", _config_boolean, "true", "HALO_GX_DISPLAY_LISTS", _environment_value, _platform_all,
+		"The Wii: the structure's draws whose vertices are their indices alone are\n"
+		"written once into GX display lists and called; false sends the indices each draw." },
 	{ "debug.gpu_xf_flush_safe", _config_boolean, "true", "HALO_GPU_XF_FLUSH_SAFE", _environment_value, _platform_all,
 		"The Wii: after an EFB copy, a draw-sync token or a draw-done, the next\n"
 		"primitive is preceded by a few vertices that draw nothing, which flush\n"

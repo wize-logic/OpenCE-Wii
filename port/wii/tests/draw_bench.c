@@ -24,6 +24,11 @@ printed instead, to compare two builds of the device.
 usage: draw_bench <scene> <frames> [record] (scene: environment, rigid, skinned, unlit, all)
 */
 
+/* (the display lists' memory outside the window, whose addresses the
+digests keep: a draw's lists leave the others' arrays where they were) */
+#define INDEX_LIST_ALLOCATE(bytes) aligned_alloc(32, ((bytes) + 31) & ~31UL)
+#define INDEX_LIST_FREE(data) free(data)
+
 #include "d3d8_gx.c"
 
 #include "host/gx_stand_in.h"
@@ -55,7 +60,7 @@ int config_boolean(const char *name)
 	/* (BENCH_CPU: every program on the processor, as debug.gpu_transform false) */
 	if (!strcmp(name, "debug.gpu_transform"))
 		return getenv("BENCH_CPU") ? 0 : 1;
-	if (!strcmp(name, "debug.gpu_cull") ||
+	if (!strcmp(name, "debug.gpu_cull") || (!strcmp(name, "debug.gx_display_lists") && !getenv("BENCH_NO_LISTS")) ||
 		!strcmp(name, "display.bumped_highlights"))
 		return 1;
 	if (!strcmp(name, "display.gx_lighting"))

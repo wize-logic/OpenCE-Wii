@@ -948,8 +948,9 @@ static void vertex_shape_check(void)
 }
 #endif
 
-/* GX_Begin, after the flush if one is due */
-static void gx_begin(u8 primitive, u8 format, u16 count)
+/* the flush before a primitive of format, if one is due (gx_begin; before
+a display list's call) */
+static void gx_flush_pending(u8 format)
 {
 #ifndef HALO_RELEASE
 	vertex_shape_check();
@@ -962,9 +963,9 @@ static void gx_begin(u8 primitive, u8 format, u16 count)
 		{
 			GX_Begin(GX_TRIANGLESTRIP, format, XF_FLUSH_VERTICES);
 			for (; bytes >= 4; bytes -= 4)
-				wgPipe->U32 = 0;
+				GX_Color1u32(0);
 			for (; bytes; bytes--)
-				wgPipe->U8 = 0;
+				GX_Position1x8(0);
 			GX_End();
 			xf_flushes++;
 		}
@@ -981,6 +982,12 @@ static void gx_begin(u8 primitive, u8 format, u16 count)
 		}
 	}
 	xf_flush_due = FALSE;
+}
+
+/* GX_Begin, after the flush if one is due */
+static void gx_begin(u8 primitive, u8 format, u16 count)
+{
+	gx_flush_pending(format);
 	GX_Begin(primitive, format, count);
 }
 
@@ -3462,6 +3469,8 @@ so every draw of these constants has the same, to the bit */
 static struct draw_projection position_projection;
 /* (config.toml's debug.gpu_transform; -1 not read yet) */
 static int gpu_transform = -1;
+/* (debug.gx_display_lists: index_list_draw) */
+static int index_lists = -1;
 
 /* the matrices and depths of recent constants, by the program, its vertex
 declaration, the constants it reads and the viewport's */
@@ -4549,6 +4558,7 @@ the copy's, takes them as they were: about two instructions an index and
 two a vertex. A buffer the game rewrites only fails the comparison. */
 #define INDEX_RECORDS 256
 #define INDEX_RECORD_BYTES (256UL * 1024UL)
+#define INDEX_LISTS 4
 
 struct index_record
 {
@@ -4572,6 +4582,14 @@ struct index_record
 	each index's key */
 	unsigned char *block;
 	unsigned long bytes;
+	/* the indices as GX display lists, one for each primitive and number
+	of indexed attributes a draw of them sent (index_list_draw) */
+	struct index_list
+	{
+		void *data;
+		u32 size;
+		u8 primitive, attributes;
+	} lists[INDEX_LISTS];
 };
 
 static struct index_record index_records[INDEX_RECORDS];
@@ -4585,7 +4603,11 @@ static struct
 {
 	unsigned long serial, least, most;
 	struct index_record *record;
+	/* (the record's indices hashed the same in an earlier draw) */
+	BOOL kept;
 } draw_range;
+
+static void index_record_lists_release(struct index_record *record, BOOL drawn);
 
 static unsigned short *index_record_vertices(const struct index_record *record)
 {
@@ -4638,6 +4660,7 @@ static void draw_range_find(const struct stream_fetch *fetch, UINT count)
 		return;
 	draw_range.serial = draw_serial;
 	draw_range.record = NULL;
+	draw_range.kept = FALSE;
 	if (!fetch->indices)
 	{
 		draw_range.least = fetch->first;
@@ -4666,6 +4689,7 @@ static void draw_range_find(const struct stream_fetch *fetch, UINT count)
 		draw_range.least = record->least;
 		draw_range.most = record->most;
 		draw_range.record = record;
+		draw_range.kept = TRUE;
 		ranges_kept++;
 		return;
 	}
@@ -4686,6 +4710,7 @@ static void draw_range_find(const struct stream_fetch *fetch, UINT count)
 		return;
 	if (record->block)
 		index_record_keys_free(record);
+	index_record_lists_release(record, FALSE);
 	record->indices = fetch->indices;
 	record->count = count;
 	record->base = device.base_vertex_index;
@@ -6442,6 +6467,168 @@ static BOOL kept_normals_find(const struct vertex_shader_object *shader, unsigne
 	return TRUE;
 }
 
+/* ---------- the structure's indices as display lists
+
+The structure's sections are drawn with the same indices each frame, and
+their passes but for a lit or keyed one send only those indices: a position,
+a normal and texture coordinates each read by index, the same index for
+each (emit_indices' first loop). Such a draw's indices, once its index record
+has hashed the same in two draws (draw_range.kept), are written once into a
+GX display list (GX_BeginDispList: the commands as they would go into the
+FIFO, in the contiguous window), and the draws call it: three words in the
+FIFO for the draw, the processor's work of its indices gone. GX's state
+(the vertex descriptor and formats, the arrays, the matrices) is set
+outside the list as for any draw: the list holds only the primitive and its
+indices, so it serves any draw of the same primitive and number of indexed
+attributes. A record keeps INDEX_LISTS lists (a section's passes differ in
+their texture coordinates); they are freed with the record's indices (a
+hash that differs, the record's place taken) and when not drawn for
+STATIC_OUTPUTS_IDLE frames, once GX has drawn the frame; at most
+INDEX_LISTS_BYTES in all, and only while the window keeps
+STATIC_OUTPUTS_RESERVE free in one run besides. WiiLibs' wl_gx_dl_* records
+its own layouts (one texture coordinate) through wl_gx_draw_indexed, so the
+device records with libogc's calls, as WiiLibs does. */
+#define INDEX_LISTS_BYTES (512UL * 1024UL)
+/* (the lists' memory: draw_bench.c gives its own, outside the window whose
+addresses its digests keep) */
+#ifndef INDEX_LIST_ALLOCATE
+#define INDEX_LIST_ALLOCATE(bytes) platform_contiguous_alloc((bytes), 32, PLATFORM_ANY_PHYSICAL_ADDRESS, 0)
+#define INDEX_LIST_FREE(data) platform_contiguous_free(data)
+#endif
+
+static unsigned long index_lists_bytes;
+static void *index_lists_frees[INDEX_RECORDS];
+static unsigned index_lists_free_count;
+/* in the statistics' window: draws by a list, lists written, and draws that
+found no room for theirs */
+static unsigned long index_list_calls, index_lists_made, index_lists_refused;
+
+static void index_list_free(void *data, BOOL drawn)
+{
+	if (drawn)
+		INDEX_LIST_FREE(data);
+	else if (index_lists_free_count < INDEX_RECORDS)
+		index_lists_frees[index_lists_free_count++] = data;
+	else
+	{
+		/* (no room to wait: GX finishes first) */
+		GX_DrawDone();
+		xf_flush_after();
+		INDEX_LIST_FREE(data);
+	}
+}
+
+static void index_record_lists_release(struct index_record *record, BOOL drawn)
+{
+	unsigned which;
+
+	for (which = 0; which < INDEX_LISTS; which++)
+	{
+		struct index_list *list = &record->lists[which];
+
+		if (!list->data)
+			continue;
+		index_list_free(list->data, drawn);
+		index_lists_bytes -= (list->size + 31) & ~31UL;
+		memset(list, 0, sizeof(*list));
+	}
+}
+
+/* once GX has drawn the frame (Present): the lists pushed out, and those of
+records not drawn for a while */
+static void index_lists_frame_drawn(void)
+{
+	unsigned index, which;
+
+	while (index_lists_free_count)
+		INDEX_LIST_FREE(index_lists_frees[--index_lists_free_count]);
+	if (!index_lists_bytes)
+		return;
+	for (index = 0; index < INDEX_RECORDS; index++)
+		if (device.frames - index_records[index].used > STATIC_OUTPUTS_IDLE)
+			for (which = 0; which < INDEX_LISTS; which++)
+				if (index_records[index].lists[which].data)
+				{
+					index_record_lists_release(&index_records[index], TRUE);
+					break;
+				}
+}
+
+/* the draw's indices by the record's display list for its primitive and
+attributes (written now if it has none): FALSE where it has none and none
+can be written (the draw then sends its indices) */
+static BOOL index_list_draw(struct index_record *record, u8 primitive, unsigned attributes, const WORD *indices,
+	UINT count)
+{
+	struct index_list *list = NULL, *empty = NULL;
+	unsigned which;
+	unsigned long capacity, largest = 0;
+	void *data;
+	u32 size;
+
+	for (which = 0; which < INDEX_LISTS; which++)
+	{
+		struct index_list *candidate = &record->lists[which];
+
+		if (candidate->data && candidate->primitive == primitive && candidate->attributes == attributes)
+		{
+			list = candidate;
+			break;
+		}
+		if (!candidate->data && !empty)
+			empty = candidate;
+	}
+	if (list)
+	{
+		gx_flush_pending(HARDWARE_VERTEX_FORMAT);
+		GX_CallDispList(list->data, list->size);
+		index_list_calls++;
+		return TRUE;
+	}
+	if (!empty)
+		return FALSE;
+	/* (the primitive's command and count, the indices, GX_EndDispList's
+	padding to 32 bytes, and room for a flush GX_Begin may send first) */
+	capacity = (3 + (unsigned long)count * attributes * 2 + 64 + 31) & ~31UL;
+	if (index_lists_bytes + capacity > INDEX_LISTS_BYTES)
+	{
+		index_lists_refused++;
+		return FALSE;
+	}
+	wii_memory_window_usage(NULL, NULL, &largest);
+	data = largest >= capacity + STATIC_OUTPUTS_RESERVE ?
+		INDEX_LIST_ALLOCATE(capacity) : NULL;
+	if (!data)
+	{
+		index_lists_refused++;
+		return FALSE;
+	}
+	/* (the list is written past the processor's cache: no line of it may be
+	written back over it) */
+	DCInvalidateRange(data, capacity);
+	gx_flush_pending(HARDWARE_VERTEX_FORMAT);
+	GX_BeginDispList(data, capacity);
+	GX_Begin(primitive, HARDWARE_VERTEX_FORMAT, (u16)count);
+	emit_indices(indices, 0, count, attributes - 1, FALSE, EMIT_NORMALS_NONE, FALSE, FALSE, FALSE);
+	GX_End();
+	size = GX_EndDispList();
+	if (!size)
+	{
+		INDEX_LIST_FREE(data);
+		index_lists_refused++;
+		return FALSE;
+	}
+	empty->data = data;
+	empty->size = size;
+	empty->primitive = primitive;
+	empty->attributes = (u8)attributes;
+	index_lists_bytes += (size + 31) & ~31UL;
+	index_lists_made++;
+	GX_CallDispList(data, size);
+	index_list_calls++;
+	return TRUE;
+}
+
 /* ---------- the vertices of a draw in hardware the processor has a part in
 
 Where the processor computes something of a draw's vertices (a blended
@@ -7348,14 +7535,24 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	}
 
 	emitting = timing_now();
-	gx_begin(gx_primitive(primitive_type), HARDWARE_VERTEX_FORMAT, (u16)count);
-	if (plain)
-		emit_indices(indices, first, count, texture_count + kept_count, keyed,
-			!lit_on ? EMIT_NORMALS_NONE : lit.normals_indexed ? EMIT_NORMALS_INDEXED : EMIT_NORMALS_SENT,
-			lit_on && lit.reflection && keyed, fog_post, lit_on && lit.fog_ramped && keyed);
+	if (index_lists < 0)
+		index_lists = config_boolean("debug.gx_display_lists") ? 1 : 0;
+	if (plain && !keyed && indices && index_lists && draw_range.kept && draw_range.serial == draw_serial &&
+		draw_range.record && (!lit_on || lit.normals_indexed) &&
+		index_list_draw(draw_range.record, gx_primitive(primitive_type),
+			1 + (lit_on ? 1 : 0) + texture_count + kept_count, indices, count))
+		;
 	else
-		hardware_emit_draw(&hardware_vertices_draw, count);
-	GX_End();
+	{
+		gx_begin(gx_primitive(primitive_type), HARDWARE_VERTEX_FORMAT, (u16)count);
+		if (plain)
+			emit_indices(indices, first, count, texture_count + kept_count, keyed,
+				!lit_on ? EMIT_NORMALS_NONE : lit.normals_indexed ? EMIT_NORMALS_INDEXED : EMIT_NORMALS_SENT,
+				lit_on && lit.reflection && keyed, fog_post, lit_on && lit.fog_ramped && keyed);
+		else
+			hardware_emit_draw(&hardware_vertices_draw, count);
+		GX_End();
+	}
 	if (lit_on)
 	{
 		lit_draws++;
@@ -7621,6 +7818,7 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		texture_frees_flush();
 		static_outputs_frame_drawn();
 		kept_normals_frame_drawn();
+		index_lists_frame_drawn();
 		/* (GX's texture cache emptied once a frame, whatever was written) */
 		texture_memory_changed = TRUE;
 		timing.present += timing_now() - started;
@@ -7689,6 +7887,9 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			"kept, %lu found (%lu KB kept)", ranges_kept, ranges_found, key_records_kept, key_records_made,
 			index_record_bytes / 1024);
 		ranges_kept = ranges_found = key_records_kept = key_records_made = 0;
+		platform_log("Direct3D: the structure's indices as display lists: %lu draws called one, %lu written (%lu KB "
+			"kept), %lu without room", index_list_calls, index_lists_made, index_lists_bytes / 1024, index_lists_refused);
+		index_list_calls = index_lists_made = index_lists_refused = 0;
 		platform_log("Direct3D: in hardware with the processor's sphere map coordinates: %lu draws (%lu lit by GX), "
 			"%lu vertices run", hardware_sphere_draws, hardware_sphere_lit_draws, hardware_spheres_run);
 		hardware_sphere_draws = hardware_sphere_lit_draws = hardware_spheres_run = 0;
