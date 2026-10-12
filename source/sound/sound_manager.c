@@ -3492,6 +3492,18 @@ static void update_channels(
 				channel->sound_index = NONE;
 				continue;
 			}
+			/* port: a looping sound's track whose looping sound has gone
+			(process_looping_sounds deletes one that was not refreshed, and
+			refresh_sound keeps a sound started in this millisecond without
+			asking its looping sound, so frames under a millisecond apart
+			leave it playing): stopped, as refresh_sound would have */
+			if (sound->type != _sound_impulse &&
+				!datum_try_and_get(looping_sound_data, sound->source_identifier))
+			{
+				sound_stop(channel->sound_index);
+				channel->sound_index = NONE;
+				continue;
+			}
 			definition = sound_definition_get(sound->definition_index);
 			fade = sound_calculate_fade(channel->sound_index);
 

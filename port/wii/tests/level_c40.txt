@@ -1,0 +1,11 @@
+# c40, Two Betrayals, from its start to its end, for
+# debug.test_input = "script:level_c40.txt" with
+# debug.network_test = "solo:levels\c40\c40" (port/wii/README.md, "The
+# playthrough check"). The level's opening plays as it is; then the
+# objective (port/linux/game/level_run.c) plays it as a person would, to
+# the next level's (d20) start.
+play 600
+log c40 begins
+objective 3600
+log c40 ended
+quit

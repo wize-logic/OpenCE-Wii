@@ -713,9 +713,14 @@ void unit_notify_impulse_sound(
 	ai_communication_packet_new(&speech_item.ai);
 	unit_speak(unit_index, play_type, &speech_item);
 
+	/* port: a dead unit does not speak (unit_speak), so a script's line for
+	one that has died (d40: a marine killed before his turn) is not its
+	current speech; the retail game, without the check, carried on, as this
+	does */
 	match_assert(
 		"c:\\halo\\SOURCE\\units\\unit_dialogue.c",
 		406,
+		TEST_FLAG(unit->object.damage_flags, _object_dead_bit) ||
 		unit->unit.speech.current.sound_definition_index == sound_definition_index);
 
 	unit->unit.speech.impulse_sound_index = impulse_sound_index;

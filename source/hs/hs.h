@@ -182,6 +182,13 @@ void hs_runtime_initialize_for_new_map(
 /* port: network co-op (port/linux/game/network_coop.c) */
 void hs_runtime_port_shift_sleep_times(
 	long ticks);
+/* port: debug.level_run (port/linux/game/level_run.c) */
+long hs_runtime_port_threads(
+	long *script_indices,
+	long *sleep_until_expression_indices,
+	long *expression_indices,
+	long *sleep_until_ticks,
+	long maximum);
 void hs_runtime_update(
 	void);
 long hs_runtime_evaluate(

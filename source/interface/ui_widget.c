@@ -4460,6 +4460,12 @@ void display_error(
 		dialog opens, so that it is never another's) */
 		wchar_t const *port_text = NULL;
 
+#ifdef HALO_WII
+		/* port: the Wii's words for a controller gone (the Xbox's speak of
+		its controller port and START) */
+		if (error_code == _error_controller_unplugged || error_code == _error_controller_unplugged_start_to_continue)
+			port_text = L"Wii Remote disconnected. Reconnect it (press 1+2), then press + to continue.";
+#endif
 		if (error_code == _error_cannot_create_saved_game_file_with_empty_name)
 		{
 			port_text = ui_widget_port_error_pending_text;

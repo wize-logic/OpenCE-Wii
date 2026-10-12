@@ -353,8 +353,14 @@ unsigned int hud_hires_png_texture(const void *png, unsigned long size, unsigned
 unsigned int hud_hires_override_texture(long asset, unsigned long *levels)
 {
 	const struct hud_hires_embedded *embedded;
+	static int null_renderer = -1;
 
-	if (asset < 0 || asset >= hud_hires_asset_count() || textures[asset].failed)
+	/* (no OpenGL without a window, debug.null_renderer: none made, as the
+	game's own textures are not; a10's help screen's button icons called
+	glGenTextures, which is not there) */
+	if (null_renderer < 0)
+		null_renderer = config_boolean("debug.null_renderer") ? 1 : 0;
+	if (null_renderer || asset < 0 || asset >= hud_hires_asset_count() || textures[asset].failed)
 		return 0;
 	if (textures[asset].texture)
 	{

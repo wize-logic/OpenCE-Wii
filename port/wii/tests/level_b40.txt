@@ -1,0 +1,11 @@
+# b40, Assault on the Control Room, from its start to its end, for
+# debug.test_input = "script:level_b40.txt" with
+# debug.network_test = "solo:levels\b40\b40" (port/wii/README.md, "The
+# playthrough check"). The level's opening plays as it is; then the
+# objective (port/linux/game/level_run.c) plays it as a person would, to
+# the next level's (c10) start.
+play 600
+log b40 begins
+objective 3600
+log b40 ended
+quit
