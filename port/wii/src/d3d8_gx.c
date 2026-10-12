@@ -4304,7 +4304,7 @@ static unsigned long hardware_draws, hardware_vertices, hardware_colors_run, har
 	hardware_blended_draws;
 /* draws whose sphere maps' coordinates the processor computes, and the
 vertices it ran for them */
-static unsigned long hardware_sphere_draws, hardware_spheres_run;
+static unsigned long hardware_sphere_draws, hardware_sphere_lit_draws, hardware_spheres_run;
 
 static int single_register(unsigned long mask)
 {
@@ -4941,26 +4941,32 @@ coordinates from the normal (gx_lighting.c says how, and how close it is):
 static int gx_lighting_on = -1;
 /* the view frames' rounding (tests/gx_lighting_check.c's REFLECTION_STEP) */
 #define LIT_SPHERE_STEP (15.0f * 3.14159265f / 180.0f)
-/* the texture matrices of the normal's sphere map coordinates, two rows
-each: the keys' in order, then the processor's vertices'. Texture
-coordinate 3's own (GX_TEXMTX3, which the draw does not use for it), then
-the free pairs past the stages' TEXMTX0 to TEXMTX4, short of GX_IDENTITY
-(row 60), the identity every draw in screen space reads its texture
-coordinates through: a matrix over it draws them all wrong. */
-static const u8 lit_sphere_rows[] = { GX_TEXMTX3, 45, 47, 49, 51, 53, 55, 57 };
+/* the texture matrices of a draw in hardware's stages (and the fog's, the
+fifth), two rows each from GX_TEXMTX0's (rows 30 to 39: GX takes a matrix
+by its first row), and of the normal's sphere map coordinates: the keys' in
+order, then the processor's vertices', in the pairs after them, short of
+GX_IDENTITY (row 60), the identity every draw in screen space reads its
+texture coordinates through: a matrix over it draws them all wrong. Ten:
+a model's nine keys and its blended vertices. */
+#define STAGE_TEXMTX(stage) ((u32)(GX_TEXMTX0 + 2 * (stage)))
+static const u8 lit_sphere_rows[] = { 40, 42, 44, 46, 48, 50, 52, 54, 56, 58 };
 #define LIT_SPHERE_MATRICES (sizeof(lit_sphere_rows) / sizeof(lit_sphere_rows[0]))
-/* (the last pair, 57 and 58, short of GX_IDENTITY; the first past TEXMTX4's
-pair, 42 and 43) */
-typedef char lit_sphere_rows_short_of_identity[57 + 2 <= GX_IDENTITY && 45 > GX_TEXMTX4 + 1 ? 1 : -1];
+/* (the first past the stages' pairs, the last short of GX_IDENTITY; room for
+every key) */
+typedef char lit_sphere_rows_short_of_identity[40 >= GX_TEXMTX0 + 2 * 5 && 58 + 2 <= GX_IDENTITY &&
+	LIT_SPHERE_MATRICES >= MATRIX_KEYS + 1 ? 1 : -1];
 /* the view's sphere maps kept (a buffer can be drawn again in the frame:
 GX copies into it after the draws before it have read it), the most drawn
 in a frame, and how far a view's frame may turn and still keep one (in its
 rows' components: about a tenth of a degree). The frames are rounded in the
 world (gx_lighting_view_frame), so a map is kept while the camera turns;
 there are as many as a frame's draws of different cube maps and directions
-from the eye use, in the contiguous window (9 KB each). */
-#define SPHERE_BAKES 32
-#define SPHERE_BAKES_A_FRAME 48
+from the eye use (b30's Pelican, its Marines about the camera: some 40,
+more than the 32 there were, so that every map was drawn again in every
+frame), in the contiguous window (9 KB each). A draw past the frame's
+maps takes the nearest kept of its cube map (sphere_bake). */
+#define SPHERE_BAKES 64
+#define SPHERE_BAKES_A_FRAME 24
 #define SPHERE_BAKE_KEPT 2.0e-3f
 /* the first row of the EFB below the back buffer, where they are drawn */
 #define SPHERE_BAKE_ROW SCREEN_HEIGHT
@@ -4990,7 +4996,7 @@ static struct
 
 /* in the statistics' window: draws lit, their vertices, the draws refused
 (no space, lights beyond GX's), sphere maps drawn */
-static unsigned long lit_draws, lit_vertices, lit_refused, sphere_bakes_made;
+static unsigned long lit_draws, lit_vertices, lit_refused, sphere_bakes_made, sphere_bakes_borrowed;
 
 static struct
 {
@@ -5035,10 +5041,33 @@ static BOOL sphere_bake(const struct texture_entry *world, const float frame[3][
 			sphere_bakes[which].frame_number = device.frames;
 		}
 	}
+	if (!buffer && sphere_bakes_in_frame >= SPHERE_BAKES_A_FRAME)
+	{
+		/* (past the frame's: the kept map of this cube map whose frame's z is
+		nearest the draw's; a later frame draws the draw's own) */
+		float best = -2.0f;
+
+		for (which = 0; which < SPHERE_BAKES; which++)
+		{
+			float along;
+
+			if (!sphere_bakes[which].buffer || sphere_bakes[which].texels != world->texels ||
+				sphere_bakes[which].scale != scale)
+				continue;
+			along = sphere_bakes[which].frame[2][0] * frame[2][0] + sphere_bakes[which].frame[2][1] * frame[2][1] +
+				sphere_bakes[which].frame[2][2] * frame[2][2];
+			if (along > best)
+			{
+				best = along;
+				buffer = sphere_bakes[which].buffer;
+			}
+		}
+		if (!buffer)
+			return FALSE;
+		sphere_bakes_borrowed++;
+	}
 	if (!buffer)
 	{
-		if (sphere_bakes_in_frame >= SPHERE_BAKES_A_FRAME)
-			return FALSE;
 		/* (an empty one, else the one drawn longest ago) */
 		which = sphere_bakes_next++ % SPHERE_BAKES;
 		for (row = 0; row < SPHERE_BAKES; row++)
@@ -6553,9 +6582,9 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 
 		memset(rows, 0, sizeof(rows));
 		memcpy(rows, stage_rows[stage], sizeof(stage_rows[stage]));
-		GX_LoadTexMtxImm(rows, GX_TEXMTX0 + 3 * stage, GX_MTX2x4);
+		GX_LoadTexMtxImm(rows, STAGE_TEXMTX(stage), GX_MTX2x4);
 		GX_SetTexCoordGen(GX_TEXCOORD0 + stage, GX_TG_MTX2x4,
-			stage < 4 && stage_source[stage] >= 0 ? GX_TG_TEX0 + stage_source[stage] : GX_TG_POS, GX_TEXMTX0 + 3 * stage);
+			stage < 4 && stage_source[stage] >= 0 ? GX_TG_TEX0 + stage_source[stage] : GX_TG_POS, STAGE_TEXMTX(stage));
 	}
 	/* (as transform_software sends the processor's coordinates; the kept
 	ones first, as their attributes are) */
@@ -6574,7 +6603,11 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		component++;
 	}
 	if (cpu_spheres)
+	{
 		hardware_sphere_draws++;
+		if (lit_on)
+			hardware_sphere_lit_draws++;
+	}
 	/* (only the coordinates and channels the stages read: each coordinate
 	generated costs GX's transform a few cycles a vertex; transform_software
 	takes all of them back, a lit draw's planar fog its sixth) */
@@ -7153,25 +7186,27 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 	if (device.frames % STATISTICS_FRAMES == 0)
 	{
 		platform_log("Direct3D: frame %lu: %lu draws, %lu immediate, %lu vertices (%lu run), %lu clears, %lu drawn "
-			"elsewhere, textures %lu bound %lu failed %lu without a mode, in the last %d", device.frames,
-			device.statistics.draws, device.statistics.immediate_draws, device.statistics.vertices,
-			device.statistics.vertices_run, device.statistics.clears,
-			device.draws_elsewhere, device.statistics.textures_bound, device.statistics.textures_failed,
-			device.statistics.stages_without_mode, STATISTICS_FRAMES);
+			"elsewhere, in the last %d", device.frames, device.statistics.draws, device.statistics.immediate_draws,
+			device.statistics.vertices, device.statistics.vertices_run, device.statistics.clears, device.draws_elsewhere,
+			STATISTICS_FRAMES);
+		platform_log("Direct3D: textures %lu bound, %lu failed, %lu without a mode", device.statistics.textures_bound,
+			device.statistics.textures_failed, device.statistics.stages_without_mode);
 		program_statistics_log();
+		/* (lines short of the log's line, some 200 characters) */
 		platform_log("Direct3D: in hardware: %lu draws (%lu of their matrices kept, %lu of several nodes, %lu with "
-			"blended vertices), %lu vertices (%lu with the processor's colours); positions the processor's in "
-			"models' draws: %lu", hardware_draws, hardware_cache_hits, hardware_keyed_draws, hardware_blended_draws,
-			hardware_vertices, hardware_colors_run, processor_positions);
+			"blended vertices), %lu vertices", hardware_draws, hardware_cache_hits, hardware_keyed_draws,
+			hardware_blended_draws, hardware_vertices);
+		platform_log("Direct3D: in hardware, the processor's: colours of %lu vertices, positions of %lu in models' draws",
+			hardware_colors_run, processor_positions);
 		hardware_draws = hardware_vertices = hardware_colors_run = hardware_cache_hits = hardware_keyed_draws = 0;
 		hardware_blended_draws = processor_positions = 0;
 		platform_log("Direct3D: draws' index ranges: %lu taken as kept, %lu found; models' node keys: %lu taken as "
 			"kept, %lu found (%lu KB kept)", ranges_kept, ranges_found, key_records_kept, key_records_made,
 			index_record_bytes / 1024);
 		ranges_kept = ranges_found = key_records_kept = key_records_made = 0;
-		platform_log("Direct3D: in hardware with the processor's sphere map coordinates: %lu draws, %lu vertices run",
-			hardware_sphere_draws, hardware_spheres_run);
-		hardware_sphere_draws = hardware_spheres_run = 0;
+		platform_log("Direct3D: in hardware with the processor's sphere map coordinates: %lu draws (%lu lit by GX), "
+			"%lu vertices run", hardware_sphere_draws, hardware_sphere_lit_draws, hardware_spheres_run);
+		hardware_sphere_draws = hardware_sphere_lit_draws = hardware_spheres_run = 0;
 		{
 			unsigned index, entries = 0, kept_entries = 0;
 
@@ -7188,12 +7223,13 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		platform_log("Direct3D: the streams GX reads: %lu ranges flushed (%lu KB), %lu flushed before and kept",
 			stream_flushes_made, stream_flush_bytes / 1024, stream_flushes_kept);
 		stream_flushes_made = stream_flush_bytes = stream_flushes_kept = 0;
-		platform_log("Direct3D: lit by GX (display.gx_lighting): %lu draws, %lu vertices, %lu refused; %lu view sphere "
-			"maps drawn; the planar fog by GX's ramp in %lu draws (%lu ramps written), the processor's in %lu; "
-			"a model's fog through its nodes' matrices in %lu draws",
-			lit_draws, lit_vertices, lit_refused, sphere_bakes_made, lit_fog_draws, fog_ramps_made, lit_fog_refused,
-			fog_post_draws);
-		lit_draws = lit_vertices = lit_refused = sphere_bakes_made = fog_post_draws = 0;
+		platform_log("Direct3D: lit by GX (display.gx_lighting): %lu draws, %lu vertices, %lu refused; view sphere maps: "
+			"%lu drawn, %lu draws took a near one", lit_draws, lit_vertices, lit_refused, sphere_bakes_made,
+			sphere_bakes_borrowed);
+		platform_log("Direct3D: lit by GX, the planar fog by GX's ramp in %lu draws (%lu ramps written), the processor's "
+			"in %lu; a model's fog through its nodes' matrices in %lu draws", lit_fog_draws, fog_ramps_made,
+			lit_fog_refused, fog_post_draws);
+		lit_draws = lit_vertices = lit_refused = sphere_bakes_made = sphere_bakes_borrowed = fog_post_draws = 0;
 		lit_fog_draws = fog_ramps_made = lit_fog_refused = 0;
 		platform_log("Direct3D: textures not drawn: %lu without data, %lu of a shape, %lu of a format, "
 			"%lu without memory, %lu not decoded; %lu converted bitmaps found", texture_failures[_failure_no_data],
@@ -7240,11 +7276,12 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 					(unsigned long)(timing.processor / 1000 / STATISTICS_FRAMES),
 					(unsigned long)(timing.immediate / 1000 / STATISTICS_FRAMES));
 				platform_log("Direct3D: GX's transform's setup, a frame (tenths of a ms): what the draw depends on %lu, "
-					"the matrices %lu, the lights and sphere maps %lu, the kept outputs %lu, GX's state %lu; %lu draws",
+					"the matrices %lu, the lights and sphere maps %lu",
 					(unsigned long)(timing.setup_keys / 100 / STATISTICS_FRAMES),
 					(unsigned long)(timing.setup_matrices / 100 / STATISTICS_FRAMES),
-					(unsigned long)(timing.setup_lit / 100 / STATISTICS_FRAMES),
-					(unsigned long)(timing.setup_kept / 100 / STATISTICS_FRAMES),
+					(unsigned long)(timing.setup_lit / 100 / STATISTICS_FRAMES));
+				platform_log("Direct3D: GX's transform's setup, a frame (tenths of a ms): the kept outputs %lu, GX's "
+					"state %lu; %lu draws", (unsigned long)(timing.setup_kept / 100 / STATISTICS_FRAMES),
 					(unsigned long)(timing.setup_state / 100 / STATISTICS_FRAMES),
 					(unsigned long)(timing.setup_draws / STATISTICS_FRAMES));
 				platform_log("Direct3D: the processor's indexed vertices: fetch %lu ms, program %lu, store %lu, emit %lu",
@@ -7252,8 +7289,8 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 					(unsigned long)(timing.program_ticks / 60750 / STATISTICS_FRAMES),
 					(unsigned long)(timing.store_ticks / 60750 / STATISTICS_FRAMES),
 					(unsigned long)(timing.emit_ticks / 60750 / STATISTICS_FRAMES));
-				platform_log("Direct3D: a frame takes %lu ms: draws %lu (vertex programs and GX), textures %lu, "
-					"pixel shaders %lu, the end of the frame %lu (waiting for GX), the rest (the game) %lu",
+				platform_log("Direct3D: a frame takes %lu ms: draws %lu, textures %lu, pixel shaders %lu, the end of "
+					"the frame %lu (waiting for GX), the game %lu",
 					(unsigned long)((now - timing.window_start) / 1000 / STATISTICS_FRAMES),
 					(unsigned long)(timing.draws / 1000 / STATISTICS_FRAMES),
 					(unsigned long)(timing.textures / 1000 / STATISTICS_FRAMES),
