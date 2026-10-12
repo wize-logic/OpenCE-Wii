@@ -243,8 +243,9 @@ static void lock_level(const DWORD *resource, unsigned long face, unsigned long 
 }
 
 /* the Wii's device keeps a mark of the pixels it has seen in a texture's
-Lock, D3D's own field (port/wii/src/d3d8_gx.c, texture_get): a lock, before
-the game writes the pixels, takes it away */
+Lock, D3D's own field (port/wii/src/d3d8_gx.c, texture_get), and of a vertex
+buffer whose outputs it keeps (static_outputs_find): a lock, before the game
+writes the pixels or vertices, takes it away */
 static void lock_unmark(void *resource)
 {
 #if defined(HALO_WII)
@@ -384,6 +385,7 @@ void WINAPI D3DVertexBuffer_Lock(D3DVertexBuffer *buffer, UINT offset, UINT size
 	/* (whatever the flags say: the decals' vertices are written under
 	D3DLOCK_READONLY) */
 	(void)flags;
+	lock_unmark(buffer);
 	*data = buffer->Data ? (BYTE *)resource_data(buffer->Data) + offset : NULL;
 	if (*data)
 		memory_watch_prepare_write(*data, size);

@@ -195,6 +195,9 @@ struct dependency_registers
 	unsigned long a0;
 	/* the inputs taken as constants (bit n: v[n]) */
 	unsigned long uniform;
+	/* (nv2a_cpu_analyze_constants: a constant register's value carries
+	NV2A_CPU_READS_CONSTANT) */
+	unsigned long constant;
 };
 
 static unsigned long product(unsigned long x, unsigned long y)
@@ -230,11 +233,15 @@ static void dependency_operand(const struct dependency_registers *registers,
 		/* (a constant at an index an input chose) */
 		if (instruction->relative)
 		{
-			source[0] = source[1] = source[2] = source[3] = not_affine(registers->a0);
+			source[0] = source[1] = source[2] = source[3] = not_affine(registers->a0) | registers->constant;
 			dependencies->relative = 1;
 		}
-		else if (instruction->constant < NV2A_CPU_CONSTANT_COUNT)
-			dependencies->constants[instruction->constant / 32] |= 1UL << (instruction->constant % 32);
+		else
+		{
+			source[0] = source[1] = source[2] = source[3] = registers->constant;
+			if (instruction->constant < NV2A_CPU_CONSTANT_COUNT)
+				dependencies->constants[instruction->constant / 32] |= 1UL << (instruction->constant % 32);
+		}
 		break;
 	default:
 		break;
@@ -256,9 +263,26 @@ void nv2a_cpu_analyze(const struct nv2a_cpu_program *program, struct nv2a_cpu_de
 	nv2a_cpu_analyze_uniform(program, 0, dependencies);
 }
 
+static void analyze(const struct nv2a_cpu_program *program, unsigned long uniform, unsigned long constant,
+	struct nv2a_cpu_dependencies *dependencies);
+
 /* the same with some inputs taken as constants: a draw whose vertices all
 have the same values there (a skinned model's part of one node) */
 void nv2a_cpu_analyze_uniform(const struct nv2a_cpu_program *program, unsigned long uniform,
+	struct nv2a_cpu_dependencies *dependencies)
+{
+	analyze(program, uniform, 0, dependencies);
+}
+
+/* which outputs read a constant: those that do not are the same whatever
+the draw's constants, for the same vertex (d3d8_gx.c keeps them for a
+static vertex buffer) */
+void nv2a_cpu_analyze_constants(const struct nv2a_cpu_program *program, struct nv2a_cpu_dependencies *dependencies)
+{
+	analyze(program, 0, NV2A_CPU_READS_CONSTANT, dependencies);
+}
+
+static void analyze(const struct nv2a_cpu_program *program, unsigned long uniform, unsigned long constant,
 	struct nv2a_cpu_dependencies *dependencies)
 {
 	struct dependency_registers registers;
@@ -267,6 +291,7 @@ void nv2a_cpu_analyze_uniform(const struct nv2a_cpu_program *program, unsigned l
 
 	memset(&registers, 0, sizeof(registers));
 	registers.uniform = uniform;
+	registers.constant = constant;
 	memset(dependencies, 0, sizeof(*dependencies));
 	for (index = 0; index < program->count; index++)
 	{
