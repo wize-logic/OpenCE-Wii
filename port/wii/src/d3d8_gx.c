@@ -3192,11 +3192,30 @@ static void inputs_seed(float (*inputs)[4])
 #ifndef DRAW_LOG_FRAME
 #define DRAW_LOG_FRAME 0
 #endif
-/* the pixel the logged frame reads back after each draw */
-#ifndef DRAW_LOG_X
-#define DRAW_LOG_X 320
-#define DRAW_LOG_Y 260
+/* the pixels the logged frame reads back after each draw: x, y, x, y ... */
+#ifndef DRAW_LOG_POINTS
+#define DRAW_LOG_POINTS { 320, 260 }
 #endif
+
+/* the logged frame's pixels after a draw to the back buffer */
+static void draw_log_pixels(void)
+{
+	static const int points[] = DRAW_LOG_POINTS;
+	unsigned point;
+
+	if (device.render_target != &device.back_buffer)
+		return;
+	GX_DrawDone();
+	xf_flush_after();
+	for (point = 0; point + 1 < sizeof(points) / sizeof(points[0]); point += 2)
+	{
+		GXColor pixel;
+
+		GX_PeekARGB((u16)points[point], (u16)points[point + 1], &pixel);
+		platform_log("  pixel (%d, %d) after: %u %u %u %u", points[point], points[point + 1], pixel.r, pixel.g, pixel.b,
+			pixel.a);
+	}
+}
 
 static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct draw_projection *projection,
 	void (*fetch)(void *, UINT, float (*)[4]), void *context, struct nv2a_cpu_program *program, float point_size)
@@ -3974,15 +3993,8 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 	}
 	/* (the logged frame: a pixel read back after each draw, to see which
 	draw makes it what it is) */
-	if (DRAW_LOG_FRAME && device.frames == DRAW_LOG_FRAME && device.render_target == &device.back_buffer)
-	{
-		GXColor pixel;
-
-		GX_DrawDone();
-		xf_flush_after();
-		GX_PeekARGB(DRAW_LOG_X, DRAW_LOG_Y, &pixel);
-		platform_log("  pixel (%d, %d) after: %u %u %u %u", DRAW_LOG_X, DRAW_LOG_Y, pixel.r, pixel.g, pixel.b, pixel.a);
-	}
+	if (DRAW_LOG_FRAME && device.frames == DRAW_LOG_FRAME)
+		draw_log_pixels();
 	program_statistics_add(program, count);
 	{
 		uint64_t spent = timing_now() - started;
@@ -7612,6 +7624,16 @@ static void draw_streams(D3DPRIMITIVETYPE primitive_type, UINT count, const WORD
 		if (draw_hardware(program, primitive_type, count, indices, first, &fetch))
 		{
 			timing.draws += timing_now() - started;
+			if (DRAW_LOG_FRAME && device.frames == DRAW_LOG_FRAME)
+			{
+				/* (described as the processor would draw it, then GX's pixels) */
+				float point_size;
+
+				memcpy(&point_size, &D3D__RenderState[D3DRS_POINTSIZE], sizeof(point_size));
+				platform_log("draw in hardware, program %08lx:", program->hash);
+				draw_log(primitive_type, count, &projection_loaded, stream_fetch, &fetch, program, point_size);
+				draw_log_pixels();
+			}
 			return;
 		}
 	}
