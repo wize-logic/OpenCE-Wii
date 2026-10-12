@@ -55,7 +55,21 @@ static void voice_audio_mix(float *output, unsigned long frames)
 	(void)frames;
 }
 
+/* the cost cap's clock (MIX_CLOCK_US): a mix takes a time of its own, set by the test, and so much for each voice it
+mixed; the clock is read before a mix and after it, and moves on at the second */
+static unsigned long fake_clock(void);
+#define MIX_CLOCK_US() fake_clock()
+
 #include "under_test.inc"
+
+static unsigned long fake_time_us, fake_fixed_us, fake_voice_us, fake_reads;
+
+static unsigned long fake_clock(void)
+{
+	if (fake_reads++ % 2)
+		fake_time_us += fake_fixed_us + fake_voice_us * voice_cap.mixed;
+	return fake_time_us;
+}
 
 #define PI 3.14159265358979323846
 #define CHUNK 144 /* frames a mix, as WiiLibs' audio thread asks */
@@ -188,6 +202,57 @@ static unsigned char *adpcm_noise(unsigned long blocks, unsigned long channels)
 	return bytes;
 }
 
+/* samples (channels' frames, interleaved) as Xbox ADPCM, a block of 64 frames at a time: each block starts with the
+channel's first sample and the step index the last left off at, the nibbles code the 63 after (a 64th pads);
+as a sound of the game's is, a signal at its level and not noise at full scale, which the decoder clamps */
+static unsigned char *adpcm_encoded(const short *samples, unsigned long blocks, unsigned long channels)
+{
+	unsigned char *bytes = calloc(blocks * XBOX_ADPCM_BLOCK_BYTES * channels, 1);
+	unsigned long block, channel, n;
+	int index[2] = { 0, 0 };
+
+	for (block = 0; block < blocks; block++)
+	{
+		unsigned char *data = bytes + block * XBOX_ADPCM_BLOCK_BYTES * channels;
+
+		for (channel = 0; channel < channels; channel++)
+		{
+			const short *frame = samples + block * XBOX_ADPCM_BLOCK_SAMPLES * channels + channel;
+			int predictor = frame[0];
+
+			data[channel * 4] = (unsigned char)(predictor & 0xff);
+			data[channel * 4 + 1] = (unsigned char)((predictor >> 8) & 0xff);
+			data[channel * 4 + 2] = (unsigned char)index[channel];
+			for (n = 0; n < 63; n++)
+			{
+				int step = ima_step_table[index[channel]], difference = frame[(n + 1) * channels] - predictor, nibble = 0;
+				unsigned char *byte = data + 4 * channels + ((n / 8) * channels + channel) * 4 + (n % 8) / 2;
+
+				if (difference < 0)
+				{
+					nibble = 8;
+					difference = -difference;
+				}
+				if (difference >= step)
+				{
+					nibble |= 4;
+					difference -= step;
+				}
+				if (difference >= step / 2)
+				{
+					nibble |= 2;
+					difference -= step / 2;
+				}
+				if (difference >= step / 4)
+					nibble |= 1;
+				ima_expand(nibble, &predictor, &index[channel]);
+				*byte |= (unsigned char)(n % 2 ? nibble << 4 : nibble);
+			}
+		}
+	}
+	return bytes;
+}
+
 static short *sine(unsigned long frames, double hertz, unsigned long rate, double amplitude)
 {
 	short *signal = malloc(frames * sizeof(short));
@@ -298,13 +363,10 @@ static void scene(unsigned long mono, unsigned long stereo44, unsigned long ster
 		unsigned long channels = world ? 1 : 2, rate = wide ? 44100 : 22050;
 		unsigned long frequency = world && v % 5 == 0 ? 22050 + 2000 * (v % 3) : 0;
 		struct sdl_stream *stream = adpcm ?
-			voice_from(adpcm_noise(blocks, channels), TRUE, blocks * XBOX_ADPCM_BLOCK_SAMPLES, channels, rate,
-				frequency) :
+			voice_from(adpcm_encoded(channels == 1 ? monos : stereos, blocks, channels), TRUE,
+				blocks * XBOX_ADPCM_BLOCK_SAMPLES, channels, rate, frequency) :
 			voice_new(channels == 1 ? monos : stereos, frames, channels, rate, frequency);
 
-		/* (ADPCM noise is at full scale) */
-		if (adpcm)
-			stream->volume = 0.25f;
 		if (!world)
 			continue;
 		stream->has_3d = TRUE;
@@ -846,6 +908,113 @@ int main(int argc, char **argv)
 		free((void *)stream->packets[1].source);
 		voices_clear();
 		free(signal);
+		return 0;
+	}
+	/* the cost cap (voice_cap_update): 24 voices in the world at distances that make them quieter the further
+	they are, and a voice of music, in mixes that take 100 microseconds and 20 for each voice mixed, against a budget
+	of 360. Under the budget nothing is dropped, and the mix is the mix without a cap to the bit. Over it, the
+	farthest voices are dropped and the nearest, the music and the four loudest are not, with no step in the sound
+	(no frame differs from the one before by more than the sum of the voices' tones without the cap does); once the
+	mixes are cheap, the voices come back */
+	CASE("cap")
+	{
+		enum { VOICES = 24, MIXES = 150 };
+		static float baseline[MIXES * CHUNK * 2], capped[MIXES * CHUNK * 2], other[MIXES * CHUNK * 2];
+		struct sdl_stream *voices[VOICES], *music;
+		short *tone = sine(100000, 40.0, 22050, 0.08);
+		float steepest = 0.0f, steepest_capped = 0.0f;
+		unsigned long pass, v, mixes;
+
+		for (pass = 0; pass < 3; pass++)
+		{
+			float *output = pass == 0 ? baseline : pass == 1 ? other : capped;
+
+			memset(&voice_cap, 0, sizeof(voice_cap));
+			/* (pass 0: no cap; 1: a budget that is never passed; 2: the budget, then cheap mixes) */
+			voice_cap.budget_us = pass == 0 ? 0 : pass == 1 ? 10000 : 360;
+			fake_reads = 0;
+			fake_fixed_us = 100;
+			fake_voice_us = 20;
+			reverb_enabled = FALSE;
+			for (v = 0; v < VOICES; v++)
+			{
+				voices[v] = voice_new(tone, 100000, 1, 22050, 0);
+				voices[v]->has_3d = TRUE;
+				voices[v]->mode = DS3DMODE_NORMAL;
+				voices[v]->position[2] = 1.5f + 0.1f * (float)v;
+				voices[v]->minimum_distance = 1.0f;
+				voices[v]->maximum_distance = 100.0f;
+				voices[v]->direct = voices[v]->direct_hf = 0;
+				voices[v]->room = voices[v]->room_hf = DSBVOLUME_MIN;
+			}
+			music = voice_new(tone, 100000, 1, 22050, 0);
+			music->volume = 0.5f;
+			voice_parameters_serial++;
+			render(output, MIXES * CHUNK);
+			if (pass == 0)
+			{
+				CHECK(!voice_cap.blocks && !voice_cap.allowed, "a cap without a budget acted");
+			}
+			else if (pass == 1)
+			{
+				CHECK(voice_cap.blocks >= MIXES / 2 && !voice_cap.allowed && !voice_cap.capped_blocks,
+					"the cap acted under its budget (%lu blocks, %lu allowed)", voice_cap.blocks, voice_cap.allowed);
+				for (n = 0; n < MIXES * CHUNK * 2; n++)
+					CHECK(output[n] == baseline[n], "sample %lu differs with a cap that never acts", n);
+			}
+			else
+			{
+				/* too long at first: fewer voices, then holding at the budget */
+				unsigned long dropped = 0;
+
+				CHECK(voice_cap.capped_blocks > 0 && voice_cap.dropped_most >= 8, "the cap did not act (%lu blocks)",
+					voice_cap.capped_blocks);
+				CHECK(voice_cap.allowed >= 10 && voice_cap.allowed <= 16, "%lu voices allowed", voice_cap.allowed);
+				CHECK(!music->capped, "the music was dropped");
+				for (v = 0; v < VOICES; v++)
+				{
+					if (voices[v]->capped)
+					{
+						dropped++;
+						CHECK(v >= 8, "voice %lu, one of the nearest, was dropped", v);
+					}
+					else if (v)
+					{
+						CHECK(!voices[v - 1]->capped, "voice %lu is mixed and a nearer one is not", v);
+					}
+				}
+				for (v = 0; v < 4; v++)
+					CHECK(!voices[v]->capped, "voice %lu, one of the loudest four, was dropped", v);
+				CHECK(dropped >= 8 && voice_cap.dropped + voice_cap.mixed == VOICES + 1, "%lu dropped, %lu mixed",
+					voice_cap.dropped, voice_cap.mixed);
+				for (v = 0; v < MIXES * CHUNK - 1; v++)
+				{
+					float step = fabsf(baseline[(v + 1) * 2] - baseline[v * 2]);
+					float step_capped = fabsf(capped[(v + 1) * 2] - capped[v * 2]);
+
+					steepest = step > steepest ? step : steepest;
+					steepest_capped = step_capped > steepest_capped ? step_capped : steepest_capped;
+				}
+				CHECK(steepest_capped <= steepest * 1.1f,
+					"a step in the sound: %f against the voices' %f", steepest_capped, steepest);
+				/* quieter, not silent: the nearest voices play */
+				CHECK(fabsf(capped[(MIXES * CHUNK - 400) * 2 + 40]) + fabsf(capped[(MIXES * CHUNK - 300) * 2]) > 0.0f,
+					"silence");
+				printf("cap: %lu voices allowed, %lu dropped of %d, %lu of %lu mixes capped, steepest step %f against %f\n",
+					voice_cap.allowed, dropped, VOICES + 1, voice_cap.capped_blocks, voice_cap.blocks, steepest_capped,
+					steepest);
+				/* cheap mixes now bring the rest back, one at a time, and the cap ends */
+				fake_voice_us = 2;
+				for (mixes = 0; mixes < 30 && voice_cap.allowed; mixes++)
+					render(output, 20 * CHUNK);
+				CHECK(!voice_cap.allowed, "the voices did not all come back (%lu allowed)", voice_cap.allowed);
+				render(output, 4 * CHUNK);
+				for (v = 0; v < VOICES; v++)
+					CHECK(!voices[v]->capped, "voice %lu is still dropped", v);
+			}
+			voices_clear();
+		}
+		free(tone);
 		return 0;
 	}
 	/* an ADPCM voice at a bus's rate is its blocks as decoded, mono and

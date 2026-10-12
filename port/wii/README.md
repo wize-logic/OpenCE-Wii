@@ -479,6 +479,45 @@ will tell which it was, from the `files:` lines and the times on them.)
     the packets decoded beforehand. Of the 861: 240 decoding ADPCM, 160 making the samples floats,
     300 the voices' gains, filters and interpolation, 100 the limiter, 70 the upsampler. A voice
     out of earshot costs about 1, the mix with nothing playing 50.
+  - **Cheaper decoding.** An ADPCM voice's samples are worked out a word a step
+    (`decode_adpcm_block_wii`: the difference and the next step index's row are one table
+    entry, a clamp that is out of line), written as the bits of floats (1.5 * 2^23 plus the
+    sample) in a plane for each channel, and made samples by one fused multiply and subtract a
+    sample; PCM is read with a byte-reversed load (`lhbrx`) where its address is even. The
+    samples are the same to the bit (`test_mixer_wii.py adpcm` against the shared decoder), a
+    voice whose gains are not moving skips their ramps. Counted with the figures' tools
+    (`mixer_wii.c`'s "bench", the scene's ADPCM now encoded from a signal at a sound's level,
+    not noise at full scale, which the decoder clamps in a fifth of its samples; built
+    non-PIC, as the Wii is): the scene above 780 instructions an output frame before, 665 now
+    (15% fewer); a battle's ("bench 30 4 2 12 3": 30 voices in the world, every
+    fifth pitched, four stereo 44 kHz, two stereo 22 kHz, 12 out of earshot, the reverb on)
+    1,615 before, 1,388 now (14%; 61 million instructions a second, 8.4% of the processor
+    by count, the 750 doing about one instruction a cycle at best). What is left is the
+    voices' own gains and filters (voice_apply, 125 a frame in the scene above), the cubic of
+    the pitched ones, the upsampler's 32 taps (75) and the limiter (35 while it limits).
+    Paired-single code would halve the upsampler, but qemu-ppc cannot run it and clang's
+    assembler does not take it, so it is not written.
+  - **The cost cap** (`audio.mix_budget_us`, 320, which is 5% of the processor for a 6.5 ms
+    block; 0 turns it off). The mixer times each block (`wl_platform_time_us`, twice a block)
+    and keeps an average of the last eight. Over the budget it works out how many voices
+    would have fitted (0.875 of the budget over the average, times the voices mixed) and
+    drops the rest from the next mix: the quietest, by the greatest of a voice's gains
+    (the speakers' and the reverb's) a mix before, a dropped one counting two thirds of
+    that so that it does not flip back. Music, speech and the interface's sounds (voices
+    that are not in the world), a voice new to the mixer and the four loudest of the rest are
+    never dropped. A dropped voice's gains are ramped to nothing across the block, as for
+    a voice turned down, so there is no click, and it moves on at no cost as one out of
+    earshot does (`voice_pass`), keeping its place in its sound. Once the average is under
+    four fifths of the budget a voice comes back every eight blocks (also ramped up across
+    one), until all are mixed and the cap ends. The log's `audio:` line after the report
+    says `cost cap (audio.mix_budget_us 320): dropped voices from N of M mixes, D voices
+    in all, K at most in one; now capped|all voices mixed`. The time is the wall clock of the
+    audio thread, so a higher-priority thread preempting it counts against it (the report's
+    "at most" shows spikes; the average smooths them). `test_mixer_wii.py cap` (a clock set
+    by the test): under the budget the mix is the uncapped one to the bit; over it the
+    farthest voices go and the nearest and the music stay, with no step in the sound, and
+    they come back when mixes are cheap; three negative controls catch a step, the loudest
+    dropped and no return.
   - **The reverb** (`audio.reverb`, on) is the other builds' network (taps, diffusers, a
     feedback delay network) from the same I3DL2 properties, so a room keeps the decay time, the
     reflections and the level the game set. Run as they do (22,050 Hz, eight lines) it added 476
@@ -1700,7 +1739,14 @@ misses it loses its time.
    corridors) and outdoors, a battle indoors, with it on and off: the room sounds like a room (a
    decay that follows the place) and not metallic or muffled, going through a door fades to the
    next room's without a click, and the mixing time rises by about 0.7% of the processor's (the harness's count). Music,
-   dialogue and effects all heard; the volume settings do what they say.
+   dialogue and effects all heard; the volume settings do what they say. The cost cap
+   (`audio.mix_budget_us`, 320): a profile of a battle in b30 (`tools/wii_profile.py report LOG
+   --callers mix`): `mix` and `voice_take` together were 7.3% of the samples (4.8 and 2.5)
+   before the cheaper decoding and the cap, and should be about 5% or under now; in a loud battle the
+   `audio: cost cap` line says how often it acted. Listen, at the moments it does, for a click
+   or a crackle as sounds drop out (there should be none: a quiet sound just ends sooner than
+   it would) and for dialogue or music being affected (they must not be); `audio.mix_budget_us =
+   0` for the A/B, and a lower budget (100) to hear it plainly.
 8. **The picture on each TV.** The console's settings (Wii Settings, Screen), a run to the menu
    and into a level each time, and the first lines of the log: `video: ...` must name the mode the
    table in "The picture on each TV" gives.

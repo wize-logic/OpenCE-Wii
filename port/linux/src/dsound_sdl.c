@@ -158,6 +158,13 @@ struct sdl_stream
 	gains it ramps to (voice_gains) and the voice_parameters_serial they
 	were worked out at */
 	BOOL high_bus;
+	/* the ADPCM block the cursor is in as the mixer takes it (decode_adpcm_block_wii):
+	each channel's 64 samples apart, each the bits of the float 1.5 * 2^23 plus the sample */
+	union
+	{
+		unsigned int bits[2][XBOX_ADPCM_BLOCK_SAMPLES];
+		float floats[2][XBOX_ADPCM_BLOCK_SAMPLES];
+	} block_taken;
 	float window[2][4];
 	double phase;
 	unsigned long silence;
@@ -165,6 +172,9 @@ struct sdl_stream
 	float target_left, target_right, target_room;
 	float target_direct_lowpass, target_room_lowpass;
 	unsigned long gains_serial;
+	/* whether the cost cap has the voice dropped from the mix (voice_cap_select): it is turned
+	down to nothing, as one out of earshot is */
+	BOOL capped;
 #else
 	/* the resampler's (resampler_reset): the last RESAMPLER_HISTORY frames
 	taken, each channel's apart and each frame twice, RESAMPLER_HISTORY apart,
@@ -1640,6 +1650,197 @@ static struct
 	unsigned long ahead_count, ahead_used;
 } wii_mix;
 
+/* ---------- the cost cap
+
+Nothing bounds how many voices the game plays (the Xbox had 64 channels, its
+sound engine more voices than that), and the mixer runs on the processor the
+game needs: its cost goes with the voices heard. When the time a mix takes
+(a block of MIX_AHEAD_FRAMES, 6.5 ms of sound) stays over a budget
+(audio.mix_budget_us, the microseconds a block may take; 0 for no cap) the
+quietest voices are dropped from it. The cap works from the time of the mixes
+before it, averaged over a few: if a mix took too long, the next mixes fewer
+voices, the number the budget would have held at the time each took, and once
+mixes are well under the budget voices are let back, one at a time. Music,
+dialogue and the interface's sounds (the voices that are not in the world) are
+never dropped, nor is a voice before it has been mixed once, nor are the four
+loudest of the rest. A voice is ranked by the greatest of its gains to the
+speakers and the reverb (voice_gains) a mix before, a voice dropped before by
+less than a third of it (a voice dropped is not flipped back and forth by
+rounding). A voice dropped goes down to nothing across the mix, as a voice
+turned down does, so no click, and comes back up across one; it keeps its place
+in its sound, taken at no cost like a voice out of earshot (voice_pass) */
+
+/* the microseconds, as the console's time base gives them */
+#ifndef MIX_CLOCK_US
+#define MIX_CLOCK_US() wl_platform_time_us()
+#endif
+/* the loudest voices of the rest that are kept whatever the budget */
+#define VOICE_CAP_MINIMUM 4
+/* the voices the cap ranks (any more are not dropped) */
+#define VOICE_CAP_RANKED 256
+/* mixes of calm before a voice is let back */
+#define VOICE_CAP_CALM 8
+
+static struct
+{
+	/* audio.mix_budget_us; the voices the mixes are allowed (0: all) */
+	unsigned long budget_us;
+	unsigned long allowed;
+	/* whether the voices' flags are to be cleared (the cap has just ended) */
+	BOOL clear;
+	/* the time of the last mixes, averaged, and the mixes since it was calm */
+	unsigned long average, calm;
+	/* of the mix that has run: the voices mixed (those out of earshot are not)
+	and the voices of the cap's dropped that would have been heard */
+	unsigned long mixed, dropped;
+	/* since the start: mixes, those the cap dropped voices from, the voices
+	it dropped in all and the most in one mix */
+	unsigned long blocks, capped_blocks, dropped_total, dropped_most;
+} voice_cap;
+
+/* whether the voice is in the world: its gains come from where it is */
+static BOOL voice_in_world(const struct sdl_stream *stream)
+{
+	return (stream->has_3d && stream->mode != DS3DMODE_DISABLE) || (stream->channels == 2 && stream->stereo_positioned);
+}
+
+/* how loud the voice was, to rank it by */
+static float voice_cap_key(const struct sdl_stream *stream)
+{
+	float key = stream->target_left > stream->target_right ? stream->target_left : stream->target_right;
+
+	if (stream->target_room > key)
+		key = stream->target_room;
+	return stream->capped ? key * 0.67f : key;
+}
+
+/* whether the voice is one the cap ranks: playing, in the world, not new,
+and heard (a voice out of earshot costs next to nothing) */
+static BOOL voice_cap_ranked(const struct sdl_stream *stream)
+{
+	return !stream->paused && stream->packet_count && stream->sample_rate && stream->gains_valid &&
+		voice_in_world(stream) && voice_cap_key(stream) > 0.0f;
+}
+
+/* flags the voices of the next mix that are dropped, so that no more than
+allowed (0: all) are mixed, the loudest kept; with the mixer's lock held */
+static void voice_cap_select(unsigned long allowed)
+{
+	float keys[VOICE_CAP_RANKED], cutoff = 0.0f;
+	unsigned long count = 0, others = 0, kept, index, tied = 0;
+	struct sdl_stream *stream;
+
+	if (allowed)
+	{
+		for (stream = streams; stream; stream = stream->next)
+		{
+			if (!stream->paused && stream->packet_count && stream->sample_rate && stream->gains_valid)
+			{
+				if (!voice_cap_ranked(stream))
+				{
+					if (!voice_in_world(stream))
+						others++;
+					continue;
+				}
+				if (count < VOICE_CAP_RANKED)
+				{
+					float key = voice_cap_key(stream);
+
+					/* (kept in order, the loudest first) */
+					for (index = count++; index && keys[index - 1] < key; index--)
+						keys[index] = keys[index - 1];
+					keys[index] = key;
+				}
+			}
+		}
+		/* (the voices that are not in the world are mixed whatever the cap
+		allows; the rest take what is left, at least the minimum) */
+		kept = allowed > others + VOICE_CAP_MINIMUM ? allowed - others : VOICE_CAP_MINIMUM;
+		if (count > kept)
+		{
+			cutoff = keys[kept - 1];
+			/* (voices as loud as the last kept take the places that are left,
+			the first of them in the list) */
+			for (index = 0; index < kept && keys[index] > cutoff; index++)
+				;
+			tied = kept - index;
+		}
+	}
+	for (stream = streams; stream; stream = stream->next)
+	{
+		BOOL drop = FALSE;
+
+		if (cutoff > 0.0f && voice_cap_ranked(stream))
+		{
+			float key = voice_cap_key(stream);
+
+			if (key == cutoff)
+			{
+				if (tied)
+					tied--;
+				else
+					drop = TRUE;
+			}
+			else
+			{
+				drop = key < cutoff;
+			}
+		}
+		stream->capped = drop;
+	}
+}
+
+/* a mix took elapsed microseconds: the cap for the next */
+static void voice_cap_update(unsigned long elapsed)
+{
+	unsigned long mixed = voice_cap.mixed, heard = voice_cap.mixed + voice_cap.dropped;
+
+	voice_cap.blocks++;
+	if (voice_cap.dropped)
+	{
+		voice_cap.capped_blocks++;
+		voice_cap.dropped_total += voice_cap.dropped;
+		if (voice_cap.dropped > voice_cap.dropped_most)
+			voice_cap.dropped_most = voice_cap.dropped;
+	}
+	voice_cap.average = voice_cap.average ? (voice_cap.average * 7 + elapsed + 4) / 8 : elapsed;
+	if (voice_cap.average > voice_cap.budget_us && mixed > VOICE_CAP_MINIMUM)
+	{
+		/* too long: the voices that fit (a little under, to come under it), taken
+		as having brought the time to the budget */
+		unsigned long allowed = (unsigned long)((float)mixed * (0.875f * (float)voice_cap.budget_us /
+			(float)voice_cap.average));
+
+		if (allowed >= mixed)
+			allowed = mixed - 1;
+		voice_cap.allowed = allowed ? allowed : 1;
+		voice_cap.average = voice_cap.budget_us;
+		voice_cap.calm = 0;
+	}
+	else if (voice_cap.allowed)
+	{
+		if (voice_cap.average * 5 < voice_cap.budget_us * 4)
+		{
+			if (++voice_cap.calm >= VOICE_CAP_CALM)
+			{
+				/* a voice back, at what a voice has cost lately */
+				voice_cap.calm = 0;
+				voice_cap.allowed = mixed + 1;
+				voice_cap.average += voice_cap.average / (mixed ? mixed : 1);
+			}
+		}
+		else
+		{
+			voice_cap.calm = 0;
+		}
+		if (voice_cap.allowed >= heard)
+		{
+			voice_cap.allowed = 0;
+			voice_cap.clear = TRUE;
+		}
+	}
+}
+
 /* the half-band low pass: a sinc whose zeros fall on the low bus's frames,
 so that every other output frame is the bus's own, Kaiser windowed; the
 weights sum to 1 */
@@ -1668,13 +1869,124 @@ static void resampler_reset(struct sdl_stream *stream)
 	stream->phase = WINDOW_FRAMES - 1;
 	stream->silence = 0;
 	stream->ended = FALSE;
+	stream->capped = FALSE;
+}
+
+/* (the samples as floats: 1.5 * 2^23 and its bits; a 16-bit sample added to
+them is the float 1.5 * 2^23 plus the sample, exactly, and the sample is that
+float less 1.5 * 2^23. The 750 has no conversion from an integer register,
+and the compiler's goes through memory with a double for each) */
+#define VOICE_SAMPLE_BIAS 12582912.0f
+#define VOICE_SAMPLE_BIAS_BITS 0x4B400000U
+/* (a sample as the float it is: less the bias, over 32768; the bias over
+32768 is 384) */
+#define VOICE_SAMPLE_SCALE (1.0f / 32768.0f)
+#define VOICE_SAMPLE_OFFSET 384.0f
+/* the 16-bit little-endian sample at an even address (a byte-reversed load on
+the big-endian Wii) */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define VOICE_PCM_SAMPLE(address) ((short)__builtin_bswap16(*(const unsigned short *)(address)))
+#else
+#define VOICE_PCM_SAMPLE(address) (*(const short *)(address))
+#endif
+
+/* ima_expand for the Wii's decoder, a nibble's whole step in one word: the
+sample's difference in the upper 19 bits (signed, the sign applied: at most
+61,438) and the byte offset in this table of the next step index's row (64
+bytes of 16 words, at most 5,632) in the lower 13. Working a sample out is a
+load, an add, a check for the clamp and the word's two parts */
+static unsigned int ima_packed[89][16];
+static BOOL ima_packed_ready;
+
+static void ima_packed_initialize(void)
+{
+	int index, nibble;
+
+	if (!ima_tables_ready)
+		ima_tables_initialize();
+	for (index = 0; index <= 88; index++)
+	{
+		for (nibble = 0; nibble < 16; nibble++)
+		{
+			int difference = ima_differences[index][nibble & 7];
+
+			if (nibble & 8)
+				difference = -difference;
+			ima_packed[index][nibble] = ((unsigned int)difference << 13) |
+				(unsigned int)(ima_next_index[index][nibble] * 64);
+		}
+	}
+	ima_packed_ready = TRUE;
+}
+
+/* a predictor outside 16 bits, held to them (out of line: a sample that far is
+rare, and a clamp the compiler can see is two compares and branches in every
+sample's way) */
+static __attribute__((noinline)) int ima_clamp(int predictor)
+{
+	return predictor < 0 ? -32768 : 32767;
+}
+
+/* the sample after predictor that the nibble (its low four bits at the
+word offset nibble_offset: 4 * the nibble) codes, at the step index row,
+which it moves on; written as the bits of the float 1.5 * 2^23 plus it */
+#define IMA_PACKED_EXPAND(nibble_offset, predictor, row, output) \
+	do \
+	{ \
+		unsigned int entry_ = *(const unsigned int *)((const char *)ima_packed + (row) + (nibble_offset)); \
+		\
+		predictor += (int)entry_ >> 13; \
+		if (__builtin_expect(predictor != (short)predictor, 0)) \
+			predictor = ima_clamp(predictor); \
+		row = entry_ & 0x1fff; \
+		*(output) = VOICE_SAMPLE_BIAS_BITS + predictor; \
+	} while (0)
+
+/* decode_adpcm_block as the mixer takes the block: each channel's 64 samples
+in a plane of their own, as the bits of floats (VOICE_SAMPLE_BIAS), so that the
+voice's frames are a straight run of each */
+static void decode_adpcm_block_wii(const unsigned char *data, unsigned long channels,
+	unsigned int (*planes)[XBOX_ADPCM_BLOCK_SAMPLES])
+{
+	unsigned long channel;
+
+	if (!ima_packed_ready)
+		ima_packed_initialize();
+	for (channel = 0; channel < channels; channel++)
+	{
+		const unsigned char *header = data + channel * 4;
+		int predictor = (short)(header[0] | (header[1] << 8));
+		unsigned int row = (header[2] > 88 ? 88 : header[2]) * 64U;
+		unsigned int *sample = planes[channel];
+		unsigned long group, byte;
+
+		*sample++ = VOICE_SAMPLE_BIAS_BITS + predictor;
+		for (group = 0; group < 8; group++)
+		{
+			const unsigned char *nibbles = data + 4 * channels + (group * channels + channel) * 4;
+
+			/* nibble n codes sample n + 1 (the 64th only pads the block) */
+			for (byte = 0; byte < 4; byte++)
+			{
+				unsigned int value = nibbles[byte];
+
+				IMA_PACKED_EXPAND((value & 0xf) << 2, predictor, row, sample);
+				sample++;
+				if (group == 7 && byte == 3)
+					break;
+				IMA_PACKED_EXPAND((value & 0xf0) >> 2, predictor, row, sample);
+				sample++;
+			}
+		}
+	}
 }
 
 /* the frames in a row at the voice's cursor in the first packet not
 finished: how many, and where, in the voice's ADPCM block (decoded first if
-decode) or the packet's little-endian PCM; 0 once the packets run out. The
-packets with none left are marked finished on the way */
-static unsigned long voice_run(struct sdl_stream *stream, BOOL decode, const short **block,
+decode; the left channel's samples as the bits of floats, the right's a plane
+on) or the packet's little-endian PCM; 0 once the packets run out. The packets
+with none left are marked finished on the way */
+static unsigned long voice_run(struct sdl_stream *stream, BOOL decode, const float **block,
 	const unsigned char **pcm)
 {
 	unsigned long position, channels = stream->channels;
@@ -1695,10 +2007,10 @@ static unsigned long voice_run(struct sdl_stream *stream, BOOL decode, const sho
 
 				if (decode && stream->block_source != source)
 				{
-					decode_adpcm_block(source, channels, stream->block);
+					decode_adpcm_block_wii(source, channels, stream->block_taken.bits);
 					stream->block_source = source;
 				}
-				*block = stream->block + offset * channels;
+				*block = stream->block_taken.floats[0] + offset;
 				*pcm = NULL;
 				return XBOX_ADPCM_BLOCK_SAMPLES - offset;
 			}
@@ -1715,7 +2027,7 @@ static unsigned long voice_run(struct sdl_stream *stream, BOOL decode, const sho
 /* whether the voice has a frame to take */
 static BOOL voice_has_frames(struct sdl_stream *stream)
 {
-	const short *block;
+	const float *block;
 	const unsigned char *pcm;
 
 	return voice_run(stream, FALSE, &block, &pcm) != 0;
@@ -1731,7 +2043,7 @@ static void voice_pass(struct sdl_stream *stream, unsigned long count)
 	memset(stream->window, 0, sizeof(stream->window));
 	while (count)
 	{
-		const short *block;
+		const float *block;
 		const unsigned char *pcm;
 		unsigned long run = voice_run(stream, FALSE, &block, &pcm);
 
@@ -1756,10 +2068,6 @@ for each (the frequency it plays at, at most this many times its bus's) */
 /* a piece of a voice (mix_voice_wii): its window, then the frames it takes,
 each channel's; and what it plays, where it is not those frames as they are */
 static float voice_taken[2][WINDOW_FRAMES + VOICE_PIECE_FRAMES * VOICE_MAXIMUM_STEP + 2];
-/* (voice_take: 1.5 * 2^23 and its bits; a 16-bit sample added to them is
-the float 1.5 * 2^23 plus the sample, exactly) */
-#define VOICE_SAMPLE_BIAS 12582912.0f
-#define VOICE_SAMPLE_BIAS_BITS 0x4B400000U
 static float voice_played[2][VOICE_PIECE_FRAMES];
 
 /* the voice's gains to its bus, ramped across a mix from those of the last */
@@ -1787,7 +2095,7 @@ static void voice_take(struct sdl_stream *stream, unsigned long count)
 	right += WINDOW_FRAMES;
 	while (taken < count)
 	{
-		const short *block;
+		const float *block;
 		const unsigned char *pcm;
 		unsigned long run = voice_run(stream, TRUE, &block, &pcm);
 		float *left_run = left + taken, *right_run = right + taken;
@@ -1802,42 +2110,63 @@ static void voice_take(struct sdl_stream *stream, unsigned long count)
 		}
 		if (run > count - taken)
 			run = count - taken;
-		/* the samples made floats without the processor's conversion (the
-		750 has none from an integer register; the compiler's goes through
-		memory with a double for each): written as the bits of the float
-		1.5 * 2^23 plus the sample, then that float taken away */
-		if (block && channels == 2)
+		/* the samples made floats without the processor's conversion
+		(VOICE_SAMPLE_BIAS): ADPCM's already are the bits of the float 1.5 *
+		2^23 plus the sample (decode_adpcm_block_wii); PCM is written as them.
+		Then that float taken away and the sample scaled, in one fused
+		multiply and subtract (both exact: the result is the sample over
+		32768) */
+		if (block)
 		{
+			const float *block_right = block + XBOX_ADPCM_BLOCK_SAMPLES;
+
 			for (frame = 0; frame < run; frame++)
+				left_run[frame] = block[frame] * VOICE_SAMPLE_SCALE - VOICE_SAMPLE_OFFSET;
+			if (channels == 2)
 			{
-				((unsigned int *)left_run)[frame] = VOICE_SAMPLE_BIAS_BITS + block[frame * 2];
-				((unsigned int *)right_run)[frame] = VOICE_SAMPLE_BIAS_BITS + block[frame * 2 + 1];
-			}
-		}
-		else if (block)
-		{
-			for (frame = 0; frame < run; frame++)
-				((unsigned int *)left_run)[frame] = VOICE_SAMPLE_BIAS_BITS + block[frame];
-		}
-		else if (channels == 2)
-		{
-			for (frame = 0; frame < run; frame++)
-			{
-				((unsigned int *)left_run)[frame] = VOICE_SAMPLE_BIAS_BITS + (short)(pcm[frame * 4] | pcm[frame * 4 + 1] << 8);
-				((unsigned int *)right_run)[frame] = VOICE_SAMPLE_BIAS_BITS + (short)(pcm[frame * 4 + 2] | pcm[frame * 4 + 3] << 8);
+				for (frame = 0; frame < run; frame++)
+					right_run[frame] = block_right[frame] * VOICE_SAMPLE_SCALE - VOICE_SAMPLE_OFFSET;
 			}
 		}
 		else
 		{
+			if (((unsigned long)pcm & 1) == 0)
+			{
+				/* (the samples little-endian: a byte-reversed load each) */
+				if (channels == 2)
+				{
+					for (frame = 0; frame < run; frame++)
+					{
+						((unsigned int *)left_run)[frame] = VOICE_SAMPLE_BIAS_BITS + VOICE_PCM_SAMPLE(pcm + frame * 4);
+						((unsigned int *)right_run)[frame] = VOICE_SAMPLE_BIAS_BITS + VOICE_PCM_SAMPLE(pcm + frame * 4 + 2);
+					}
+				}
+				else
+				{
+					for (frame = 0; frame < run; frame++)
+						((unsigned int *)left_run)[frame] = VOICE_SAMPLE_BIAS_BITS + VOICE_PCM_SAMPLE(pcm + frame * 2);
+				}
+			}
+			else if (channels == 2)
+			{
+				for (frame = 0; frame < run; frame++)
+				{
+					((unsigned int *)left_run)[frame] = VOICE_SAMPLE_BIAS_BITS + (short)(pcm[frame * 4] | pcm[frame * 4 + 1] << 8);
+					((unsigned int *)right_run)[frame] = VOICE_SAMPLE_BIAS_BITS + (short)(pcm[frame * 4 + 2] | pcm[frame * 4 + 3] << 8);
+				}
+			}
+			else
+			{
+				for (frame = 0; frame < run; frame++)
+					((unsigned int *)left_run)[frame] = VOICE_SAMPLE_BIAS_BITS + (short)(pcm[frame * 2] | pcm[frame * 2 + 1] << 8);
+			}
 			for (frame = 0; frame < run; frame++)
-				((unsigned int *)left_run)[frame] = VOICE_SAMPLE_BIAS_BITS + (short)(pcm[frame * 2] | pcm[frame * 2 + 1] << 8);
-		}
-		for (frame = 0; frame < run; frame++)
-			left_run[frame] = (left_run[frame] - VOICE_SAMPLE_BIAS) * (1.0f / 32768.0f);
-		if (channels == 2)
-		{
-			for (frame = 0; frame < run; frame++)
-				right_run[frame] = (right_run[frame] - VOICE_SAMPLE_BIAS) * (1.0f / 32768.0f);
+				left_run[frame] = left_run[frame] * VOICE_SAMPLE_SCALE - VOICE_SAMPLE_OFFSET;
+			if (channels == 2)
+			{
+				for (frame = 0; frame < run; frame++)
+					right_run[frame] = right_run[frame] * VOICE_SAMPLE_SCALE - VOICE_SAMPLE_OFFSET;
+			}
 		}
 		stream->cursor += run;
 		stream->silence = 0;
@@ -1867,7 +2196,27 @@ static void voice_apply(const struct sdl_stream *stream, const float *left_frame
 	if (!filtered && !sent && !positioned)
 	{
 		/* (most voices: their frames into the bus at their gains) */
-		if (stereo)
+		if (!ramp_left && !ramp_right)
+		{
+			/* (gains that are not moving: a voice and a listener standing still) */
+			if (stereo)
+			{
+				for (frame = 0; frame < frames; frame++)
+				{
+					output[frame * 2] += left_frames[frame] * left;
+					output[frame * 2 + 1] += right_frames[frame] * right;
+				}
+			}
+			else
+			{
+				for (frame = 0; frame < frames; frame++)
+				{
+					output[frame * 2] += left_frames[frame] * left;
+					output[frame * 2 + 1] += left_frames[frame] * right;
+				}
+			}
+		}
+		else if (stereo)
 		{
 			for (frame = 0; frame < frames; frame++)
 			{
@@ -2028,7 +2377,7 @@ static void mix_voice_wii(struct sdl_stream *stream, float *low_output, float *l
 	float *high_send, unsigned long low_frames)
 {
 	unsigned long frequency, rate, frames, done, frame;
-	float *output, *send;
+	float *output, *send, left, right, room;
 	double step, phase;
 	BOOL native, stereo = stream->channels == 2;
 	struct voice_ramp ramp;
@@ -2082,22 +2431,37 @@ static void mix_voice_wii(struct sdl_stream *stream, float *low_output, float *l
 		stream->room_lowpass = 0.0f;
 		stream->gains_valid = TRUE;
 	}
+	/* (a voice the cost cap drops goes down to nothing across this mix, as it
+	does in the ones after until it is let back, then comes up across one:
+	its target gains are kept, to rank it by) */
+	if (stream->capped)
+	{
+		left = right = room = 0.0f;
+		if (stream->target_left || stream->target_right || stream->target_room)
+			voice_cap.dropped++;
+	}
+	else
+	{
+		left = stream->target_left;
+		right = stream->target_right;
+		room = stream->target_room;
+	}
 	ramp.left = stream->current_left;
 	ramp.right = stream->current_right;
 	ramp.room = stream->current_room;
 	ramp.direct_lowpass = stream->current_direct_lowpass;
 	ramp.room_lowpass = stream->current_room_lowpass;
-	ramp.ramp_left = (stream->target_left - ramp.left) / (float)frames;
-	ramp.ramp_right = (stream->target_right - ramp.right) / (float)frames;
-	ramp.ramp_room = (stream->target_room - ramp.room) / (float)frames;
+	ramp.ramp_left = (left - ramp.left) / (float)frames;
+	ramp.ramp_right = (right - ramp.right) / (float)frames;
+	ramp.ramp_room = (room - ramp.room) / (float)frames;
 	ramp.ramp_direct_lowpass = (stream->target_direct_lowpass - ramp.direct_lowpass) / (float)frames;
 	ramp.ramp_room_lowpass = (stream->target_room_lowpass - ramp.room_lowpass) / (float)frames;
 	ramp.direct_state[0] = stream->direct_lowpass[0];
 	ramp.direct_state[1] = stream->direct_lowpass[1];
 	ramp.room_state = stream->room_lowpass;
-	stream->current_left = stream->target_left;
-	stream->current_right = stream->target_right;
-	stream->current_room = stream->target_room;
+	stream->current_left = left;
+	stream->current_right = right;
+	stream->current_room = room;
 	stream->current_direct_lowpass = stream->target_direct_lowpass;
 	stream->current_room_lowpass = stream->target_room_lowpass;
 
@@ -2132,6 +2496,7 @@ static void mix_voice_wii(struct sdl_stream *stream, float *low_output, float *l
 		stream->ended = stream->silence >= WINDOW_FRAMES;
 		return;
 	}
+	voice_cap.mixed++;
 	if (!stream->high_bus)
 		wii_mix.low_written = TRUE;
 	if (ramp.room || ramp.ramp_room)
@@ -2219,7 +2584,7 @@ static void mix_voice_wii(struct sdl_stream *stream, float *low_output, float *l
 
 /* mixes 2 pairs frames of output: the voices into the buses, the reverb into
 the low bus, the low bus doubled into the output */
-static void mix_pairs(float *output, unsigned long pairs)
+static void mix_pairs_run(float *output, unsigned long pairs)
 {
 	struct sdl_stream *stream;
 	DSI3DL2LISTENER properties;
@@ -2233,6 +2598,12 @@ static void mix_pairs(float *output, unsigned long pairs)
 	memset(wii_mix.high_send, 0, frames * sizeof(float));
 	wii_mix.low_sent = wii_mix.high_sent = wii_mix.low_written = FALSE;
 	pthread_mutex_lock(&mixer_lock);
+	voice_cap.mixed = voice_cap.dropped = 0;
+	if (voice_cap.allowed || voice_cap.clear)
+	{
+		voice_cap_select(voice_cap.allowed);
+		voice_cap.clear = FALSE;
+	}
 	for (stream = streams; stream; stream = stream->next)
 		mix_voice_wii(stream, low, reverb.send, output, wii_mix.high_send, pairs);
 	/* a new environment, once the fade to the last is over */
@@ -2299,6 +2670,21 @@ static void mix_pairs(float *output, unsigned long pairs)
 	/* the players' voices (voice_audio.c), dry, under the limiter */
 	voice_audio_mix(output, frames);
 	limit(output, frames);
+}
+
+/* the mix, timed for the cost cap */
+static void mix_pairs(float *output, unsigned long pairs)
+{
+	unsigned long started;
+
+	if (!voice_cap.budget_us)
+	{
+		mix_pairs_run(output, pairs);
+		return;
+	}
+	started = (unsigned long)MIX_CLOCK_US();
+	mix_pairs_run(output, pairs);
+	voice_cap_update((unsigned long)MIX_CLOCK_US() - started);
 }
 
 /* frames of output, from mixes of MIX_AHEAD_FRAMES (what each voice costs a
@@ -2429,6 +2815,12 @@ void dsound_wii_audio_report(void)
 		"peak %d of 32767", (unsigned long)stats.blocks_filled, (unsigned long)stats.blocks_played,
 		(unsigned long)stats.underruns, (unsigned long)(stats.blocks_filled ? stats.fill_us_total / stats.blocks_filled : 0),
 		(unsigned long)stats.fill_us_max, audio_peak);
+	if (voice_cap.budget_us)
+	{
+		platform_log("audio: cost cap (audio.mix_budget_us %lu): dropped voices from %lu of %lu mixes, %lu voices in all, "
+			"%lu at most in one; now %s", voice_cap.budget_us, voice_cap.capped_blocks, voice_cap.blocks,
+			voice_cap.dropped_total, voice_cap.dropped_most, voice_cap.allowed ? "capped" : "all voices mixed");
+	}
 	audio_peak = 0;
 }
 
@@ -2472,6 +2864,7 @@ static void audio_start(void)
 	audio_started = TRUE;
 	master_volume = (float)config_real("audio.volume");
 	reverb_enabled = config_boolean("audio.reverb");
+	voice_cap.budget_us = config_integer("audio.mix_budget_us") > 0 ? (unsigned long)config_integer("audio.mix_budget_us") : 0;
 	audio_speakers_read();
 	upsampler_initialize();
 	reverb_initialize();
