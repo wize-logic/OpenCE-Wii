@@ -876,7 +876,7 @@ and pixel shaders.
       coordinates, the planar fog's alpha, a normal sent): each vertex's part computed once a
       draw into the vertex memo, then sent by a loop made for that combination of what is sent
       (`hardware_emit`), in place of one loop testing every case at every index. The log's
-      `the processor's part in hardware's vertices` line lists the combinations (their flags in
+      `hardware's kinds` line lists the combinations (their flags in
       hex: `HW_KEYED` 1 and so on) with their draws and indices. Each loop reads the draw's
       fields once, into registers (a store to the FIFO may alias any memory in this build, so a
       field read at each index was loaded again at each), and sends with as few stores as the

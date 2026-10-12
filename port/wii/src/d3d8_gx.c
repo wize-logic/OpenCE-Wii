@@ -8880,8 +8880,8 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			char line[320];
 			unsigned kind, shown, length;
 
-			length = (unsigned)snprintf(line, sizeof(line), "Direct3D: the processor's part in hardware's vertices "
-				"(kind: draws/indices):");
+			/* (short: the log keeps some 200 characters of a line) */
+			length = (unsigned)snprintf(line, sizeof(line), "Direct3D: hardware's kinds (draws/indices):");
 			for (shown = 0; shown < 8 && length < sizeof(line) - 32; shown++)
 			{
 				unsigned best = HW_KINDS;
@@ -8921,9 +8921,9 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		platform_log("Direct3D: lit by GX, the planar fog by GX's ramp in %lu draws (%lu its product with the "
 			"atmospheric fog; %lu ramps written), the processor's in %lu; a model's fog through its nodes' matrices in "
 			"%lu draws", lit_fog_draws, lit_fog_products, fog_ramps_made, lit_fog_refused, fog_post_draws);
-		platform_log("Direct3D: lit by GX, the planar fog the processor's: %lu its pixel shader beyond GX, %lu its form "
-			"(a product of other directions, or too long), %lu no texture map free, %lu beyond the ramp's range, %lu no "
-			"ramp free this frame, %lu no room, %lu not translated with it", lit_fog_refusals[FOG_REFUSED_SHADER],
+		/* (short: the log keeps some 200 characters of a line) */
+		platform_log("Direct3D: the planar fog the processor's, why: shader %lu, form %lu, no map %lu, range %lu, "
+			"no ramp free %lu, no room %lu, translation %lu", lit_fog_refusals[FOG_REFUSED_SHADER],
 			lit_fog_refusals[FOG_REFUSED_FORM], lit_fog_refusals[FOG_REFUSED_MAP], lit_fog_refusals[FOG_REFUSED_MATRIX],
 			lit_fog_refusals[FOG_REFUSED_SLOT], lit_fog_refusals[FOG_REFUSED_MEMORY],
 			lit_fog_refusals[FOG_REFUSED_TRANSLATION]);
