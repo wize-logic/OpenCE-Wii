@@ -14,6 +14,28 @@ controllers", lists what each button does.
 
 #include "wl/platform/platform.h"
 
+/* The Nunchuk's thrust (input.nunchuk_melee) as a press of the melee button,
+B, for one frame. The thrust is found at a poll of the controllers
+(wl_thrust_feed); the game reads the gamepad later, perhaps after another poll
+and perhaps more than once. So a thrust waits to be read, is then shown for
+every read of the poll that first showed it, and is gone at the first read of
+a later poll (the game sees a press and a release). One not read within
+WII_MELEE_PENDING_US is dropped, and none is shown while a menu is up (B is
+back there). */
+#define WII_MELEE_PENDING_US 250000u
+
+struct wii_melee_press
+{
+	int state;
+	uint64_t flagged_us;
+	unsigned long shown_poll;
+};
+
+void wii_melee_press_flag(struct wii_melee_press *press, uint64_t now_us);
+/* whether the read of poll number `poll` at now_us sees melee pressed */
+BOOL wii_melee_press_read(struct wii_melee_press *press, unsigned long poll, uint64_t now_us, BOOL menu);
+void wii_map_melee(XINPUT_GAMEPAD *pad);
+
 /* The pointer: no turn while it is within this fraction of the half screen's
 width or height from the middle; a turn lost for no longer than the hold
 below is carried on with the last position. */

@@ -20,7 +20,7 @@ from harness import CHECK_FAILED, build, mutated, read, run  # noqa: E402
 
 SOURCE = "port/linux/src/dsound_sdl.c"
 CASES = ["native", "sines", "pitched", "silent-voice", "mono", "chunks", "ends", "adpcm", "reverb", "reverb-steady",
-         "reverb-change", "reverb-silent", "send-voice", "mono-output"]
+         "reverb-change", "reverb-silent", "send-voice", "mono-output", "cap"]
 
 # a fault in the Wii's mixing, and the case that must catch it
 NEGATIVE_CONTROLS = {
@@ -47,6 +47,10 @@ NEGATIVE_CONTROLS = {
                         "send-voice"),
     "mono-left-only": (("		float mean = 0.5f * (output[frame * 2] + output[frame * 2 + 1]);",
                         "		float mean = output[frame * 2];"), "mono-output"),
+    "cap-step": (("	ramp.ramp_left = (left - ramp.left) / (float)frames;",
+                  "	ramp.ramp_left = 0.0f;\n	ramp.left = left;"), "cap"),
+    "cap-drops-loudest": (("				drop = key < cutoff;", "				drop = key > cutoff;"), "cap"),
+    "cap-no-return": (("			if (++voice_cap.calm >= VOICE_CAP_CALM)", "			if (++voice_cap.calm >= 1000000)"), "cap"),
     "adpcm-clamp": (("		if (predictor > 32767) \\\n			predictor = 32767; \\",
                      "		if (predictor > 32000) \\\n			predictor = 32000; \\"), "adpcm"),
 }

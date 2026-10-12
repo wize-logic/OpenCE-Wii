@@ -27,8 +27,10 @@ wii_home_game.h.
 #include "wl/platform/overlay.h"
 #include "wl/platform/platform.h"
 
+#include "port_config.h"
 #include "wii_home.h"
 #include "wii_home_game.h"
+#include "wii_strap.h"
 
 /* (ui_widget.c, game_time.c, main.c, players.c, wii_platform.c) */
 extern unsigned char main_menu_is_active(void);
@@ -42,9 +44,16 @@ void platform_request_quit(void);
 
 static struct wii_home home;
 static BOOL home_started;
+/* the wrist strap reminder (display.wii_strap_reminder), shown once at the start */
+static struct wii_strap strap;
+/* what has the overlay hooked in: the HOME menu or notice, the reminder */
+static BOOL home_visible;
+static BOOL strap_visible;
+static BOOL overlay_hooked;
 /* (the rumble service reads these on the watcher thread) */
 static volatile int home_open_flag;
 static volatile int home_blocking_flag;
+static volatile int strap_blocking_flag;
 
 /* ---------- the ops */
 
@@ -74,11 +83,23 @@ static void ops_leave_for_loader(void *user)
 
 static void home_draw(void *user, uint32_t width, uint32_t height);
 
+/* (nothing is hooked into the frame while there is nothing to draw) */
+static void overlay_update(void)
+{
+	BOOL wanted = home_visible || strap_visible;
+
+	if (wanted != overlay_hooked)
+	{
+		overlay_hooked = wanted;
+		wl_gx_set_overlay(wanted ? home_draw : NULL, NULL);
+	}
+}
+
 static void ops_visible(void *user, BOOL visible)
 {
 	(void)user;
-	/* (nothing is hooked into the frame while there is nothing to draw) */
-	wl_gx_set_overlay(visible ? home_draw : NULL, NULL);
+	home_visible = visible;
+	overlay_update();
 }
 
 static void ops_log(void *user, const char *text)
@@ -109,6 +130,26 @@ void wii_home_game_poll(const WlRawInput *raw, uint64_t now_us, unsigned extra_n
 	{
 		home_started = TRUE;
 		wii_home_init(&home);
+		wii_strap_init(&strap, config_boolean("display.wii_strap_reminder") ? TRUE : FALSE);
+	}
+	/* (the reminder, while it is up, takes the controllers: HOME does nothing
+	under it, and the game sees nothing) */
+	if (strap.state == WII_STRAP_WAITING || strap.state == WII_STRAP_UP || strap.state == WII_STRAP_SWALLOWING)
+	{
+		BOOL up = wii_strap_step(&strap, raw, extra_nav, now_us);
+
+		if (up != strap_visible)
+		{
+			strap_visible = up;
+			overlay_update();
+		}
+		strap_blocking_flag = wii_strap_blocks_input(&strap);
+		if (up)
+		{
+			home_open_flag = 1;
+			home_blocking_flag = 1;
+			return;
+		}
 	}
 	memset(&world, 0, sizeof(world));
 	/* (the controllers are read from the game's start, before its time exists:
@@ -137,7 +178,7 @@ BOOL wii_home_game_open(void)
 
 BOOL wii_home_game_blocks_input(void)
 {
-	return home_blocking_flag ? TRUE : FALSE;
+	return home_blocking_flag || strap_blocking_flag ? TRUE : FALSE;
 }
 
 /* ---------- the overlay: capitals only, in WiiLibs' small font */
@@ -252,10 +293,38 @@ static void draw_notices(uint32_t width)
 	wl_overlay_text(((int)width - box_w) / 2 + 16, y + 12, 2, COLOR_WARNING, text);
 }
 
+/* the reminder: a plain screen of text on black */
+static void draw_strap(uint32_t width, uint32_t height)
+{
+	int y = (int)height / 5;
+	int index;
+
+	wl_overlay_rect(0, 0, (int)width, (int)height, 0x000000FFu);
+	text_centered(width, y, 4, COLOR_WARNING, wii_strap_line(&strap, 0));
+	y += 90;
+	for (index = 1; index <= 4; index++)
+	{
+		const char *line = wii_strap_line(&strap, index);
+
+		if (!line)
+			continue;
+		text_centered(width, y, 2, COLOR_TEXT, line);
+		y += 36;
+	}
+	text_centered(width, (int)height - 90, 3,
+		wii_strap_ready(&strap, wl_platform_time_us()) ? COLOR_GOOD : COLOR_GAUGE_BACK, wii_strap_line(&strap, 5));
+}
+
 static void home_draw(void *user, uint32_t width, uint32_t height)
 {
 	(void)user;
 	wl_overlay_begin();
+	if (strap_visible)
+	{
+		draw_strap(width, height);
+		wl_overlay_end();
+		return;
+	}
 	if (home.state != WII_HOME_CLOSED)
 		draw_menu(width, height);
 	draw_notices(width);

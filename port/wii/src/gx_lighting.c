@@ -15,9 +15,9 @@ light each vertex by its normal, skinned by the same nodes as its position:
   max(1 - d^2/r^2, 0) times n.l times the spot clamped to [0, 1];
 - D1: the reflection's Fresnel colour, c-80 + c-81 (n.e), e the unit
   vector to the eye (c-92);
-- D0's alpha: 0, or the planar fog's (a function of the world position:
-  on GX, a ramp texture at coordinates GX makes of the position,
-  gx_lighting_fog_ramp);
+- D0's alpha: 0, or the planar fog's, or its product with the atmospheric
+  fog's (a function of the world position: on GX, a ramp texture at
+  coordinates GX makes of the position, gx_lighting_fog_ramp);
 - texture coordinate 3: the eye's reflection about the normal,
   c-92.w (n.e) n - e, a cube map's direction (its sphere map's coordinates).
 
@@ -527,45 +527,122 @@ float gx_lighting_planar_fog(const struct gx_lighting *lighting, const float wor
 	return clamp01(a);
 }
 
-BOOL gx_lighting_fog_ramped(const struct gx_lighting *lighting)
+/* the ramp's value at s and t: the planar fog's, or its product with the
+atmospheric fog's */
+static float fog_form_value(const struct gx_lighting_fog_form *form, float s, float t)
 {
-	return lighting->alpha == _gx_lighting_alpha_planar_fog;
+	const float fog[3] = { form->density, form->fog[0], form->fog[1] };
+	float a = planar_fog(s, t, fog);
+
+	if (form->product)
+		return clamp01((1.0f - clamp01(form->alpha * t + form->beta) * form->density) * (1.0f - a));
+	return clamp01(a);
 }
 
-void gx_lighting_fog_ramp(const struct gx_lighting *lighting,
-	unsigned char texels[GX_LIGHTING_FOG_SIZE][GX_LIGHTING_FOG_SIZE])
+/* the least whole number not below x (0 <= x < 2^24) */
+static unsigned whole_above(float x)
 {
-	int row, column;
+	unsigned whole = (unsigned)x;
 
-	for (row = 0; row < GX_LIGHTING_FOG_SIZE; row++)
+	return (float)whole < x ? whole + 1 : whole;
+}
+
+BOOL gx_lighting_fog_form(const struct gx_lighting *lighting, struct gx_lighting_fog_form *form)
+{
+	const float *t_row = lighting->fog_rows[1], *r_row = lighting->fog_rows[2];
+	float tt = dot3(t_row, t_row), alpha, error[3], low, length, per_unit;
+	int k;
+
+	memset(form, 0, sizeof(*form));
+	if (lighting->alpha == _gx_lighting_alpha_zero)
+		return FALSE;
+	form->fog[0] = lighting->fog[1];
+	form->fog[1] = lighting->fog[2];
+	form->t_low = 0.0f;
+	form->t_high = 1.0f;
+	form->rows = GX_LIGHTING_FOG_SIZE;
+	form->product = lighting->alpha == _gx_lighting_alpha_fog_product;
+	form->density = form->product ? lighting->fog[0] : 0.0f;
+	/* (the planar fog alone, or no atmospheric fog: the product is 1 - a) */
+	if (form->density == 0.0f)
+		return TRUE;
+	/* (r of t: c-88 of c-86's direction, alpha times as long) */
+	if (!(tt > 0.0f))
+		return FALSE;
+	alpha = dot3(r_row, t_row) / tt;
+	for (k = 0; k < 3; k++)
+		error[k] = r_row[k] - alpha * t_row[k];
+	if (!(alpha > 0.0f) || dot3(error, error) > 1e-8f * dot3(r_row, r_row))
+		return FALSE;
+	form->alpha = alpha;
+	form->beta = r_row[3] - alpha * t_row[3];
+	/* The rows a step apart, r's 0 and 1 (t of low and low + length) on two
+	of them, so that the atmospheric fog's, linear between them and constant
+	beyond, is the bilinear filter's between rows; as many as hold [0, 1] in
+	32 a unit, else 16 or 8 (where GX_LIGHTING_FOG_ROWS hold no more). */
+	low = -form->beta / alpha;
+	length = 1.0f / alpha;
+	for (per_unit = (float)GX_LIGHTING_FOG_SIZE; per_unit >= 8.0f; per_unit *= 0.5f)
+	{
+		float intervals = length * per_unit, step, high, first, count;
+		unsigned rows;
+
+		if (!(intervals < (float)GX_LIGHTING_FOG_ROWS) || !(low < 4096.0f && low > -4096.0f))
+			continue;
+		step = length / (float)whole_above(intervals > 1.0f ? intervals : 1.0f);
+		/* (down from r's 0 to t's 0, up from r's 1 to t's 1) */
+		first = low > 0.0f ? low - (float)whole_above(low / step) * step : low;
+		high = low + length > 1.0f ? low + length : 1.0f;
+		count = (high - first) / step;
+		if (!(count < (float)GX_LIGHTING_FOG_ROWS))
+			continue;
+		rows = (whole_above(count) + 1 + 3) & ~3U;
+		if (rows > GX_LIGHTING_FOG_ROWS)
+			continue;
+		form->t_low = first;
+		form->t_high = first + (float)(rows - 1) * step;
+		form->rows = rows;
+		return TRUE;
+	}
+	return FALSE;
+}
+
+void gx_lighting_fog_ramp(const struct gx_lighting_fog_form *form, unsigned first_row, unsigned row_count,
+	unsigned char *texels)
+{
+	unsigned row, column;
+
+	for (row = first_row; row < first_row + row_count; row++)
 		for (column = 0; column < GX_LIGHTING_FOG_SIZE; column++)
 		{
-			float value = clamp01(planar_fog((float)column / (GX_LIGHTING_FOG_SIZE - 1),
-				(float)row / (GX_LIGHTING_FOG_SIZE - 1), lighting->fog));
+			float value = fog_form_value(form, (float)column / (GX_LIGHTING_FOG_SIZE - 1),
+				form->t_low + (form->t_high - form->t_low) * ((float)row / (float)(form->rows - 1)));
 
-			texels[row][column] = (unsigned char)(int)(value * 255.0f + 0.5f);
+			texels[(row - first_row) * GX_LIGHTING_FOG_SIZE + column] = (unsigned char)(int)(value * 255.0f + 0.5f);
 		}
 }
 
 /* how far beyond 0 to 1 the ramp's coordinates may be at a draw's point */
 #define FOG_RANGE 256.0f
 
-BOOL gx_lighting_fog_matrix(const struct gx_lighting *lighting, const struct gx_lighting_space *space,
-	const float center[3], float out[3][4])
+BOOL gx_lighting_fog_matrix(const struct gx_lighting *lighting, const struct gx_lighting_fog_form *form,
+	const struct gx_lighting_space *space, const float center[3], float out[3][4])
 {
-	/* (0 to 1 onto the first texel's centre to the last's) */
-	const float scale = (float)(GX_LIGHTING_FOG_SIZE - 1) / GX_LIGHTING_FOG_SIZE, bias = 0.5f / GX_LIGHTING_FOG_SIZE;
 	float inverse = 1.0f / (space->sigma * space->sigma);
 	int row, column, k;
 
 	for (row = 0; row < 2; row++)
 	{
 		const float *fog = lighting->fog_rows[row];
+		/* (low to high onto the first texel's centre to the last's) */
+		float texels = row ? (float)form->rows : (float)GX_LIGHTING_FOG_SIZE;
+		float low = row ? form->t_low : 0.0f, span = row ? form->t_high - form->t_low : 1.0f;
+		float scale = (texels - 1.0f) / texels / span, bias = 0.5f / texels;
 		float value;
 
 		/* (the world of E: E's rows' transpose over sigma squared, less their
 		translation) */
-		out[row][3] = fog[3];
+		out[row][3] = fog[3] - low;
 		for (column = 0; column < 3; column++)
 		{
 			float g = 0.0f;
@@ -586,12 +663,11 @@ BOOL gx_lighting_fog_matrix(const struct gx_lighting *lighting, const struct gx_
 	return TRUE;
 }
 
-unsigned char gx_lighting_fog_sample(const unsigned char texels[GX_LIGHTING_FOG_SIZE][GX_LIGHTING_FOG_SIZE],
-	float s, float t)
+unsigned char gx_lighting_fog_sample(const unsigned char *texels, unsigned rows, float s, float t)
 {
 	/* (in 128ths of a texel, less half a texel: the bilinear filter's) */
-	long x = lroundf(s * GX_LIGHTING_FOG_SIZE * 128.0f) - 64, y = lroundf(t * GX_LIGHTING_FOG_SIZE * 128.0f) - 64;
-	long column = x >> 7, row = y >> 7, fx = x & 127, fy = y & 127, sum = 0;
+	long x = lroundf(s * GX_LIGHTING_FOG_SIZE * 128.0f) - 64, y = lroundf(t * (float)rows * 128.0f) - 64;
+	long column = x >> 7, row = y >> 7, fx = x & 127, fy = y & 127, sum = 0, last = (long)rows - 1;
 	int corner;
 
 	for (corner = 0; corner < 4; corner++)
@@ -599,8 +675,9 @@ unsigned char gx_lighting_fog_sample(const unsigned char texels[GX_LIGHTING_FOG_
 		long c = column + (corner & 1), r = row + (corner >> 1);
 
 		c = c < 0 ? 0 : c > GX_LIGHTING_FOG_SIZE - 1 ? GX_LIGHTING_FOG_SIZE - 1 : c;
-		r = r < 0 ? 0 : r > GX_LIGHTING_FOG_SIZE - 1 ? GX_LIGHTING_FOG_SIZE - 1 : r;
-		sum += (long)texels[r][c] * ((corner & 1) ? fx : 128 - fx) * ((corner >> 1) ? fy : 128 - fy);
+		r = r < 0 ? 0 : r > last ? last : r;
+		sum += (long)texels[r * GX_LIGHTING_FOG_SIZE + c] * ((corner & 1) ? fx : 128 - fx) *
+			((corner >> 1) ? fy : 128 - fy);
 	}
 	return (unsigned char)(sum >> 14);
 }

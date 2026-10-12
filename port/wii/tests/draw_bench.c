@@ -25,9 +25,11 @@ usage: draw_bench <scene> <frames> [record] (scene: environment, rigid, skinned,
 */
 
 /* (the display lists' memory outside the window, whose addresses the
-digests keep: a draw's lists leave the others' arrays where they were) */
-#define INDEX_LIST_ALLOCATE(bytes) aligned_alloc(32, ((bytes) + 31) & ~31UL)
-#define INDEX_LIST_FREE(data) free(data)
+digests keep: a draw's lists leave the others' arrays where they were;
+BENCH_NO_ROOM: none, as the kept buffers' pages, to count what a draw
+refused room costs) */
+#define INDEX_LIST_ALLOCATE(bytes) (getenv("BENCH_NO_ROOM") ? NULL : aligned_alloc(32, ((bytes) + 31) & ~31UL))
+#define INDEX_LIST_FREE(data, ...) free(data)
 
 #include "d3d8_gx.c"
 
@@ -188,6 +190,24 @@ void *platform_contiguous_alloc(unsigned long size, unsigned long alignment, uns
 void platform_contiguous_free(void *address)
 {
 	(void)address;
+}
+
+/* (the kept buffers' pages: from the window, in order, as the device's
+other blocks) */
+void *wii_memory_window_alloc_low(unsigned long size, unsigned long keep_largest)
+{
+	(void)keep_largest;
+	return getenv("BENCH_NO_ROOM") ? NULL : window_allocate(size);
+}
+
+unsigned long wii_memory_window_frees(void)
+{
+	return 0;
+}
+
+void wii_memory_window_set_reclaim(int (*reclaim)(void))
+{
+	(void)reclaim;
 }
 
 /* ---------- the regions counted (their names printed as they begin) */
@@ -491,9 +511,10 @@ static void camera_set(int frame)
 	C(-71)[1] = -1.0f;
 	C(-70)[0] = C(-70)[1] = C(-70)[2] = 0.3f;
 	C(-69)[0] = C(-69)[1] = C(-69)[2] = 0.15f;
-	/* the fogs: two planes and the atmospheric distance's (c-88 to c-86),
-	and their amounts (c-85) */
-	C(-88)[2] = 0.2f;
+	/* the fogs: two planes and the atmospheric distance's (c-88 to c-86;
+	the atmospheric distance along the planar fog's distance, as the game
+	makes them: rasterizer_xbox.c), and their amounts (c-85) */
+	C(-88)[1] = 0.01f;
 	C(-88)[3] = 0.1f;
 	C(-87)[0] = 0.05f;
 	C(-87)[3] = 0.4f;

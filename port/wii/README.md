@@ -112,14 +112,15 @@ A save survives a reset, a power-off or a pulled card. Each file the game opens 
 `apps/halo/saves` (the profiles, the saved games, each profile's `savegame.bin`, the checkpoint the
 game keeps for Save and Quit) is written beside itself as `<file>.wtmp`, and takes the file's place
 when the game closes it (`xbox_files.c`, "saves that survive a cut"): the data is synced, then the
-copy is renamed over the old file. libfat cannot rename over a file, so there the old one goes
-aside as `<file>.wold` for the moment between the two renames. A cut at any call leaves the old file
-or the new one, whole.
+copy is renamed over the old file (WiiLibs' `wl_file_replace`, `wl/platform/file_replace.h`). libfat
+cannot rename over a file, so there the old one goes aside as `<file>.wold` for the moment between
+the two renames. A cut at any call leaves the old file or the new one, whole.
 
 - A file the game writes whole from its start (a profile; the checkpoint) is not copied into its
   copy first; one written in part (a patch in the middle, an append, a resize) is.
-- The next start sweeps the save folders (`shadow_sweep`): a `.wold` is put back where its file is
-  missing (the cut came between the two renames) and goes where it is not, and a `.wtmp` goes. The
+- The next start sweeps the save folders (`shadow_sweep`, WiiLibs' `wl_file_recover`): a `.wold` is
+  put back where its file is missing (the cut came between the two renames) and goes where it is not,
+  and a `.wtmp` goes. The
   game's directory listings never show either. A file with a copy that is still open when the
   console leaves is not replaced: the old one stays.
 - Not shadowed: `z:\savegame.bin` opened unbuffered and kept open (the game state's revert buffer,
@@ -133,7 +134,9 @@ or the new one, whole.
 - Writes still go through the gate the shutdown uses (`wii_files_quiesce`): the ones under way
   finish, the ones that would start wait; so does the replacing at close.
 
-Checked on the host: `python -m pytest -q tools/harness/tests/test_atomic_saves.py` runs the
+Checked on the host: `python -m pytest -q tools/harness/tests/test_atomic_saves.py` (with WiiLibs'
+`wl/platform/file_replace.c`, from `WIILIBS`, `./WiiLibs` or `../WiiLibs`; the tests are skipped without
+it, and WiiLibs has its own, `tests/platform/test_platform_file_replace.c`) runs the
 game's own sequences (a profile written whole, the checkpoint with its header last, a patch, an
 append, a file made, emptied and written, grown) on a real directory with the card modelled, cut
 before each call that changes it (and half-way through each write), on a card that renames over a
@@ -177,8 +180,9 @@ looks into the card's directories at every open. The look was one opening and re
 for every part of every path (libfat searches the path from the root for each entry it reads), and
 for a file that is not there yet, as the saves' new files are, the one `stat` that the first way
 spared did not help. The first start's 250 translations took 1066 ms of the 1.84 s of its start-up
-checks. Now a directory is read once (`xbox_files.c`, "the directories' listings": up to 64
-directories of up to 512 entries) and the spellings of its entries come from the listing; the answer is the
+checks. Now a directory is read once (`xbox_files.c`, "the directories' listings", WiiLibs'
+`wl_dircache`, `wl/platform/dircache.h`: up to 64 directories of up to 512 entries) and the spellings
+of its entries come from the listing; the answer is the
 one the look gives, except in the case of a letter for a file made or removed since the directory was read,
 and the card does not tell cases apart. A directory that was not there when it was first looked into stays so
 (its parts are taken as written), and a drive's directory (`saves/z`) is asked for once. The test
@@ -488,6 +492,45 @@ will tell which it was, from the `files:` lines and the times on them.)
     the packets decoded beforehand. Of the 861: 240 decoding ADPCM, 160 making the samples floats,
     300 the voices' gains, filters and interpolation, 100 the limiter, 70 the upsampler. A voice
     out of earshot costs about 1, the mix with nothing playing 50.
+  - **Cheaper decoding.** An ADPCM voice's samples are worked out a word a step
+    (`decode_adpcm_block_wii`: the difference and the next step index's row are one table
+    entry, a clamp that is out of line), written as the bits of floats (1.5 * 2^23 plus the
+    sample) in a plane for each channel, and made samples by one fused multiply and subtract a
+    sample; PCM is read with a byte-reversed load (`lhbrx`) where its address is even. The
+    samples are the same to the bit (`test_mixer_wii.py adpcm` against the shared decoder), a
+    voice whose gains are not moving skips their ramps. Counted with the figures' tools
+    (`mixer_wii.c`'s "bench", the scene's ADPCM now encoded from a signal at a sound's level,
+    not noise at full scale, which the decoder clamps in a fifth of its samples; built
+    non-PIC, as the Wii is): the scene above 780 instructions an output frame before, 665 now
+    (15% fewer); a battle's ("bench 30 4 2 12 3": 30 voices in the world, every
+    fifth pitched, four stereo 44 kHz, two stereo 22 kHz, 12 out of earshot, the reverb on)
+    1,615 before, 1,388 now (14%; 61 million instructions a second, 8.4% of the processor
+    by count, the 750 doing about one instruction a cycle at best). What is left is the
+    voices' own gains and filters (voice_apply, 125 a frame in the scene above), the cubic of
+    the pitched ones, the upsampler's 32 taps (75) and the limiter (35 while it limits).
+    Paired-single code would halve the upsampler, but qemu-ppc cannot run it and clang's
+    assembler does not take it, so it is not written.
+  - **The cost cap** (`audio.mix_budget_us`, 320, which is 5% of the processor for a 6.5 ms
+    block; 0 turns it off). The mixer times each block (`wl_platform_time_us`, twice a block)
+    and keeps an average of the last eight. Over the budget it works out how many voices
+    would have fitted (0.875 of the budget over the average, times the voices mixed) and
+    drops the rest from the next mix: the quietest, by the greatest of a voice's gains
+    (the speakers' and the reverb's) a mix before, a dropped one counting two thirds of
+    that so that it does not flip back. Music, speech and the interface's sounds (voices
+    that are not in the world), a voice new to the mixer and the four loudest of the rest are
+    never dropped. A dropped voice's gains are ramped to nothing across the block, as for
+    a voice turned down, so there is no click, and it moves on at no cost as one out of
+    earshot does (`voice_pass`), keeping its place in its sound. Once the average is under
+    four fifths of the budget a voice comes back every eight blocks (also ramped up across
+    one), until all are mixed and the cap ends. The log's `audio:` line after the report
+    says `cost cap (audio.mix_budget_us 320): dropped voices from N of M mixes, D voices
+    in all, K at most in one; now capped|all voices mixed`. The time is the wall clock of the
+    audio thread, so a higher-priority thread preempting it counts against it (the report's
+    "at most" shows spikes; the average smooths them). `test_mixer_wii.py cap` (a clock set
+    by the test): under the budget the mix is the uncapped one to the bit; over it the
+    farthest voices go and the nearest and the music stay, with no step in the sound, and
+    they come back when mixes are cheap; three negative controls catch a step, the loudest
+    dropped and no return.
   - **The reverb** (`audio.reverb`, on) is the other builds' network (taps, diffusers, a
     feedback delay network) from the same I3DL2 properties, so a room keeps the decay time, the
     reflections and the level the game set. Run as they do (22,050 Hz, eight lines) it added 476
@@ -568,7 +611,7 @@ the game's thread starts) 128.
 | Range | Holds | Before | Now |
 | --- | --- | ---: | ---: |
 | `0x90000000` to libogc's MEM2 arena | libogc's IOS buffers (the memory report's window line says where the arena began) | a few | a few |
-| from there to `0x90100000` | before, no one's; now the window's lowest pages, which only its top-down blocks reach | about 1000 | in the window |
+| from there to `0x90100000` | before, no one's; now the window's lowest pages, which its top-down blocks reach last and the Direct3D device's kept buffers first ("The kept buffers' memory") | about 1000 | in the window |
 | `0x90100000`–`0x91700000` | the tag cache (22528 KB), at the window's bottom: a map's tags (at most 16.2 MB, b40) and the structure bsp loaded at its top (at most 8.6 MB, c20) | 22528 | 22528 |
 | top-down from the window's top | the texture cache (12288 KB, the game's own cache of the map's bitmaps, converted to GX's formats), the sound cache (4096 KB), Direct3D's resources (vertex and index buffers, textures the game makes, render targets: b30 1.4 to 3.8 MB) and what is free | 22528 | 23040 and the pages below |
 | window, in all | `0x90100000`–`0x92D00000`, now from libogc's arena to `0x92D80000` | 45056 | 45568 and about 1000 |
@@ -825,9 +868,14 @@ and pixel shaders.
       same twice, as a GX display list of its primitive and indices, written once and called
       (`index_list_draw`; libogc's `GX_BeginDispList`, since WiiLibs' `wl_gx_dl_*` records only
       its own layouts). GX's state stays outside the list, so one list serves every pass of the
-      same primitive and number of attributes (four a record), at most 512 KB in all, with the
-      kept outputs' reserve. The log's `the structure's indices as display lists` line counts
-      the calls, the lists written and those without room; `debug.gx_display_lists = false`
+      same primitive and number of attributes (four a record), at most 768 KB in all, in the
+      kept buffers' memory (below). A record refused room for a list does not ask again until
+      room may have come, so its draws cost what they did before the lists (the bench with no
+      room at all: 115 instructions more in a structure's draw of 82,000, 71 in a rigid
+      model's of 25,000). With room, the later frames' structure draws take 38,043
+      instructions against 43,675 with `debug.gx_display_lists = false`, the rigid models'
+      16,715 against 21,100. The log's `the structure's indices as display lists` line counts
+      the calls, the lists written and the draws refused one; `debug.gx_display_lists = false`
       sends the indices again;
     - a draw the processor has a part in (a blended vertex's position, the colours, a sphere map's
       coordinates, the planar fog's alpha, a normal sent): each vertex's part computed once a
@@ -875,13 +923,41 @@ and pixel shaders.
     `10c30c53`) were nearly all the CPU's vertices. The program itself saves little (1110 to 1108
     instructions a vertex for `8f831b43`: its skinning and lighting are most of it); each index
     sends 7 words to the FIFO in place of 14.
+  - **The kept buffers' memory.** What the device keeps for GX to read (the static buffers'
+    outputs, the lit models' normals, the structure's display lists, a fog ramp of more than 32
+    rows) took the contiguous window's pages top-down, as the game's blocks do, a page at least
+    each (a display list of 1.5 KB took four), and only while the window kept 1 MB more free in
+    one run. The game's blocks and the device's lay between one another: once a level was
+    loaded, the largest free run was the 1016 KB below the tag cache (b30: 2,996 KB free in
+    all), and every kept buffer was refused (b30: 846 lists, 5,323 lit draws' normals and 305
+    draws' outputs every 3 seconds). They now have a pool of their own (`kept_alloc`):
+    - pages from the window's bottom (`wii_memory_window_alloc_low`), in the smallest free run
+      they fit, where the game's top-down blocks reach last; refused where the window's largest
+      free run would be left below 512 KB (unless it is not the run they take);
+    - a buffer of 16 KB or less cut from a slab of 64 KB in 32-byte granules (a bit each), a
+      larger one in pages of its own (GX reads each draw's arrays and lists from one block); at
+      most 2.5 MB in all, each kind within its own budget;
+    - freed once GX has drawn what reads it; an empty slab's pages go back to the window;
+    - the game's blocks first: where one finds no room in the window, `wii_memory.c` calls the
+      device back (`kept_reclaim`, on the device's thread and not while a draw reads them),
+      which waits for GX, frees every kept buffer, and the block is looked for again (the log:
+      `contiguous memory: the Direct3D device's kept buffers given back`). The 512 KB margin
+      keeps that rare: the blocks made once a level is loaded are the loading screen's texture
+      (320 by 240, 300 KB) and the device's own (sphere maps of 9 KB; the back buffer's
+      parking, two of 1,200 KB made once, which go to the heap where the window has no room);
+    - a buffer refused is not asked for again (by the entry or index record that wanted it)
+      until room may have come: a free of the window's pages or of a slab's granules, seen once
+      a frame is drawn; within that, a window block as large as one refused is refused without
+      a look.
+    The log's `the kept buffers' memory` line gives the window's KB the pool holds, its slabs
+    and the KB of them in use, the blocks of their own, the window blocks refused and the times
+    they were given back.
   - **Static buffers' outputs kept.** An output that reads no constant is, for a vertex, the
     same whatever the draw's constants (`nv2a_cpu_analyze_constants`; the generated programs
     list them as "the vertex's alone"). Where what the processor computes for such a draw (a
     sphere-mapped stage's coordinates, or both colours) reads no constant and the streams it
-    reads are static, it is computed once a vertex, kept beside the buffers in the contiguous
-    window (at most 1 MB, and only while the window keeps 1 MB more free in one run), and GX
-    reads it by index as it reads the buffers (`static_outputs_find`).
+    reads are static, it is computed once a vertex, kept in the kept buffers' memory (below; at
+    most 1 MB), and GX reads it by index as it reads the buffers (`static_outputs_find`).
     - A vertex buffer is static while the game does not lock it: its header's `Lock` holds a
       serial the device gives it, which `D3DVertexBuffer_Lock` clears. The kept outputs are
       keyed by each stream's header, data, stride and serial, the program, the shader and the
@@ -919,8 +995,8 @@ and pixel shaders.
       matrices make E, the projection is multiplied by K, the depth's row is the same. The
       normal matrices are E's rows of each node's matrix.
     - The normal is three floats, from the map's 11:11:10 word as the programs read it, decoded
-      once for each static buffer into an array beside it in the contiguous window (at most
-      768 KB, and only while the window keeps 1 MB more free in one run), which GX reads by
+      once for each static buffer into an array in the kept buffers' memory (at most 768 KB;
+      an entry refused room asks again only once room may have come), which GX reads by
       index as it reads the positions (`kept_normals_find`; three floats in the buffer it reads
       where they are). It was decoded and sent for every index of every draw, 58,000 a frame in
       b30. A draw with vertices whose position is the processor's (a blend beyond the draw's
@@ -929,7 +1005,8 @@ and pixel shaders.
       one opposite for a translucent shader's back side), and each point light. COLOR1A1 is
       D1, the Fresnel colour c-80 + c-81 (n.e): two lights at the eye, signed
       (`GX_DF_SIGNED`), one for the channels where c-81 is positive and one, with a negative
-      attenuation, for those where it is negative. D0's alpha is 0, or the planar fog's.
+      attenuation, for those where it is negative. D0's alpha is 0, the planar fog's, or its
+      product with the atmospheric fog's.
     - The planar fog's alpha (`8f831b43`: the Pelican, the first-person weapon, b30's
       scenery at sea level) is a function of two values affine in the world position, the
       depth below the fog's plane (c-87) and the distance ahead (c-86), constant beyond 0 and
@@ -939,10 +1016,22 @@ and pixel shaders.
       (`GX_DTTMTX0`, E to the ramp's coordinates). The pixel shader is translated again with
       D0's alpha that texture's (`gx_psh_textures.d0_alpha_map`, a map of 4 to 7 the stages
       leave free), so the vertices send no alpha. The fog is then the fog's at each pixel,
-      where the Xbox interpolates the vertices'. The product with the atmospheric fog
-      (`1d3f5b13`, `e6e006c7`), a draw with no map free or whose coordinates at its centre
-      are more than 256 ramps from it, and a pixel shader beyond GX with it keep the
-      processor's alpha, computed from the world position.
+      where the Xbox interpolates the vertices'.
+    - The product with the atmospheric fog (`1d3f5b13`, `e6e006c7`: lit characters in fog),
+      (1 - r' f)(1 - a), r' the atmospheric distance c-88 p clamped to [0, 1] and f its
+      density, is a ramp too: the game makes c-88 of c-86's direction (the camera's forward,
+      `_rasterizer_window_set_fog`), so r = alpha t + beta and the product is a function of s
+      and t, constant beyond [0, 1] in s and beyond both [0, 1] and r's [0, 1] in t. Its ramp
+      spans that t, 32 rows a unit of t (16 or 8 where 256 rows hold no more; a longer one is
+      refused), with r's 0 and 1 each on a row, so that the atmospheric fog's, linear between
+      them, is the filter's (`gx_lighting_fog_form`). A ramp of more than 32 rows is held in the
+      kept buffers' memory. `tests/gx_lighting_check.c` compares it with the programs: within
+      2/255 at the vertices, 1.5 halfway between two (the planar fog's alone: 1, 1.5). In the
+      bench's later frames the fogged scene's draws take 97,698 instructions against 104,302,
+      the skinned scene's (a third of whose characters have the product) 92,286 against 98,154.
+    - A draw with no map free or whose coordinates at its centre are more than 256 ramps from
+      it, a product of fogs whose distances are not of one direction, and a pixel shader beyond
+      GX with it keep the processor's alpha, computed from the world position.
     - A point light's fall-off, max(1 - d^2/r^2, 0), is not a form GX has: its reciprocal's
       second-order expansion about the draw's distance gives GX's k0 + k1 d + k2 d^2. Its spot,
       clamp(cos s + o, 0, 1), is a parabola through the same cut-off, 1 on its axis.
@@ -1146,8 +1235,10 @@ and pixel shaders.
   consoles nearly black), so on the Wii `bitmap_2d_get_pixel` asks
   `port/wii/src/wii_bitmap_texel.c` which levels the converter rewrote and reads the texel from
   GX's tiles: the Xbox's texel value for the game's own conversion, or for DXT the CMPR block as
-  the GPU decodes it, with DXT3/5's alpha from the I4 levels. `tools/wii_gx_texel_check.py`
-  checks it on the host against WiiLibs' conversions of every format.
+  the GPU decodes it, with DXT3/5's alpha from the I4 levels. Where a texel sits in GX's tiles and what
+  the hardware makes of it is WiiLibs' (`wl_gxc_texel_raw` and `wl_gxc_texel_read`, `wl/codec/gx_tex.h`);
+  the file keeps the game's part: its bitmap formats, its levels, the Xbox's word.
+  `tools/wii_gx_texel_check.py` checks it on the host against WiiLibs' conversions of every format.
 - **Depth.** A program's position matrix and its depth's a + b/w come from its constants alone,
   from two points along w's gradient. Both vertex paths take them, so a surface's passes meet
   their equal-depth tests whichever path each pass took. A draw whose vertices are all at one w
@@ -1525,10 +1616,54 @@ of the half screen from the middle, and turns beyond it, slowly then faster to t
 out: without it the view turns by fits and starts there. The box and the turn ramp are as before.
 A pointer found again after the sensor bar was lost starts at its reading.
 
+**The GameCube controller, every video field.** The game polls the controllers once in a 30
+frames-a-second frame, and a GameCube controller's reading is one instant, so a tap shorter than a
+frame could fall between two polls. WiiLibs reads the four ports at every video retrace instead (60
+a second on an NTSC or EuRGB60 TV, 50 on PAL; `wl_input_wii_retrace`, called from the retrace
+interrupt, a few hundred instructions each) and the poll takes what came in since its last: a
+button seen pressed in any sample is pressed for the poll (released at the next, so the game sees a
+press and a release, as with the Remote's reports), and the sticks and triggers are the latest
+sample's. The poll never reads a pad again after a retrace's read of the same field (that second
+read finds no new data and answers a transfer error); it reads for itself only when no retrace has
+sampled since its last poll. With `debug.input_log = true` the log says, every few seconds with a
+GameCube controller in use, `input: pads read at the retrace: N samples, M with fresh data; ...`:
+M should be near N (see "What only a real Wii can show", item 2).
+
 **The GameCube controller's errors.** libogc hands back a controller whose transfer failed with
 nothing pressed, which released a held trigger for a frame. A controller that answers
-`PAD_ERR_TRANSFER` or `PAD_ERR_NOT_READY` keeps its last good state; after ten polls in a row of
-errors it counts as unplugged (the game's pause), and plugged in again with its next good read.
+`PAD_ERR_TRANSFER` or `PAD_ERR_NOT_READY` keeps its last good state; after twenty samples in a row of
+errors (a third of a second at 60 a second) it counts as unplugged (the game's pause), and plugged in
+again with its next good read.
+
+**The Nunchuk's thrust as melee (`input.nunchuk_melee`, off by default).** With the setting on, a
+quick forward thrust of the Nunchuk presses the melee button (B) for one frame, as a swing of the
+arm would. WiiLibs keeps the Nunchuk's acceleration of every report of a frame
+(`WlRawRemote.nunchuk_accel`, `WPADData.exp.nunchuk.gforce` times 100) and `wl_thrust_feed`
+(`wl/platform/input_gesture.h`) finds the thrust in them. It is told by a change, not a size: the
+Nunchuk's accelerometer clips near 2 g and a hand at rest already reads a gram, so the forward
+axis (its long axis) must rise by about 1 g within 130 ms, after 150 ms of rest in which no axis
+moves by more than a third of a gram, while the other two axes stay within 0.6 g; the thrust fires
+once, and nothing fires for 600 ms after it. Walking, a turn of the wrist, a quick tilt (the sideways
+axes move with it), a tilt held, a bump of half a gram, a slow lean and a pull back do not fire it,
+and a thrust needs a rest before it (a wind-up that runs into the thrust does not count). The press
+is made at the poll that found the thrust and shown to every read of the game within that poll, then
+released at the next (`wii_melee_press_*`, `xinput_wii_map.c`); a thrust the game does not read within
+a quarter second is dropped; while a menu is up it does nothing (B is back there). It works on a
+Remote with a Nunchuk only; the detector costs a few hundred operations a frame and runs only with
+the setting on. Which way is forward is the sign of the Nunchuk's long axis (`forward_sign` in
+`WlThrustParams`, 1 as the accelerometer reads a push along it): the first real-console run
+confirms it (item 2 below).
+
+**The wrist strap reminder (`display.wii_strap_reminder`, off by default).** With the setting on, a
+plain screen of black and text comes up at the start, drawn with the overlay (`wii_home_game.c`, the
+HOME menu's mechanism): "PLEASE USE THE WRIST STRAP", a line on fastening it, a line on making room
+and standing back from the screen, and when a Remote with a Nunchuk is connected, a line on holding
+the Nunchuk firmly and keeping its cable clear. The controllers are ignored for the first second (the
+prompt "A: CONTINUE" is dim until then): A (the Classic Controller's lower button, a GameCube
+controller's A) goes on, and only a fresh press does, so an A held from the loader does not. The game
+sees no controller (and no rumble) while it is up and until that A is let go (or 1.5 s); it comes
+once per start, and HOME does nothing under it. The words are our own. `wii_strap.c` is the state
+machine; `tests/wii_strap_check.c` checks it.
 
 Sticks and triggers arrive from WiiLibs over their whole travel (the GameCube's sticks are
 full at the end of their gates, its triggers run from 30 to 180 as `PAD_Clamp` takes them, the
@@ -1640,6 +1775,19 @@ console is reset or powered off. The console's setting (the Wii's Remote vibrati
 SYSCONF, read by libogc's `CONF_GetPadMotorMode`, through WiiLibs' `wl_platform_rumble_enabled`)
 is kept: with it off no motor, GameCube controllers' included, is switched on.
 
+Checking the thrust and the reminder: the same script builds `tests/wii_input_check.c` with WiiLibs'
+`input_gesture.c` (synthetic acceleration traces polled every 33 ms and read once to three times a
+poll: a thrust is one press in one poll, in the poll after it rose, and a walk's shake, a held tilt and
+a turn of the wrist press nothing; a thrust in a menu is dropped; the press shown to every read of its
+poll, released at the next, dropped when unread) and `tests/wii_strap_check.c` with `src/wii_strap.c`
+(the first second ignored, a fresh press of A going on, an A held from before not, every controller's A
+and no other button, the game kept from the A until it is let go, once only, the Nunchuk line only with a
+Nunchuk, and only characters the overlay's font has). WiiLibs' `test_platform_input_gesture` checks the
+detector alone (a thrust at three report rates and frame lengths, a tilted hand, a clipped one, two
+thrusts close and far apart, no rest before, and the signs), and `test_platform_input_wii` and
+`test_platform_input_reports` the retrace sampling (a tap between polls, a held button, errors, the
+counters, no read after a retrace's) and the Nunchuk's readings.
+
 Checking the HOME menu: the same script builds `tests/wii_home_check.c` with `src/wii_home.c` (the
 state machine against fake controllers, a fake game and a clock: opening and closing, the pause
 made once and undone only if it was the menu's, the sound's fades, the items and the loader's question,
@@ -1712,11 +1860,22 @@ misses it loses its time.
    the box's edge with a steady hand: the view must not turn by fits; then try `input.pointer_steadiness`
    `0` and `0.1` and say which feels right, and whether a quick aim across the screen lags), taps of
    A and B much shorter than a frame (a quick flick) still jump and fire once, and a held trigger of
-   a GameCube controller is not released for a frame now and then; stops 150 ms after
+   a GameCube controller is not released for a frame now and then (with a GameCube controller, tap
+   A and B as fast as possible, a tap of a field or two, many times in a row, in play and in a
+   menu: none may be missed, and the log's `pads read at the retrace` line should show the fresh
+   samples near the samples, 60 a second; about half would mean the pads' own polling runs at
+   30 a second and the taps are no better than before: say so); stops 150 ms after
    the sensor bar is lost (cover it), and the aim magnetism holds a target. The Wii U Pro Controller
    is not supported; say whether it does anything. Remote batteries: `remote N battery code C` in the
    log against the percent the HOME menu shows, with a Remote that is full and one nearly spent
-   (the notice appears once below 10%).
+   (the notice appears once below 10%). `input.nunchuk_melee = true` with a Remote and Nunchuk:
+   the thrust's feel, which only the hand tells. Thrust the Nunchuk forward from rest the way a
+   punch goes (about 1.2 to 1.5 g): it should melee once; walk with it, turn on the spot, tilt it, shake
+   it, thrust twice quickly (one melee, then another after about half a second); say whether it
+   missed real thrusts (a softer or slower one) or fired on its own, and whether a pull back fires
+   (it should not; if a forward thrust does nothing and a pull does, `forward_sign` is the other way).
+   `display.wii_strap_reminder = true`: the screen at start, dismissed by A after the first second and
+   not before, with the Nunchuk line when one is plugged in.
 3. **The HOME menu.** In the menu and in play, press HOME on a Remote and on a Classic Controller
    (a GameCube controller has none). Look for: the menu opens over the paused game with its three
    items and the batteries' line (every connected Remote), the sound fades out over 300 ms and back
@@ -1760,7 +1919,14 @@ misses it loses its time.
    corridors) and outdoors, a battle indoors, with it on and off: the room sounds like a room (a
    decay that follows the place) and not metallic or muffled, going through a door fades to the
    next room's without a click, and the mixing time rises by about 0.7% of the processor's (the harness's count). Music,
-   dialogue and effects all heard; the volume settings do what they say.
+   dialogue and effects all heard; the volume settings do what they say. The cost cap
+   (`audio.mix_budget_us`, 320): a profile of a battle in b30 (`tools/wii_profile.py report LOG
+   --callers mix`): `mix` and `voice_take` together were 7.3% of the samples (4.8 and 2.5)
+   before the cheaper decoding and the cap, and should be about 5% or under now; in a loud battle the
+   `audio: cost cap` line says how often it acted. Listen, at the moments it does, for a click
+   or a crackle as sounds drop out (there should be none: a quiet sound just ends sooner than
+   it would) and for dialogue or music being affected (they must not be); `audio.mix_budget_us =
+   0` for the A/B, and a lower budget (100) to hear it plainly.
 8. **The picture on each TV.** The console's settings (Wii Settings, Screen), a run to the menu
    and into a level each time, and the first lines of the log: `video: ...` must name the mode the
    table in "The picture on each TV" gives.

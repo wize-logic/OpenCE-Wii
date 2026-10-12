@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from harness import build, function, mutated, read, run  # noqa: E402
+from harness import build, function, mutated, read, read_wiilibs, run, wiilibs  # noqa: E402
 
 FILES = "port/linux/src/xbox_files.c"
 SEQUENCES = ["profile", "savegame", "patch", "head", "append", "create", "replace", "grow", "made"]
@@ -20,17 +20,20 @@ OTHER_CASES = ["profile:not-shadowed", "profile:two-writers", "profile:create-ne
                "profile:find-skips-copies", "profile:regen-first", "profile:regen-again", "profile:regen-changed",
                "profile:regen-other-deleted"]
 
-# a fault in the saves, and a case that must catch it (its exit status is not 0; a hang is killed by the case's alarm)
+pytestmark = pytest.mark.skipif(wiilibs() is None, reason="WiiLibs not found (WIILIBS, ./WiiLibs or ../WiiLibs)")
+
+# a fault in the saves (the faults marked "wiilibs" are in WiiLibs' wl/platform/file_replace.c, which the saves take
+# their replacing and sweeping from), and a case that must catch it (its exit status is not 0; a hang is killed by the case's alarm)
 NEGATIVE_CONTROLS = {
     "written-in-place": (("	return length && !strncmp(path, root, length) && path[length] == '/';",
                           "	return 0 && length && !strncmp(path, root, length) && path[length] == '/';"), "profile:cut"),
     "not-synced": (("		if (fsync(file->descriptor) != 0)\n			error = errno ? errno : EIO;",
                     "		if (0)\n			error = errno ? errno : EIO;"), "profile:cut"),
-    "unlink-first": (("	if (rename(path, old_path) != 0)\n		return errno ? errno : EIO;",
-                      "	if (unlink(path) != 0)\n		return errno ? errno : EIO;"), "profile:cut-fat"),
+    "unlink-first": (("    if (rename(path, old_path) != 0) {\n        return errno != 0 ? errno : EIO;",
+                      "    if (unlink(path) != 0) {\n        return errno != 0 ? errno : EIO;"), "profile:cut-fat", "wiilibs"),
     "failed-write-kept": (("	if (file->damaged)\n	{\n		error = -1;", "	if (0)\n	{\n		error = -1;"), "profile:full"),
-    "no-sweep": (("guard < 1000 && shadow_sweep_directory(root, 0)", "guard < 0 && shadow_sweep_directory(root, 0)"),
-                 "profile:cut-fat"),
+    "no-sweep": (("changes < 1000u && recover_directory(", "changes < 0u && recover_directory("),
+                 "profile:cut-fat", "wiilibs"),
     "zero-write-repeats": (("		if (result == 0)\n		{\n			/* port: a card with no room",
                             "		if (0)\n		{\n			/* port: a card with no room"), "profile:no-room"),
     "whole-write-copied-short": (("resize || offset != 0 || count < file->original_size", "resize || offset != 0"),
@@ -54,7 +57,11 @@ NEGATIVE_CONTROLS = {
 }
 
 
-def generated(fault=None):
+def generated(fault=None, library=False):
+    replacing = read_wiilibs("wl/platform/file_replace.c")
+    if fault and library:
+        replacing = mutated(replacing, *fault)
+        fault = None
     text = read(FILES)
     kernel = read("port/linux/src/xbox_kernel.c")
     win32 = read("port/include/xdk/xdk_win32.h")
@@ -84,7 +91,7 @@ def generated(fault=None):
         assert match, name
         constants += f"#define {name} {match.group(1)}\n"
     mapping = mapping.replace("DWORD platform_set_last_error_from_errno", "static DWORD platform_set_last_error_from_errno", 1)
-    return (("under_test.inc", code), ("constants.inc", constants), ("errors.inc", mapping),
+    return (("under_test.inc", code), ("file_replace.inc", replacing), ("constants.inc", constants), ("errors.inc", mapping),
             ("posix.h", read("port/linux/src/posix.h")), ("posix_files.inc", read("port/linux/src/posix_files.c")))
 
 
@@ -96,6 +103,6 @@ def test_case(case):
 
 @pytest.mark.parametrize("control", NEGATIVE_CONTROLS)
 def test_negative_control(control):
-    fault, case = NEGATIVE_CONTROLS[control]
-    status, output = run(build("atomic_saves", generated(fault)), case)
+    fault, case, *library = NEGATIVE_CONTROLS[control]
+    status, output = run(build("atomic_saves", generated(fault, bool(library))), case)
     assert status != 0, f"the saves with a fault ({control}) passed '{case}': the test cannot see it"
