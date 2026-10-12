@@ -254,6 +254,12 @@ static const struct config_setting config_settings[] =
 		"What the sound is played for: \"console\" (the Wii's sound setting: mono\n"
 		"plays both channels the same; stereo and surround play stereo),\n"
 		"\"stereo\" or \"mono\"." },
+	{ "audio.mix_budget_us", _config_integer, "320", "HALO_MIX_BUDGET_US", _environment_value, _platform_wii,
+		"The time the Wii may take to mix a block of sound (6.5 ms of it), in\n"
+		"microseconds: 320 is 5% of the processor. When the mixes run over it the\n"
+		"quietest sounds in the world are dropped from the mix, fading out, until\n"
+		"they fit; music, speech and the interface's sounds never are. 0: no\n"
+		"limit (every sound mixed, however many)." },
 	{ "audio.voice_chat", _config_string, "\"push_to_talk\"", "HALO_VOICE_CHAT", _environment_value, _platform_all,
 		"Talking in network games' voice chat: \"push_to_talk\" (while\n"
 		"controls.push_to_talk is held; the microphone opens the first time),\n"
