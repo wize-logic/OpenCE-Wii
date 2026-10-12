@@ -835,9 +835,44 @@ static void xf_flush_after(void)
 	xf_flush_due = TRUE;
 }
 
+/* GX misreads a vertex whose descriptor holds only its position (indexed)
+and matrix indices: a draw of the device whose vertices carry a matrix
+index sends another attribute with it, a colour no channel reads where it
+needs none (draw_hardware's pad_color, draw_run's EMIT_PAD; a skinned
+model's pass whose stages read no texture coordinate from its vertices and
+whose colours are constant). Checked before each primitive in a build with
+assertions, whether the position is indexed or direct. */
+#ifndef HALO_RELEASE
+static void vertex_shape_check(void)
+{
+	GXVtxDesc descriptor[GX_MAX_VTXDESC_LISTSIZE];
+	unsigned index, others = 0;
+	BOOL position = FALSE, matrices = FALSE;
+
+	GX_GetVtxDescv(descriptor);
+	for (index = 0; index < GX_MAX_VTXDESC_LISTSIZE && descriptor[index].attr != GX_VA_NULL; index++)
+	{
+		if (descriptor[index].type == GX_NONE)
+			continue;
+		if (descriptor[index].attr <= GX_VA_TEX7MTXIDX)
+			matrices = TRUE;
+		else if (descriptor[index].attr == GX_VA_POS)
+			position = TRUE;
+		else
+			others++;
+	}
+	if (position && matrices && !others)
+		platform_log("Direct3D: a vertex of its position and matrix indices alone, which GX misreads");
+	WL_ASSERT(!position || !matrices || others);
+}
+#endif
+
 /* GX_Begin, after the flush if one is due */
 static void gx_begin(u8 primitive, u8 format, u16 count)
 {
+#ifndef HALO_RELEASE
+	vertex_shape_check();
+#endif
 	if (xf_flush_due && xf_flush_on)
 	{
 		unsigned long bytes = (unsigned long)vertex_bytes(format) * XF_FLUSH_VERTICES;
@@ -910,8 +945,10 @@ static BOOL transform_hardware;
 static BOOL emit_matrix_index;
 /* the attributes a processor's draw sends (emit_attributes_set): bit 0 and 1
 the colours, 2 to 5 the texture coordinates, 6 the fog; all of them unless
-a draw says fewer */
+a draw says fewer; EMIT_PAD, where it sends none of them but a matrix index,
+a colour of 0 in their place, which no channel reads (vertex_shape_check) */
 #define EMIT_ALL 0x7F
+#define EMIT_PAD 0x80
 static unsigned emit_attributes = EMIT_ALL;
 
 static void transform_software(void)
@@ -2884,6 +2921,8 @@ static inline void vertex_emit(const struct gx_vertex *vertex)
 	}
 	if (emit_attributes & 1)
 		GX_Color1u32(color_word(vertex->color0));
+	else if (emit_attributes & EMIT_PAD)
+		GX_Color1u32(0);
 	if (emit_attributes & 2)
 		GX_Color1u32(color_word(vertex->color1));
 	for (stage = 0; stage < 4; stage++)
@@ -2903,8 +2942,12 @@ static void emit_attributes_set(void)
 
 	if (wanted == EMIT_ALL)
 		return;
+	/* (never the position and its matrix index alone: the first colour
+	stays, sent as 0) */
+	if (!wanted && emit_matrix_index)
+		wanted = EMIT_PAD;
 	for (index = 0; index < 7; index++)
-		if (!(wanted & (1U << index)))
+		if (!(wanted & (1U << index)) && !(index == 0 && (wanted & EMIT_PAD)))
 			GX_SetVtxDesc(attributes[index], GX_NONE);
 	emit_attributes = wanted;
 	transform_hardware = TRUE;
@@ -4960,7 +5003,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	struct draw_projection projection;
 	/* (position_read: a stage reads a coordinate GX makes from the position,
 	which a vertex the processor transforms does not give it) */
-	BOOL fogged = FALSE, cpu_colors = FALSE, position_read = FALSE, keyed, lit_on;
+	BOOL fogged = FALSE, cpu_colors = FALSE, position_read = FALSE, keyed, lit_on, pad_color = FALSE;
 	const unsigned char *position_stream;
 	UINT position_stride;
 	unsigned long long key;
@@ -5316,7 +5359,15 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	}
 	else
 	{
-		/* the colours: constant */
+		/* the colours: constant (and where the vertex would otherwise be its
+		position and matrix indices alone, which GX misreads, a colour of 0
+		that neither channel reads goes with it: vertex_shape_check) */
+		pad_color = keyed && !texture_count && !cpu_spheres && !lit_on;
+		if (pad_color)
+		{
+			GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+			vertex_format(HARDWARE_VERTEX_FORMAT, GX_VA_CLR0, GX_CLR_RGB, GX_RGB565, 0);
+		}
 		GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_REG, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
 		GX_SetChanCtrl(GX_COLOR1A1, GX_DISABLE, GX_SRC_REG, GX_SRC_REG, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
 		GX_SetChanMatColor(GX_COLOR0A0, (GXColor){ color_byte(base.d0[0]), color_byte(base.d0[1]),
@@ -5479,6 +5530,8 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 			GX_Color1u32(color_word(computed->color0));
 			GX_Color1u32(color_word(computed->color1));
 		}
+		else if (pad_color)
+			GX_Color1u16(0);
 		for (component = 0; component < texture_count; component++)
 			GX_TexCoord1x16(index);
 		for (stage = 0; stage < 4; stage++)

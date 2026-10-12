@@ -692,6 +692,12 @@ and pixel shaders.
   ms) runs out, at the frame's draws or its display copy, the log says where GX stood: its status
   flags, the GP FIFO's read and write pointers and fill, the CPU FIFO's write pointer, the last
   token passed and the flushes sent (`GX did not finish in time`).
+- **No vertex of a position and matrix indices alone.** GX misreads a vertex whose descriptor
+  holds only its indexed position and matrix indices, which a skinned model's pass whose stages
+  read no texture coordinate from its vertices and whose colours are constant would be. Such a
+  draw sends a colour of 0 (RGB565, two bytes) that neither channel reads; the processor's draws
+  of a matrix index and nothing else read send their first colour as 0. A build with assertions
+  checks every primitive's descriptor (`vertex_shape_check`).
 - **Debugging.** The desktop ports' `debug.gpu_debug_flat` and `debug.gpu_debug_texture0` (in
   `config.toml`) show the diffuse colour, or the first texture, alone. One frame's draws are
   described in the log (`DRAW_LOG_FRAME`).
