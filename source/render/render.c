@@ -238,6 +238,11 @@ static void render_nonplayer_frame(
 	return;
 }
 
+/* port: a frame of the Wii's loading screen alone, through a level's load
+(progress_bar.c's progress_bar_port_pump): no widgets, whose tags the load
+is replacing */
+boolean render_port_loading_frame= FALSE;
+
 void render_frame_pregame(
 	struct render_window const *window,
 	struct bitmap_data *bitmap)
@@ -262,10 +267,13 @@ void render_frame_pregame(
 	rasterizer_parameters.rasterizer_target = 0;
 	rasterizer_window_begin(&rasterizer_parameters);
 
-	halo_screen_ui_offset(TRUE);
-	render_ui_widgets(0, &window->rasterizer_camera.viewport_bounds);
-	halo_screen_ui_offset(FALSE);
-	bink_playback_render();
+	if (!render_port_loading_frame)
+	{
+		halo_screen_ui_offset(TRUE);
+		render_ui_widgets(0, &window->rasterizer_camera.viewport_bounds);
+		halo_screen_ui_offset(FALSE);
+		bink_playback_render();
+	}
 
 	{
 		real progress;

@@ -362,6 +362,7 @@ symbols in this file:
 #include "bitmaps/bitmap_group.h"
 #include "bitmaps/bitmaps.h"
 #include "bitmaps/tiff_file.h"
+#include "interface/progress_bar.h" /* port: the Wii's loading screen */
 #include "interface/hud.h"
 #include "interface/hud_definitions.h"
 #include "interface/attract_mode.h"
@@ -1473,6 +1474,10 @@ static void main_new_map(
 	{
 		error(_error_immediate, "game_load() failed.");
 	}
+#ifdef HALO_WII
+	/* port: the loading screen's end, the game made (progress_bar.c) */
+	progress_bar_port_load_end();
+#endif
 
 	if (!errors_handle())
 	{
@@ -1939,7 +1944,14 @@ void main_pregame_render(
 	static struct render_window window;
 
 	collision_log_continue_period(TRUE);
-	sound_render();
+	/* port: not in a frame of the Wii's loading screen alone, drawn while
+	the load starts the sound again (progress_bar.c) */
+	{
+		extern boolean render_port_loading_frame;
+
+		if (!render_port_loading_frame)
+			sound_render();
+	}
 	{
 		real_point3d position = { 0.0f, 0.0f, 0.0f };
 		real_vector3d forward = { 0.0f, 0.0f, 1.0f };

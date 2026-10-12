@@ -185,6 +185,9 @@ symbols in this file:
 #include "cache/cache_files.h"
 #include "cache/cache_files_decompress_windows.h"
 #include "cache/texture_cache.h"
+#ifdef HALO_WII
+#include "interface/progress_bar.h" /* port: the loading screen */
+#endif
 #include "interface/ui_widget.h"
 #include "tag_files/files.h"
 #include "tag_files/tag_files.h"
@@ -802,6 +805,9 @@ void cache_file_block_until_not_busy(
 	do
 	{
 		SleepEx(0, TRUE);
+#ifdef HALO_WII
+		progress_bar_port_pump(); /* port: the loading screen (progress_bar.c) */
+#endif
 		busy = FALSE;
 		for (request_index = 0;
 			request_index < MAXIMUM_SIMULTANEOUS_CACHE_REQUESTS;
@@ -1586,6 +1592,9 @@ static boolean cached_map_block_on_async_request(
 {
 	boolean completed;
 
+#ifdef HALO_WII
+	progress_bar_port_pump(); /* port: the loading screen (progress_bar.c) */
+#endif
 	while (!*completion_flag)
 	{
 		if (SleepEx(5000, TRUE) != WAIT_IO_COMPLETION)
