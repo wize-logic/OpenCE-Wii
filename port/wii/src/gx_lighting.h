@@ -168,14 +168,18 @@ normal, the eye taken to be along the frame's z (for every vertex of the
 draws that look it up: the approximation).
 
 The frame of a view (rows: world directions to it) whose z is the direction
-toward (in E) to the eye, its angles about E's y and x rounded to step
-radians (0: as they are), E's x and y turned with it; turn (if not NULL) is the
-turn of E to the frame (rows). */
+toward (in E) to the eye: with a step, its elevation and azimuth in the world
+rounded to step radians and its x level, the same however the camera turns;
+with none (0), as it is, E's x and y turned with it. turn (if not NULL) is
+the turn of E to the frame (rows). */
 void gx_lighting_view_frame(const struct gx_lighting_space *space, const float toward[3], float step, float frame[3][3],
 	float turn[3][3]);
 /* what texel (s, t) of the frame's sphere map holds: the world's sphere
-map's coordinates */
+map's coordinates. In two steps, the first the same for every frame: the
+unit sphere's point at (s, t), then what the frame's sphere map holds there */
 void gx_lighting_sphere_texel(const float frame[3][3], float reflection_scale, float s, float t, float out[2]);
+void gx_lighting_sphere_point(float s, float t, float point[3]);
+void gx_lighting_sphere_point_texel(const float frame[3][3], float reflection_scale, const float point[3], float out[2]);
 /* the world's sphere map's coordinates of a direction (d3d8_gx.c's
 sphere_coordinates) */
 void gx_lighting_sphere_coordinates(const float direction[3], float out[2]);

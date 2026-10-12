@@ -120,7 +120,7 @@ static float dot3(const float *a, const float *b)
 
 static float length3(const float *a)
 {
-	return sqrtf(dot3(a, a));
+	return nv2a_sqrtf(dot3(a, a));
 }
 
 /* E's rows applied to a world direction (no translation) */
@@ -159,7 +159,7 @@ BOOL gx_lighting_space_make(const float (*c)[4], struct gx_lighting_space *space
 	sigma2 = dot3(v[2], v[2]);
 	if (!(sigma2 > 1.0e-20f))
 		return FALSE;
-	space->sigma = sqrtf(sigma2);
+	space->sigma = nv2a_sqrtf(sigma2);
 	/* (Gram-Schmidt from the last row up: K's columns) */
 	space->k12 = dot3(v[1], v[2]) / sigma2;
 	for (column = 0; column < 3; column++)
@@ -360,7 +360,7 @@ static BOOL point_light(struct gx_lighting *lighting, const float (*c)[4], const
 		a[2] = -1.0f / (d * d);
 	}
 	/* the fall-off, in E (whose lengths are sigma times the world's) */
-	radius = space->sigma / sqrtf(c[position_constant][3]);
+	radius = space->sigma / nv2a_sqrtf(c[position_constant][3]);
 	for (component = 0; component < 3; component++)
 		offset_e[component] = center[component] - position[component];
 	distance = length3(offset_e);
@@ -459,7 +459,7 @@ void gx_lighting_evaluate(const struct gx_lighting *lighting, const float positi
 			for (component = 0; component < 3; component++)
 				to[component] = light->position[component] - position[component];
 			distance2 = dot3(to, to);
-			distance = sqrtf(distance2);
+			distance = nv2a_sqrtf(distance2);
 			for (component = 0; component < 3; component++)
 				to[component] /= distance;
 			/* (the hardware's direction is GX_InitLightDir's negated) */
@@ -681,21 +681,59 @@ void gx_lighting_view_frame(const struct gx_lighting_space *space, const float t
 	float z[3], x[3], y[3], length, k;
 	int row, column;
 
-	length = sqrtf(dot3(toward, toward));
+	length = nv2a_sqrtf(dot3(toward, toward));
+	if (step > 0.0f && length > 1.0e-12f)
+	{
+		/* (rounded in the world: its elevation and azimuth to the nearest
+		step, its x level, so that the frame is the same whichever way the
+		camera turns, and a view's sphere map is drawn again only when the
+		draw's direction from the eye crosses a step) */
+		float world[3], elevation, azimuth, across;
+
+		for (column = 0; column < 3; column++)
+			world[column] = (space->world_to_eye[0][column] * toward[0] + space->world_to_eye[1][column] * toward[1] +
+				space->world_to_eye[2][column] * toward[2]) / (space->sigma * length);
+		elevation = asinf(world[2] < -1.0f ? -1.0f : world[2] > 1.0f ? 1.0f : world[2]);
+		azimuth = atan2f(world[1], world[0]);
+		elevation = step * floorf(elevation / step + 0.5f);
+		azimuth = step * floorf(azimuth / step + 0.5f);
+		across = cosf(elevation);
+		z[0] = across * cosf(azimuth);
+		z[1] = across * sinf(azimuth);
+		z[2] = sinf(elevation);
+		if (across > 1.0e-3f)
+		{
+			x[0] = -sinf(azimuth);
+			x[1] = cosf(azimuth);
+			x[2] = 0.0f;
+		}
+		else
+		{
+			x[0] = 1.0f;
+			x[1] = x[2] = 0.0f;
+		}
+		/* (y = z x x) */
+		y[0] = z[1] * x[2] - z[2] * x[1];
+		y[1] = z[2] * x[0] - z[0] * x[2];
+		y[2] = z[0] * x[1] - z[1] * x[0];
+		for (column = 0; column < 3; column++)
+		{
+			frame[0][column] = x[column];
+			frame[1][column] = y[column];
+			frame[2][column] = z[column];
+		}
+		if (turn)
+			for (row = 0; row < 3; row++)
+				for (column = 0; column < 3; column++)
+					turn[row][column] = (frame[row][0] * space->world_to_eye[column][0] +
+						frame[row][1] * space->world_to_eye[column][1] + frame[row][2] * space->world_to_eye[column][2]) /
+						space->sigma;
+		return;
+	}
 	if (!(length > 1.0e-12f) || !(toward[2] > 0.0f))
 	{
 		z[0] = z[1] = 0.0f;
 		z[2] = 1.0f;
-	}
-	else if (step > 0.0f)
-	{
-		/* (its angles about E's y and x, to the nearest step) */
-		z[0] = tanf(step * floorf(atan2f(toward[0], toward[2]) / step + 0.5f));
-		z[1] = tanf(step * floorf(atan2f(toward[1], toward[2]) / step + 0.5f));
-		z[2] = 1.0f;
-		length = sqrtf(dot3(z, z));
-		for (row = 0; row < 3; row++)
-			z[row] /= length;
 	}
 	else
 		for (row = 0; row < 3; row++)
@@ -726,10 +764,9 @@ void gx_lighting_view_frame(const struct gx_lighting_space *space, const float t
 	}
 }
 
-void gx_lighting_sphere_texel(const float frame[3][3], float reflection_scale, float s, float t, float out[2])
+void gx_lighting_sphere_point(float s, float t, float point[3])
 {
-	float x = 2.0f * s - 1.0f, y = 2.0f * t - 1.0f, z, r2 = x * x + y * y, reflection[3], world[3];
-	int row, column;
+	float x = 2.0f * s - 1.0f, y = 2.0f * t - 1.0f, z, r2 = x * x + y * y;
 
 	if (r2 >= 1.0f)
 	{
@@ -741,6 +778,24 @@ void gx_lighting_sphere_texel(const float frame[3][3], float reflection_scale, f
 	}
 	else
 		z = (1.0f - r2) * reciprocal_root(1.0f - r2);
+	point[0] = x;
+	point[1] = y;
+	point[2] = z;
+}
+
+void gx_lighting_sphere_texel(const float frame[3][3], float reflection_scale, float s, float t, float out[2])
+{
+	float point[3];
+
+	gx_lighting_sphere_point(s, t, point);
+	gx_lighting_sphere_point_texel(frame, reflection_scale, point, out);
+}
+
+void gx_lighting_sphere_point_texel(const float frame[3][3], float reflection_scale, const float point[3], float out[2])
+{
+	float x = point[0], y = point[1], z = point[2], reflection[3], world[3];
+	int row, column;
+
 	/* (the eye along the frame's z) */
 	reflection[0] = reflection_scale * z * x;
 	reflection[1] = reflection_scale * z * y;

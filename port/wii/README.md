@@ -74,8 +74,10 @@ image (with WiiLibs checked out into `./WiiLibs`) and keeps it as an artifact.
   runner now acts only on its own (its `--name` user folder).
 - The game's log (`src/d3d8_gx.c`, not the runner) reports how long a frame takes in emulated time
   every 60 frames, split into draws, textures, pixel shaders, the end of the frame and the game,
-  with the draws' split (GX's transform, the processor's, immediate), the processor's
-  vertices (fetch, program, store, emit), the end of the frame's (GX finishing the frame's
+  with the draws' split (GX's transform, the processor's, immediate), GX's transform's setup by
+  part (what the draw depends on, the matrices, the lights and sphere maps, the kept outputs,
+  GX's state; in tenths of a millisecond, with the draws in hardware a frame), the processor's
+  vertices (fetch, program, store, emit), the streams' flushes (made and kept), the end of the frame's (GX finishing the frame's
   draws; the copy to the display and the wait for its retrace) and the textures' counts (found
   by their mark or looked up, made, hashed, decoded, flushed, TMEM emptied). A frame of more than
   half a second (loading, mostly) gets a split of its own.
@@ -499,6 +501,17 @@ and pixel shaders.
     a value without one) are the CPU's: their position is sent in the same draw, through the
     identity (`GX_PNMTX0`) and the same projection, and every pass of the model makes the same
     choice, as it depends on the vertices alone.
+  - A model's fog from its nodes (the lit programs with the atmospheric fog, `cfc6f3a4`) is a
+    function of the world position, which each node's position matrix maps the vertex to by an
+    affine map the camera makes invertible: so it is one affine function of that matrix's
+    result for every node, and for the blended vertices the CPU positions through `GX_PNMTX0`.
+    Texture coordinate 4 is made of the position through the vertex's own position matrix (its
+    matrix index) and a post-transform matrix (`GX_DTTMTX1`), solved from the first node's
+    matrix and fog row and checked against the program at a vertex of every other node
+    (`fog_post_matrix`, `fog_post_check`); where it does not hold, the draw is the CPU's. Such
+    draws were all the CPU's: b30's opening drew 6,400 of them, 3.7 million vertices, in 60
+    frames. The bench's fogged characters (below) give each vertex's fog coordinate within
+    0.00001 of the CPU's path.
   - In the model parts of eleven maps (the campaign and Blood Gulch), GX now computes the position
     of 89 to 96% of the vertices, where it computed 49 to 80% (a draw of more than nine values was
     all the CPU's): b30 60% to 93%, c10 49% to 91%. 2 to 14% of them blend two nodes.
@@ -511,6 +524,35 @@ and pixel shaders.
   - In a10, 4.0 of 6.5 million vertices a minute go to GX. The CPU runs 1.6 million programs where
     it ran 7.9 million, and a frame takes about 160 ms in Dolphin (it took 200 to 450).
     `debug.gpu_transform = false` keeps every program on the CPU.
+  - What is the same from draw to draw is kept, not found again (a draw's cost is mostly its
+    setup):
+    - an indexed draw's index range, and a model part's node keys, by a hash of its indices (two
+      32-bit lanes, about two instructions an index) and a copy of its vertices' node indices and
+      weights, in 256 index records (`draw_range_find`, `node_keys_find`);
+    - the constants a program reads, hashed a row at a time from hashes kept as the rows are set
+      (`constant_rows_changed`: the exclusive or of the rows read, or of all 192 for a program
+      that indexes them), where every word of every row read was hashed after any constant was
+      set;
+    - the streams GX reads, flushed from the CPU's cache once under their buffer's serial (the
+      header's `Lock`, cleared by `D3DVertexBuffer_Lock`), not at every pass: a serial's first
+      frame is flushed at every draw, so a buffer the game locks each frame always is
+      (`stream_flush`);
+    - whether a draw's indices name only kept outputs already computed (its index record notes
+      the entry), so the scan is skipped;
+    - the pixel engine's state (blend, updates, depth, alpha test, culling), written only where it
+      changes (`states_shadow`), and only the texture coordinates and colour channels the
+      stages read generated.
+    - `tools/wii_draw_bench.py` measures it without a Wii: `port/wii/tests/draw_bench.c` includes
+      `src/d3d8_gx.c`, compiled as the Wii build compiles it, over a stand-in of libogc's GX
+      (`tests/host/gx_stand_in.c`), draws synthetic scenes the game's way (a structure's
+      sections, rigid, skinned, unlit and fogged characters) and runs under `qemu-ppc`: `count`
+      gives the instructions a draw by function, `record` a digest of what GX would draw
+      (`--save`, `--compare`, `--device` another copy of the device's sources). Later frames'
+      draws, `wii-port` at a5581ec6 then now: the structure's 164,076 instructions then 43,304,
+      the rigid models' 92,971 then 25,154, the skinned characters' 225,373 then 171,176, the
+      fogged ones' 292,638 then 174,271. With `BENCH_PROBE` it lists the GX state an immediate
+      draw finds after each draw, with `BENCH_TRACE` each vertex's fog coordinate as GX makes it,
+      and `BENCH_CPU` puts every program on the CPU.
   - An indexed draw on the CPU runs each vertex's program once, however many indices name it.
   - A draw on the CPU plans its vertex elements once: only the registers its program reads, each
     type with its own case, bytes and packed normals converted by table. Each vertex then computes
@@ -605,8 +647,12 @@ and pixel shaders.
       Its sphere map of the view is drawn from the world's in the 48 rows of the EFB below the
       back buffer, 48 texels square, a 24 by 24 grid each of whose points is the world's
       sphere map at the reflection a normal there makes of the eye straight along the frame,
-      then copied out, for each cube map and rounded direction, and kept while the view turns
-      less than about a tenth of a degree. The node matrices take texture matrix rows 39 (texture
+      then copied out, for each cube map and rounded direction. The direction's elevation and
+      azimuth are rounded in the world, the frame's x level, so the map is the same however the
+      camera turns and is drawn again only when a draw's direction from the eye crosses a step
+      (rounded in the eye's space, a moving camera drew every map again each frame: b30, riding
+      the Pelican, 25 a frame). 32 are kept, in the contiguous window, the one drawn longest ago
+      replaced. The node matrices take texture matrix rows 39 (texture
       coordinate 3's own) and 45 to 58, eight of them, so a draw of more nodes (with its blended
       vertices' matrix) has its reflection's coordinates from the processor. Row 60 is
       `GX_IDENTITY`, which every draw in screen space reads its texture coordinates through: the
@@ -714,6 +760,12 @@ and pixel shaders.
       linear per vertex.
     - The Fresnel term's normal (DOT_RFLCT_DIFF's lookup) is the flat one, per vertex, in
       colour 1. The combiners are then translated as the flat cube map's, exactly (14 stages).
+    - A reflection whose bump GX cannot follow (the water's: DOTPRODUCT in stages 1 and 2, its
+      bump map the ripples the game draws each frame, not a palette of normals; or any with
+      `display.bumped_highlights` off) reads the cube map's sphere map at the flat normal's
+      reflection, its coordinates computed per vertex as above (`gx_psh_textures.reflected`).
+      Without it the water's reflection pass added nothing, and b30's far sea, where nothing
+      lies under the water, was black.
   - (1 - x)p + xq is TEV's lerp, one stage.
   - Constants read as 0 or 1 need no register. Those needed in every channel take the four konst
     registers first, and any beyond four are set in TEV registers kept for them.
@@ -757,7 +809,17 @@ and pixel shaders.
   too, whose texel is the direction a bump map's dot product takes.
 - **Depth.** A program's position matrix and its depth's a + b/w come from its constants alone,
   from two points along w's gradient. Both vertex paths take them, so a surface's passes meet
-  their equal-depth tests whichever path each pass took.
+  their equal-depth tests whichever path each pass took. A draw whose vertices are all at one w
+  takes the last fit's depth: any draw's whose depth was fitted, on either path.
+  - The z bias (`D3DRS_ZBIAS`, a polygon offset of -bias depth units and -bias/4 times the
+    depth's slope on the Xbox) has no GX form: a biased draw's depth is pulled toward the eye by
+    bias / 16384 of its distance (b of a + b/w). The decals (bias 8, `LESSEQUAL` over their
+    wall) were not drawn with GX's transform on: the wall's depth is GX's and the decal's the
+    CPU's, a few units apart (a10's screens beside the cryo bay's red doors).
+- **Registers no stream gives.** A stream draw's program reading a register no stream gives
+  reads what `D3DDevice_SetVertexData` last set, as NV2A keeps it (`draw_unstreamed`): the
+  detail objects' (grass) cells set their place in register 2 and their reference vector in 3,
+  then draw their quads from the one buffer. The matrices' keys include those values.
 - **Frame buffer.** The EFB has an alpha channel (RGBA6_Z24), because the game blends by
   destination alpha.
 - **GX kept from hanging.** GX's transform unit can hang on a clipped primitive that follows an

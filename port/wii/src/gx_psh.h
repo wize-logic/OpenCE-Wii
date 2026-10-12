@@ -62,7 +62,7 @@ enum
 	coordinates 1 and 2 the bump's two terms, 3 the sphere map's coordinates
 	of the reflection of the flat normal, and colour 1 that normal, (n + 1) / 2
 	(all from texture coordinates 1 to 3: the tangent frame's rows, the eye in
-	their w) */
+	their w); a flat one's (gx_psh_textures.reflected) the same */
 	_gx_psh_vertices_bumped_reflection,
 	/* a specular light from a lightmap: colour 0 (1 - e.l) / 2 in red, green
 	and blue, of the directions of texture coordinates 2 and 3 (the eye's and
@@ -103,6 +103,11 @@ struct gx_psh_textures
 	/* the stages read as colour 1, which the device makes what the stage's
 	lookup would give of the flat normal (DOT_RFLCT_DIFF's normal) */
 	unsigned vertex_color;
+	/* the stages whose lookup (a DOT_RFLCT_SPEC whose bump GX cannot
+	follow: the water's, of a bump map drawn each frame) is the cube map's
+	sphere map at the flat normal's reflection, its coordinates the device's
+	(texture coordinate 3, as a bumped reflection's): read as any texture */
+	unsigned reflected;
 	/* fog (D3DRS_FOGENABLE, its ramp bound) and its colour */
 	unsigned char fog;
 	DWORD fog_color;
