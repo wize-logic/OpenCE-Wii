@@ -16,9 +16,9 @@ one motor on and off by a duty cycle (xinput_wii_map.c), keeps the console's
 rumble setting, and stops it when the game stops asking, a menu is up, the
 controller goes, or the game quits.
 
-The HOME button (wii_home.c, wii_home_game.c) is looked for where the
-controllers are read: while its menu is up the game is given no controller and
-no rumble. A script's changes to the Remotes (test_input.c: remote, extension,
+The HOME button (WiiLibs' home_shell.h, joined to the game by
+wii_home_game.c) is looked for where the controllers are read: while its menu
+is up the game is given no controller and no rumble. A script's changes to the Remotes (test_input.c: remote, extension,
 battery, home) are made to the raw input there, as the console's would be.
 
 The Wii Remote's pointer aims (halo_linux_mouse_look): the view turns while
@@ -39,7 +39,7 @@ where it is held (input.pointer_steadiness), which takes the hand's tremor out.
 
 #include "port_config.h"
 #include "test_input.h"
-#include "wii_home.h"
+#include "wii_home_config.h"
 #include "wii_home_game.h"
 #include "xinput_wii_map.h"
 
