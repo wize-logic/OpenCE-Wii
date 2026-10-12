@@ -24,7 +24,9 @@ battery, home) are made to the raw input there, as the console's would be.
 The Wii Remote's pointer aims (halo_linux_mouse_look): the view turns while
 it points outside a box at the screen's centre, faster nearer the edge, at the
 rates of the player's look sensitivity. It keeps turning for a moment when the
-sensor bar is lost.
+sensor bar is lost. The pointer is the mean of the Remote's reports of the
+frame (WiiLibs reads them all), and it holds still within a small radius of
+where it is held (input.pointer_steadiness), which takes the hand's tremor out.
 */
 
 #include "platform.h"
@@ -116,6 +118,20 @@ static void script_remotes(WlRawInput *raw)
 	}
 }
 
+/* input.pointer_steadiness, read again when the settings change */
+static float pointer_steadiness(void)
+{
+	static unsigned long read_at = (unsigned long)-1;
+	static float radius = WII_POINTER_STEADINESS_DEFAULT;
+
+	if (read_at != config_changes())
+	{
+		read_at = config_changes();
+		radius = wii_pointer_steadiness(config_real("input.pointer_steadiness"));
+	}
+	return radius;
+}
+
 /* the controllers once a frame at most (every port reads them each tick) */
 static const WlRawInput *input_read(void)
 {
@@ -142,7 +158,8 @@ static const WlRawInput *input_read(void)
 			if (input.remotes[port].extension == WL_EXT_CLASSIC)
 				memset(&pointers[port], 0, sizeof(pointers[port]));
 			else
-				wl_pointer_update(&pointers[port], &input.remotes[port], now, WII_POINTER_HOLD_US);
+				wl_pointer_update_steady(&pointers[port], &input.remotes[port], now, WII_POINTER_HOLD_US,
+					pointer_steadiness());
 		}
 		remotes_connected = remote_bits;
 		pads_connected = pad_bits;

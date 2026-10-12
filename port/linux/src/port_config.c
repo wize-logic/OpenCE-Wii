@@ -294,6 +294,12 @@ static const struct config_setting config_settings[] =
 		"slowed and dragged along by a target. The last of the mouse and the\n"
 		"right stick to move decides. The bullets' autoaim (bent toward the\n"
 		"target) stays either way." },
+	{ "input.pointer_steadiness", _config_real, "0.03", "HALO_POINTER_STEADINESS", _environment_value, _platform_wii,
+		"The Wii Remote's pointer holds still while it moves less than this from\n"
+		"where it is held, which takes a hand's tremor out of the aim; a larger\n"
+		"move takes it to where it points at once. The distance is a share of\n"
+		"half the screen: 0 for none (every report moves it), 0.03 the default\n"
+		"(about 10 pixels of the 640 across), 0.25 the most." },
 	{ "input.mouse_vertical_sensitivity", _config_real, "0.0", "HALO_MOUSE_VERTICAL_SENSITIVITY", _environment_value,
 		_platform_desktop,
 		"How far the view turns up and down for the mouse's movement; 0 for the\n"
