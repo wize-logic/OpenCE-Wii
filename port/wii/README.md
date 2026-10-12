@@ -925,5 +925,5 @@ Dolphin runs the game, but these need the console:
    - not big-endian: a shadow's bounding radius left unset in the mirror's window, which the
      object shadow pass then read (a NaN halted c40).
 4. Real hardware, from the Homebrew Channel (`ninja wii-package`).
-5. CI. The workflow's `wii` job checks out WiiLibs' `main` branch, which holds everything the
+5. CI. The workflow's `wii` job checks out WiiLibs' `Xbox` branch, which holds everything the
    port takes from it (the TEV programs, the threads, the codec, the present).

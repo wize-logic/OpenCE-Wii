@@ -237,7 +237,7 @@ converted, how it draws, and the lockstep check.
 - The x86 Linux build for the lockstep check is built and run headless in
   the CI's `archlinux` image with Docker (Snap's Docker sees only folders
   under the home folder; hand the files back with `chown` when done).
-- Commit on `wii-port` only (WiiLibs: `main`);
+- Commit on `wii-port` only (WiiLibs: `Xbox`);
   push only when asked. Commits carry no AI attribution: no
   `Co-Authored-By`, session link or "generated with" line.
 
@@ -377,11 +377,11 @@ Owns the lockstep check (`debug.fixed_ticks`, `debug.lockstep_log`,
 ### wiilibs-steward
 
 Owns the give-and-take with WiiLibs (`/home/bcolb/GitHub/WiiLibs`, branch
-`main`): what the port works out that any Wii
+`Xbox`): what the port works out that any Wii
 program could use goes into WiiLibs, with its tests, and the port then
 takes it from there.
 - Works in its own git worktree of WiiLibs, on a branch named for its task,
-  off `main`; follows WiiLibs' own conventions
+  off `Xbox`; follows WiiLibs' own conventions
   and runs its tests (host `ctest`, the big-endian `ppc-be` build under
   qemu, and the Wii compile check; `ctest -L dolphin` only through a
   checkpoint run of the main session).
