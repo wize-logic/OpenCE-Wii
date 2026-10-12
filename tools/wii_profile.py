@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""The Wii port's sampling profiler (port/wii/src/wii_profile.c, WiiLibs' wl/platform/profile.h).
+"""The Wii port's sampling profiler (port/wii/src/wii_profile.c, WiiLibs' wl/platform/profile.h
+and profile_arm.h, which reads profile.txt).
 
     tools/wii_profile.py setup --note b30 --seconds 20        # writes build/wii/sd/apps/halo/profile.txt
     tools/wii_dolphin.py --seconds 900 --until "[profile] done" > build/wii/profile.log   # a checkpoint run

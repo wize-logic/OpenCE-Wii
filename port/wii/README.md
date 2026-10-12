@@ -747,7 +747,11 @@ interrupt's view of the processor 500 times a second: where it was, and who call
 
 It is off unless the game's folder holds `profile.txt` (`sd:/apps/halo/profile.txt`, or the USB
 drive's). It is a file and not a setting of `port_config.c`, so that a normal run knows nothing of
-it. `src/wii_profile.c` reads it at start-up and starts a watcher thread:
+it. The file's reading, the watcher thread, the ring and the dump are WiiLibs'
+(`wl/platform/profile_arm.h`, whose README section has the details); `src/wii_profile.c` reads it
+at start-up and gives the watcher what is Halo's, the three hooks that say when to sample. The
+file is lines of `name value` (`#` starts a comment; a name WiiLibs does not know is logged as a
+warning):
 
 ```
 # sd:/apps/halo/profile.txt: "name value" lines; these are the defaults
@@ -761,11 +765,13 @@ log 1          # also write the samples to the log (Dolphin's OSREPORT)
 note b30       # words for the header of the dump
 ```
 
-The watcher waits for a level (the game clock running, no map loading, the clock past `after`
-seconds, `skip` maps already loaded), samples for `seconds` or until the next map starts to load,
-then writes `profile<N>.txt` beside `profile.txt` and, with `log`, the same lines to the log. The
-ring is malloc'd (700 KB for the defaults), memory the game then does not have. `tools/wii_profile.py`
-writes the file and runs the tables:
+The watcher asks the game's hooks every tenth of a second. `ready`: a level is playing (the game
+clock running, no map loading, the clock past `after` seconds, `skip` maps already loaded; a map is
+told by its load, or by its clock starting over). `stop` and `advanced`: the next map has started
+to load, which ends the profile early and, in a tour, lets the next profile wait for its level.
+The profile lasts `seconds`, then `profile<N>.txt` is written beside `profile.txt` and, with
+`log`, the same lines go to the log. The ring is malloc'd (700 KB for the defaults), memory the
+game then does not have. `tools/wii_profile.py` writes the file and runs the tables:
 
 ```sh
 tools/wii_profile.py setup --note b30 --repeat 2        # build/wii/sd/apps/halo/profile.txt; prints the config.toml lines

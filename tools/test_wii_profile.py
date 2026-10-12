@@ -1,6 +1,7 @@
-"""tools/wii_profile.py: the profile.txt it writes (and the game's reading of it, which has the
+"""tools/wii_profile.py: the profile.txt it writes (and WiiLibs' reading of it, which has the
 same names), and the command it runs for a report."""
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -24,10 +25,14 @@ class SetupTests(unittest.TestCase):
             wii_profile.main(["setup", "--sd", sd, "--remove"])
             self.assertFalse((Path(sd) / "apps" / "halo" / "profile.txt").exists())
 
-    def test_every_key_is_one_the_game_reads(self):
-        source = (Path(__file__).resolve().parent.parent / "port" / "wii" / "src" / "wii_profile.c").read_text()
+    def test_every_key_is_one_wiilibs_parser_reads(self):
+        wiilibs = Path(os.environ.get("WIILIBS", Path(__file__).resolve().parent.parent.parent / "WiiLibs"))
+        parser = wiilibs / "wl" / "platform" / "profile_arm.c"
+        if not parser.is_file():
+            self.skipTest(f"no {parser}: WiiLibs' profiler arming is not there (WIILIBS)")
+        source = parser.read_text()
         for key in (*wii_profile.KEYS, "log", "note"):
-            self.assertIn(f'!strcmp(name, "{key}")', source)
+            self.assertIn(f'"{key}"', source)
 
 
 class ReportTests(unittest.TestCase):
