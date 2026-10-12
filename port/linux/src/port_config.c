@@ -656,6 +656,9 @@ static const struct config_setting config_settings[] =
 	{ "debug.gpu_transform", _config_boolean, "true", "HALO_GPU_TRANSFORM", _environment_value, _platform_all,
 		"The Wii: draws whose vertex programs GX's own transform can compute go to it;\n"
 		"false runs every program on the processor." },
+	{ "debug.input_log", _config_boolean, "false", "HALO_INPUT_LOG", _environment_set_is_true, _platform_all,
+		"The Wii: each controller's gamepad state (buttons, triggers and sticks) is logged\n"
+		"whenever it changes, to check the mapping." },
 	{ "debug.screenshot_directory", _config_string, "\"\"", "HALO_SCREENSHOT_DIR", _environment_value, _platform_all,
 		"A folder to save frames to (with screenshot_every); empty none." },
 	{ "debug.screenshot_every", _config_integer, "0", "HALO_SCREENSHOT_EVERY", _environment_value, _platform_all,

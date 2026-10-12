@@ -5,39 +5,34 @@ The Xbox controllers (XInput) on the Wii's, in place of
 port/linux/src/xinput_sdl.c, through WiiLibs' raw input
 (wl_platform_input_poll). Port N is the Nth Wii Remote, with its Classic
 Controller or Nunchuk, or the Nth GameCube controller when no Remote is
-connected there. The Xbox's controls are Halo's defaults: A jump, B melee, X
-action and reload, Y switch weapons, the left trigger a grenade, the right
-fire, Black switch grenades, White the flashlight, a click of the left stick
-crouch and of the right zoom.
+connected there. The buttons are mapped in xinput_wii_map.c (and listed in
+port/wii/README.md, "The controllers"); this file is the XAPI around them,
+the pointer's aim and the desktop's controls a Wii has none of.
 
-- Classic Controller: its buttons where the Xbox controller's are (b is A, a
-  B, y X, x Y), its triggers and sticks the same; ZL Black, ZR White; the
-  D-pad, and down and up are also the stick clicks; - Back, + Start.
-- GameCube controller: A, B, X, Y, the triggers and sticks the same; Z
-  Black, Start; the D-pad, down and up also the stick clicks, left Back and
-  right White.
-- Wii Remote and Nunchuk: the Nunchuk's stick moves; B fires, Z throws a
-  grenade, A jumps, C crouches, 1 melees, 2 zooms; the D-pad up switches
-  weapons, down is the action and reload, left Black, right White; - Back,
-  + Start. The pointer aims (halo_linux_mouse_look): the view turns while it
-  points outside a box at the screen's centre, faster nearer the edge.
+The Wii Remote's pointer aims (halo_linux_mouse_look): the view turns while
+it points outside a box at the screen's centre, faster nearer the edge, at the
+rates of the player's look sensitivity. It keeps turning for a moment when the
+sensor bar is lost.
 */
 
 #include "platform.h"
 
-#include <math.h>
 #include <string.h>
 
+#include "wl/platform/input_shape.h"
 #include "wl/platform/platform.h"
 
+#include "port_config.h"
 #include "test_input.h"
+#include "xinput_wii_map.h"
 
 #define PORT_COUNT 4
-/* the pointer's box in which the view does not turn (a fraction of the
-screen's half width and height), and the fastest turn, at the edge */
-#define POINTER_DEAD_ZONE 0.35f
-#define POINTER_TURN_RADIANS_PER_SECOND 3.0f
-#define TRIGGER_THRESHOLD 0x30
+
+/* (player_control.c: degrees per second, the profile's look sensitivity) */
+extern float player_look_yaw_rate[];
+extern float player_look_pitch_rate[];
+/* (ui_widget.c) whether any menu is up */
+extern unsigned char ui_widgets_active(void);
 
 XPP_DEVICE_TYPE XDEVICE_TYPE_GAMEPAD_TABLE;
 XPP_DEVICE_TYPE XDEVICE_TYPE_MEMORY_UNIT_TABLE;
@@ -55,6 +50,7 @@ static DWORD reported_gamepads;
 static WlRawInput input;
 static uint64_t input_polled_us;
 static uint64_t look_us[PORT_COUNT];
+static WlPointer pointers[PORT_COUNT];
 
 /* the controllers once a frame at most (every port reads them each tick) */
 static const WlRawInput *input_read(void)
@@ -63,10 +59,34 @@ static const WlRawInput *input_read(void)
 
 	if (!input_polled_us || now - input_polled_us > 4000)
 	{
+		int port;
+
 		wl_platform_input_poll(&input);
 		input_polled_us = now;
+		for (port = 0; port < PORT_COUNT; port++)
+		{
+			/* (the Classic Controller has the sticks to look with, not the pointer) */
+			if (input.remotes[port].extension == WL_EXT_CLASSIC)
+				memset(&pointers[port], 0, sizeof(pointers[port]));
+			else
+				wl_pointer_update(&pointers[port], &input.remotes[port], now, WII_POINTER_HOLD_US);
+		}
 	}
 	return &input;
+}
+
+/* debug.input_log: the gamepad state written to the log when it changes */
+static BOOL input_logging(void)
+{
+	static unsigned long read_at = (unsigned long)-1;
+	static BOOL on;
+
+	if (read_at != config_changes())
+	{
+		read_at = config_changes();
+		on = config_boolean("debug.input_log") ? TRUE : FALSE;
+	}
+	return on;
 }
 
 /* (the scripted player of the automated tests is controller 1:
@@ -74,100 +94,6 @@ port/linux/src/test_input.c) */
 static BOOL port_connected(const WlRawInput *raw, int port)
 {
 	return raw->remotes[port].connected || raw->pads[port].connected || (port == 0 && test_input_active());
-}
-
-static short stick(int8_t value)
-{
-	long scaled = (long)value * 32767 / 127;
-
-	return (short)(scaled < -32768 ? -32768 : scaled > 32767 ? 32767 : scaled);
-}
-
-static void button(XINPUT_GAMEPAD *pad, BOOL held, int analog)
-{
-	if (held)
-		pad->bAnalogButtons[analog] = 0xFF;
-}
-
-static void digital(XINPUT_GAMEPAD *pad, BOOL held, WORD flag)
-{
-	if (held)
-		pad->wButtons |= flag;
-}
-
-static void classic_state(const WlRawRemote *remote, XINPUT_GAMEPAD *pad)
-{
-	uint32_t held = remote->buttons;
-
-	button(pad, held & WL_CC_B, XINPUT_GAMEPAD_A);
-	button(pad, held & WL_CC_A, XINPUT_GAMEPAD_B);
-	button(pad, held & WL_CC_Y, XINPUT_GAMEPAD_X);
-	button(pad, held & WL_CC_X, XINPUT_GAMEPAD_Y);
-	button(pad, held & WL_CC_ZL, XINPUT_GAMEPAD_BLACK);
-	button(pad, held & WL_CC_ZR, XINPUT_GAMEPAD_WHITE);
-	pad->bAnalogButtons[XINPUT_GAMEPAD_LEFT_TRIGGER] = (held & WL_CC_L) ? 0xFF : remote->trigger[0];
-	pad->bAnalogButtons[XINPUT_GAMEPAD_RIGHT_TRIGGER] = (held & WL_CC_R) ? 0xFF : remote->trigger[1];
-	digital(pad, held & WL_CC_UP, XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_RIGHT_THUMB);
-	digital(pad, held & WL_CC_DOWN, XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_LEFT_THUMB);
-	digital(pad, held & WL_CC_LEFT, XINPUT_GAMEPAD_DPAD_LEFT);
-	digital(pad, held & WL_CC_RIGHT, XINPUT_GAMEPAD_DPAD_RIGHT);
-	digital(pad, held & WL_CC_PLUS, XINPUT_GAMEPAD_START);
-	digital(pad, held & WL_CC_MINUS, XINPUT_GAMEPAD_BACK);
-	pad->sThumbLX = stick(remote->stick[0][0]);
-	pad->sThumbLY = stick(remote->stick[0][1]);
-	pad->sThumbRX = stick(remote->stick[1][0]);
-	pad->sThumbRY = stick(remote->stick[1][1]);
-}
-
-static void nunchuk_state(const WlRawRemote *remote, XINPUT_GAMEPAD *pad)
-{
-	uint32_t held = remote->buttons;
-
-	button(pad, held & WL_WM_A, XINPUT_GAMEPAD_A);
-	button(pad, held & WL_WM_1, XINPUT_GAMEPAD_B);
-	button(pad, held & WL_WM_DOWN, XINPUT_GAMEPAD_X);
-	button(pad, held & WL_WM_UP, XINPUT_GAMEPAD_Y);
-	button(pad, held & WL_WM_LEFT, XINPUT_GAMEPAD_BLACK);
-	button(pad, held & WL_WM_RIGHT, XINPUT_GAMEPAD_WHITE);
-	button(pad, held & WL_NC_Z, XINPUT_GAMEPAD_LEFT_TRIGGER);
-	button(pad, held & WL_WM_B, XINPUT_GAMEPAD_RIGHT_TRIGGER);
-	digital(pad, held & WL_NC_C, XINPUT_GAMEPAD_LEFT_THUMB);
-	digital(pad, held & WL_WM_2, XINPUT_GAMEPAD_RIGHT_THUMB);
-	digital(pad, held & WL_WM_PLUS, XINPUT_GAMEPAD_START);
-	digital(pad, held & WL_WM_MINUS, XINPUT_GAMEPAD_BACK);
-	/* (the menus are driven with the D-pad as well as the stick) */
-	digital(pad, held & WL_WM_UP, XINPUT_GAMEPAD_DPAD_UP);
-	digital(pad, held & WL_WM_DOWN, XINPUT_GAMEPAD_DPAD_DOWN);
-	digital(pad, held & WL_WM_LEFT, XINPUT_GAMEPAD_DPAD_LEFT);
-	digital(pad, held & WL_WM_RIGHT, XINPUT_GAMEPAD_DPAD_RIGHT);
-	if (remote->extension == WL_EXT_NUNCHUK)
-	{
-		pad->sThumbLX = stick(remote->stick[0][0]);
-		pad->sThumbLY = stick(remote->stick[0][1]);
-	}
-}
-
-static void gamecube_state(const WlRawPad *gamecube, XINPUT_GAMEPAD *pad)
-{
-	uint16_t held = gamecube->buttons;
-
-	button(pad, held & WL_PAD_A, XINPUT_GAMEPAD_A);
-	button(pad, held & WL_PAD_B, XINPUT_GAMEPAD_B);
-	button(pad, held & WL_PAD_X, XINPUT_GAMEPAD_X);
-	button(pad, held & WL_PAD_Y, XINPUT_GAMEPAD_Y);
-	button(pad, held & WL_PAD_Z, XINPUT_GAMEPAD_BLACK);
-	button(pad, held & WL_PAD_RIGHT, XINPUT_GAMEPAD_WHITE);
-	pad->bAnalogButtons[XINPUT_GAMEPAD_LEFT_TRIGGER] = (held & WL_PAD_L) ? 0xFF : gamecube->trigger[0];
-	pad->bAnalogButtons[XINPUT_GAMEPAD_RIGHT_TRIGGER] = (held & WL_PAD_R) ? 0xFF : gamecube->trigger[1];
-	digital(pad, held & WL_PAD_UP, XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_RIGHT_THUMB);
-	digital(pad, held & WL_PAD_DOWN, XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_LEFT_THUMB);
-	digital(pad, held & WL_PAD_LEFT, XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_BACK);
-	digital(pad, held & WL_PAD_RIGHT, XINPUT_GAMEPAD_DPAD_RIGHT);
-	digital(pad, held & WL_PAD_START, XINPUT_GAMEPAD_START);
-	pad->sThumbLX = stick(gamecube->stick[0][0]);
-	pad->sThumbLY = stick(gamecube->stick[0][1]);
-	pad->sThumbRX = stick(gamecube->stick[1][0]);
-	pad->sThumbRY = stick(gamecube->stick[1][1]);
 }
 
 /* ---------- XAPI */
@@ -248,13 +174,13 @@ DWORD WINAPI XInputGetState(HANDLE device, PXINPUT_STATE state)
 	if (raw->remotes[port].connected)
 	{
 		if (raw->remotes[port].extension == WL_EXT_CLASSIC)
-			classic_state(&raw->remotes[port], &state->Gamepad);
+			wii_map_classic(&raw->remotes[port], &state->Gamepad, ui_widgets_active());
 		else
-			nunchuk_state(&raw->remotes[port], &state->Gamepad);
+			wii_map_remote(&raw->remotes[port], &state->Gamepad, ui_widgets_active());
 	}
 	else if (raw->pads[port].connected)
 	{
-		gamecube_state(&raw->pads[port], &state->Gamepad);
+		wii_map_gamecube(&raw->pads[port], &state->Gamepad, ui_widgets_active());
 	}
 	else if (!(port == 0 && test_input_active()))
 	{
@@ -266,6 +192,16 @@ DWORD WINAPI XInputGetState(HANDLE device, PXINPUT_STATE state)
 	{
 		controllers[port].packet_number++;
 		controllers[port].previous = state->Gamepad;
+		if (input_logging())
+		{
+			const XINPUT_GAMEPAD *pad = &state->Gamepad;
+
+			platform_log("input %d: buttons %04x analog %02x %02x %02x %02x %02x %02x %02x %02x left %d %d right %d %d%s",
+				port, pad->wButtons, pad->bAnalogButtons[0], pad->bAnalogButtons[1], pad->bAnalogButtons[2],
+				pad->bAnalogButtons[3], pad->bAnalogButtons[4], pad->bAnalogButtons[5], pad->bAnalogButtons[6],
+				pad->bAnalogButtons[7], pad->sThumbLX, pad->sThumbLY, pad->sThumbRX, pad->sThumbRY,
+				ui_widgets_active() ? " (menu)" : "");
+		}
 	}
 	state->dwPacketNumber = controllers[port].packet_number;
 	return ERROR_SUCCESS;
@@ -308,37 +244,31 @@ DWORD WINAPI XInputDebugGetKeystroke(PXINPUT_DEBUG_KEYSTROKE keystroke)
 
 static BOOL pointer_aiming(short gamepad_index, float *x, float *y)
 {
-	const WlRawRemote *remote;
-
 	if (gamepad_index < 0 || gamepad_index >= PORT_COUNT)
 		return FALSE;
-	remote = &input_read()->remotes[gamepad_index];
-	if (!remote->connected || remote->extension == WL_EXT_CLASSIC || !remote->ir_valid)
+	input_read();
+	if (!pointers[gamepad_index].tracking)
 		return FALSE;
-	/* -1 to 1 across the 640 by 480 screen */
-	*x = (remote->ir_x - 320) / 320.0f;
-	*y = (remote->ir_y - 240) / 240.0f;
+	*x = pointers[gamepad_index].x;
+	*y = pointers[gamepad_index].y;
 	return TRUE;
 }
 
-/* no aim magnetism while the pointer aims, as for the mouse */
+/* no aim magnetism while the pointer turns the view, as for the mouse; it
+holds still in the box, where the magnetism helps to stay on a target */
 int halo_linux_mouse_aiming(short gamepad_index)
 {
 	float x, y;
 
-	return pointer_aiming(gamepad_index, &x, &y);
+	return pointer_aiming(gamepad_index, &x, &y) &&
+		(wl_pointer_turn(x, WII_POINTER_DEAD_ZONE) != 0.0f || wl_pointer_turn(y, WII_POINTER_DEAD_ZONE) != 0.0f);
 }
 
-static float turn(float offset)
+/* the fastest turn, at the edge: the player's look rate (degrees per second
+in player_control.c), until the game has set it */
+static float look_rate(const float *rates, short gamepad_index, float fallback)
 {
-	float magnitude = fabsf(offset);
-
-	if (magnitude <= POINTER_DEAD_ZONE)
-		return 0.0f;
-	if (magnitude > 1.0f)
-		magnitude = 1.0f;
-	magnitude = (magnitude - POINTER_DEAD_ZONE) / (1.0f - POINTER_DEAD_ZONE);
-	return (offset < 0.0f ? -1.0f : 1.0f) * magnitude * magnitude * POINTER_TURN_RADIANS_PER_SECOND;
+	return rates[gamepad_index] > 0.0f ? rates[gamepad_index] * (3.14159265f / 180.0f) : fallback;
 }
 
 int halo_linux_mouse_look(short gamepad_index, float *yaw, float *pitch)
@@ -358,9 +288,10 @@ int halo_linux_mouse_look(short gamepad_index, float *yaw, float *pitch)
 	if (seconds > 0.1f)
 		seconds = 0.1f;
 	look_us[gamepad_index] = now;
-	/* right turns the view right (yaw down), up looks up */
-	*yaw = -turn(x) * seconds;
-	*pitch = -turn(y) * seconds;
+	wii_map_pointer_look(x, y, seconds,
+		look_rate(player_look_yaw_rate, gamepad_index, WII_POINTER_DEFAULT_YAW_RADIANS_PER_SECOND),
+		look_rate(player_look_pitch_rate, gamepad_index, WII_POINTER_DEFAULT_PITCH_RADIANS_PER_SECOND),
+		yaw, pitch);
 	return TRUE;
 }
 
