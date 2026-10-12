@@ -226,6 +226,9 @@ converted, how it draws, and the lockstep check.
   from it rather than keeping its own copy. Before writing platform code,
   look in WiiLibs first; after writing it, ask whether it belongs there.
 
+- **30 frames a second on every level, as the Xbox ran it, is a requirement**
+  (see "Choosing the work"): speed work leads, and every change is weighed
+  against a level's 33 ms.
 - `HALO_WII` marks the Wii's code in shared files. The Wii keeps the Xbox's
   capacities (`halo_port_capacity.h`), so it does not join the other
   builds' network games.
@@ -480,7 +483,11 @@ serves that, and work that brings it nearer comes first. In order:
      session (the memory report's peaks);
    - sound: music, dialogue and effects heard (the audio report);
    - **the frame rate: 30 frames a second (33 ms a frame) on every level**,
-     the Xbox's own rate. The frame's time split (`a frame takes`) for each
+     the Xbox's own rate. This is a requirement of the port, not a goal to
+     approach: the game was made to run at 30, and a port that runs slower
+     is not the game. No effect is on by default on the Wii if it breaks a
+     level's 33 ms (it stays a setting, off, until it fits); Dolphin's
+     milliseconds are a proxy, the console's the measure. The frame's time split (`a frame takes`) for each
      level shows where it goes; cut the largest part first, and count the
      cut as the log's work (the processor's vertices, stages, textures
      uploaded, the game's own update) as well as the milliseconds, which
