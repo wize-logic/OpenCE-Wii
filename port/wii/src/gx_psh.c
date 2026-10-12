@@ -3512,6 +3512,417 @@ static BOOL specular_lightmap_recipe(const DWORD *state, const struct gx_psh_tex
 	return TRUE;
 }
 
+/* ---------- the models' program
+
+The models' pixel shader (rasterizer_xbox_models.c's
+set_environment_shader_pixel_shader) is eight combiners over four
+textures: the base map t0, the detail map t1, the multipurpose map t2 and
+the reflection's cube map t3. Its first stage picks the multipurpose map's
+red and green by dot products with c0 and c1 (always 0x00FF0000 and
+0x0000FF00), and from there it keeps more values alive than TEV has
+registers: the general translation (combiner_portion) gives up on it with
+the cube map bound ("no free register"), and the models were drawn as their
+base map times the diffuse colour, the detail map, self-illumination,
+change colour, reflection and fog left out, and every vertex's sphere map
+coordinates computed for a reflection nothing read.
+
+Here the program is recognized and made by hand, exactly: the dot products
+are the multipurpose map read through swap tables, the change colour and
+the reflection's mask (with v1's alpha) come of one read of it, and the
+values are scheduled into PREV, REG0 and REG1 with REG2 holding the
+atmospheric fog's colour (c1 of stage 5), a fifth constant past the four
+konst colours:
+
+- REG0: R = lerp(1, c0_2, t2.b) (the change colour), its alpha t2.r v1.a
+  (the reflection's mask); then t3 v1, the reflection;
+- REG1: V = v0 + t2.g c0_1 (self-illumination), then V R;
+- PREV's alpha: the detail mask m (a channel of the multipurpose map, or 1),
+  its colour the detail lerp(h, t1, m) (h 1/2 or 1, the detail function's);
+- then, by double_diffuse_intensity, the detail function f of t0 and the
+  detail, times V R, plus the reflection times its mask; or the base map
+  times V R plus the reflection, then f of that and the detail; in PREV;
+- the final combiner: (1 - a) r0 F.a + a F + clamp(A - a E), a D0's alpha
+  (the planar fog's: rasterized, or a ramp's: gx_psh_textures.d0_alpha_map),
+  F the fog's colour, E the fog's error colour (c0 of stage 5); or, with the
+  true atmospheric fog, the fog register's lerp; alpha t0's.
+
+Each constant is a konst colour (or REG2's preload) as the game sets it, so
+the cache (gx_psh_cache.c) finds the program generic and rewrites only those
+for new constants. */
+
+enum
+{
+	_model_function_biased_multiply,
+	_model_function_multiply,
+	_model_function_biased_add,
+	NUMBER_OF_MODEL_FUNCTIONS
+};
+
+struct model_variant
+{
+	BOOL double_diffuse, true_fog;
+	int function;
+	/* the detail mask: 1 (no texture read), or a channel (WL_TEV_SWAP_*) of
+	the multipurpose map, inverted or not */
+	BOOL mask_one, mask_invert;
+	unsigned char mask_channel;
+	/* the detail function's h: 1, else 1/2 */
+	BOOL half_one;
+};
+
+/* the detail functions' combiner inputs over x (t0, or r0 when doubled) */
+static int model_function_of(DWORD inputs, unsigned long x)
+{
+	if (inputs == (x << 24 | 0x09UL << 16 | x << 8 | 0x09UL))
+		return _model_function_biased_multiply;
+	if (inputs == (x << 24 | 0x09UL << 16))
+		return _model_function_multiply;
+	if (inputs == (x << 24 | 0x20UL << 16 | 0x49UL << 8 | 0x20UL))
+		return _model_function_biased_add;
+	return -1;
+}
+
+static BOOL model_match(const DWORD *state, const struct gx_psh_textures *textures, struct model_variant *variant)
+{
+	static const unsigned long words[][5] =
+	{
+		/* (combiner stage, rgb inputs, rgb outputs, alpha inputs and outputs:
+		the stages every variant has) */
+		{ 0, 0x0A020A01, 0x000030CD, 0x0A200000, 0x000000C0 },
+		{ 1, 0x04200C01, 0x00000400, 0x1C200000, 0x00000090 },
+		{ 2, 0x3C201C01, 0x00000C00, 0x0C200D15, 0x000000CD },
+		{ 3, 0, 0x00000900, 0, 0 },
+		{ 4, 0x0B05040C, 0x000000B4, 0, 0 },
+		{ 5, 0x022014E1, 0x00000D00, 0, 0 },
+		{ 6, 0, 0, 0, 0 },
+		{ 7, 0, 0, 0, 0 },
+	};
+	DWORD detail = state[D3DRS_PSRGBINPUTS0 + 3];
+	unsigned long mask_byte = (detail >> 8) & 0xFF, h_byte = (detail >> 16) & 0xFF;
+	unsigned index;
+
+	if (state[D3DRS_PSCOMBINERCOUNT] != 0x00011008 || state[D3DRS_PSCONSTANT0_0] != 0x00FF0000UL ||
+		state[D3DRS_PSCONSTANT1_0] != 0x0000FF00UL)
+		return FALSE;
+	/* (no texture of a kind this does not read as a texture: a bumped or
+	device-made lookup, an alpha-only multipurpose or base map; one not
+	sampled reads as 0, as it does in the general translation) */
+	if (textures->bumped || textures->vertex_color || textures->reflected ||
+		textures->contents[0] == _gx_psh_texture_alpha || textures->contents[2] == _gx_psh_texture_alpha)
+		return FALSE;
+	for (index = 0; index < sizeof(words) / sizeof(words[0]); index++)
+	{
+		unsigned stage = (unsigned)words[index][0];
+
+		if ((words[index][1] && state[D3DRS_PSRGBINPUTS0 + stage] != words[index][1]) ||
+			(words[index][2] && state[D3DRS_PSRGBOUTPUTS0 + stage] != words[index][2]) ||
+			state[D3DRS_PSALPHAINPUTS0 + stage] != words[index][3] || state[D3DRS_PSALPHAOUTPUTS0 + stage] != words[index][4])
+			return FALSE;
+	}
+	/* the detail: (mask ^ invert, h, mask, t1) */
+	if (h_byte == 0xA0)
+		variant->half_one = FALSE;
+	else if (h_byte == 0x20)
+		variant->half_one = TRUE;
+	else
+		return FALSE;
+	if ((detail & 0xFF) != 0x09 || (detail >> 24) != (mask_byte ^ 0x20))
+		return FALSE;
+	variant->mask_one = mask_byte == 0x20;
+	variant->mask_invert = (mask_byte & 0x20) != 0;
+	variant->mask_channel = WL_TEV_SWAP_R;
+	if (!variant->mask_one)
+	{
+		/* (r1's colour: t2's red; r0's alpha: t2's green, as stage 2 left
+		it; t1's alpha: t2's blue, as stage 1 left it; t2's alpha) */
+		switch (mask_byte & 0x1F)
+		{
+		case 0x0D: variant->mask_channel = WL_TEV_SWAP_R; break;
+		case 0x1C: variant->mask_channel = WL_TEV_SWAP_G; break;
+		case 0x19: variant->mask_channel = WL_TEV_SWAP_B; break;
+		case 0x1A: variant->mask_channel = WL_TEV_SWAP_A; break;
+		default: return FALSE;
+		}
+	}
+	/* stages 6 and 7: the detail function of t0, then the lighting; or the
+	lighting, then the detail function of r0 */
+	if (state[D3DRS_PSRGBINPUTS0 + 7] == 0x08040B1D && state[D3DRS_PSRGBOUTPUTS0 + 7] == 0x00000C00 &&
+		state[D3DRS_PSRGBOUTPUTS0 + 6] == 0x00000800)
+	{
+		variant->double_diffuse = FALSE;
+		variant->function = model_function_of(state[D3DRS_PSRGBINPUTS0 + 6], 0x08);
+	}
+	else if (state[D3DRS_PSRGBINPUTS0 + 6] == 0x08040B1D && state[D3DRS_PSRGBOUTPUTS0 + 6] == 0x00000C00 &&
+		state[D3DRS_PSRGBOUTPUTS0 + 7] == 0x00000C00)
+	{
+		variant->double_diffuse = TRUE;
+		variant->function = model_function_of(state[D3DRS_PSRGBINPUTS0 + 7], 0x0C);
+	}
+	else
+		return FALSE;
+	if (variant->function < 0)
+		return FALSE;
+	if (state[D3DRS_PSFINALCOMBINERINPUTSABCD] == 0x340F010D && state[D3DRS_PSFINALCOMBINERINPUTSEFG] == 0x0C111800)
+		variant->true_fog = FALSE;
+	else if (state[D3DRS_PSFINALCOMBINERINPUTSABCD] == 0x330C0300 &&
+		state[D3DRS_PSFINALCOMBINERINPUTSEFG] == 0x00001800)
+		variant->true_fog = TRUE;
+	else
+		return FALSE;
+	return TRUE;
+}
+
+/* a recipe's stage reading texture map `map` at texture coordinate
+`texcoord` (no texture where map is WL_TEV_NONE), through swap table
+`swap`, and colour `channel` (WL_TEV_NONE: none) */
+static WlTevStage *model_stage(WlTevProgram *tev, uint8_t texcoord, uint8_t map, unsigned char swap, uint8_t channel)
+{
+	WlTevStage *stage = recipe_stage(tev, -1, 0, FALSE);
+
+	if (map != WL_TEV_NONE)
+	{
+		stage->texcoord = texcoord;
+		stage->texmap = map;
+		stage->tex_swap = swap;
+	}
+	if (channel != WL_TEV_NONE)
+		stage->channel = channel;
+	return stage;
+}
+
+/* a texture stage's colour as the recipe reads it: its texel's, 1 for an
+alpha-only texture, 0 where it is not sampled */
+static uint8_t model_texc(const struct gx_psh_textures *textures, const uint8_t *maps, int stage)
+{
+	if (maps[stage] == WL_TEV_NONE)
+		return WL_TEV_CC_ZERO;
+	return textures->contents[stage] == _gx_psh_texture_alpha ? WL_TEV_CC_ONE : WL_TEV_CC_TEXC;
+}
+
+/* the swap tables the recipe reads the multipurpose map through */
+enum { _model_swap_rgba, _model_swap_bbbr, _model_swap_gggg, _model_swap_rgbb };
+
+static BOOL model_recipe(const DWORD *state, const struct gx_psh_textures *textures, struct gx_psh_program *program)
+{
+	WlTevProgram *tev = &program->tev;
+	struct model_variant variant;
+	WlTevStage *stage;
+	/* each texture stage's map (WL_TEV_NONE: not sampled, read as 0) */
+	uint8_t maps[4];
+	uint8_t c1_slot, c2_slot, f_slot, e_slot;
+	/* D0's alpha: the rasterized colour's, or a ramp's (its map at texture
+	coordinate 5) */
+	uint8_t a_map = textures->d0_alpha_map ? textures->d0_alpha_map : WL_TEV_NONE;
+	uint8_t a_input = a_map != WL_TEV_NONE ? WL_TEV_CC_TEXA : WL_TEV_CC_RASA;
+	uint8_t a_channel = a_map != WL_TEV_NONE ? WL_TEV_NONE : WL_TEV_CH_COLOR0A0;
+	/* where r0 is made (non-doubled: PREV; doubled: REG1, then PREV) */
+	int index;
+
+	if (!model_match(state, textures, &variant))
+		return FALSE;
+	recipe_overflowed = FALSE;
+	memset(program, 0, sizeof(*program));
+	wl_tev_program_init(tev);
+	for (index = 0; index < 4; index++)
+		maps[index] = (textures->present & (1U << index)) ? (uint8_t)index : WL_TEV_NONE;
+	wl_tev_set_swap(tev, _model_swap_bbbr, WL_TEV_SWAP_B, WL_TEV_SWAP_B, WL_TEV_SWAP_B, WL_TEV_SWAP_R);
+	wl_tev_set_swap(tev, _model_swap_gggg, WL_TEV_SWAP_G, WL_TEV_SWAP_G, WL_TEV_SWAP_G, WL_TEV_SWAP_G);
+	wl_tev_set_swap(tev, _model_swap_rgbb, WL_TEV_SWAP_R, WL_TEV_SWAP_G, WL_TEV_SWAP_B, WL_TEV_SWAP_B);
+	c2_slot = (uint8_t)wl_tev_konst_slot(tev, rgba(state[D3DRS_PSCONSTANT0_0 + 2]));
+	c1_slot = (uint8_t)wl_tev_konst_slot(tev, rgba(state[D3DRS_PSCONSTANT0_0 + 1]));
+	if (variant.true_fog)
+	{
+		f_slot = (uint8_t)wl_tev_konst_slot(tev, rgba(textures->fog_color | 0xFF000000UL));
+		e_slot = f_slot;
+	}
+	else
+	{
+		f_slot = (uint8_t)wl_tev_konst_slot(tev, rgba(state[D3DRS_PSFINALCOMBINERCONSTANT0]));
+		e_slot = (uint8_t)wl_tev_konst_slot(tev, rgba(state[D3DRS_PSCONSTANT0_0 + 5]));
+		/* (the atmospheric fog's colour, A) */
+		wl_tev_preload(tev, WL_TEV_REG2, rgba(state[D3DRS_PSCONSTANT1_0 + 5]));
+	}
+	/* (wl_tev_konst_slot is -1 past four; there are four at most) */
+
+	/* REG0: lerp(1, c0_2, t2.b), its alpha t2.r v1.a */
+	stage = model_stage(tev, 2, maps[2], _model_swap_bbbr, WL_TEV_CH_COLOR1A1);
+	stage->kcsel = wl_tev_kcsel(c2_slot, WL_TEV_K_RGB);
+	recipe_color(stage, WL_TEV_CC_ONE, WL_TEV_CC_KONST, maps[2] != WL_TEV_NONE ? WL_TEV_CC_TEXC : WL_TEV_CC_ZERO,
+		WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO, WL_TEV_SCALE_1, TRUE, WL_TEV_REG0);
+	recipe_alpha(stage, WL_TEV_CA_ZERO, maps[2] != WL_TEV_NONE ? WL_TEV_CA_TEXA : WL_TEV_CA_ZERO, WL_TEV_CA_RASA,
+		WL_TEV_CA_ZERO, WL_TEV_BIAS_ZERO, WL_TEV_SCALE_1, TRUE, WL_TEV_REG0);
+	/* REG1: v0 + t2.g c0_1, then times REG0 */
+	stage = model_stage(tev, 2, maps[2], _model_swap_gggg, WL_TEV_CH_COLOR0A0);
+	stage->kcsel = wl_tev_kcsel(c1_slot, WL_TEV_K_RGB);
+	recipe_color(stage, WL_TEV_CC_ZERO, WL_TEV_CC_KONST, maps[2] != WL_TEV_NONE ? WL_TEV_CC_TEXC : WL_TEV_CC_ZERO,
+		WL_TEV_CC_RASC, WL_TEV_BIAS_ZERO, WL_TEV_SCALE_1, TRUE, WL_TEV_REG1);
+	stage = model_stage(tev, 0, WL_TEV_NONE, 0, WL_TEV_NONE);
+	recipe_color(stage, WL_TEV_CC_ZERO, WL_TEV_CC_C1, WL_TEV_CC_C0, WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO, WL_TEV_SCALE_1,
+		TRUE, WL_TEV_REG1);
+	/* REG0's colour: the reflection, t3 v1 */
+	if (maps[3] != WL_TEV_NONE)
+	{
+		stage = model_stage(tev, 3, maps[3], _model_swap_rgba, WL_TEV_CH_COLOR1A1);
+		recipe_color(stage, WL_TEV_CC_ZERO, model_texc(textures, maps, 3), WL_TEV_CC_RASC, WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO,
+			WL_TEV_SCALE_1, TRUE, WL_TEV_REG0);
+	}
+	/* PREV: the detail mask in its alpha, the detail in its colour */
+	if (!variant.mask_one)
+	{
+		BOOL separate = variant.mask_channel == WL_TEV_SWAP_A && (textures->separate_alpha & 4);
+		BOOL ones = variant.mask_channel == WL_TEV_SWAP_A && textures->contents[2] == _gx_psh_texture_color;
+		uint8_t source = maps[2] == WL_TEV_NONE ? WL_TEV_CA_ZERO : ones ? WL_TEV_CA_KONST : WL_TEV_CA_TEXA;
+		static const unsigned char swaps[4] = { _model_swap_bbbr, _model_swap_gggg, _model_swap_rgbb, _model_swap_rgba };
+
+		stage = model_stage(tev, 2, separate && maps[2] != WL_TEV_NONE ? 6 : maps[2], swaps[variant.mask_channel],
+			WL_TEV_NONE);
+		stage->kasel = WL_TEV_KSEL_1;
+		if (variant.mask_invert)
+			recipe_alpha(stage, WL_TEV_CA_KONST, WL_TEV_CA_ZERO, source, WL_TEV_CA_ZERO, WL_TEV_BIAS_ZERO,
+				WL_TEV_SCALE_1, TRUE, WL_TEV_PREV);
+		else
+			recipe_alpha(stage, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, source, WL_TEV_BIAS_ZERO,
+				WL_TEV_SCALE_1, TRUE, WL_TEV_PREV);
+	}
+	stage = model_stage(tev, 1, maps[1], _model_swap_rgba, WL_TEV_NONE);
+	if (variant.mask_one)
+		recipe_color(stage, WL_TEV_CC_ZERO, WL_TEV_CC_ZERO, WL_TEV_CC_ZERO, model_texc(textures, maps, 1),
+			WL_TEV_BIAS_ZERO, WL_TEV_SCALE_1, TRUE, WL_TEV_PREV);
+	else
+		recipe_color(stage, variant.half_one ? WL_TEV_CC_ONE : WL_TEV_CC_HALF, model_texc(textures, maps, 1),
+			WL_TEV_CC_APREV, WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO, WL_TEV_SCALE_1, TRUE, WL_TEV_PREV);
+	{
+		/* the base map, and the detail function of x and the detail (PREV),
+		into PREV */
+		uint8_t t0 = model_texc(textures, maps, 0);
+		uint8_t x;
+
+		if (variant.double_diffuse)
+		{
+			/* r0 = t0 V R + the reflection, into REG1 */
+			stage = model_stage(tev, 0, maps[0], _model_swap_rgba, WL_TEV_NONE);
+			recipe_color(stage, WL_TEV_CC_ZERO, t0, WL_TEV_CC_C1, WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO, WL_TEV_SCALE_1, TRUE,
+				WL_TEV_REG1);
+			if (maps[3] != WL_TEV_NONE)
+			{
+				stage = model_stage(tev, 0, WL_TEV_NONE, 0, WL_TEV_NONE);
+				recipe_color(stage, WL_TEV_CC_ZERO, WL_TEV_CC_C0, WL_TEV_CC_A0, WL_TEV_CC_C1, WL_TEV_BIAS_ZERO,
+					WL_TEV_SCALE_1, TRUE, WL_TEV_REG1);
+			}
+			stage = model_stage(tev, 0, WL_TEV_NONE, 0, WL_TEV_NONE);
+			x = WL_TEV_CC_C1;
+		}
+		else
+		{
+			stage = model_stage(tev, 0, maps[0], _model_swap_rgba, WL_TEV_NONE);
+			x = t0;
+		}
+		switch (variant.function)
+		{
+		case _model_function_biased_multiply:
+			recipe_color(stage, WL_TEV_CC_ZERO, x, WL_TEV_CC_CPREV, WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO, WL_TEV_SCALE_2,
+				TRUE, WL_TEV_PREV);
+			break;
+		case _model_function_multiply:
+			recipe_color(stage, WL_TEV_CC_ZERO, x, WL_TEV_CC_CPREV, WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO, WL_TEV_SCALE_1,
+				TRUE, WL_TEV_PREV);
+			break;
+		default:
+			/* x + 2 detail - 1, as (detail + x / 2 - 1/2) 2 */
+			recipe_color(stage, WL_TEV_CC_ZERO, x, WL_TEV_CC_HALF, WL_TEV_CC_CPREV, WL_TEV_BIAS_SUBHALF, WL_TEV_SCALE_2,
+				TRUE, WL_TEV_PREV);
+			break;
+		}
+		if (!variant.double_diffuse)
+		{
+			/* times V R, plus the reflection */
+			stage = model_stage(tev, 0, WL_TEV_NONE, 0, WL_TEV_NONE);
+			recipe_color(stage, WL_TEV_CC_ZERO, WL_TEV_CC_CPREV, WL_TEV_CC_C1, WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO,
+				WL_TEV_SCALE_1, TRUE, WL_TEV_PREV);
+			if (maps[3] != WL_TEV_NONE)
+			{
+				stage = model_stage(tev, 0, WL_TEV_NONE, 0, WL_TEV_NONE);
+				recipe_color(stage, WL_TEV_CC_ZERO, WL_TEV_CC_C0, WL_TEV_CC_A0, WL_TEV_CC_CPREV, WL_TEV_BIAS_ZERO,
+					WL_TEV_SCALE_1, TRUE, WL_TEV_PREV);
+			}
+		}
+	}
+	/* the final combiner */
+	if (variant.true_fog)
+	{
+		/* lerp(r0, the fog's colour, the fog's factor: its ramp's, else 1) */
+		if (textures->fog)
+		{
+			stage = model_stage(tev, GX_PSH_FOG_TEXCOORD, GX_PSH_FOG_TEXMAP, _model_swap_rgba, WL_TEV_NONE);
+			stage->kcsel = wl_tev_kcsel(f_slot, WL_TEV_K_RGB);
+			recipe_color(stage, WL_TEV_CC_CPREV, WL_TEV_CC_KONST, WL_TEV_CC_TEXA, WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO,
+				WL_TEV_SCALE_1, TRUE, WL_TEV_PREV);
+		}
+		else
+		{
+			stage = model_stage(tev, 0, WL_TEV_NONE, 0, WL_TEV_NONE);
+			stage->kcsel = wl_tev_kcsel(f_slot, WL_TEV_K_RGB);
+			recipe_color(stage, WL_TEV_CC_ZERO, WL_TEV_CC_ZERO, WL_TEV_CC_ZERO, WL_TEV_CC_KONST, WL_TEV_BIAS_ZERO,
+				WL_TEV_SCALE_1, TRUE, WL_TEV_PREV);
+		}
+	}
+	else
+	{
+		/* (1 - a) r0 F.a + a F, into PREV */
+		stage = model_stage(tev, 0, WL_TEV_NONE, 0, WL_TEV_NONE);
+		stage->kcsel = wl_tev_kcsel(f_slot, WL_TEV_K_A);
+		recipe_color(stage, WL_TEV_CC_ZERO, WL_TEV_CC_KONST, WL_TEV_CC_CPREV, WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO,
+			WL_TEV_SCALE_1, TRUE, WL_TEV_PREV);
+		stage = model_stage(tev, GX_PSH_D0_ALPHA_TEXCOORD, a_map, _model_swap_rgba, a_channel);
+		stage->kcsel = wl_tev_kcsel(f_slot, WL_TEV_K_RGB);
+		recipe_color(stage, WL_TEV_CC_CPREV, WL_TEV_CC_KONST, a_input, WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO,
+			WL_TEV_SCALE_1, TRUE, WL_TEV_PREV);
+		/* clamp(A - a E), into REG0 (A is REG2's) */
+		stage = model_stage(tev, GX_PSH_D0_ALPHA_TEXCOORD, a_map, _model_swap_rgba, a_channel);
+		stage->kcsel = wl_tev_kcsel(e_slot, WL_TEV_K_RGB);
+		recipe_color(stage, WL_TEV_CC_ZERO, WL_TEV_CC_KONST, a_input, WL_TEV_CC_ZERO, WL_TEV_BIAS_ZERO,
+			WL_TEV_SCALE_1, TRUE, WL_TEV_REG0);
+		stage = model_stage(tev, 0, WL_TEV_NONE, 0, WL_TEV_NONE);
+		wl_tev_stage_color(stage, WL_TEV_CC_C0, WL_TEV_CC_ZERO, WL_TEV_CC_ZERO, WL_TEV_CC_C2, WL_TEV_SUB,
+			WL_TEV_BIAS_ZERO, WL_TEV_SCALE_1, true, WL_TEV_REG0);
+		/* plus it */
+		stage = model_stage(tev, 0, WL_TEV_NONE, 0, WL_TEV_NONE);
+		recipe_color(stage, WL_TEV_CC_C0, WL_TEV_CC_ZERO, WL_TEV_CC_ZERO, WL_TEV_CC_CPREV, WL_TEV_BIAS_ZERO,
+			WL_TEV_SCALE_1, TRUE, WL_TEV_PREV);
+	}
+	/* the alpha: t0's (its separate map's, 1 for a map without one, 0 without
+	the map), in the last stage */
+	{
+		uint8_t map = maps[0] == WL_TEV_NONE ? WL_TEV_NONE : (textures->separate_alpha & 1) ? 4 : 0;
+		uint8_t alpha = maps[0] == WL_TEV_NONE ? WL_TEV_CA_ZERO :
+			textures->contents[0] == _gx_psh_texture_color ? WL_TEV_CA_KONST : WL_TEV_CA_TEXA;
+
+		if (stage->texmap != WL_TEV_NONE && map != WL_TEV_NONE && alpha == WL_TEV_CA_TEXA)
+			stage = model_stage(tev, 0, WL_TEV_NONE, 0, WL_TEV_NONE);
+		if (alpha == WL_TEV_CA_TEXA)
+		{
+			stage->texcoord = 0;
+			stage->texmap = map;
+			stage->tex_swap = _model_swap_rgba;
+		}
+		stage->kasel = WL_TEV_KSEL_1;
+		recipe_alpha(stage, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, WL_TEV_CA_ZERO, alpha, WL_TEV_BIAS_ZERO, WL_TEV_SCALE_1, TRUE,
+			WL_TEV_PREV);
+	}
+	program->vertices = _gx_psh_vertices_program;
+	if (recipe_overflowed)
+	{
+		program->reason = "more than 16 stages";
+		return FALSE;
+	}
+	if (!wl_tev_validate(tev, NULL))
+	{
+		program->reason = "an invalid TEV program";
+		return FALSE;
+	}
+	return TRUE;
+}
+
 /* ---------- public code */
 
 /* the swap tables the stages read through (resources_add): as it is, the
@@ -3596,8 +4007,9 @@ BOOL gx_psh_translate(const DWORD *render_state, const struct gx_psh_textures *t
 		{ { FALSE, 2 }, { FALSE, 1 }, { FALSE, -1 }, { TRUE, 0 }, { TRUE, -1 } };
 	unsigned attempt, stage;
 
-	/* (the specular lights' programs, made by hand) */
-	if (gx_psh_specular_recipes && specular_lightmap_recipe(render_state, textures, program))
+	/* (the specular lights' programs and the models', made by hand) */
+	if ((gx_psh_specular_recipes && specular_lightmap_recipe(render_state, textures, program)) ||
+		model_recipe(render_state, textures, program))
 	{
 		program->texcoords = (unsigned char)wl_tev_texcoords_mask(&program->tev);
 		program->channels = (unsigned char)wl_tev_channels_mask(&program->tev);

@@ -2584,7 +2584,13 @@ static void tev_setup(unsigned stages)
 		tev_channels = program->channels;
 	}
 	else
+	{
+		/* (the fallback's texture 0 and colour 0 alone: the draws in hardware
+		compute nothing else, a cube map's sphere map coordinates among it) */
 		tev_fallback(stages);
+		tev_texcoords = (stages & 1) && bound_entries[0] ? 1 : 0;
+		tev_channels = 1;
+	}
 }
 
 /* ---------- vertices

@@ -953,6 +953,143 @@ static int game_programs(void)
 	return failures;
 }
 
+/* the models' program (rasterizer_xbox_models.c's
+set_environment_shader_pixel_shader), made by hand (gx_psh.c's
+model_recipe): every detail mask and function, doubled or not, with the
+atmospheric fog's two finals, with and without the cube map's sphere map,
+D0's alpha rasterized or a ramp's, and the game's constants random but the
+dot products' channel picks. Each must be exact, and agree with NV2A's
+combiners (nv2a_eval: the detail's biased add is signed, 2 t1 - 1 darkening
+where the detail is below 1/2, which the clamped model of the general
+translation does not hold), its alpha t0's. */
+static int model_programs(void)
+{
+	/* (the detail masks' and functions' inputs, as the game builds them) */
+	static const unsigned masks[9] = { 0x20, 0x2D, 0x0D, 0x3C, 0x1C, 0x39, 0x19, 0x3A, 0x1A };
+	static const unsigned halves[3] = { 0xA0, 0x20, 0xA0 };
+	static const DWORD functions[2][3] = {
+		{ 0x08090809, 0x08090000, 0x08204920 },
+		{ 0x0C090C09, 0x0C090000, 0x0C204920 } };
+	int failures = 0, checked = 0, most_stages = 0, eval_worst_bytes = 0;
+	float worst = 0;
+
+	for (unsigned mask = 0; mask < 9; mask++)
+	for (unsigned function = 0; function < 3; function++)
+	for (unsigned doubled = 0; doubled < 2; doubled++)
+	for (unsigned true_fog = 0; true_fog < 2; true_fog++)
+	for (unsigned cube = 0; cube < 2; cube++)
+	for (unsigned ramp = 0; ramp < 2; ramp++)
+	{
+		static const DWORD ri[8] = { 0x0A020A01, 0x04200C01, 0x3C201C01, 0, 0x0B05040C, 0x022014E1, 0, 0 };
+		static const DWORD ro[8] = { 0x000030CD, 0x00000400, 0x00000C00, 0x00000900, 0x000000B4, 0x00000D00, 0, 0 };
+		static const DWORD ai[8] = { 0x0A200000, 0x1C200000, 0x0C200D15 };
+		static const DWORD ao[8] = { 0x000000C0, 0x00000090, 0x000000CD };
+		DWORD state[200];
+		struct gx_psh_textures textures;
+		struct gx_psh_program program;
+		char name[96];
+		float program_worst = 0;
+
+		memset(state, 0, sizeof(state));
+		state[D3DRS_PSCOMBINERCOUNT] = 0x00011008;
+		for (unsigned stage = 0; stage < 8; stage++)
+		{
+			state[D3DRS_PSRGBINPUTS0 + stage] = ri[stage];
+			state[D3DRS_PSRGBOUTPUTS0 + stage] = ro[stage];
+			state[D3DRS_PSALPHAINPUTS0 + stage] = ai[stage];
+			state[D3DRS_PSALPHAOUTPUTS0 + stage] = ao[stage];
+			state[D3DRS_PSCONSTANT0_0 + stage] = (DWORD)rand() * 2654435761u;
+			state[D3DRS_PSCONSTANT1_0 + stage] = (DWORD)rand() * 40503u * 65537u;
+		}
+		state[D3DRS_PSCONSTANT0_0] = 0x00FF0000;
+		state[D3DRS_PSCONSTANT1_0] = 0x0000FF00;
+		state[D3DRS_PSFINALCOMBINERCONSTANT0] = (DWORD)rand() * 2246822519u;
+		state[D3DRS_PSFINALCOMBINERCONSTANT1] = state[D3DRS_PSCONSTANT1_0 + 5];
+		state[D3DRS_PSRGBINPUTS0 + 3] = (DWORD)(masks[mask] ^ 0x20) << 24 | (DWORD)halves[function] << 16 |
+			(DWORD)masks[mask] << 8 | 0x09;
+		if (doubled)
+		{
+			state[D3DRS_PSRGBINPUTS0 + 6] = 0x08040B1D;
+			state[D3DRS_PSRGBINPUTS0 + 7] = functions[1][function];
+			state[D3DRS_PSRGBOUTPUTS0 + 6] = state[D3DRS_PSRGBOUTPUTS0 + 7] = 0x00000C00;
+		}
+		else
+		{
+			state[D3DRS_PSRGBINPUTS0 + 6] = functions[0][function];
+			state[D3DRS_PSRGBOUTPUTS0 + 6] = 0x00000800;
+			state[D3DRS_PSRGBINPUTS0 + 7] = 0x08040B1D;
+			state[D3DRS_PSRGBOUTPUTS0 + 7] = 0x00000C00;
+		}
+		state[D3DRS_PSFINALCOMBINERINPUTSABCD] = true_fog ? 0x330C0300 : 0x340F010D;
+		state[D3DRS_PSFINALCOMBINERINPUTSEFG] = true_fog ? 0x00001800 : 0x0C111800;
+		fog_on = true_fog && (mask & 1);
+		fog_color = (DWORD)rand() * 2654435761u;
+		memset(&textures, 0, sizeof(textures));
+		textures.present = cube ? 0xF : 7;
+		textures.cube = cube ? 8 : 0;
+		textures.fog = (unsigned char)fog_on;
+		textures.fog_color = fog_color & 0x00FFFFFFUL;
+		textures.d0_alpha_map = ramp ? 6 : 0;
+		snprintf(name, sizeof(name), "model program (mask %u, function %u%s%s%s%s)", mask, function,
+			doubled ? ", doubled" : "", true_fog ? ", true fog" : "", cube ? ", cube map" : "", ramp ? ", ramped" : "");
+		checked++;
+		if (!gx_psh_translate(state, &textures, &program) || program.approximate || !validate(&program))
+		{
+			printf("%s: not translated exactly (%s)\n", name, program.reason ? program.reason :
+				program.approximate ? "approximate" : "refused by the validator");
+			failures++;
+			continue;
+		}
+		if (program.tev.stage_count > most_stages)
+			most_stages = program.tev.stage_count;
+		for (int trial = 0; trial < 200; trial++)
+		{
+			struct inputs_set in;
+			v4 maps[8], want, got;
+
+			for (int i = 0; i < 4; i++) in.t[i] = rand4();
+			if (!cube)
+				memset(&in.t[3], 0, sizeof(in.t[3]));
+			in.v0 = rand4();
+			in.v1 = rand4();
+			memset(maps, 0, sizeof(maps));
+			fog_factor = frand();
+			for (int ch = 0; ch < 4; ch++) maps[GX_PSH_FOG_TEXMAP].c[ch] = fog_factor;
+			for (int i = 0; i < 4; i++) maps[i] = in.t[i];
+			if (ramp)
+				for (int ch = 0; ch < 4; ch++) maps[6].c[ch] = in.v0.c[3];
+			want = nv2a_eval(state, &in);
+			want.c[3] = in.t[0].c[3];
+			got = simulate(&program, &in, maps);
+			for (int ch = 0; ch < 4; ch++)
+			{
+				float d = fabsf(want.c[ch] - got.c[ch]);
+
+				if (d > program_worst)
+					program_worst = d;
+			}
+			{
+				/* (and WiiLibs' evaluator, in TEV's 8 bits, against the simulation) */
+				int e = eval_compare(&program, &in, maps, got);
+
+				if (e > eval_worst_bytes)
+					eval_worst_bytes = e;
+			}
+		}
+		if (program_worst > worst)
+			worst = program_worst;
+		if (program_worst > 0.01f)
+		{
+			printf("%s: DIFFERS from NV2A's by %.1f/255\n", name, program_worst * 255.0f);
+			failures++;
+		}
+	}
+	fog_on = 0;
+	printf("the models' program: %d variants (at most %d stages), %d not exact or differ; worst %.1f/255, in TEV's "
+		"8 bits (wl_tev_eval) %d/255\n", checked, most_stages, failures, worst * 255.0f, eval_worst_bytes);
+	return failures;
+}
+
 int main(int argc, char **argv)
 {
 	int seed_count = argc > 1 ? atoi(argv[1]) : 2000;
@@ -1026,7 +1163,7 @@ int main(int argc, char **argv)
 	printf("%lu TEV stages for the %lu translated (%.2f a program)\n", stages_made, programs_made,
 		programs_made ? (double)stages_made / (double)programs_made : 0.0);
 	{
-		int game = only < 0 ? game_programs() + specular_programs() : 0;
+		int game = only < 0 ? game_programs() + specular_programs() + model_programs() : 0;
 
 		if (only < 0)
 		{
