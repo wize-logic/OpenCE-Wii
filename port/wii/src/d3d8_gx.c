@@ -5675,6 +5675,20 @@ product's), ramps written, and draws whose fog stayed the processor's (a
 product of fogs of other directions or too long, no map free, no room for
 the ramp, beyond the ramp's range, a pixel shader beyond GX with it) */
 static unsigned long lit_fog_draws, lit_fog_products, fog_ramps_made, lit_fog_refused;
+/* (the refused by why: lit_fog_ramp's last) */
+enum
+{
+	FOG_REFUSED_SHADER,
+	FOG_REFUSED_FORM,
+	FOG_REFUSED_MAP,
+	FOG_REFUSED_MATRIX,
+	FOG_REFUSED_SLOT,
+	FOG_REFUSED_MEMORY,
+	FOG_REFUSED_TRANSLATION,
+	FOG_REFUSED_KINDS
+};
+static unsigned long lit_fog_refusals[FOG_REFUSED_KINDS];
+static unsigned lit_fog_reason;
 
 /* D0's alpha the fog's ramp (lit.fog_ramped): the ramp bound to a
 texture map the pixel shader leaves free, the pixel shader translated again
@@ -5694,7 +5708,11 @@ static BOOL lit_fog_ramp(BOOL keyed)
 	GXTexObj object;
 	struct gx_lighting_fog_form form;
 
-	if (!pixel_shader_usable || !gx_lighting_fog_form(&lit.lighting, &form))
+	lit_fog_reason = FOG_REFUSED_SHADER;
+	if (!pixel_shader_usable)
+		return FALSE;
+	lit_fog_reason = FOG_REFUSED_FORM;
+	if (!gx_lighting_fog_form(&lit.lighting, &form))
 		return FALSE;
 	/* (a map of 4 to 7 that the stages' separate alphas, the fog's ramp
 	and a bumped lookup leave free) */
@@ -5702,7 +5720,11 @@ static BOOL lit_fog_ramp(BOOL keyed)
 		if (!(textures->separate_alpha & (1U << (map - 4))) && !(map == GX_PSH_FOG_TEXMAP && textures->fog) &&
 			!(map == GX_PSH_BUMP_TEXMAP && (textures->bumped || textures->vertex_color)))
 			break;
-	if (map < 4 || !gx_lighting_fog_matrix(&lit.lighting, &form, &lit.space, lit.center, matrix))
+	lit_fog_reason = FOG_REFUSED_MAP;
+	if (map < 4)
+		return FALSE;
+	lit_fog_reason = FOG_REFUSED_MATRIX;
+	if (!gx_lighting_fog_matrix(&lit.lighting, &form, &lit.space, lit.center, matrix))
 		return FALSE;
 	for (which = 0; which < FOG_RAMPS; which++)
 		if (fog_ramps[which].made && !memcmp(&fog_ramps[which].form, &form, sizeof(form)))
@@ -5720,12 +5742,14 @@ static BOOL lit_fog_ramp(BOOL keyed)
 			if (!fog_ramps[which].made || fog_ramps[which].frame_number != device.frames)
 				break;
 		}
+		lit_fog_reason = FOG_REFUSED_SLOT;
 		if (slot == FOG_RAMPS)
 			return FALSE;
 		/* (the slot's memory: its own, or a kept buffer of the ramp's rows;
 		the one it had freed once GX has drawn the frame) */
 		texels = form.rows == GX_LIGHTING_FOG_SIZE ? fog_ramps[which].small :
 			fog_ramps[which].bytes == bytes ? fog_ramps[which].texels : kept_alloc(bytes);
+		lit_fog_reason = FOG_REFUSED_MEMORY;
 		if (!texels)
 			return FALSE;
 		if (fog_ramps[which].bytes && texels != fog_ramps[which].texels)
@@ -5761,6 +5785,7 @@ static BOOL lit_fog_ramp(BOOL keyed)
 	program = gx_psh_cache_program(D3D__RenderState, &ramped, &usable, &translated);
 	if (!usable)
 	{
+		lit_fog_reason = FOG_REFUSED_TRANSLATION;
 		/* (the draw's own again: the cache keeps the last program it gave) */
 		pixel_shader_program = gx_psh_cache_program(D3D__RenderState, textures, &usable, &translated);
 		return FALSE;
@@ -5832,7 +5857,10 @@ static void lit_state(BOOL keyed, const struct draw_projection *projection, cons
 			lit_fog_draws++;
 		}
 		else if (lit.alpha)
+		{
 			lit_fog_refused++;
+			lit_fog_refusals[lit_fog_reason % FOG_REFUSED_KINDS]++;
+		}
 		lit_lights_load(d1_constant);
 		if (lit.alpha)
 		{
@@ -8686,6 +8714,13 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		platform_log("Direct3D: lit by GX, the planar fog by GX's ramp in %lu draws (%lu its product with the "
 			"atmospheric fog; %lu ramps written), the processor's in %lu; a model's fog through its nodes' matrices in "
 			"%lu draws", lit_fog_draws, lit_fog_products, fog_ramps_made, lit_fog_refused, fog_post_draws);
+		platform_log("Direct3D: lit by GX, the planar fog the processor's: %lu its pixel shader beyond GX, %lu its form "
+			"(a product of other directions, or too long), %lu no texture map free, %lu beyond the ramp's range, %lu no "
+			"ramp free this frame, %lu no room, %lu not translated with it", lit_fog_refusals[FOG_REFUSED_SHADER],
+			lit_fog_refusals[FOG_REFUSED_FORM], lit_fog_refusals[FOG_REFUSED_MAP], lit_fog_refusals[FOG_REFUSED_MATRIX],
+			lit_fog_refusals[FOG_REFUSED_SLOT], lit_fog_refusals[FOG_REFUSED_MEMORY],
+			lit_fog_refusals[FOG_REFUSED_TRANSLATION]);
+		memset(lit_fog_refusals, 0, sizeof(lit_fog_refusals));
 		{
 			unsigned index, entries = 0;
 			unsigned long wanted = 0;
