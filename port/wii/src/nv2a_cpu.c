@@ -113,6 +113,7 @@ void nv2a_cpu_compile(const DWORD *instructions, unsigned long instruction_count
 	}
 	program->native = NULL;
 	program->native_colors = NULL;
+	program->native_positions = NULL;
 	program->hash = nv2a_cpu_hash(instructions, instruction_count);
 #ifndef NV2A_CPU_NO_NATIVES
 	{
@@ -124,6 +125,7 @@ void nv2a_cpu_compile(const DWORD *instructions, unsigned long instruction_count
 			{
 				program->native = nv2a_cpu_natives[index].run;
 				program->native_colors = nv2a_cpu_natives[index].colors;
+				program->native_positions = nv2a_cpu_natives[index].positions;
 				break;
 			}
 		}
@@ -517,6 +519,15 @@ void nv2a_cpu_run_live(const struct nv2a_cpu_program *program, const float (*con
 		return;
 	}
 	nv2a_cpu_run(program, constants, inputs, point_size, output);
+}
+
+int nv2a_cpu_run_positions(const struct nv2a_cpu_program *program, const float (*constants)[4],
+	const float (*inputs)[4], const float (*points)[4], float (*clips)[4], float (*positions)[4])
+{
+	if (!program->native_positions)
+		return 0;
+	program->native_positions(constants, inputs, points, clips, positions);
+	return 1;
 }
 
 static void nv2a_cpu_interpret(const struct nv2a_cpu_program *program, const float (*constants)[4],

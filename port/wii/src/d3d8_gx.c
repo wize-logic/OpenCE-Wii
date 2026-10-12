@@ -2584,7 +2584,13 @@ static void tev_setup(unsigned stages)
 		tev_channels = program->channels;
 	}
 	else
+	{
+		/* (the fallback's texture 0 and colour 0 alone: the draws in hardware
+		compute nothing else, a cube map's sphere map coordinates among it) */
 		tev_fallback(stages);
+		tev_texcoords = (stages & 1) && bound_entries[0] ? 1 : 0;
+		tev_channels = 1;
+	}
 }
 
 /* ---------- vertices
@@ -3424,6 +3430,9 @@ static void matrix_inputs(const struct vertex_shader_object *shader, float (*inp
 }
 
 static Mtx position_matrix_rows;
+/* in the statistics' window: the position matrices' runs of a program's four
+at once, and of one at a time */
+static unsigned long position_lanes_runs, position_single_runs;
 /* the depth's a + b / w for the same constants (position_matrix): from the
 program's outputs for the origin and the axes, not from a draw's vertices,
 so every draw of these constants has the same, to the bit */
@@ -3512,29 +3521,48 @@ static unsigned long long constants_hash(const struct vertex_shader_object *shad
 	return hash;
 }
 
+/* a key's hash and a word more: two lanes of 32-bit FNV-1 (the processor
+multiplies 64 bits in some twenty instructions, 32 in one) */
+static inline unsigned long long hash_step(unsigned long long hash, u32 word)
+{
+	u32 low = ((u32)hash ^ word) * 16777619U, high = ((u32)(hash >> 32) ^ word) * 2246822519U;
+
+	return (unsigned long long)high << 32 | low;
+}
+
+static unsigned long long hash_words(unsigned long long hash, const void *data, unsigned long bytes)
+{
+	const u32 *words = data;
+	unsigned long index;
+
+	for (index = 0; index < bytes / 4; index++)
+		hash = hash_step(hash, words[index]);
+	return hash;
+}
+
 static unsigned long long constants_key(const struct vertex_shader_object *shader, const struct nv2a_cpu_program *program)
 {
 	unsigned long long hash = constants_hash(shader, program);
 	unsigned long row, word;
 
-	hash = (hash ^ draw_uniform.mask) * 1099511628211ULL;
+	hash = hash_step(hash, (u32)draw_uniform.mask);
 	for (row = 0; row < NV2A_CPU_INPUT_COUNT; row++)
 		if (draw_uniform.mask & (1UL << row))
 		{
 			const unsigned long *words = (const unsigned long *)draw_uniform.values[row];
 
 			for (word = 0; word < 4; word++)
-				hash = (hash ^ words[word]) * 1099511628211ULL;
+				hash = hash_step(hash, (u32)words[word]);
 		}
 	/* (and the registers no stream gives: draw_unstreamed) */
-	hash = (hash ^ draw_unstreamed) * 1099511628211ULL;
+	hash = hash_step(hash, (u32)draw_unstreamed);
 	for (row = 0; row < NV2A_CPU_INPUT_COUNT; row++)
 		if (draw_unstreamed & (1UL << row))
 		{
 			const unsigned long *words = (const unsigned long *)device.vertex_registers[row];
 
 			for (word = 0; word < 4; word++)
-				hash = (hash ^ words[word]) * 1099511628211ULL;
+				hash = hash_step(hash, (u32)words[word]);
 		}
 	return hash ? hash : 1;
 }
@@ -3564,6 +3592,37 @@ static BOOL position_matrix(const struct vertex_shader_object *shader, struct nv
 	return TRUE;
 }
 
+/* the program's clip-space and screen-space positions for up to four
+values of the position's register (points), the other inputs as given: its
+compiled function for four at once where it has one and the position is v0
+(nv2a_cpu_run_positions, the same to the bit), else a run for each */
+static void position_runs(struct nv2a_cpu_program *program, float (*inputs)[4], int reg, float point_size,
+	const float (*points)[4], int count, float (*clips)[4], float (*screens)[4])
+{
+	float saved[4];
+	int point;
+
+	if (reg == 0 && nv2a_cpu_run_positions(program, (const float (*)[4])device.vertex_constants,
+		(const float (*)[4])inputs, points, clips, screens))
+	{
+		position_lanes_runs++;
+		return;
+	}
+	memcpy(saved, inputs[reg], sizeof(saved));
+	for (point = 0; point < count; point++)
+	{
+		struct nv2a_cpu_output out;
+
+		memcpy(inputs[reg], points[point], sizeof(inputs[reg]));
+		nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
+			&out, NV2A_CPU_LIVE_POSITION);
+		memcpy(clips[point], out.clip, sizeof(clips[point]));
+		memcpy(screens[point], out.position, sizeof(screens[point]));
+	}
+	memcpy(inputs[reg], saved, sizeof(saved));
+	position_single_runs += (unsigned long)count;
+}
+
 static BOOL position_matrix_compute(const struct vertex_shader_object *shader, struct nv2a_cpu_program *program,
 	int reg, float point_size, BOOL fit)
 {
@@ -3571,31 +3630,33 @@ static BOOL position_matrix_compute(const struct vertex_shader_object *shader, s
 	const float *scale = device.vertex_constants[VERTEX_CONSTANT_BIAS - 38];
 	const float *offset = device.vertex_constants[VERTEX_CONSTANT_BIAS - 37];
 	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
-	struct nv2a_cpu_output base, column;
+	/* (the origin, then each axis: the base and the columns) */
+	float points[4][4], clips[4][4], screens[4][4];
 	int component;
 
 	/* (the program for its position alone: the same, bit for bit) */
 	matrix_inputs(shader, inputs);
-	nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
-		&base, NV2A_CPU_LIVE_POSITION);
 	for (component = 0; component < 4; component++)
 	{
-		float x = base.clip[0], y = base.clip[1], w = base.clip[3];
+		memcpy(points[component], inputs[reg], sizeof(points[component]));
+		if (component)
+			points[component][component - 1] = 1.0f;
+	}
+	position_runs(program, inputs, reg, point_size, (const float (*)[4])points, 4, clips, screens);
+	for (component = 0; component < 4; component++)
+	{
+		float x = clips[0][0], y = clips[0][1], w = clips[0][3];
 
 		if (component < 3)
 		{
-			inputs[reg][component] = 1.0f;
-			nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
-				point_size, &column, NV2A_CPU_LIVE_POSITION);
-			inputs[reg][component] = 0.0f;
-			x = column.clip[0] - base.clip[0];
-			y = column.clip[1] - base.clip[1];
-			w = column.clip[3] - base.clip[3];
+			x = clips[1 + component][0] - clips[0][0];
+			y = clips[1 + component][1] - clips[0][1];
+			w = clips[1 + component][3] - clips[0][3];
 		}
 		position_matrix_rows[0][component] = x * scale[0] + (offset[0] + 0.5f) * w;
 		position_matrix_rows[1][component] = y * scale[1] + (offset[1] + 0.5f) * w;
 		position_matrix_rows[2][component] = -w;
-		ws[component] = component < 3 ? column.clip[3] : base.clip[3];
+		ws[component] = component < 3 ? clips[1 + component][3] : clips[0][3];
 	}
 	/* two points along w's gradient, at w 1 and 1000, give the fit (draw_run's
 	projection_fit, for points of the program's own choosing) */
@@ -3614,19 +3675,20 @@ static BOOL position_matrix_compute(const struct vertex_shader_object *shader, s
 			return TRUE;
 		if (!(length > 1.0e-12f))
 			return FALSE;
+		for (point = 0; point < 4; point++)
+		{
+			float t = (targets[point & 1] - ws[3]) / length;
+
+			memcpy(points[point], inputs[reg], sizeof(points[point]));
+			for (component = 0; component < 3; component++)
+				points[point][component] = t * gradient[component];
+		}
+		position_runs(program, inputs, reg, point_size, (const float (*)[4])points, 2, clips, screens);
 		for (point = 0; point < 2; point++)
 		{
-			float t = (targets[point] - ws[3]) / length;
-
-			for (component = 0; component < 3; component++)
-				inputs[reg][component] = t * gradient[component];
-			nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
-				point_size, &column, NV2A_CPU_LIVE_POSITION);
-			d[point] = column.position[2] / 16777215.0f;
-			v[point] = column.clip[3];
+			d[point] = screens[point][2] / 16777215.0f;
+			v[point] = clips[point][3];
 		}
-		for (component = 0; component < 3; component++)
-			inputs[reg][component] = 0.0f;
 		if (!(fabsf(v[0]) > 1.0e-6f) || !(fabsf(v[1]) > 1.0e-6f) || !(fabsf(1.0f / v[1] - 1.0f / v[0]) > 1.0e-6f))
 			return FALSE;
 		position_projection.b = (d[1] - d[0]) / (1.0f / v[1] - 1.0f / v[0]);
@@ -4298,7 +4360,7 @@ static unsigned long hardware_draws, hardware_vertices, hardware_colors_run, har
 	hardware_blended_draws;
 /* draws whose sphere maps' coordinates the processor computes, and the
 vertices it ran for them */
-static unsigned long hardware_sphere_draws, hardware_spheres_run;
+static unsigned long hardware_sphere_draws, hardware_sphere_lit_draws, hardware_spheres_run;
 
 static int single_register(unsigned long mask)
 {
@@ -4866,16 +4928,6 @@ struct hardware_matrices
 static struct hardware_matrices hardware_cache[HARDWARE_CACHE_ENTRIES];
 static unsigned long hardware_cache_hits;
 
-static unsigned long long hash_words(unsigned long long hash, const void *data, unsigned long bytes)
-{
-	const unsigned long *words = data;
-	unsigned long index;
-
-	for (index = 0; index < bytes / 4; index++)
-		hash = (hash ^ words[index]) * 1099511628211ULL;
-	return hash;
-}
-
 static unsigned long long hardware_key(const struct vertex_shader_object *shader, const struct nv2a_cpu_program *program)
 {
 	/* (the program, its declaration and the constants: constants_hash) */
@@ -4935,26 +4987,32 @@ coordinates from the normal (gx_lighting.c says how, and how close it is):
 static int gx_lighting_on = -1;
 /* the view frames' rounding (tests/gx_lighting_check.c's REFLECTION_STEP) */
 #define LIT_SPHERE_STEP (15.0f * 3.14159265f / 180.0f)
-/* the texture matrices of the normal's sphere map coordinates, two rows
-each: the keys' in order, then the processor's vertices'. Texture
-coordinate 3's own (GX_TEXMTX3, which the draw does not use for it), then
-the free pairs past the stages' TEXMTX0 to TEXMTX4, short of GX_IDENTITY
-(row 60), the identity every draw in screen space reads its texture
-coordinates through: a matrix over it draws them all wrong. */
-static const u8 lit_sphere_rows[] = { GX_TEXMTX3, 45, 47, 49, 51, 53, 55, 57 };
+/* the texture matrices of a draw in hardware's stages (and the fog's, the
+fifth), two rows each from GX_TEXMTX0's (rows 30 to 39: GX takes a matrix
+by its first row), and of the normal's sphere map coordinates: the keys' in
+order, then the processor's vertices', in the pairs after them, short of
+GX_IDENTITY (row 60), the identity every draw in screen space reads its
+texture coordinates through: a matrix over it draws them all wrong. Ten:
+a model's nine keys and its blended vertices. */
+#define STAGE_TEXMTX(stage) ((u32)(GX_TEXMTX0 + 2 * (stage)))
+static const u8 lit_sphere_rows[] = { 40, 42, 44, 46, 48, 50, 52, 54, 56, 58 };
 #define LIT_SPHERE_MATRICES (sizeof(lit_sphere_rows) / sizeof(lit_sphere_rows[0]))
-/* (the last pair, 57 and 58, short of GX_IDENTITY; the first past TEXMTX4's
-pair, 42 and 43) */
-typedef char lit_sphere_rows_short_of_identity[57 + 2 <= GX_IDENTITY && 45 > GX_TEXMTX4 + 1 ? 1 : -1];
+/* (the first past the stages' pairs, the last short of GX_IDENTITY; room for
+every key) */
+typedef char lit_sphere_rows_short_of_identity[40 >= GX_TEXMTX0 + 2 * 5 && 58 + 2 <= GX_IDENTITY &&
+	LIT_SPHERE_MATRICES >= MATRIX_KEYS + 1 ? 1 : -1];
 /* the view's sphere maps kept (a buffer can be drawn again in the frame:
 GX copies into it after the draws before it have read it), the most drawn
 in a frame, and how far a view's frame may turn and still keep one (in its
 rows' components: about a tenth of a degree). The frames are rounded in the
 world (gx_lighting_view_frame), so a map is kept while the camera turns;
 there are as many as a frame's draws of different cube maps and directions
-from the eye use, in the contiguous window (9 KB each). */
-#define SPHERE_BAKES 32
-#define SPHERE_BAKES_A_FRAME 48
+from the eye use (b30's Pelican, its Marines about the camera: some 40,
+more than the 32 there were, so that every map was drawn again in every
+frame), in the contiguous window (9 KB each). A draw past the frame's
+maps takes the nearest kept of its cube map (sphere_bake). */
+#define SPHERE_BAKES 64
+#define SPHERE_BAKES_A_FRAME 24
 #define SPHERE_BAKE_KEPT 2.0e-3f
 /* the first row of the EFB below the back buffer, where they are drawn */
 #define SPHERE_BAKE_ROW SCREEN_HEIGHT
@@ -4978,13 +5036,17 @@ static struct
 	const unsigned char *normals;
 	UINT normal_stride;
 	BOOL normal_packed;
+	/* where GX reads the normals by index (kept_normals_find), if it does */
+	BOOL normals_indexed;
+	const unsigned char *normals_array;
+	UINT normals_array_stride;
 	/* a point of the draw in E */
 	float center[3];
 } lit;
 
 /* in the statistics' window: draws lit, their vertices, the draws refused
 (no space, lights beyond GX's), sphere maps drawn */
-static unsigned long lit_draws, lit_vertices, lit_refused, sphere_bakes_made;
+static unsigned long lit_draws, lit_vertices, lit_refused, sphere_bakes_made, sphere_bakes_borrowed;
 
 static struct
 {
@@ -5029,10 +5091,33 @@ static BOOL sphere_bake(const struct texture_entry *world, const float frame[3][
 			sphere_bakes[which].frame_number = device.frames;
 		}
 	}
+	if (!buffer && sphere_bakes_in_frame >= SPHERE_BAKES_A_FRAME)
+	{
+		/* (past the frame's: the kept map of this cube map whose frame's z is
+		nearest the draw's; a later frame draws the draw's own) */
+		float best = -2.0f;
+
+		for (which = 0; which < SPHERE_BAKES; which++)
+		{
+			float along;
+
+			if (!sphere_bakes[which].buffer || sphere_bakes[which].texels != world->texels ||
+				sphere_bakes[which].scale != scale)
+				continue;
+			along = sphere_bakes[which].frame[2][0] * frame[2][0] + sphere_bakes[which].frame[2][1] * frame[2][1] +
+				sphere_bakes[which].frame[2][2] * frame[2][2];
+			if (along > best)
+			{
+				best = along;
+				buffer = sphere_bakes[which].buffer;
+			}
+		}
+		if (!buffer)
+			return FALSE;
+		sphere_bakes_borrowed++;
+	}
 	if (!buffer)
 	{
-		if (sphere_bakes_in_frame >= SPHERE_BAKES_A_FRAME)
-			return FALSE;
 		/* (an empty one, else the one drawn longest ago) */
 		which = sphere_bakes_next++ % SPHERE_BAKES;
 		for (row = 0; row < SPHERE_BAKES; row++)
@@ -5473,8 +5558,10 @@ static void lit_state(BOOL keyed, const struct draw_projection *projection, cons
 			memcpy(turn[row], lit.space.world_to_eye[row], sizeof(turn[row]));
 		GX_LoadNrmMtxImm(turn, GX_PNMTX0);
 	}
-	GX_SetVtxDesc(GX_VA_NRM, GX_DIRECT);
+	GX_SetVtxDesc(GX_VA_NRM, lit.normals_indexed ? GX_INDEX16 : GX_DIRECT);
 	vertex_format(HARDWARE_VERTEX_FORMAT, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
+	if (lit.normals_indexed)
+		GX_SetArray(GX_VA_NRM, (void *)lit.normals_array, (u8)lit.normals_array_stride);
 	if (lit.colors)
 	{
 		if (lit.alpha && lit_fog_ramp(keyed))
@@ -5512,6 +5599,10 @@ static void lit_state(BOOL keyed, const struct draw_projection *projection, cons
 	}
 }
 
+/* (emit_indices' normals: none, each decoded and sent, or read by GX by
+index) */
+enum { EMIT_NORMALS_NONE, EMIT_NORMALS_SENT, EMIT_NORMALS_INDEXED };
+
 /* the vertices of a draw in hardware of which the processor computes nothing:
 each index's matrix indices (keyed: its value's position matrix, and with
 sphere_matrices its normal's sphere map matrix, with fog_post_matrices its
@@ -5519,7 +5610,7 @@ fog's (fog_post_matrix), with fog_matrices its planar fog ramp
 coordinate's), its position and texture coordinates by index, and a
 lit draw's normal. A loop for each case, so that an index costs only what
 it sends. */
-static void emit_indices(const WORD *indices, UINT first, UINT count, unsigned texture_count, BOOL keyed, BOOL normals,
+static void emit_indices(const WORD *indices, UINT first, UINT count, unsigned texture_count, BOOL keyed, int normals,
 	BOOL sphere_matrices, BOOL fog_post_matrices, BOOL fog_matrices)
 {
 	UINT base = indices ? device.base_vertex_index : first, vertex;
@@ -5583,7 +5674,9 @@ static void emit_indices(const WORD *indices, UINT first, UINT count, unsigned t
 				GX_MatrixIndex1x8((u8)(GX_PNMTX1 + 3 * key));
 		}
 		GX_Position1x16(index);
-		if (normals)
+		if (normals == EMIT_NORMALS_INDEXED)
+			GX_Normal1x16(index);
+		else if (normals)
 		{
 			float normal[3];
 
@@ -6150,6 +6243,182 @@ static struct static_outputs *static_outputs_find(struct nv2a_cpu_program *progr
 	return entry;
 }
 
+/* ---------- the lit models' normals, decoded once
+
+A draw lit by GX sends each vertex's normal, which the models' buffers hold
+packed (11, 11 and 10 bits: D3DVSDT_NORMPACKED3), a form GX does not read:
+it was decoded for every index of every lit draw (58,000 a frame in b30).
+The models' buffers are static, so each one's normals are decoded once into
+three floats a vertex (the same as lit_normal's, to the bit) beside it in
+the contiguous window, and GX reads them by index as it reads the
+positions. A buffer is keyed as the kept outputs key theirs (its header,
+data, stride and serial, the normal's offset), and kept from the frame
+after it is first seen, its vertices decoded from 0 to the most a draw
+names; at most KEPT_NORMALS_BYTES in all, and only while the window keeps
+STATIC_OUTPUTS_RESERVE free in one run besides. An entry not drawn for
+STATIC_OUTPUTS_IDLE frames is freed once GX has drawn the frame. Normals of
+three floats in the buffer GX reads where they are. */
+#define KEPT_NORMALS_ENTRIES 128
+#define KEPT_NORMALS_WAYS 4
+#define KEPT_NORMALS_BYTES (768UL * 1024UL)
+
+struct kept_normals
+{
+	const D3DVertexBuffer *buffer;
+	DWORD data, serial;
+	UINT stride, offset;
+	unsigned long seen_frame, used_frame;
+	/* vertices 0 to decoded - 1, three floats each; room for capacity */
+	float *values;
+	unsigned long decoded, capacity;
+};
+
+static struct kept_normals kept_normals[KEPT_NORMALS_ENTRIES];
+static unsigned long kept_normals_bytes;
+static float *kept_normals_frees[KEPT_NORMALS_ENTRIES];
+static unsigned kept_normals_free_count;
+/* in the statistics' window: lit draws whose normals GX read by index (from
+the kept, or from their buffer), vertices decoded, draws without room */
+static unsigned long kept_normal_draws, kept_normals_decoded, kept_normals_refused;
+
+/* an entry's values freed: once GX has drawn the frame (or now, past room
+to wait) */
+static void kept_normals_release(struct kept_normals *entry, BOOL drawn)
+{
+	if (entry->values)
+	{
+		if (drawn)
+			platform_contiguous_free(entry->values);
+		else if (kept_normals_free_count < KEPT_NORMALS_ENTRIES)
+			kept_normals_frees[kept_normals_free_count++] = entry->values;
+		else
+		{
+			GX_DrawDone();
+			xf_flush_after();
+			platform_contiguous_free(entry->values);
+		}
+		kept_normals_bytes -= entry->capacity * 12;
+	}
+	memset(entry, 0, sizeof(*entry));
+}
+
+static void kept_normals_frame_drawn(void)
+{
+	unsigned index;
+
+	while (kept_normals_free_count)
+		platform_contiguous_free(kept_normals_frees[--kept_normals_free_count]);
+	for (index = 0; index < KEPT_NORMALS_ENTRIES; index++)
+		if (kept_normals[index].buffer && device.frames - kept_normals[index].used_frame > STATIC_OUTPUTS_IDLE)
+			kept_normals_release(&kept_normals[index], TRUE);
+}
+
+/* the array GX reads a lit draw's normals from by index, vertices up to
+most (lit.normals_array, lit.normals_array_stride); FALSE where the normals
+are sent with each vertex (not static yet, no room) */
+static BOOL kept_normals_find(const struct vertex_shader_object *shader, unsigned long least, unsigned long most)
+{
+	const struct vertex_element *normal = element_of(shader, 1);
+	unsigned stream = normal->stream & (MAXIMUM_STREAMS - 1);
+	D3DVertexBuffer *buffer = device.streams[stream].buffer;
+	UINT stride = device.streams[stream].stride;
+	struct kept_normals *entry = NULL, *victim = NULL;
+	unsigned set, way;
+	unsigned long vertex;
+
+	if (!buffer || !buffer->Data || stride > 255)
+		return FALSE;
+	if (!lit.normal_packed)
+	{
+		/* (three floats: GX reads them where they are) */
+		lit.normals_array = lit.normals;
+		lit.normals_array_stride = stride;
+		stream_flush(buffer, lit.normals - normal->offset + least * stride, (most - least + 1) * stride);
+		kept_normal_draws++;
+		return TRUE;
+	}
+	if (!buffer->Lock)
+	{
+		if (!++vertex_buffer_serial)
+			vertex_buffer_serial++;
+		buffer->Lock = vertex_buffer_serial;
+	}
+	set = (unsigned)((((unsigned long)buffer >> 4) * 2654435761UL) >> 8) % (KEPT_NORMALS_ENTRIES / KEPT_NORMALS_WAYS) *
+		KEPT_NORMALS_WAYS;
+	for (way = 0; way < KEPT_NORMALS_WAYS; way++)
+	{
+		struct kept_normals *candidate = &kept_normals[set + way];
+
+		if (candidate->buffer == buffer && candidate->data == buffer->Data && candidate->serial == buffer->Lock &&
+			candidate->stride == stride && candidate->offset == normal->offset)
+		{
+			entry = candidate;
+			break;
+		}
+		if (!victim || (victim->buffer && (!candidate->buffer || candidate->used_frame < victim->used_frame)))
+			victim = candidate;
+	}
+	if (!entry)
+	{
+		kept_normals_release(victim, FALSE);
+		victim->buffer = buffer;
+		victim->data = buffer->Data;
+		victim->serial = buffer->Lock;
+		victim->stride = stride;
+		victim->offset = normal->offset;
+		victim->seen_frame = victim->used_frame = device.frames;
+		return FALSE;
+	}
+	entry->used_frame = device.frames;
+	/* (not static yet: seen this frame only) */
+	if (entry->seen_frame == device.frames)
+		return FALSE;
+	if (most >= entry->capacity)
+	{
+		unsigned long capacity = (most + 1024) & ~1023UL, largest = 0;
+		float *values = NULL;
+
+		wii_memory_window_usage(NULL, NULL, &largest);
+		if (kept_normals_bytes - entry->capacity * 12 + capacity * 12 <= KEPT_NORMALS_BYTES &&
+			largest >= capacity * 12 + STATIC_OUTPUTS_RESERVE)
+			values = platform_contiguous_alloc(capacity * 12, 32, PLATFORM_ANY_PHYSICAL_ADDRESS, 0);
+		if (!values)
+		{
+			kept_normals_refused++;
+			return FALSE;
+		}
+		if (entry->values)
+		{
+			memcpy(values, entry->values, entry->decoded * 12);
+			DCFlushRange(values, entry->decoded * 12);
+			if (kept_normals_free_count < KEPT_NORMALS_ENTRIES)
+				kept_normals_frees[kept_normals_free_count++] = entry->values;
+			else
+			{
+				GX_DrawDone();
+				xf_flush_after();
+				platform_contiguous_free(entry->values);
+			}
+			kept_normals_bytes -= entry->capacity * 12;
+		}
+		entry->values = values;
+		entry->capacity = capacity;
+		kept_normals_bytes += capacity * 12;
+	}
+	if (most >= entry->decoded)
+	{
+		for (vertex = entry->decoded; vertex <= most; vertex++)
+			lit_normal((UINT)vertex, entry->values + 3 * vertex);
+		DCFlushRange(entry->values + 3 * entry->decoded, (most + 1 - entry->decoded) * 12);
+		kept_normals_decoded += most + 1 - entry->decoded;
+		entry->decoded = most + 1;
+	}
+	lit.normals_array = (const unsigned char *)entry->values;
+	lit.normals_array_stride = 12;
+	kept_normal_draws++;
+	return TRUE;
+}
+
 static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitive_type, UINT count,
 	const WORD *indices, UINT first, struct stream_fetch *fetch)
 {
@@ -6451,6 +6720,9 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		lit_on = FALSE;
 		lit_refused++;
 	}
+	/* (the normals by index, where no vertex sends its own: the processor's
+	blended ones) */
+	lit.normals_indexed = lit_on && !draw_keys.processor && kept_normals_find(shader, least, most);
 	lit_done = wl_platform_time_us();
 	if (lit_on)
 	{
@@ -6547,9 +6819,9 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 
 		memset(rows, 0, sizeof(rows));
 		memcpy(rows, stage_rows[stage], sizeof(stage_rows[stage]));
-		GX_LoadTexMtxImm(rows, GX_TEXMTX0 + 3 * stage, GX_MTX2x4);
+		GX_LoadTexMtxImm(rows, STAGE_TEXMTX(stage), GX_MTX2x4);
 		GX_SetTexCoordGen(GX_TEXCOORD0 + stage, GX_TG_MTX2x4,
-			stage < 4 && stage_source[stage] >= 0 ? GX_TG_TEX0 + stage_source[stage] : GX_TG_POS, GX_TEXMTX0 + 3 * stage);
+			stage < 4 && stage_source[stage] >= 0 ? GX_TG_TEX0 + stage_source[stage] : GX_TG_POS, STAGE_TEXMTX(stage));
 	}
 	/* (as transform_software sends the processor's coordinates; the kept
 	ones first, as their attributes are) */
@@ -6568,7 +6840,11 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		component++;
 	}
 	if (cpu_spheres)
+	{
 		hardware_sphere_draws++;
+		if (lit_on)
+			hardware_sphere_lit_draws++;
+	}
 	/* (only the coordinates and channels the stages read: each coordinate
 	generated costs GX's transform a few cycles a vertex; transform_software
 	takes all of them back, a lit draw's planar fog its sixth) */
@@ -6683,8 +6959,9 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	emitting = wl_platform_time_us();
 	gx_begin(gx_primitive(primitive_type), HARDWARE_VERTEX_FORMAT, (u16)count);
 	if (plain)
-		emit_indices(indices, first, count, texture_count + kept_count, keyed, lit_on, lit_on && lit.reflection && keyed,
-			fog_post, lit_on && lit.fog_ramped && keyed);
+		emit_indices(indices, first, count, texture_count + kept_count, keyed,
+			!lit_on ? EMIT_NORMALS_NONE : lit.normals_indexed ? EMIT_NORMALS_INDEXED : EMIT_NORMALS_SENT,
+			lit_on && lit.reflection && keyed, fog_post, lit_on && lit.fog_ramped && keyed);
 	else
 		for (vertex = 0; vertex < count; vertex++)
 		{
@@ -6787,6 +7064,8 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 				alpha where it is the fog's */
 				if (processor)
 					GX_Normal3f32(computed->normal[0], computed->normal[1], computed->normal[2]);
+				else if (lit.normals_indexed)
+					GX_Normal1x16(index);
 				else
 				{
 					float normal[3];
@@ -7100,6 +7379,7 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		xf_flush_after();
 		texture_frees_flush();
 		static_outputs_frame_drawn();
+		kept_normals_frame_drawn();
 		/* (GX's texture cache emptied once a frame, whatever was written) */
 		texture_memory_changed = TRUE;
 		timing.present += wl_platform_time_us() - started;
@@ -7147,25 +7427,30 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 	if (device.frames % STATISTICS_FRAMES == 0)
 	{
 		platform_log("Direct3D: frame %lu: %lu draws, %lu immediate, %lu vertices (%lu run), %lu clears, %lu drawn "
-			"elsewhere, textures %lu bound %lu failed %lu without a mode, in the last %d", device.frames,
-			device.statistics.draws, device.statistics.immediate_draws, device.statistics.vertices,
-			device.statistics.vertices_run, device.statistics.clears,
-			device.draws_elsewhere, device.statistics.textures_bound, device.statistics.textures_failed,
-			device.statistics.stages_without_mode, STATISTICS_FRAMES);
+			"elsewhere, in the last %d", device.frames, device.statistics.draws, device.statistics.immediate_draws,
+			device.statistics.vertices, device.statistics.vertices_run, device.statistics.clears, device.draws_elsewhere,
+			STATISTICS_FRAMES);
+		platform_log("Direct3D: textures %lu bound, %lu failed, %lu without a mode", device.statistics.textures_bound,
+			device.statistics.textures_failed, device.statistics.stages_without_mode);
 		program_statistics_log();
+		/* (lines short of the log's line, some 200 characters) */
 		platform_log("Direct3D: in hardware: %lu draws (%lu of their matrices kept, %lu of several nodes, %lu with "
-			"blended vertices), %lu vertices (%lu with the processor's colours); positions the processor's in "
-			"models' draws: %lu", hardware_draws, hardware_cache_hits, hardware_keyed_draws, hardware_blended_draws,
-			hardware_vertices, hardware_colors_run, processor_positions);
+			"blended vertices), %lu vertices", hardware_draws, hardware_cache_hits, hardware_keyed_draws,
+			hardware_blended_draws, hardware_vertices);
+		platform_log("Direct3D: in hardware, the processor's: colours of %lu vertices, positions of %lu in models' draws",
+			hardware_colors_run, processor_positions);
+		platform_log("Direct3D: position matrices' program runs: %lu of four points at once, %lu of one",
+			position_lanes_runs, position_single_runs);
+		position_lanes_runs = position_single_runs = 0;
 		hardware_draws = hardware_vertices = hardware_colors_run = hardware_cache_hits = hardware_keyed_draws = 0;
 		hardware_blended_draws = processor_positions = 0;
 		platform_log("Direct3D: draws' index ranges: %lu taken as kept, %lu found; models' node keys: %lu taken as "
 			"kept, %lu found (%lu KB kept)", ranges_kept, ranges_found, key_records_kept, key_records_made,
 			index_record_bytes / 1024);
 		ranges_kept = ranges_found = key_records_kept = key_records_made = 0;
-		platform_log("Direct3D: in hardware with the processor's sphere map coordinates: %lu draws, %lu vertices run",
-			hardware_sphere_draws, hardware_spheres_run);
-		hardware_sphere_draws = hardware_spheres_run = 0;
+		platform_log("Direct3D: in hardware with the processor's sphere map coordinates: %lu draws (%lu lit by GX), "
+			"%lu vertices run", hardware_sphere_draws, hardware_sphere_lit_draws, hardware_spheres_run);
+		hardware_sphere_draws = hardware_sphere_lit_draws = hardware_spheres_run = 0;
 		{
 			unsigned index, entries = 0, kept_entries = 0;
 
@@ -7182,12 +7467,23 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		platform_log("Direct3D: the streams GX reads: %lu ranges flushed (%lu KB), %lu flushed before and kept",
 			stream_flushes_made, stream_flush_bytes / 1024, stream_flushes_kept);
 		stream_flushes_made = stream_flush_bytes = stream_flushes_kept = 0;
-		platform_log("Direct3D: lit by GX (display.gx_lighting): %lu draws, %lu vertices, %lu refused; %lu view sphere "
-			"maps drawn; the planar fog by GX's ramp in %lu draws (%lu ramps written), the processor's in %lu; "
-			"a model's fog through its nodes' matrices in %lu draws",
-			lit_draws, lit_vertices, lit_refused, sphere_bakes_made, lit_fog_draws, fog_ramps_made, lit_fog_refused,
-			fog_post_draws);
-		lit_draws = lit_vertices = lit_refused = sphere_bakes_made = fog_post_draws = 0;
+		platform_log("Direct3D: lit by GX (display.gx_lighting): %lu draws, %lu vertices, %lu refused; view sphere maps: "
+			"%lu drawn, %lu draws took a near one", lit_draws, lit_vertices, lit_refused, sphere_bakes_made,
+			sphere_bakes_borrowed);
+		platform_log("Direct3D: lit by GX, the planar fog by GX's ramp in %lu draws (%lu ramps written), the processor's "
+			"in %lu; a model's fog through its nodes' matrices in %lu draws", lit_fog_draws, fog_ramps_made,
+			lit_fog_refused, fog_post_draws);
+		{
+			unsigned index, entries = 0;
+
+			for (index = 0; index < KEPT_NORMALS_ENTRIES; index++)
+				entries += kept_normals[index].values ? 1 : 0;
+			platform_log("Direct3D: lit by GX, the normals read by index in %lu draws; %lu decoded, %u buffers' kept "
+				"(%lu KB), %lu draws without room", kept_normal_draws, kept_normals_decoded, entries,
+				kept_normals_bytes / 1024, kept_normals_refused);
+			kept_normal_draws = kept_normals_decoded = kept_normals_refused = 0;
+		}
+		lit_draws = lit_vertices = lit_refused = sphere_bakes_made = sphere_bakes_borrowed = fog_post_draws = 0;
 		lit_fog_draws = fog_ramps_made = lit_fog_refused = 0;
 		platform_log("Direct3D: textures not drawn: %lu without data, %lu of a shape, %lu of a format, "
 			"%lu without memory, %lu not decoded; %lu converted bitmaps found", texture_failures[_failure_no_data],
@@ -7234,11 +7530,12 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 					(unsigned long)(timing.processor / 1000 / STATISTICS_FRAMES),
 					(unsigned long)(timing.immediate / 1000 / STATISTICS_FRAMES));
 				platform_log("Direct3D: GX's transform's setup, a frame (tenths of a ms): what the draw depends on %lu, "
-					"the matrices %lu, the lights and sphere maps %lu, the kept outputs %lu, GX's state %lu; %lu draws",
+					"the matrices %lu, the lights and sphere maps %lu",
 					(unsigned long)(timing.setup_keys / 100 / STATISTICS_FRAMES),
 					(unsigned long)(timing.setup_matrices / 100 / STATISTICS_FRAMES),
-					(unsigned long)(timing.setup_lit / 100 / STATISTICS_FRAMES),
-					(unsigned long)(timing.setup_kept / 100 / STATISTICS_FRAMES),
+					(unsigned long)(timing.setup_lit / 100 / STATISTICS_FRAMES));
+				platform_log("Direct3D: GX's transform's setup, a frame (tenths of a ms): the kept outputs %lu, GX's "
+					"state %lu; %lu draws", (unsigned long)(timing.setup_kept / 100 / STATISTICS_FRAMES),
 					(unsigned long)(timing.setup_state / 100 / STATISTICS_FRAMES),
 					(unsigned long)(timing.setup_draws / STATISTICS_FRAMES));
 				platform_log("Direct3D: the processor's indexed vertices: fetch %lu ms, program %lu, store %lu, emit %lu",
@@ -7246,8 +7543,8 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 					(unsigned long)(timing.program_ticks / 60750 / STATISTICS_FRAMES),
 					(unsigned long)(timing.store_ticks / 60750 / STATISTICS_FRAMES),
 					(unsigned long)(timing.emit_ticks / 60750 / STATISTICS_FRAMES));
-				platform_log("Direct3D: a frame takes %lu ms: draws %lu (vertex programs and GX), textures %lu, "
-					"pixel shaders %lu, the end of the frame %lu (waiting for GX), the rest (the game) %lu",
+				platform_log("Direct3D: a frame takes %lu ms: draws %lu, textures %lu, pixel shaders %lu, the end of "
+					"the frame %lu (waiting for GX), the game %lu",
 					(unsigned long)((now - timing.window_start) / 1000 / STATISTICS_FRAMES),
 					(unsigned long)(timing.draws / 1000 / STATISTICS_FRAMES),
 					(unsigned long)(timing.textures / 1000 / STATISTICS_FRAMES),

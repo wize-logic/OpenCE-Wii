@@ -23,6 +23,8 @@ struct nv2a_cpu_native
 	nv2a_cpu_live_proc run;
 	/* its colours (d0, d1) and fog alone */
 	nv2a_cpu_native_proc colors;
+	/* its position for four values of v0 */
+	nv2a_cpu_positions_proc positions;
 };
 
 extern const struct nv2a_cpu_native nv2a_cpu_natives[];

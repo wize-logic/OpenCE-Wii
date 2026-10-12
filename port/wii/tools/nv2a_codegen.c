@@ -28,6 +28,11 @@ static char components_name(int component, int count)
 	return count > 1 ? components[component] : ' ';
 }
 
+/* writing a program's positions function (positions_code): the lane whose
+registers an instruction's code names (R<lane>, P<lane>, a<lane>, v0 its
+point), -1 for the other functions' (r, p, a0, v) */
+static int lane = -1;
+
 /* an operand's source, as read_operand chooses it */
 static void source(char *text, size_t size, const struct nv2a_cpu_instruction *instruction,
 	const struct nv2a_cpu_operand *operand)
@@ -35,16 +40,28 @@ static void source(char *text, size_t size, const struct nv2a_cpu_instruction *i
 	switch (operand->mux)
 	{
 	case _mux_temporary:
-		if (operand->index == 12)
+		if (lane >= 0)
+		{
+			if (operand->index == 12)
+				snprintf(text, size, "P%d", lane);
+			else
+				snprintf(text, size, "R%d[%d]", lane, operand->index < 12 ? operand->index : 0);
+		}
+		else if (operand->index == 12)
 			snprintf(text, size, "p");
 		else
 			snprintf(text, size, "r[%d]", operand->index < 12 ? operand->index : 0);
 		break;
 	case _mux_input:
-		snprintf(text, size, "v[%d]", instruction->input);
+		if (lane >= 0 && instruction->input == 0)
+			snprintf(text, size, "points[%d]", lane);
+		else
+			snprintf(text, size, "v[%d]", instruction->input);
 		break;
 	case _mux_constant:
-		if (instruction->relative)
+		if (instruction->relative && lane >= 0)
+			snprintf(text, size, "c[nv2a_clamp(%d + a%d)]", instruction->constant, lane);
+		else if (instruction->relative)
 			snprintf(text, size, "c[nv2a_clamp(%d + a0)]", instruction->constant);
 		else
 			snprintf(text, size, "c[%d]", instruction->constant < NV2A_CPU_CONSTANT_COUNT ? instruction->constant :
@@ -82,7 +99,11 @@ static void masked(FILE *out, const char *destination, const char *value, unsign
 
 static const char *temporary_name(unsigned temporary, char *text, size_t size)
 {
-	if (temporary == 12)
+	if (lane >= 0 && temporary == 12)
+		snprintf(text, size, "P%d", lane);
+	else if (lane >= 0)
+		snprintf(text, size, "R%d[%u]", lane, temporary < 12 ? temporary : 0);
+	else if (temporary == 12)
 		snprintf(text, size, "p");
 	else
 		snprintf(text, size, "r[%u]", temporary < 12 ? temporary : 0);
@@ -160,9 +181,13 @@ static void instruction_code(FILE *out, const struct nv2a_cpu_instruction *instr
 		fprintf(out, "\t\tI[0] = I[1] = I[2] = I[3] = 0.0f;\n");
 		break;
 	}
-	if (instruction->captures_clip && !colors_only)
+	if (instruction->captures_clip && lane >= 0)
+		fprintf(out, "\t\tmemcpy(clips[%d], P%d, sizeof(clips[0]));\n", lane, lane);
+	else if (instruction->captures_clip && !colors_only)
 		fprintf(out, "\t\tmemcpy(o->clip, p, sizeof(o->clip));\n\t\to->clip_captured = 1;\n");
-	if (instruction->mac == _mac_arl)
+	if (instruction->mac == _mac_arl && lane >= 0)
+		fprintf(out, "\t\ta%d = nv2a_floor_index(M[0] + 0.001f);\n", lane);
+	else if (instruction->mac == _mac_arl)
 		fprintf(out, "\t\ta0 = nv2a_floor_index(M[0] + 0.001f);\n");
 	else if (instruction->mac != _mac_nop && instruction->mac_mask)
 		masked(out, temporary_name(instruction->temporary, text, sizeof(text)), "M", instruction->mac_mask);
@@ -177,6 +202,14 @@ static void instruction_code(FILE *out, const struct nv2a_cpu_instruction *instr
 	{
 		const char *value = instruction->output_from_ilu ? "I" : "M";
 
+		/* (a positions function writes the position alone) */
+		if (lane >= 0)
+		{
+			if (instruction->output_address == _output_position)
+				masked(out, temporary_name(12, text, sizeof(text)), value, instruction->output_mask);
+			fprintf(out, "\t}\n");
+			return;
+		}
 		switch (instruction->output_address)
 		{
 		case _output_position: masked(out, "p", value, instruction->output_mask); break;
@@ -416,10 +449,131 @@ static void constant_free_comment(FILE *out, const struct nv2a_cpu_program *prog
 	fprintf(out, "%s */\n", any ? "" : " none");
 }
 
+/* writing a program's positions function: the instructions that reach the
+position (live_needs), for four values of v0 at once. An instruction that
+reads nothing of v0 (through its operands, the registers written from it,
+or a0 made from it) is the same in every lane: written once, from lane 0's
+registers, and what it writes copied to the others; one that does is
+written for each lane. Each lane does what a run for the position does,
+operation for operation, so its results are the same to the bit. */
+
+/* the temporaries' and p's components (bit 3 x) an instruction writes, and
+whether it writes a0 */
+static void instruction_writes(const struct nv2a_cpu_instruction *instruction, unsigned writes[13], int *writes_a0)
+{
+	memset(writes, 0, 13 * sizeof(writes[0]));
+	*writes_a0 = instruction->mac == _mac_arl;
+	if (instruction->mac != _mac_nop && instruction->mac != _mac_arl && instruction->mac_mask)
+		writes[temporary_index(instruction->temporary)] |= instruction->mac_mask;
+	if (instruction->ilu != _ilu_nop && instruction->ilu_mask)
+		writes[temporary_index(instruction->mac != _mac_nop ? 1 : instruction->temporary)] |= instruction->ilu_mask;
+	if (instruction->output_mask && instruction->output_is_register &&
+		(instruction->output_from_ilu ? instruction->ilu : instruction->mac) != 0 &&
+		instruction->output_address == _output_position)
+		writes[12] |= instruction->output_mask;
+}
+
+/* whether an instruction reads something of v0 (tainted: each temporary's
+components, bit 3 x; a0's) */
+static int instruction_tainted(const struct nv2a_cpu_instruction *instruction, const unsigned tainted[13],
+	int a0_tainted)
+{
+	int reads[3] = { 0, 0, 0 }, which, component;
+
+	if (instruction->mac != _mac_nop)
+	{
+		reads[0] = 1;
+		if (instruction->mac != _mac_mov && instruction->mac != _mac_arl && instruction->mac != _mac_add)
+			reads[1] = 1;
+	}
+	if (instruction->ilu != _ilu_nop || instruction->mac == _mac_add || instruction->mac == _mac_mad)
+		reads[2] = 1;
+	for (which = 0; which < 3; which++)
+	{
+		const struct nv2a_cpu_operand *operand = &instruction->operands[which];
+
+		if (!reads[which])
+			continue;
+		if (operand->mux == _mux_input && instruction->input == 0)
+			return 1;
+		if (operand->mux == _mux_constant && instruction->relative && a0_tainted)
+			return 1;
+		if (operand->mux == _mux_temporary)
+			for (component = 0; component < 4; component++)
+				if (tainted[temporary_index(operand->index)] & (8u >> (operand->swizzle[component] & 3)))
+					return 1;
+	}
+	return 0;
+}
+
+static void positions_code(FILE *out, const struct nv2a_cpu_program *program, const unsigned *needs, unsigned long hash)
+{
+	unsigned tainted[13] = { 0 };
+	int a0_tainted = 0, which;
+	unsigned long index;
+
+	fprintf(out, "static void program_%08lx_positions(const float (*c)[4], const float (*v)[4], const float (*points)[4],\n"
+		"\tfloat (*clips)[4], float (*positions)[4])\n{\n", hash);
+	for (which = 0; which < 4; which++)
+		fprintf(out, "\tfloat R%d[12][4] = { { 0.0f } };\n\tfloat P%d[4] = { 0.0f, 0.0f, 0.0f, 1.0f };\n"
+			"\tint a%d = 0;\n", which, which, which);
+	fprintf(out, "\tfloat A[4], B[4], C[4], M[4], I[4];\n\n\t(void)c;\n\t(void)v;\n\t(void)A;\n\t(void)B;\n\t(void)C;\n"
+		"\t(void)I;\n");
+	for (which = 0; which < 4; which++)
+		fprintf(out, "\t(void)R%d;\n\t(void)a%d;\n\tclips[%d][0] = clips[%d][1] = clips[%d][2] = clips[%d][3] = 0.0f;\n",
+			which, which, which, which, which, which);
+	for (index = 0; index < program->count; index++)
+	{
+		const struct nv2a_cpu_instruction *instruction = &program->instructions[index];
+		unsigned writes[13];
+		int writes_a0, taint, temporary, component;
+
+		if (!(needs[index] & NV2A_CPU_LIVE_POSITION))
+			continue;
+		instruction_writes(instruction, writes, &writes_a0);
+		taint = instruction_tainted(instruction, tainted, a0_tainted);
+		if (taint)
+			for (lane = 0; lane < 4; lane++)
+				instruction_code(out, instruction, index);
+		else
+		{
+			lane = 0;
+			instruction_code(out, instruction, index);
+			for (which = 1; which < 4; which++)
+			{
+				/* (p as it was, then what the instruction wrote) */
+				if (instruction->captures_clip)
+					fprintf(out, "\tmemcpy(clips[%d], P%d, sizeof(clips[0]));\n", which, which);
+				for (temporary = 0; temporary < 13; temporary++)
+					for (component = 0; component < 4; component++)
+						if (writes[temporary] & (8u >> component))
+						{
+							if (temporary == 12)
+								fprintf(out, "\tP%d[%d] = P0[%d];\n", which, component, component);
+							else
+								fprintf(out, "\tR%d[%d][%d] = R0[%d][%d];\n", which, temporary, component, temporary,
+									component);
+						}
+				if (writes_a0)
+					fprintf(out, "\ta%d = a0;\n", which);
+			}
+		}
+		lane = -1;
+		for (temporary = 0; temporary < 13; temporary++)
+			tainted[temporary] = taint ? tainted[temporary] | writes[temporary] : tainted[temporary] & ~writes[temporary];
+		if (writes_a0)
+			a0_tainted = taint;
+	}
+	for (which = 0; which < 4; which++)
+		fprintf(out, "\tmemcpy(positions[%d], P%d, sizeof(positions[0]));\n", which, which);
+	fprintf(out, "}\n\n");
+}
+
 int main(int argc, char **argv)
 {
 	static DWORD words[MAXIMUM_WORDS];
 	static unsigned long hashes[MAXIMUM_PROGRAMS], counts[MAXIMUM_PROGRAMS];
+	static int positioned[MAXIMUM_PROGRAMS];
 	static struct nv2a_cpu_program program;
 	static unsigned needs[NV2A_CPU_MAXIMUM_INSTRUCTIONS];
 	unsigned long word_count = 0, position, program_count = 0, index;
@@ -549,11 +703,30 @@ int main(int argc, char **argv)
 				fprintf(out, "\t}\n");
 		}
 		fprintf(out, "\tmemcpy(o->position, p, sizeof(o->position));\n}\n\n");
+		/* (its position for four values of v0: for the skinned programs, whose
+		position a model's every node makes a matrix of, d3d8_gx.c's
+		position_keys; the others' matrices are made once for a frame's
+		constants, and their code would take the processor's memory for
+		nothing) */
+		{
+			struct nv2a_cpu_dependencies dependencies;
+
+			nv2a_cpu_analyze(&program, &dependencies);
+			positioned[program_count - 1] = dependencies.relative && dependencies.clip_captured;
+			if (positioned[program_count - 1])
+				positions_code(out, &program, needs, hash);
+		}
 	}
 	fprintf(out, "const struct nv2a_cpu_native nv2a_cpu_natives[] =\n{\n");
 	for (index = 0; index < program_count; index++)
-		fprintf(out, "\t{ 0x%08lxUL, %lu, program_%08lx, program_%08lx_colors },\n", hashes[index], counts[index],
-			hashes[index], hashes[index]);
+	{
+		char positions[40] = "NULL";
+
+		if (positioned[index])
+			snprintf(positions, sizeof(positions), "program_%08lx_positions", hashes[index]);
+		fprintf(out, "\t{ 0x%08lxUL, %lu, program_%08lx, program_%08lx_colors, %s },\n", hashes[index], counts[index],
+			hashes[index], hashes[index], positions);
+	}
 	fprintf(out, "};\n\nconst unsigned long nv2a_cpu_native_count = %lu;\n", program_count);
 	fclose(out);
 	printf("nv2a_codegen: %lu programs from %lu words\n", program_count, word_count);
