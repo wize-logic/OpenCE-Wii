@@ -344,6 +344,21 @@ enum
 	(byte *)(thread)->stack<(thread)->stack_data+HS_THREAD_STACK_SIZE && \
 	(thread)->stack->data+(thread)->stack->size<=(thread)->stack_data+HS_THREAD_STACK_SIZE)
 
+/* port: the bytes from a stack frame's address to the next multiple of 4,
+where the Wii starts each allocation (hs_stack_allocate): a frame's data
+starts 2 bytes off a long's, and the shorts allocated from it move what
+follows further, but its values are read as longs and reals (a function's
+arguments, the arithmetic's operands), and the PowerPC 750's floating-point
+loads and stores at an address that is not a multiple of 4 raise an
+alignment exception. A function allocates the same sizes from the same
+frame each time it runs, so it is given the same addresses again. The other
+builds keep the Xbox's layout */
+#ifdef HALO_WII
+#define HS_STACK_PADDING(address) ((short)((4-((unsigned long)(address)&3))&3))
+#else
+#define HS_STACK_PADDING(address) 0
+#endif
+
 #define HS_GLOBAL_DESIGNATOR_IS_EXTERNAL(designator) \
 	TEST_FLAG((designator), _hs_global_external_bit)
 
@@ -917,7 +932,8 @@ static char const *expression_get_function_name(
 			return hs_function_get((word)syntax_node->index)->name;
 		}
 
-		next_expression_index = *(long *)thread->stack->data;
+		next_expression_index = *(long *)(thread->stack->data+
+			HS_STACK_PADDING(thread->stack->data)); /* port: */
 		if (next_expression_index == NONE)
 			return "(end of script)";
 
@@ -2844,7 +2860,8 @@ static void *hs_stack_allocate(
 	/* port: none past the thread's stack (hs_stack_overflow); the caller
 	returns on NULL */
 	if (size<0 ||
-		size>thread->stack_data+HS_THREAD_STACK_SIZE-(frame->data+frame->size) ||
+		size+HS_STACK_PADDING(frame->data+frame->size)>
+			thread->stack_data+HS_THREAD_STACK_SIZE-(frame->data+frame->size) ||
 		TEST_FLAG(thread->flags, _hs_thread_stack_overflow_bit))
 	{
 		hs_stack_overflow(thread_index);
@@ -2852,6 +2869,7 @@ static void *hs_stack_allocate(
 		return NULL;
 	}
 
+	frame->size += HS_STACK_PADDING(frame->data+frame->size); /* port: */
 	result = frame->data+frame->size;
 	frame->size += (short)size;
 
