@@ -16,6 +16,11 @@ one motor on and off by a duty cycle (xinput_wii_map.c), keeps the console's
 rumble setting, and stops it when the game stops asking, a menu is up, the
 controller goes, or the game quits.
 
+The HOME button (wii_home.c, wii_home_game.c) is looked for where the
+controllers are read: while its menu is up the game is given no controller and
+no rumble. A script's changes to the Remotes (test_input.c: remote, extension,
+battery, home) are made to the raw input there, as the console's would be.
+
 The Wii Remote's pointer aims (halo_linux_mouse_look): the view turns while
 it points outside a box at the screen's centre, faster nearer the edge, at the
 rates of the player's look sensitivity. It keeps turning for a moment when the
@@ -31,6 +36,8 @@ sensor bar is lost.
 
 #include "port_config.h"
 #include "test_input.h"
+#include "wii_home.h"
+#include "wii_home_game.h"
 #include "xinput_wii_map.h"
 
 #define PORT_COUNT 4
@@ -77,9 +84,37 @@ static struct motor motors[PORT_COUNT];
 service, which must not read the poll's state while it is being filled */
 static volatile unsigned remotes_connected;
 static volatile unsigned pads_connected;
+/* the scripted controller's navigation of the HOME menu, as of its last read */
+static unsigned script_navigation;
 static WlPlatformMutex motor_lock;
 static BOOL motor_lock_made;
 static BOOL motors_stopped;
+
+/* a script's say over a Remote (test_input.c) in place of what the console
+reported: gone, or there with nothing pressed, its extension, its battery */
+static void script_remotes(WlRawInput *raw)
+{
+	int port;
+
+	for (port = 0; port < PORT_COUNT; port++)
+	{
+		struct test_input_remote script;
+		WlRawRemote *remote = &raw->remotes[port];
+
+		if (!test_input_remote_override(port, &script))
+			continue;
+		if (script.connected == 0)
+			memset(remote, 0, sizeof(*remote));
+		else if (script.connected == 1 && !remote->connected)
+			remote->connected = TRUE;
+		if (!remote->connected)
+			continue;
+		if (script.extension >= 0)
+			remote->extension = (unsigned char)script.extension;
+		if (script.battery >= 0)
+			remote->battery = (unsigned char)script.battery;
+	}
+}
 
 /* the controllers once a frame at most (every port reads them each tick) */
 static const WlRawInput *input_read(void)
@@ -94,6 +129,9 @@ static const WlRawInput *input_read(void)
 
 		wl_platform_input_poll(&input);
 		input_polled_us = now;
+		script_remotes(&input);
+		/* (the HOME menu: its look at the controllers, and what the script presses) */
+		wii_home_game_poll(&input, now, script_navigation, test_input_home_pressed());
 		for (port = 0; port < PORT_COUNT; port++)
 		{
 			if (input.remotes[port].connected)
@@ -128,9 +166,21 @@ static BOOL input_logging(void)
 
 /* (the scripted player of the automated tests is controller 1:
 port/linux/src/test_input.c) */
+static BOOL scripted_port(const WlRawInput *raw, int port)
+{
+	struct test_input_remote script;
+
+	/* (a script that has taken Remote 0 away leaves the scripted controller
+	with nothing, as it would be with no Remote and no pad) */
+	if (port == 0 && test_input_remote_override(0, &script) && script.connected == 0)
+		return FALSE;
+	(void)raw;
+	return port == 0 && test_input_active();
+}
+
 static BOOL port_connected(const WlRawInput *raw, int port)
 {
-	return raw->remotes[port].connected || raw->pads[port].connected || (port == 0 && test_input_active());
+	return raw->remotes[port].connected || raw->pads[port].connected || scripted_port(raw, port);
 }
 
 /* ---------- XAPI */
@@ -222,14 +272,22 @@ DWORD WINAPI XInputGetState(HANDLE device, PXINPUT_STATE state)
 	{
 		wii_map_gamecube(&raw->pads[port], &state->Gamepad, ui_widgets_active());
 	}
-	else if (!(port == 0 && test_input_active()))
+	else if (!scripted_port(raw, port))
 	{
 		/* (a controller that has gone does not keep its motor running) */
 		motors[port].strength = 0;
 		return ERROR_DEVICE_NOT_CONNECTED;
 	}
 	if (port == 0)
+	{
 		test_input_gamepad(&state->Gamepad, wl_platform_time_us() / 1000);
+		/* (the scripted controller steers the HOME menu, if it is up) */
+		script_navigation = test_input_active() ? wii_home_pad_navigation(&state->Gamepad) : 0;
+	}
+	/* the HOME menu is up, or a button that closed it is still down: the game
+	sees a controller with nothing pressed */
+	if (wii_home_game_blocks_input())
+		memset(&state->Gamepad, 0, sizeof(state->Gamepad));
 	if (memcmp(&state->Gamepad, &controllers[port].previous, sizeof(state->Gamepad)))
 	{
 		controllers[port].packet_number++;
@@ -260,7 +318,7 @@ DWORD WINAPI XInputSetState(HANDLE device, PXINPUT_FEEDBACK feedback)
 		return ERROR_DEVICE_NOT_CONNECTED;
 	/* (the service switches the motor: the strength and when it was asked, and
 	none while a menu is up, as when the game is paused) */
-	motors[port].strength = ui_widgets_active() ? 0 :
+	motors[port].strength = ui_widgets_active() || wii_home_game_open() ? 0 :
 		wii_rumble_strength(feedback->Rumble.wLeftMotorSpeed, feedback->Rumble.wRightMotorSpeed);
 	motors[port].asked_ms = (unsigned long)(wl_platform_time_us() / 1000);
 	return ERROR_SUCCESS;
@@ -295,7 +353,7 @@ void wii_rumble_tick(void *unused)
 			unsigned strength = motor->strength;
 			BOOL on;
 
-			if (now_ms - motor->asked_ms > RUMBLE_STALE_MS)
+			if (now_ms - motor->asked_ms > RUMBLE_STALE_MS || wii_home_game_open())
 				strength = 0;
 			if (!remote && !pad)
 			{
@@ -357,7 +415,8 @@ static BOOL pointer_aiming(short gamepad_index, float *x, float *y)
 	if (gamepad_index < 0 || gamepad_index >= PORT_COUNT)
 		return FALSE;
 	input_read();
-	if (!pointers[gamepad_index].tracking)
+	/* (the HOME menu is up: the view does not turn) */
+	if (!pointers[gamepad_index].tracking || wii_home_game_blocks_input())
 		return FALSE;
 	*x = pointers[gamepad_index].x;
 	*y = pointers[gamepad_index].y;

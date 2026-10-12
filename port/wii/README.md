@@ -138,6 +138,8 @@ inflated it to, and the Wii reads it where it is.
   | `wii_posix.c` | names for the shared files over WiiLibs: where the game's folder is (`wl_platform_fs_find_app_dir`), random bytes (`wl_platform_random_bytes`), thread priorities (`wl_posix_thread_set_relative_priority`), the heap report |
   | `xinput_wii.c` | XInput over the Wii Remote with Nunchuk or Classic Controller, and the GameCube controller; the pointer's aim |
   | `xinput_wii_map.c` | what each button and stick of those controllers is as the Xbox gamepad (checked on the host) |
+  | `wii_home.c` | the HOME button's menu and the Wii's notices as a state machine apart from the game (checked on the host) |
+  | `wii_home_game.c` | that machine joined to the game (its pause, WiiLibs' sound fade and exit) and the overlay it draws over the frame |
   | `posix_net_wii.c` | sockets over WiiLibs' network layer, for system link |
   | `d3d8_gx.c` | the Direct3D device |
   | `wii_extras.c` | the desktop additions the Wii goes without |
@@ -1010,6 +1012,22 @@ SAVE AND QUIT from the pause menu, the profile's settings, and the saved game lo
   degrees, tick ...)`), and each checkpoint saved, reverted or loaded (`game state: ...`). It ends
   with `test_input: script finished`, or `test_input: script stopped at line N (...): timed out`
   and what was shown then. Its last step quits, which on the Wii goes back to the loader.
+- The Wii's controllers and buttons have steps of their own, for the HOME menu and the notices
+  (`tests/home_menu.txt` plays them over a10, with a list in its header of the log lines to look for):
+
+  ```
+  home                              HOME pressed and let go, on any Remote
+  remote <port> off|on|real         Wii Remote 0 to 3 gone, there (with nothing pressed, if none is), or as reported
+  extension <port> none|nunchuk|classic|real
+  battery <port> <percent>|real
+  event reset|power                 the watcher thread sees the console's button (logged; nothing leaves)
+  ```
+
+  They change the raw input before `xinput_wii.c` reads it, so the game's own handling of a Remote
+  that leaves (`remote 0 off` is a controller removed: its pause message) is what is tested; and while
+  the HOME menu is up the scripted controller's up, down, a and b (`press down`, `press a`) steer it.
+  `remote 0 on` makes a Remote of its own when there is none (Dolphin with no Remote connected).
+  `tools/wii_input_check.py` runs the verbs against the real `test_input.c` on the host.
 - The x86 Linux build plays the same script (`HALO_MENUS=xbox HALO_TEST_INPUT=script:...`, headless
   or on a virtual display with `debug.screenshot_every`) to the same screens and places.
 - The Xbox's pause menu has no settings (the PC version's has); the settings are reached from the
@@ -1060,11 +1078,62 @@ that a menu's left, right, up and down never also mean Back, a click or a weapon
 | Start (pause) | + | + | Start |
 | D-pad (menus) | D-pad | D-pad | D-pad |
 
-The Home button does nothing in the game (the menus' Quit returns to the loader); the console's
-reset and power buttons, and a Remote's power button, are served by the watcher thread ("Reset,
-Power and quitting", above). The Remote
-without a Nunchuk has no way to move (its buttons and pointer work); the Classic Controller's
-pointer is not used; the Wii U Pro Controller is not supported (its stick clicks are not read).
+The console's reset and power buttons, and a Remote's power button, are served by the watcher
+thread ("Reset, Power and quitting", above). The Remote without a Nunchuk has no way to move (its
+buttons and pointer work, and the game tells the player so: "The notices", below); the Classic
+Controller's pointer is not used; the Wii U Pro Controller is not supported (its stick clicks are
+not read).
+
+**The HOME button** (a Wii Remote's, or a Classic Controller's own; a GameCube controller has none)
+opens a menu over the game, `src/wii_home.c` and `src/wii_home_game.c`:
+
+```
+HOME
+> Resume
+  Reset to title
+  Return to the loader
+
+WII REMOTE BATTERIES: REMOTE 1 [=========   ] 80%      A: CHOOSE   B OR HOME: RESUME
+```
+
+- **Resume** closes it. **Reset to title** is the game's way to its main menu
+  (`main_goto_main_menu`), as if the level were left without saving (SAVE AND QUIT in the pause menu
+  saves); it is not offered while a menu is up already (no level running). **Return to the loader**
+  asks first, "Unsaved progress will be lost", with Cancel chosen, and then leaves for the Homebrew
+  Channel as the menus' Quit does (`platform_request_quit`: the saves finish, the audio and motors
+  stop, the SD card is written out). The battery gauges list each connected Remote.
+- Any controller steers it: the D-pad or the stick moves (wrapping), A (the Classic Controller's
+  lower button b) chooses, B, 1 (the Classic Controller's a) or HOME again goes back or resumes.
+- While it is up the game is paused as its pause menu pauses it (`game_time_set_paused`; a game
+  paused already, by its own menu, is left as it is when the menu closes), the sound fades out over
+  300 ms and back over 300 ms when it closes (WiiLibs' `wl_platform_audio_fade`, at the output, so
+  the game's mixer is untouched), the rumble is off, the pointer turns nothing and the game is
+  given a controller with nothing pressed. A button held as it closes (the A that chose Resume)
+  does nothing in the game until it is let go, or for a second and a half.
+- It is drawn by WiiLibs at the end of the frame, over the finished picture (`wl_gx_set_overlay`,
+  called from `wl_gx_end_frame`, which `D3DDevice_Present` ends its frame with; 5 by 7 capitals in a
+  built-in font, `wl/platform/overlay.h`), and the hook is set only while there is a menu or a notice
+  to draw. A closed menu costs the frame nothing; the controllers are looked at where the game reads
+  them anyway (`xinput_wii.c`), a few comparisons a read, and the battery every two seconds, not each
+  frame. The menu's draws are a few hundred flat quads.
+
+**The notices** (the same overlay, a box at the top; they pause nothing and take no controller):
+
+- *A Remote with nothing to move with*: in play, on a controller with a player, with no Nunchuk or
+  Classic Controller for a moment and a half (a Nunchuk plugged in is read as none for a moment
+  first), the box says "Wii Remote 1: Connect a Nunchuk or Classic Controller to move" for seven
+  seconds. Once, until something has been plugged in and pulled out again. The game's own message
+  (the Xbox's "controller unplugged", `source/input/input_abstraction.c`) still pauses the game when
+  a Remote drops.
+- *A weak battery*: once, when a Remote's battery (0 to 100, from its status reports; a 0 before
+  the first nonzero reading is not known yet) falls below 10%: "Wii Remote 2: Battery low (8%)".
+  Told again only after it has been 15% or more.
+
+**On a run without a person** (`debug.test_input = "script:<file>"`, "The playthrough check") the
+script's `home`, `remote`, `extension`, `battery` and `event` steps do the same as the hardware
+would, through the same code (they change the raw input that `xinput_wii.c` reads, before the HOME
+menu and the game see it), and the scripted controller's D-pad up and down, a and b steer the HOME
+menu. `tests/home_menu.txt` plays them.
 
 **The pointer** (a Remote without a Classic Controller) aims like a mouse's direct look
 (`halo_linux_mouse_look`): the view does not turn while the pointer is within 35% of the half
@@ -1090,6 +1159,16 @@ motor's state forgotten, so that one that comes back starts still), when the gam
 console is reset or powered off. The console's setting (the Wii's Remote vibration, `BT.MOT` in
 SYSCONF, read by libogc's `CONF_GetPadMotorMode`, through WiiLibs' `wl_platform_rumble_enabled`)
 is kept: with it off no motor, GameCube controllers' included, is switched on.
+
+Checking the HOME menu: the same script builds `tests/wii_home_check.c` with `src/wii_home.c` (the
+state machine against fake controllers, a fake game and a clock: opening and closing, the pause
+made once and undone only if it was the menu's, the sound's fades, the items and the loader's question,
+the buttons held as it closes, every controller's navigation, HOME of the Classic Controller only on
+one, the notices' debounce, their once and their expiry, the battery looked at every two seconds, and
+nothing asked while closed) and `tests/wii_script_check.c` with the real `test_input.c` (a script of
+the verbs played a read at a time, and lines that must be refused). WiiLibs' tests cover the frame
+overlay, the font, the audio fade and the simulated buttons (`test_platform_overlay`,
+`test_platform_audio_fade`, `test_platform_shutdown`).
 
 Checking the mapping: `tools/wii_input_check.py` builds `tests/wii_input_check.c` for the host
 with WiiLibs' `input_shape.c` and maps synthetic input states, comparing the Xbox gamepad with
@@ -1137,7 +1216,10 @@ Dolphin runs the game, but these need the console:
   in Dolphin) and **the controllers** ("The controllers", above: that the sticks'
   and triggers' real ranges are the ones read, a Remote's drop-outs, the pointer's feel and
   look speed, the Classic Controller Pro's triggers, whether the Wii U Pro Controller and the
-  Home button need handling; `debug.input_log` writes each state to the log).
+  Home button need handling beyond its menu; the menu itself needs the console to show that HOME
+  opens and closes it from a Remote and a Classic Controller, the dimming, the text's legibility on a
+  television and the fade, and a Remote's battery codes against the percent the notice shows, which
+  the log has (`remote N battery code C`); `debug.input_log` writes each state to the log).
 - **Reset, Power and the Remote's power button** (needs a checkpoint run in Dolphin, which has
   emulated Reset and Power buttons on its menu and a Remote that can be disconnected, and the
   console): each while a map loads and in play; the log ends with "leaving (loader)" or "leaving

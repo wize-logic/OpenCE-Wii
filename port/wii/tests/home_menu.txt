@@ -1,0 +1,122 @@
+# The HOME button's menu and the Wii's notices, for debug.test_input =
+# "script:home_menu.txt" (port/wii/README.md, "The controllers" and "The
+# playthrough check"), with display.menus = "xbox" and an empty saves folder.
+# The first steps are the playthrough's, to a10's cryo bay; then the log shows
+# the menu's own lines ("home: ..."), and a screenshot (debug.screenshot_every,
+# or Dolphin's) at each "look" line shows what is drawn. Checkpoint run: say so
+# first, one Dolphin at a time.
+#
+# What to see in the log, in order:
+#   home: menu opened (game paused)         HOME in play
+#   home: menu closed                       Resume (A), then B, then HOME
+#   home: asking before the loader          Return to the loader, A
+#   home: reset to the title                Reset to title
+#   home: notice: Wii Remote 1 has no Nunchuk or Classic Controller
+#   home: notice: Wii Remote 1 battery low (5%)
+#   system: reset button (simulated): not leaving
+# and the game's own "controller unplugged" pause when the Remote goes.
+
+screen main_menu\main_menu 300
+wait 2
+press a
+screen new_campaign_creating_profile 60
+wait 2
+press a
+screen difficulty_select 120
+wait 2
+select normal_difficulty_item
+press a
+play 300
+wait 8
+press a
+ticks 150
+
+# (a Wii Remote with a Nunchuk and a good battery on port 1, as a person would
+# have; with a real one the script's changes below are made to it instead)
+remote 0 on
+extension 0 nunchuk
+battery 0 80
+
+# HOME in play: the menu, Resume chosen, the picture dimmed, the sound out
+log step 1: HOME
+home
+wait 1
+log look 1: the menu over a10 (Resume, Reset to title, Return to the loader; the Remotes' batteries)
+wait 1
+
+# up and down wrap; A resumes, and the game runs on from where it stopped
+press down
+press up
+log step 2: Resume with A
+press a
+wait 1
+log look 2: no menu; the game runs
+ticks 60
+
+# HOME again closes it; so does B
+log step 3: HOME opens, B closes
+home
+wait 1
+press b
+ticks 60
+log step 4: HOME opens, HOME closes
+home
+wait 1
+home
+ticks 60
+
+# the loader asks first, and Cancel keeps the game (nothing leaves)
+log step 5: Return to the loader, then Cancel
+home
+wait 1
+press up
+press a
+wait 1
+log look 3: Unsaved progress will be lost; Cancel chosen
+press a
+wait 1
+log look 4: back in the menu, on Return to the loader
+home
+ticks 60
+
+# a Remote with nothing to move with (a Classic Controller or Nunchuk pulled)
+log step 6: Wii Remote 1 without a Nunchuk
+extension 0 none
+wait 3
+log look 5: the notice at the top, Connect a Nunchuk or Classic Controller to move
+extension 0 nunchuk
+wait 1
+
+# a weak battery, once
+log step 7: Wii Remote 1 at 5 percent
+battery 0 5
+wait 4
+log look 6: the battery notice, once
+wait 4
+battery 0 real
+
+# the Remote gone: the game's own pause, and back
+log step 8: Wii Remote 1 off
+remote 0 off
+wait 3
+log look 7: the game's controller unplugged message
+remote 0 on
+wait 2
+press start
+ticks 30
+
+# the reset button, as the watcher sees it (nothing leaves)
+log step 9: the reset button, simulated
+event reset
+wait 1
+
+# Reset to title: the game's main menu
+log step 10: Reset to title
+home
+wait 1
+press down
+press a
+screen main_menu\main_menu 120
+wait 2
+log step 11: done
+quit

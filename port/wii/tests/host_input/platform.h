@@ -8,6 +8,7 @@ tools/wii_input_check.py compares them. */
 
 typedef int BOOL;
 typedef unsigned short WORD;
+typedef short SHORT;
 #define TRUE 1
 #define FALSE 0
 
@@ -38,5 +39,9 @@ typedef struct _XINPUT_GAMEPAD
 	short sThumbRX;
 	short sThumbRY;
 } XINPUT_GAMEPAD;
+
+/* what test_input.c asks of the platform (tests/wii_script_check.c) */
+void platform_log(const char *format, ...) __attribute__((format(printf, 1, 2)));
+const char *platform_data_root(void);
 
 #endif

@@ -27,6 +27,10 @@ The hooks:
   game_state_xbox.c), so one that is stopped between two is not a valid save
   and the one before it stays.
 
+A script (test_input.c, the verb "event") can have the watcher see a reset or
+power button without leaving: it logs "reset button (simulated)" and goes on
+(wii_system_simulate).
+
 The watcher thread also runs the rumble service's tick (xinput_wii.c): the
 motors' on and off by a duty cycle, which a stalled game must not leave
 running.
@@ -66,6 +70,13 @@ static void files_hook(WlExitTarget target, void *user)
 	unfinished = wii_files_quiesce(WRITES_TIMEOUT_MS);
 	if (unfinished)
 		platform_log("leaving: %d file writes still under way after %d ms", unfinished, WRITES_TIMEOUT_MS);
+}
+
+/* the watcher sees the reset button (power: 0) or the power button as it
+would, and leaves nothing; nonzero when it is not running (test_input.c) */
+int wii_system_simulate(int power)
+{
+	return wl_platform_system_simulate(power ? WL_SYS_POWER : WL_SYS_RESET) == WL_OK ? 0 : 1;
 }
 
 /* after WiiLibs' heaps are up (the watcher's stack is one of them) */
