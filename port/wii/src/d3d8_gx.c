@@ -2855,6 +2855,8 @@ struct gx_vertex
 {
 	/* (its position matrix's index, sent when emit_matrix_index: draw_keys) */
 	u8 matrix;
+	/* (a lit draw in hardware's: D0's alpha, the planar fog's) */
+	u8 alpha;
 	float position[3];
 	u8 color0[4], color1[4];
 	float texcoord[4][2];
@@ -6419,6 +6421,318 @@ static BOOL kept_normals_find(const struct vertex_shader_object *shader, unsigne
 	return TRUE;
 }
 
+/* ---------- the vertices of a draw in hardware the processor has a part in
+
+Where the processor computes something of a draw's vertices (a blended
+vertex's position, the colours, a sphere map's coordinates, the planar fog's
+alpha) or sends what GX cannot read by index, each vertex's part is
+computed once however many of the indices name it (a strip names most
+twice), into the vertex memo, and each index then sends what its vertex
+has. The loop that sends them is made for each common combination of what
+is sent (hardware_emit's flags, constants there), so that an index costs
+only what it sends: the general one tested each case at every index. */
+enum
+{
+	/* each vertex's matrix indices, by its key (hardware_key_bytes): the
+	position's, then one, two or three more */
+	HW_KEYED = 1 << 0,
+	HW_MATRIX2 = 1 << 1,
+	HW_MATRIX3 = 1 << 2,
+	HW_MATRIX4 = 1 << 3,
+	/* every position sent (a draw with blended vertices): the processor's,
+	or the vertex's own */
+	HW_POSITIONS = 1 << 4,
+	/* a normal, sent (the map's, or a blended vertex's) or by index */
+	HW_LIT = 1 << 5,
+	HW_NORMALS_INDEXED = 1 << 6,
+	/* D0's alpha, the planar fog's (lit.alpha) */
+	HW_ALPHA = 1 << 7,
+	/* the colours: the processor's, kept (by index), or a pad of 0 */
+	HW_CPU_COLORS = 1 << 8,
+	HW_KEPT_COLORS = 1 << 9,
+	HW_PAD = 1 << 10,
+	/* the processor's sphere maps' coordinates */
+	HW_SPHERES = 1 << 11
+};
+/* (what needs the vertex's computed part) */
+#define HW_COMPUTED(flags) \
+	(((flags) & (HW_POSITIONS | HW_ALPHA | HW_CPU_COLORS | HW_SPHERES)) || \
+		((flags) & (HW_LIT | HW_NORMALS_INDEXED)) == HW_LIT)
+
+struct hardware_vertices
+{
+	unsigned flags;
+	struct nv2a_cpu_program *program;
+	/* (fetch's elements for what the processor computes of a vertex) */
+	struct stream_fetch *fetch;
+	float (*inputs)[4];
+	float point_size;
+	BOOL cpu_colors;
+	unsigned cpu_spheres;
+	const WORD *indices;
+	UINT first;
+	unsigned long base, least, memo_size;
+	const unsigned char *position_stream;
+	UINT position_stride;
+	unsigned texture_count, sphere_count;
+	int sphere_list[4];
+};
+
+/* each key's matrix indices, in the order the vertex sends them */
+static u8 hardware_key_bytes[256][4];
+static struct hardware_vertices hardware_vertices_draw;
+/* in the statistics' window: the draws and indices of each kind (flags),
+the first HW_KINDS kinds seen */
+#define HW_KINDS 16
+static struct
+{
+	unsigned flags;
+	unsigned long draws, indices;
+} hardware_kinds[HW_KINDS];
+
+/* a vertex's own position, normal and planar fog (not the processor's
+vertex) */
+static inline __attribute__((always_inline)) void hardware_vertex_own(const struct hardware_vertices *h,
+	unsigned long whole, unsigned key, struct gx_vertex *computed, const unsigned flags)
+{
+	const unsigned char *position = h->position_stream + whole * h->position_stride;
+
+	if (flags & (HW_POSITIONS | HW_ALPHA))
+	{
+		word_copy(&computed->position[0], position);
+		word_copy(&computed->position[1], position + 4);
+		word_copy(&computed->position[2], position + 8);
+	}
+	if ((flags & (HW_LIT | HW_NORMALS_INDEXED)) == HW_LIT)
+		lit_normal(whole, computed->normal);
+	if (flags & HW_ALPHA)
+	{
+		const float (*rows)[4] = (const float (*)[4])lit.world[(flags & HW_KEYED) ? key : 0];
+		const float *model = computed->position;
+		float world[3];
+		int row;
+
+		for (row = 0; row < 3; row++)
+			world[row] = rows[row][0] * model[0] + rows[row][1] * model[1] + rows[row][2] * model[2] + rows[row][3];
+		computed->alpha = color_byte(gx_lighting_planar_fog(&lit.lighting, world));
+	}
+}
+
+/* what the processor computes of a vertex (its value whole, at index vertex,
+of the key key): out, or the memo's entry, which it returns */
+static struct gx_vertex *hardware_vertex_compute(const struct hardware_vertices *h, UINT vertex, unsigned long whole,
+	unsigned key, struct gx_vertex *out)
+{
+	unsigned long slot = whole - h->least;
+	struct gx_vertex *computed = slot < h->memo_size ? &vertex_memo[slot] : out;
+	BOOL processor = key == KEY_PROCESSOR;
+	unsigned flags = h->flags;
+	int stage, component;
+
+	if (processor || h->cpu_colors || h->cpu_spheres)
+	{
+		/* what the processor computes of the vertex: its position (in
+		draw_run's (x w, y w, -w), through the identity) where it is the
+		processor's, its colours and sphere maps' coordinates where they
+		are */
+		struct nv2a_cpu_output out_values;
+		float (*inputs)[4] = h->inputs;
+
+		stream_fetch(h->fetch, vertex, inputs);
+		if (processor || h->cpu_spheres)
+		{
+			unsigned live = (processor ? NV2A_CPU_LIVE_POSITION : 0) |
+				(h->cpu_colors ? NV2A_CPU_LIVE_D0 | NV2A_CPU_LIVE_D1 : 0) | h->cpu_spheres * NV2A_CPU_LIVE_T0;
+
+			nv2a_cpu_run_live(h->program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
+				h->point_size, &out_values, live);
+			if (processor)
+			{
+				clip_position(out_values.clip, computed->position);
+				processor_positions++;
+			}
+			for (stage = 0; stage < 4; stage++)
+				if (h->cpu_spheres & (1U << stage))
+					sphere_coordinates(out_values.t[stage], computed->texcoord[stage]);
+			if (h->cpu_spheres)
+				hardware_spheres_run++;
+			if ((flags & HW_LIT) && processor)
+			{
+				/* (a lit draw's blended vertex: its normal and world position
+				by its own blend of the nodes, as the program skins them) */
+				const float (*constants)[4] = (const float (*)[4])device.vertex_constants + VERTEX_CONSTANT_BIAS;
+				float blend[3][4], world[3];
+				int row;
+
+				gx_lighting_skin(constants, inputs[NODE_INDICES], inputs[NODE_WEIGHT], blend);
+				for (row = 0; row < 3; row++)
+				{
+					computed->normal[row] = blend[row][0] * inputs[1][0] + blend[row][1] * inputs[1][1] +
+						blend[row][2] * inputs[1][2];
+					world[row] = blend[row][0] * inputs[0][0] + blend[row][1] * inputs[0][1] +
+						blend[row][2] * inputs[0][2] + blend[row][3];
+				}
+				if (flags & HW_ALPHA)
+					computed->color0[3] = color_byte(gx_lighting_planar_fog(&lit.lighting, world));
+			}
+		}
+		else
+			nv2a_cpu_run_colors(h->program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
+				&out_values);
+		if (h->cpu_colors)
+		{
+			for (component = 0; component < 4; component++)
+			{
+				computed->color0[component] = color_byte(out_values.d0[component]);
+				computed->color1[component] = color_byte(out_values.d1[component]);
+			}
+			hardware_colors_run++;
+		}
+	}
+	if (processor)
+		computed->alpha = computed->color0[3];
+	else
+		hardware_vertex_own(h, whole, key, computed, flags);
+	if (computed != out)
+		vertex_memo_stamps[slot] = vertex_memo_draw;
+	return computed;
+}
+
+/* each index's vertex sent: what flags (a constant where this is inlined)
+says it has */
+static inline __attribute__((always_inline)) void hardware_emit(const struct hardware_vertices *h, UINT count,
+	const unsigned flags)
+{
+	UINT vertex;
+	unsigned stage;
+
+	for (vertex = 0; vertex < count; vertex++)
+	{
+		unsigned long whole = h->indices ? (unsigned long)h->indices[vertex] + h->base : h->first + vertex;
+		u16 index = (u16)whole;
+		unsigned key = (flags & HW_KEYED) ? draw_key_of[vertex] : 0;
+		const struct gx_vertex *computed = NULL;
+		struct gx_vertex local;
+
+		if (HW_COMPUTED(flags))
+		{
+			unsigned long slot = whole - h->least;
+
+			if (slot < h->memo_size && vertex_memo_stamps[slot] == vertex_memo_draw)
+				computed = &vertex_memo[slot];
+			else if (!(flags & (HW_CPU_COLORS | HW_SPHERES)) && key != KEY_PROCESSOR)
+			{
+				/* (the vertex's own alone: here) */
+				struct gx_vertex *own = slot < h->memo_size ? &vertex_memo[slot] : &local;
+
+				hardware_vertex_own(h, whole, key, own, flags);
+				if (own != &local)
+					vertex_memo_stamps[slot] = vertex_memo_draw;
+				computed = own;
+			}
+			else
+				computed = hardware_vertex_compute(h, vertex, whole, key, &local);
+		}
+		if (flags & HW_KEYED)
+		{
+			const u8 *bytes = hardware_key_bytes[key];
+
+			GX_MatrixIndex1x8(bytes[0]);
+			if (flags & HW_MATRIX2)
+				GX_MatrixIndex1x8(bytes[1]);
+			if (flags & HW_MATRIX3)
+				GX_MatrixIndex1x8(bytes[2]);
+			if (flags & HW_MATRIX4)
+				GX_MatrixIndex1x8(bytes[3]);
+		}
+		if (flags & HW_POSITIONS)
+			GX_Position3f32(computed->position[0], computed->position[1], computed->position[2]);
+		else
+			GX_Position1x16(index);
+		if (flags & HW_LIT)
+		{
+			if (flags & HW_NORMALS_INDEXED)
+				GX_Normal1x16(index);
+			else
+				GX_Normal3f32(computed->normal[0], computed->normal[1], computed->normal[2]);
+			if (flags & HW_ALPHA)
+				GX_Color4u8(255, 255, 255, computed->alpha);
+		}
+		if (flags & HW_CPU_COLORS)
+		{
+			/* (a colour's four bytes as one word: the same bytes in the FIFO) */
+			GX_Color1u32(color_word(computed->color0));
+			GX_Color1u32(color_word(computed->color1));
+		}
+		else if (flags & HW_KEPT_COLORS)
+		{
+			GX_Color1x16(index);
+			GX_Color1x16(index);
+		}
+		else if (flags & HW_PAD)
+			GX_Color1u16(0);
+		for (stage = 0; stage < h->texture_count; stage++)
+			GX_TexCoord1x16(index);
+		if (flags & HW_SPHERES)
+			for (stage = 0; stage < h->sphere_count; stage++)
+				GX_TexCoord2f32(computed->texcoord[h->sphere_list[stage]][0], computed->texcoord[h->sphere_list[stage]][1]);
+	}
+}
+
+/* the draw's vertices sent, by the loop made for its flags */
+static void hardware_emit_draw(const struct hardware_vertices *h, UINT count)
+{
+	unsigned kind;
+
+	for (kind = 0; kind < HW_KINDS && hardware_kinds[kind].draws && hardware_kinds[kind].flags != h->flags; kind++)
+		;
+	if (kind < HW_KINDS)
+	{
+		hardware_kinds[kind].flags = h->flags;
+		hardware_kinds[kind].draws++;
+		hardware_kinds[kind].indices += count;
+	}
+#define HW_EMIT(flags) \
+	case (flags): \
+		hardware_emit(h, count, (flags)); \
+		break;
+
+	switch (h->flags)
+	{
+	/* (a model's blended vertices, lit: with a reflection, the planar fog) */
+	HW_EMIT(HW_KEYED | HW_POSITIONS | HW_LIT)
+	HW_EMIT(HW_KEYED | HW_MATRIX2 | HW_POSITIONS | HW_LIT)
+	HW_EMIT(HW_KEYED | HW_POSITIONS | HW_LIT | HW_ALPHA)
+	HW_EMIT(HW_KEYED | HW_MATRIX2 | HW_POSITIONS | HW_LIT | HW_ALPHA)
+	/* (a model lit, its planar fog the processor's) */
+	HW_EMIT(HW_KEYED | HW_LIT | HW_ALPHA)
+	HW_EMIT(HW_KEYED | HW_MATRIX2 | HW_LIT | HW_ALPHA)
+	HW_EMIT(HW_KEYED | HW_LIT | HW_NORMALS_INDEXED | HW_ALPHA)
+	HW_EMIT(HW_KEYED | HW_MATRIX2 | HW_LIT | HW_NORMALS_INDEXED | HW_ALPHA)
+	HW_EMIT(HW_LIT | HW_ALPHA)
+	HW_EMIT(HW_LIT | HW_NORMALS_INDEXED | HW_ALPHA)
+	/* (unlit: the processor's colours, blended vertices, a pad) */
+	HW_EMIT(HW_CPU_COLORS)
+	HW_EMIT(HW_KEYED | HW_CPU_COLORS)
+	HW_EMIT(HW_KEYED | HW_POSITIONS)
+	HW_EMIT(HW_KEYED | HW_POSITIONS | HW_CPU_COLORS)
+	HW_EMIT(HW_KEYED | HW_POSITIONS | HW_PAD)
+	HW_EMIT(HW_KEYED | HW_PAD)
+	HW_EMIT(HW_KEYED | HW_MATRIX2 | HW_PAD)
+	HW_EMIT(HW_KEPT_COLORS)
+	/* (and with the processor's sphere maps' coordinates) */
+	HW_EMIT(HW_SPHERES)
+	HW_EMIT(HW_CPU_COLORS | HW_SPHERES)
+	HW_EMIT(HW_KEYED | HW_CPU_COLORS | HW_SPHERES)
+	HW_EMIT(HW_KEYED | HW_POSITIONS | HW_CPU_COLORS | HW_SPHERES)
+	HW_EMIT(HW_KEYED | HW_POSITIONS | HW_SPHERES)
+	default:
+		hardware_emit(h, count, h->flags);
+		break;
+	}
+#undef HW_EMIT
+}
+
 static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitive_type, UINT count,
 	const WORD *indices, UINT first, struct stream_fetch *fetch)
 {
@@ -6911,50 +7225,106 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		GX_SetChanMatColor(GX_COLOR1A1, (GXColor){ color_byte(base.d1[0]), color_byte(base.d1[1]),
 			color_byte(base.d1[2]), color_byte(base.d1[3]) });
 	}
-	if (cpu_colors || cpu_spheres || draw_keys.processor)
-	{
-		/* (what the processor computes of a vertex, once however many of
-		the indices name it) */
-		if (!vertex_memo)
-		{
-			vertex_memo = malloc(VERTEX_MEMO_SIZE * sizeof(*vertex_memo));
-			vertex_memo_stamps = calloc(VERTEX_MEMO_SIZE, sizeof(*vertex_memo_stamps));
-			if (!vertex_memo || !vertex_memo_stamps)
-			{
-				free(vertex_memo);
-				free(vertex_memo_stamps);
-				vertex_memo = NULL;
-				vertex_memo_stamps = NULL;
-			}
-		}
-		vertex_memo_draw++;
-		/* (the registers what the processor computes reads, alone: its
-		fetch's elements for the outputs it runs the program for, and a lit
-		draw's blended vertices' position, normal, node indices and weight) */
-		{
-			const struct nv2a_cpu_dependencies *general = &shader->dependencies;
-			unsigned long reads = 0;
-			unsigned element;
-
-			if (draw_keys.processor)
-				reads |= nv2a_cpu_live_inputs(general, NV2A_CPU_LIVE_POSITION) |
-					(lit_on ? 1UL << 0 | 1UL << 1 | 1UL << NODE_INDICES | 1UL << NODE_WEIGHT : 0);
-			if (cpu_colors)
-				reads |= nv2a_cpu_live_inputs(general, NV2A_CPU_LIVE_D0 | NV2A_CPU_LIVE_D1 | NV2A_CPU_LIVE_FOG);
-			reads |= nv2a_cpu_live_inputs(general, cpu_spheres * NV2A_CPU_LIVE_T0);
-			vertex_fetch = *fetch;
-			vertex_fetch.element_count = 0;
-			for (element = 0; element < fetch->element_count; element++)
-				if (reads & (1UL << fetch->elements[element].reg))
-					vertex_fetch.elements[vertex_fetch.element_count++] = fetch->elements[element];
-		}
-	}
-	/* (the stages whose sphere maps' coordinates the processor's, in order) */
-	for (stage = 0; stage < 4; stage++)
-		if (cpu_spheres & (1U << stage))
-			sphere_list[sphere_count++] = stage;
 	/* (nothing of the vertices the processor's: emit_indices) */
 	plain = !cpu_colors && !cpu_spheres && !draw_keys.processor && !(lit_on && lit.alpha) && !kept_colors && !pad_color;
+	if (!plain)
+	{
+		struct hardware_vertices *h = &hardware_vertices_draw;
+		unsigned flags = 0;
+
+		if (keyed)
+		{
+			unsigned extra = (lit_on && lit.reflection) + fog_post + (lit_on && lit.fog_ramped);
+
+			flags |= HW_KEYED | (extra > 0 ? HW_MATRIX2 : 0) | (extra > 1 ? HW_MATRIX3 : 0) | (extra > 2 ? HW_MATRIX4 : 0);
+		}
+		if (draw_keys.processor)
+			flags |= HW_POSITIONS;
+		if (lit_on)
+			flags |= HW_LIT | (lit.normals_indexed ? HW_NORMALS_INDEXED : 0) | (lit.alpha ? HW_ALPHA : 0);
+		flags |= cpu_colors ? HW_CPU_COLORS : kept_colors ? HW_KEPT_COLORS : pad_color ? HW_PAD : 0;
+		if (cpu_spheres)
+			flags |= HW_SPHERES;
+		if (keyed)
+		{
+			/* each key's matrix indices, and the processor's vertices' */
+			unsigned key;
+
+			for (key = 0; key <= draw_keys.count; key++)
+			{
+				unsigned which = key < draw_keys.count ? key : KEY_PROCESSOR;
+				u8 position = (u8)(which == KEY_PROCESSOR ? GX_PNMTX0 : GX_PNMTX1 + 3 * key), *bytes = hardware_key_bytes[which];
+				unsigned count_bytes = 1;
+
+				bytes[0] = position;
+				if (lit_on && lit.reflection)
+					bytes[count_bytes++] = lit_sphere_rows[key];
+				if (fog_post)
+					bytes[count_bytes++] = position;
+				if (lit_on && lit.fog_ramped)
+					bytes[count_bytes++] = position;
+			}
+		}
+		h->flags = flags;
+		h->program = program;
+		h->inputs = inputs;
+		h->point_size = point_size;
+		h->cpu_colors = cpu_colors;
+		h->cpu_spheres = cpu_spheres;
+		h->indices = indices;
+		h->first = first;
+		h->base = device.base_vertex_index;
+		h->least = least;
+		h->memo_size = 0;
+		h->position_stream = position_stream;
+		h->position_stride = position_stride;
+		h->texture_count = texture_count + kept_count;
+		h->sphere_count = 0;
+		for (stage = 0; stage < 4; stage++)
+			if (cpu_spheres & (1U << stage))
+				h->sphere_list[h->sphere_count++] = stage;
+		if (HW_COMPUTED(flags))
+		{
+			/* (what the processor computes of a vertex, once however many of
+			the indices name it) */
+			if (!vertex_memo)
+			{
+				vertex_memo = malloc(VERTEX_MEMO_SIZE * sizeof(*vertex_memo));
+				vertex_memo_stamps = calloc(VERTEX_MEMO_SIZE, sizeof(*vertex_memo_stamps));
+				if (!vertex_memo || !vertex_memo_stamps)
+				{
+					free(vertex_memo);
+					free(vertex_memo_stamps);
+					vertex_memo = NULL;
+					vertex_memo_stamps = NULL;
+				}
+			}
+			if (vertex_memo)
+				h->memo_size = VERTEX_MEMO_SIZE;
+			vertex_memo_draw++;
+			/* (the registers what the processor computes reads, alone: its
+			fetch's elements for the outputs it runs the program for, and a lit
+			draw's blended vertices' position, normal, node indices and weight) */
+			{
+				const struct nv2a_cpu_dependencies *general = &shader->dependencies;
+				unsigned long reads = 0;
+				unsigned element;
+
+				if (draw_keys.processor)
+					reads |= nv2a_cpu_live_inputs(general, NV2A_CPU_LIVE_POSITION) |
+						(lit_on ? 1UL << 0 | 1UL << 1 | 1UL << NODE_INDICES | 1UL << NODE_WEIGHT : 0);
+				if (cpu_colors)
+					reads |= nv2a_cpu_live_inputs(general, NV2A_CPU_LIVE_D0 | NV2A_CPU_LIVE_D1 | NV2A_CPU_LIVE_FOG);
+				reads |= nv2a_cpu_live_inputs(general, cpu_spheres * NV2A_CPU_LIVE_T0);
+				vertex_fetch = *fetch;
+				vertex_fetch.element_count = 0;
+				for (element = 0; element < fetch->element_count; element++)
+					if (reads & (1UL << fetch->elements[element].reg))
+						vertex_fetch.elements[vertex_fetch.element_count++] = fetch->elements[element];
+			}
+		}
+		h->fetch = &vertex_fetch;
+	}
 
 	emitting = wl_platform_time_us();
 	gx_begin(gx_primitive(primitive_type), HARDWARE_VERTEX_FORMAT, (u16)count);
@@ -6963,157 +7333,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 			!lit_on ? EMIT_NORMALS_NONE : lit.normals_indexed ? EMIT_NORMALS_INDEXED : EMIT_NORMALS_SENT,
 			lit_on && lit.reflection && keyed, fog_post, lit_on && lit.fog_ramped && keyed);
 	else
-		for (vertex = 0; vertex < count; vertex++)
-		{
-			unsigned long whole = indices ? (unsigned long)indices[vertex] + device.base_vertex_index : first + vertex;
-			u16 index = (u16)whole;
-			BOOL processor = keyed && draw_key_of[vertex] == KEY_PROCESSOR;
-			struct gx_vertex local, *computed = &local;
-
-			if (keyed)
-				GX_MatrixIndex1x8((u8)(processor ? GX_PNMTX0 : GX_PNMTX1 + 3 * draw_key_of[vertex]));
-			if (lit_on && lit.reflection && keyed)
-				GX_MatrixIndex1x8(lit_sphere_rows[processor ? draw_keys.count : draw_key_of[vertex]]);
-			if (fog_post)
-				GX_MatrixIndex1x8((u8)(processor ? GX_PNMTX0 : GX_PNMTX1 + 3 * draw_key_of[vertex]));
-			if (lit_on && lit.fog_ramped && keyed)
-				GX_MatrixIndex1x8((u8)(processor ? GX_PNMTX0 : GX_PNMTX1 + 3 * draw_key_of[vertex]));
-			if (processor || cpu_colors || cpu_spheres)
-			{
-				/* what the processor computes of the vertex: its position (in
-				draw_run's (x w, y w, -w), through the identity) where it is the
-				processor's, its colours and sphere maps' coordinates where they
-				are */
-				unsigned long slot = whole - least;
-
-				if (vertex_memo && slot < VERTEX_MEMO_SIZE)
-					computed = &vertex_memo[slot];
-				if (computed == &local || vertex_memo_stamps[slot] != vertex_memo_draw)
-				{
-					struct nv2a_cpu_output out;
-
-					stream_fetch(&vertex_fetch, vertex, inputs);
-					if (processor || cpu_spheres)
-					{
-						live = (processor ? NV2A_CPU_LIVE_POSITION : 0) |
-							(cpu_colors ? NV2A_CPU_LIVE_D0 | NV2A_CPU_LIVE_D1 : 0) | cpu_spheres * NV2A_CPU_LIVE_T0;
-						nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants,
-							(const float (*)[4])inputs, point_size, &out, live);
-						if (processor)
-						{
-							clip_position(out.clip, computed->position);
-							processor_positions++;
-						}
-						for (stage = 0; stage < 4; stage++)
-							if (cpu_spheres & (1U << stage))
-								sphere_coordinates(out.t[stage], computed->texcoord[stage]);
-						if (cpu_spheres)
-							hardware_spheres_run++;
-						if (lit_on && processor)
-						{
-							/* (a lit draw's blended vertex: its normal and world position
-							by its own blend of the nodes, as the program skins them) */
-							const float (*constants)[4] = (const float (*)[4])device.vertex_constants + VERTEX_CONSTANT_BIAS;
-							float blend[3][4], world[3];
-							int row;
-
-							gx_lighting_skin(constants, inputs[NODE_INDICES], inputs[NODE_WEIGHT], blend);
-							for (row = 0; row < 3; row++)
-							{
-								computed->normal[row] = blend[row][0] * inputs[1][0] + blend[row][1] * inputs[1][1] +
-									blend[row][2] * inputs[1][2];
-								world[row] = blend[row][0] * inputs[0][0] + blend[row][1] * inputs[0][1] +
-									blend[row][2] * inputs[0][2] + blend[row][3];
-							}
-							if (lit.alpha)
-								computed->color0[3] = color_byte(gx_lighting_planar_fog(&lit.lighting, world));
-						}
-					}
-					else
-						nv2a_cpu_run_colors(program, (const float (*)[4])device.vertex_constants,
-							(const float (*)[4])inputs, &out);
-					if (cpu_colors)
-					{
-						for (component = 0; component < 4; component++)
-						{
-							computed->color0[component] = color_byte(out.d0[component]);
-							computed->color1[component] = color_byte(out.d1[component]);
-						}
-						hardware_colors_run++;
-					}
-					if (computed != &local)
-						vertex_memo_stamps[slot] = vertex_memo_draw;
-				}
-			}
-			if (processor)
-				GX_Position3f32(computed->position[0], computed->position[1], computed->position[2]);
-			else if (draw_keys.processor)
-			{
-				float position[3];
-
-				word_copy(&position[0], position_stream + whole * position_stride);
-				word_copy(&position[1], position_stream + whole * position_stride + 4);
-				word_copy(&position[2], position_stream + whole * position_stride + 8);
-				GX_Position3f32(position[0], position[1], position[2]);
-			}
-			else
-				GX_Position1x16(index);
-			if (lit_on)
-			{
-				/* the normal (the map's, or the processor's skinned one), and D0's
-				alpha where it is the fog's */
-				if (processor)
-					GX_Normal3f32(computed->normal[0], computed->normal[1], computed->normal[2]);
-				else if (lit.normals_indexed)
-					GX_Normal1x16(index);
-				else
-				{
-					float normal[3];
-
-					lit_normal(whole, normal);
-					GX_Normal3f32(normal[0], normal[1], normal[2]);
-				}
-				if (lit.alpha)
-				{
-					u8 alpha;
-
-					if (processor)
-						alpha = computed->color0[3];
-					else
-					{
-						const float (*rows)[4] = (const float (*)[4])lit.world[keyed ? draw_key_of[vertex] : 0];
-						float model[3], world[3];
-						int row;
-
-						word_copy(&model[0], position_stream + whole * position_stride);
-						word_copy(&model[1], position_stream + whole * position_stride + 4);
-						word_copy(&model[2], position_stream + whole * position_stride + 8);
-						for (row = 0; row < 3; row++)
-							world[row] = rows[row][0] * model[0] + rows[row][1] * model[1] + rows[row][2] * model[2] + rows[row][3];
-						alpha = color_byte(gx_lighting_planar_fog(&lit.lighting, world));
-					}
-					GX_Color4u8(255, 255, 255, alpha);
-				}
-			}
-			if (cpu_colors)
-			{
-				/* (a colour's four bytes as one word: the same bytes in the FIFO) */
-				GX_Color1u32(color_word(computed->color0));
-				GX_Color1u32(color_word(computed->color1));
-			}
-			else if (kept_colors)
-			{
-				GX_Color1x16(index);
-				GX_Color1x16(index);
-			}
-			else if (pad_color)
-				GX_Color1u16(0);
-			for (component = 0; component < texture_count + (int)kept_count; component++)
-				GX_TexCoord1x16(index);
-			for (component = 0; component < sphere_count; component++)
-				GX_TexCoord2f32(computed->texcoord[sphere_list[component]][0],
-					computed->texcoord[sphere_list[component]][1]);
-		}
+		hardware_emit_draw(&hardware_vertices_draw, count);
 	GX_End();
 	if (lit_on)
 	{
@@ -7451,6 +7671,30 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		platform_log("Direct3D: in hardware with the processor's sphere map coordinates: %lu draws (%lu lit by GX), "
 			"%lu vertices run", hardware_sphere_draws, hardware_sphere_lit_draws, hardware_spheres_run);
 		hardware_sphere_draws = hardware_sphere_lit_draws = hardware_spheres_run = 0;
+		{
+			/* (the kinds of hardware_emit's draws, most indices first) */
+			char line[200];
+			unsigned kind, shown, length;
+
+			length = (unsigned)snprintf(line, sizeof(line), "Direct3D: the processor's part in hardware's vertices "
+				"(kind: draws/indices):");
+			for (shown = 0; shown < 6 && length < sizeof(line) - 24; shown++)
+			{
+				unsigned best = HW_KINDS;
+
+				for (kind = 0; kind < HW_KINDS; kind++)
+					if (hardware_kinds[kind].indices &&
+						(best == HW_KINDS || hardware_kinds[kind].indices > hardware_kinds[best].indices))
+						best = kind;
+				if (best == HW_KINDS)
+					break;
+				length += (unsigned)snprintf(line + length, sizeof(line) - length, " %x: %lu/%lu",
+					hardware_kinds[best].flags, hardware_kinds[best].draws, hardware_kinds[best].indices);
+				hardware_kinds[best].indices = 0;
+			}
+			platform_log("%s", line);
+			memset(hardware_kinds, 0, sizeof(hardware_kinds));
+		}
 		{
 			unsigned index, entries = 0, kept_entries = 0;
 

@@ -87,6 +87,8 @@ WlResult wl_gx_init(void) { return WL_OK; }
 void wl_gx_invalidate_shadow(void) {}
 void wl_gx_set_efb_alpha(bool enabled) { (void)enabled; }
 WlResult wl_platform_video_init(void) { return WL_OK; }
+WlResult wii_video_init(void) { return WL_OK; }
+void wii_video_present_interval(unsigned interval) { (void)interval; }
 uint64_t wl_platform_time_us(void) { static uint64_t now; return now += 10; }
 void wl_platform_log_flush(void) {}
 void wl_platform_video_set_interval(uint32_t retraces) { (void)retraces; }
