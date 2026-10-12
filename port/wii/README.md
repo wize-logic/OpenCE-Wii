@@ -1504,10 +1504,54 @@ of the half screen from the middle, and turns beyond it, slowly then faster to t
 out: without it the view turns by fits and starts there. The box and the turn ramp are as before.
 A pointer found again after the sensor bar was lost starts at its reading.
 
+**The GameCube controller, every video field.** The game polls the controllers once in a 30
+frames-a-second frame, and a GameCube controller's reading is one instant, so a tap shorter than a
+frame could fall between two polls. WiiLibs reads the four ports at every video retrace instead (60
+a second on an NTSC or EuRGB60 TV, 50 on PAL; `wl_input_wii_retrace`, called from the retrace
+interrupt, a few hundred instructions each) and the poll takes what came in since its last: a
+button seen pressed in any sample is pressed for the poll (released at the next, so the game sees a
+press and a release, as with the Remote's reports), and the sticks and triggers are the latest
+sample's. The poll never reads a pad again after a retrace's read of the same field (that second
+read finds no new data and answers a transfer error); it reads for itself only when no retrace has
+sampled since its last poll. With `debug.input_log = true` the log says, every few seconds with a
+GameCube controller in use, `input: pads read at the retrace: N samples, M with fresh data; ...`:
+M should be near N (see "What only a real Wii can show", item 2).
+
 **The GameCube controller's errors.** libogc hands back a controller whose transfer failed with
 nothing pressed, which released a held trigger for a frame. A controller that answers
-`PAD_ERR_TRANSFER` or `PAD_ERR_NOT_READY` keeps its last good state; after ten polls in a row of
-errors it counts as unplugged (the game's pause), and plugged in again with its next good read.
+`PAD_ERR_TRANSFER` or `PAD_ERR_NOT_READY` keeps its last good state; after twenty samples in a row of
+errors (a third of a second at 60 a second) it counts as unplugged (the game's pause), and plugged in
+again with its next good read.
+
+**The Nunchuk's thrust as melee (`input.nunchuk_melee`, off by default).** With the setting on, a
+quick forward thrust of the Nunchuk presses the melee button (B) for one frame, as a swing of the
+arm would. WiiLibs keeps the Nunchuk's acceleration of every report of a frame
+(`WlRawRemote.nunchuk_accel`, `WPADData.exp.nunchuk.gforce` times 100) and `wl_thrust_feed`
+(`wl/platform/input_gesture.h`) finds the thrust in them. It is told by a change, not a size: the
+Nunchuk's accelerometer clips near 2 g and a hand at rest already reads a gram, so the forward
+axis (its long axis) must rise by about 1 g within 130 ms, after 150 ms of rest in which no axis
+moves by more than a third of a gram, while the other two axes stay within 0.6 g; the thrust fires
+once, and nothing fires for 600 ms after it. Walking, a turn of the wrist, a quick tilt (the sideways
+axes move with it), a tilt held, a bump of half a gram, a slow lean and a pull back do not fire it,
+and a thrust needs a rest before it (a wind-up that runs into the thrust does not count). The press
+is made at the poll that found the thrust and shown to every read of the game within that poll, then
+released at the next (`wii_melee_press_*`, `xinput_wii_map.c`); a thrust the game does not read within
+a quarter second is dropped; while a menu is up it does nothing (B is back there). It works on a
+Remote with a Nunchuk only; the detector costs a few hundred operations a frame and runs only with
+the setting on. Which way is forward is the sign of the Nunchuk's long axis (`forward_sign` in
+`WlThrustParams`, 1 as the accelerometer reads a push along it): the first real-console run
+confirms it (item 2 below).
+
+**The wrist strap reminder (`display.wii_strap_reminder`, off by default).** With the setting on, a
+plain screen of black and text comes up at the start, drawn with the overlay (`wii_home_game.c`, the
+HOME menu's mechanism): "PLEASE USE THE WRIST STRAP", a line on fastening it, a line on making room
+and standing back from the screen, and when a Remote with a Nunchuk is connected, a line on holding
+the Nunchuk firmly and keeping its cable clear. The controllers are ignored for the first second (the
+prompt "A: CONTINUE" is dim until then): A (the Classic Controller's lower button, a GameCube
+controller's A) goes on, and only a fresh press does, so an A held from the loader does not. The game
+sees no controller (and no rumble) while it is up and until that A is let go (or 1.5 s); it comes
+once per start, and HOME does nothing under it. The words are our own. `wii_strap.c` is the state
+machine; `tests/wii_strap_check.c` checks it.
 
 Sticks and triggers arrive from WiiLibs over their whole travel (the GameCube's sticks are
 full at the end of their gates, its triggers run from 30 to 180 as `PAD_Clamp` takes them, the
@@ -1619,6 +1663,19 @@ console is reset or powered off. The console's setting (the Wii's Remote vibrati
 SYSCONF, read by libogc's `CONF_GetPadMotorMode`, through WiiLibs' `wl_platform_rumble_enabled`)
 is kept: with it off no motor, GameCube controllers' included, is switched on.
 
+Checking the thrust and the reminder: the same script builds `tests/wii_input_check.c` with WiiLibs'
+`input_gesture.c` (synthetic acceleration traces polled every 33 ms and read once to three times a
+poll: a thrust is one press in one poll, in the poll after it rose, and a walk's shake, a held tilt and
+a turn of the wrist press nothing; a thrust in a menu is dropped; the press shown to every read of its
+poll, released at the next, dropped when unread) and `tests/wii_strap_check.c` with `src/wii_strap.c`
+(the first second ignored, a fresh press of A going on, an A held from before not, every controller's A
+and no other button, the game kept from the A until it is let go, once only, the Nunchuk line only with a
+Nunchuk, and only characters the overlay's font has). WiiLibs' `test_platform_input_gesture` checks the
+detector alone (a thrust at three report rates and frame lengths, a tilted hand, a clipped one, two
+thrusts close and far apart, no rest before, and the signs), and `test_platform_input_wii` and
+`test_platform_input_reports` the retrace sampling (a tap between polls, a held button, errors, the
+counters, no read after a retrace's) and the Nunchuk's readings.
+
 Checking the HOME menu: the same script builds `tests/wii_home_check.c` with `src/wii_home.c` (the
 state machine against fake controllers, a fake game and a clock: opening and closing, the pause
 made once and undone only if it was the menu's, the sound's fades, the items and the loader's question,
@@ -1691,11 +1748,22 @@ misses it loses its time.
    the box's edge with a steady hand: the view must not turn by fits; then try `input.pointer_steadiness`
    `0` and `0.1` and say which feels right, and whether a quick aim across the screen lags), taps of
    A and B much shorter than a frame (a quick flick) still jump and fire once, and a held trigger of
-   a GameCube controller is not released for a frame now and then; stops 150 ms after
+   a GameCube controller is not released for a frame now and then (with a GameCube controller, tap
+   A and B as fast as possible, a tap of a field or two, many times in a row, in play and in a
+   menu: none may be missed, and the log's `pads read at the retrace` line should show the fresh
+   samples near the samples, 60 a second; about half would mean the pads' own polling runs at
+   30 a second and the taps are no better than before: say so); stops 150 ms after
    the sensor bar is lost (cover it), and the aim magnetism holds a target. The Wii U Pro Controller
    is not supported; say whether it does anything. Remote batteries: `remote N battery code C` in the
    log against the percent the HOME menu shows, with a Remote that is full and one nearly spent
-   (the notice appears once below 10%).
+   (the notice appears once below 10%). `input.nunchuk_melee = true` with a Remote and Nunchuk:
+   the thrust's feel, which only the hand tells. Thrust the Nunchuk forward from rest the way a
+   punch goes (about 1.2 to 1.5 g): it should melee once; walk with it, turn on the spot, tilt it, shake
+   it, thrust twice quickly (one melee, then another after about half a second); say whether it
+   missed real thrusts (a softer or slower one) or fired on its own, and whether a pull back fires
+   (it should not; if a forward thrust does nothing and a pull does, `forward_sign` is the other way).
+   `display.wii_strap_reminder = true`: the screen at start, dismissed by A after the first second and
+   not before, with the Nunchuk line when one is plugged in.
 3. **The HOME menu.** In the menu and in play, press HOME on a Remote and on a Classic Controller
    (a GameCube controller has none). Look for: the menu opens over the paused game with its three
    items and the batteries' line (every connected Remote), the sound fades out over 300 ms and back
