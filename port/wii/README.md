@@ -781,8 +781,8 @@ console's settings and logs it once at the device's creation, as `video: 480i NT
   copy and draws it back as one filtered quad over columns 80 to 560 of 640 (`wl_gx_target_squeeze`);
   the interface then widens the 640 columns and the 480 of them are three quarters of the screen: 4:3,
   circles round. The cost is one 640x480 EFB copy and one quad a frame, the picture 25% less sharp
-  sideways, and a 1.2 MB block of memory, the one the render targets park the back buffer's colour
-  in (`efb_park_alloc`, in the contiguous window when there is room; the two share it). With no
+  sideways, and a 1.2 MB block of memory, which the render targets then park the back buffer's
+  colour in (`efb_park_alloc`, in the contiguous window when there is room; the two share it). With no
   memory the picture is shown stretched (one warning in the log). `"stretch"` fills the screen as
   before. A 4:3 console setting is not touched. The game's projection is unchanged: a real
   anamorphic mode (drawing all 640 columns in a 16:9 picture) would widen the HUD and the field of
@@ -885,7 +885,7 @@ and pixel shaders.
       coordinates, the planar fog's alpha, a normal sent): each vertex's part computed once a
       draw into the vertex memo, then sent by a loop made for that combination of what is sent
       (`hardware_emit`), in place of one loop testing every case at every index. The log's
-      `the processor's part in hardware's vertices` line lists the combinations (their flags in
+      `hardware's kinds` line lists the combinations (their flags in
       hex: `HW_KEYED` 1 and so on) with their draws and indices. Each loop reads the draw's
       fields once, into registers (a store to the FIFO may alias any memory in this build, so a
       field read at each index was loaded again at each), and sends with as few stores as the
@@ -905,7 +905,9 @@ and pixel shaders.
       (`tests/host/gx_stand_in.c`), draws synthetic scenes the game's way (a structure's
       sections, rigid, skinned, unlit and fogged characters) and runs under `qemu-ppc`: `count`
       gives the instructions a draw by function, `record` a digest of what GX would draw
-      (`--save`, `--compare`, `--device` another copy of the device's sources). Later frames'
+      (`--save`, `--compare`, `--device` another copy of the device's sources), `subdivide` the
+      check of a sea's big triangles drawn in pieces on a sphere map (`count --scene subdivide`
+      their instructions, a triangle a region). Later frames'
       draws, `wii-port` at a5581ec6 then now: the structure's 164,076 instructions then 43,304,
       the rigid models' 92,971 then 25,154, the skinned characters' 225,373 then 171,176, the
       fogged ones' 292,638 then 174,271. With `BENCH_PROBE` it lists the GX state an immediate
@@ -958,7 +960,8 @@ and pixel shaders.
       `contiguous memory: the Direct3D device's kept buffers given back`). The 512 KB margin
       keeps that rare: the blocks made once a level is loaded are the loading screen's texture
       (320 by 240, 300 KB) and the device's own (sphere maps of 9 KB; the back buffer's
-      parking, two of 1,200 KB made once, which go to the heap where the window has no room);
+      parking, two blocks of the largest target's size, 64 KB each for b30's water, which go to
+      the heap where the window has no room);
     - a buffer refused is not asked for again (by the entry or index record that wanted it)
       until room may have come: a free of the window's pages or of a slab's granules, seen once
       a frame is drawn; within that, a window block as large as one refused is refused without
@@ -1203,6 +1206,30 @@ and pixel shaders.
       reflection, its coordinates computed per vertex as above (`gx_psh_textures.reflected`).
       Without it the water's reflection pass added nothing, and b30's far sea, where nothing
       lies under the water, was black.
+    - Coordinates on a sphere map computed per vertex and interpolated across a big triangle
+      read directions it does not face: the map bends, and a straight line on it between two
+      directions passes nearer the middle (straight up). The sky's water (the sky model's sea, a
+      disc from radius 1,200 to the horizon at the sky's eye level, drawn without depth) is
+      triangles from an octagon near the eye to a ring at the horizon, the eye's reflection
+      along each near the horizon but at directions apart around it: interpolated, the
+      coordinates read the sky well above the horizon, a violet band under b30's horizon (its
+      white line) where the Xbox's sky water reflects the haze and meets the structure's sea.
+      A processor's draw of up to 256 vertices whose stages read a sphere map, and that neither
+      tests nor writes depth, is drawn in pieces where an edge's ends lie apart on the map
+      (`subdivide_triangle`): a triangle is halved across the edge whose middle's coordinates
+      lie furthest (over a texel) from its ends' mean, the middle's outputs the ends' mixed (its
+      position the edge's middle, exactly) and its coordinates its own direction's. An edge is
+      halved by its ends alone, so no crack opens; pieces out of sight are not sent. A draw in
+      hardware of up to 64 indices whose sphere map's coordinates the processor computes, and
+      free of depth, is the processor's, so that it can be. A draw that reads or writes depth is
+      drawn whole: a piece's depth, interpolated from its own corners, differs from the whole
+      triangle's by GX's rounding, and the surface's other passes then fail their tests pixel by
+      pixel (b30's sea in pieces, its reflection pass `LESSEQUAL` over its opacity pass's depth,
+      was hatched, and drawn nearer, white). The sea's own reflection keeps its per-vertex error
+      (3 to 16 texels of 64, bluer far off) until its passes can be cut alike.
+      `tools/wii_draw_bench.py subdivide` checks a sea's triangles: within a texel (1.4 in the
+      worst, a triangle from the eye's feet to the horizon), every point in sight in exactly one
+      piece, at about 2,000 instructions a piece.
   - (1 - x)p + xq is TEV's lerp, one stage.
   - Constants read as 0 or 1 need no register. Those needed in every channel take the four konst
     registers first, and any beyond four are set in TEV registers kept for them.
@@ -1224,9 +1251,15 @@ and pixel shaders.
   each draw goes to, records the targets that were copied, and sets its own vertex and texture
   coordinate state again after a quad:
   - The back buffer's colour and depth are parked (in the contiguous window where there is room,
-    else the heap).
-  - The target is drawn at the EFB's origin and copied into its own memory in GX's format, where
-    its texture is bound from.
+    else the heap): only the part a target can draw over, its scissor from the EFB's origin
+    (WiiLibs parks again, larger, for a larger target). b30's water builds its ripples into four
+    targets, 128 to 16 pixels square, every frame: the park is 128 by 128, 128 KB copied out and
+    written back, where the whole back buffer was 2.4 MB each way (and 2.4 MB of memory), and
+    the processor's invalidation of the blocks, 2% of a frame's time in Dolphin, as much smaller.
+  - The target is drawn at the EFB's origin, within its scissor, and copied into its own memory
+    in GX's format, where its texture is bound from. Nothing the device draws while a target has
+    the EFB may leave the scissor: the world's sphere map, baked below the back buffer, sets the
+    owner's scissor again after it (`sphere_bake`).
   - The back buffer returns through a quad that writes the parked colour, and the parked depth
     through a Z texture.
   - A clear once the frame has begun is a quad.
@@ -1301,7 +1334,8 @@ and pixel shaders.
   [debug]
   fixed_ticks = true            # a frame a tick, the same frame on every run
   draw_log_tick = 300           # a level's first frame at or after game tick 300 (not the menu's); -1 none
-  draw_log_points = "320,190;60,90;560,250"   # back buffer pixels (640 by 480), at most 16
+  draw_log_points = "320,190;60,90;560,170-200"   # back buffer pixels (640 by 480); x,y0-y1 a column
+  draw_log_vertices = 200       # the draws of at most 200 vertices: each vertex logged; 0 none
   ```
 
   Each draw, the processor's and GX's alike, and each clear, is numbered and described: `draw N
@@ -1311,9 +1345,16 @@ and pixel shaders.
   how many lie before the near plane and past the far), the last vertex's outputs, the pixel shader's
   combiners and constants and each texture (`t0 256x256/14d@<its data's address>`). After each
   draw to the back buffer the points are read back (GX drawn to that point first, so the frame
-  is slow), and each change is logged, `pixel (x, y) changed by draw N: r g b a, was r g b a`;
-  render target changes are logged too. When the frame is shown, `draw log: frame F: N draws`
-  and each point's last eight writers close it. Off, a draw pays a load and a compare.
+  is slow), colour and depth, and each change is logged, `pixel (x, y) changed by draw N: r g b
+  a z 7ffe12, was r g b a z ...` (the depth's 24 bits); render target changes are logged too. A
+  draw of at most `draw_log_vertices` vertices has each vertex logged, in the draw's order, on
+  two lines: `v3 i17 c x y z w s x y depth` (its index, clip-space and screen position) and its
+  texture coordinates, D0 and fog, as the processor computes them, which is enough to rebuild
+  the draw on the host. Before the frame is copied to the display, its picture and depth are
+  written to the game's folder, `draw_log.tga` (BGRA, top row first) and `draw_log_depth.tga`
+  (the depth's bytes as BGR), the frame the log describes, whatever the screenshot shows. When
+  the frame is shown, `draw log: frame F: N draws` and each point's last eight writers close
+  it. Off, a draw pays a load and a compare.
 
 ### What the frame draws
 

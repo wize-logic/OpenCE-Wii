@@ -21,7 +21,8 @@ calls the script finds in qemu's trace to count the instructions between
 them; with the stand-in's recording, each draw's digest of what GX draws is
 printed instead, to compare two builds of the device.
 
-usage: draw_bench <scene> <frames> [record] (scene: environment, rigid, skinned, unlit, all)
+usage: draw_bench <scene> <frames> [record] (scene: environment, rigid, skinned, unlit, fogged, all;
+or programs, or subdivide: the check of a sphere map across big triangles)
 */
 
 /* (the display lists' memory outside the window, whose addresses the
@@ -143,6 +144,13 @@ void wl_gx_target_set_back_buffer_size(uint32_t width, uint32_t height) { (void)
 void wl_gx_target_set_allocator(WlGxTargetAlloc alloc, WlGxTargetFree release) { (void)alloc; (void)release; }
 const WlGxTarget *wl_gx_target_use(const WlGxTarget *target) { (void)target; return NULL; }
 const WlGxTarget *wl_gx_target_current(void) { return NULL; }
+void wl_gx_target_scissor_size(const WlGxTarget *target, uint32_t back_w, uint32_t back_h, uint32_t *w, uint32_t *h)
+{
+	*w = target->width < back_w ? target->width : back_w;
+	*h = target->height < back_h ? target->height : back_h;
+}
+/* (the draw log's pictures: none are written) */
+const char *wii_game_folder(void) { return "."; }
 void wl_gx_target_drawn(void) {}
 void wl_gx_target_clear(bool colour, bool depth, uint32_t rgba, float z, int x, int y, int w, int h)
 {
@@ -915,6 +923,234 @@ static void skinned_draw(int frame, const char *scene)
 	}
 }
 
+/* ---------- a sphere map across big triangles (subdivide_triangle)
+
+A flat sea of big triangles seen from 31 above it, as b30's from the
+Pelican, its reflection read on a sphere map: each triangle drawn as the
+device draws it, its pieces as sent, against the map's coordinates of each
+point's own direction (what the Xbox reads, a pixel at a time). A point of a
+piece is found in the whole triangle by its homogeneous position, which GX
+interpolates the piece's coordinates along; the pieces must cover the
+triangle exactly once. Exits 1 where a triangle the device halved is still
+off by more than SUBDIVIDE_CHECK_ERROR, or the pieces do not cover it. */
+#define SUBDIVIDE_CHECK_ERROR (1.0f / 32.0f)
+
+static void subdivide_check_corner(float x, float y, const struct draw_projection *projection,
+	struct subdivide_vertex *corner)
+{
+	static const float height = 31.0f;
+
+	memset(corner, 0, sizeof(*corner));
+	/* (the eye at (0, 0, height) looking along x: clip x the side, y the
+	height, w the distance) */
+	corner->out.clip[0] = y;
+	corner->out.clip[1] = -height;
+	corner->out.clip[3] = x;
+	corner->out.clip_captured = 1;
+	/* (the reflection of the eye's ray on the water: its height turned up) */
+	corner->out.t[0][0] = x;
+	corner->out.t[0][1] = y;
+	corner->out.t[0][2] = height;
+	corner->out.t[0][3] = 1.0f;
+	vertex_store(&corner->out, projection, NULL, &corner->sent);
+	corner->sent.matrix = GX_PNMTX1;
+	corner->filled = TRUE;
+}
+
+/* a point (x w, y w, -w) of the triangle as its corners' weights */
+static BOOL subdivide_check_weights(const struct gx_vertex *corner, const float point[3], float weight[3])
+{
+	double m[3][3], d;
+	int row, column;
+
+	for (column = 0; column < 3; column++)
+		for (row = 0; row < 3; row++)
+			m[row][column] = corner[column].position[row];
+	d = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+		m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+	if (fabs(d) < 1.0e-12)
+		return FALSE;
+	for (column = 0; column < 3; column++)
+	{
+		double n[3][3];
+
+		memcpy(n, m, sizeof(n));
+		for (row = 0; row < 3; row++)
+			n[row][column] = point[row];
+		weight[column] = (float)((n[0][0] * (n[1][1] * n[2][2] - n[1][2] * n[2][1]) -
+			n[0][1] * (n[1][0] * n[2][2] - n[1][2] * n[2][0]) + n[0][2] * (n[1][0] * n[2][1] - n[1][1] * n[2][0])) / d);
+	}
+	return TRUE;
+}
+
+/* the pieces of the triangle being checked, as sent (subdivide_piece_seen) */
+enum { SUBDIVIDE_CHECK_PIECES = 1 << (SUBDIVIDE_DEPTH + 1) };
+static struct gx_vertex subdivide_check_pieces[SUBDIVIDE_CHECK_PIECES][3];
+static unsigned subdivide_check_piece_count;
+
+static void subdivide_check_seen(const struct gx_vertex *corner)
+{
+	if (subdivide_check_piece_count < SUBDIVIDE_CHECK_PIECES)
+		memcpy(subdivide_check_pieces[subdivide_check_piece_count++], corner, 3 * sizeof(*corner));
+}
+
+/* whether a point of the whole triangle (its weights) is in sight */
+static BOOL subdivide_check_seen_point(const struct subdivide_vertex *corner, const float weight[3])
+{
+	float clip[4];
+	int axis;
+
+	for (axis = 0; axis < 4; axis++)
+		clip[axis] = weight[0] * corner[0].out.clip[axis] + weight[1] * corner[1].out.clip[axis] +
+			weight[2] * corner[2].out.clip[axis];
+	return fabsf(clip[0]) <= clip[3] && fabsf(clip[1]) <= clip[3];
+}
+
+/* the most a piece's interpolated coordinates are off the map's at its
+points in sight */
+static float subdivide_check_piece(const struct gx_vertex *piece, const struct gx_vertex *whole,
+	const struct subdivide_vertex *corner)
+{
+	enum { STEPS = 8 };
+	float worst = 0.0f, at[3][3];
+	int i, j, which;
+
+	for (which = 0; which < 3; which++)
+		if (!subdivide_check_weights(whole, piece[which].position, at[which]))
+			return 1.0f;
+	for (i = 0; i <= STEPS; i++)
+		for (j = 0; j <= STEPS - i; j++)
+		{
+			float u = (float)i / STEPS, v = (float)j / STEPS, w = 1.0f - u - v, weight[3], direction[4], exact[2];
+			int axis;
+
+			for (which = 0; which < 3; which++)
+				weight[which] = w * at[0][which] + u * at[1][which] + v * at[2][which];
+			if (!subdivide_check_seen_point(corner, weight))
+				continue;
+			for (axis = 0; axis < 4; axis++)
+				direction[axis] = weight[0] * corner[0].out.t[0][axis] + weight[1] * corner[1].out.t[0][axis] +
+					weight[2] * corner[2].out.t[0][axis];
+			sphere_coordinates(direction, exact);
+			for (axis = 0; axis < 2; axis++)
+			{
+				float drawn = w * piece[0].texcoord[0][axis] + u * piece[1].texcoord[0][axis] + v * piece[2].texcoord[0][axis];
+
+				if (fabsf(drawn - exact[axis]) > worst)
+					worst = fabsf(drawn - exact[axis]);
+			}
+		}
+	return worst;
+}
+
+/* the points of the whole triangle in sight, and those of them inside
+exactly one piece */
+static void subdivide_check_cover(const struct gx_vertex *whole, const struct subdivide_vertex *corner,
+	unsigned *seen, unsigned *once)
+{
+	enum { STEPS = 60 };
+	int i, j;
+
+	*seen = *once = 0;
+	for (i = 0; i < STEPS; i++)
+		for (j = 0; j < STEPS - i; j++)
+		{
+			/* (off the pieces' edges: a third of a step in) */
+			float weight[3], point[3];
+			unsigned piece, inside = 0;
+			int axis;
+
+			weight[1] = ((float)i + 0.31f) / STEPS;
+			weight[2] = ((float)j + 0.37f) / STEPS;
+			weight[0] = 1.0f - weight[1] - weight[2];
+			if (weight[0] <= 0.0f || !subdivide_check_seen_point(corner, weight))
+				continue;
+			(*seen)++;
+			for (axis = 0; axis < 3; axis++)
+				point[axis] = weight[0] * whole[0].position[axis] + weight[1] * whole[1].position[axis] +
+					weight[2] * whole[2].position[axis];
+			for (piece = 0; piece < subdivide_check_piece_count; piece++)
+			{
+				float at[3];
+
+				if (subdivide_check_weights(subdivide_check_pieces[piece], point, at) &&
+					at[0] > -1.0e-5f && at[1] > -1.0e-5f && at[2] > -1.0e-5f)
+					inside++;
+			}
+			if (inside == 1)
+				(*once)++;
+		}
+}
+
+static int subdivide_check(void)
+{
+	static const float corners[][3][2] = {
+		{ { 40, -100 }, { 40, 100 }, { 400, 0 } }, { { 60, -300 }, { 60, 300 }, { 900, 0 } },
+		{ { 100, -40 }, { 300, 0 }, { 100, 40 } }, { { 200, -600 }, { 1200, -600 }, { 200, 600 } },
+		{ { 500, -200 }, { 520, 200 }, { 1500, 50 } }, { { 1000, -50 }, { 1100, 50 }, { 1200, -50 } },
+		{ { 32, -800 }, { 32, 800 }, { 2000, 0 } }, { { 5, -10 }, { 5, 10 }, { 20, 0 } },
+	};
+	struct draw_projection projection = { TRUE, 1.000061f, -0.0625f, TRUE };
+	unsigned which;
+	int failed = 0;
+
+	/* (the screen: 640 by 480, its centre the view's axis) */
+	device.vertex_constants[VERTEX_CONSTANT_BIAS - 38][0] = 320.0f;
+	device.vertex_constants[VERTEX_CONSTANT_BIAS - 38][1] = -240.0f;
+	device.vertex_constants[VERTEX_CONSTANT_BIAS - 37][0] = 320.0f;
+	device.vertex_constants[VERTEX_CONSTANT_BIAS - 37][1] = 240.0f;
+	transform_hardware = TRUE;
+	transform_software();
+	store_plan.live = NV2A_CPU_LIVE_POSITION | NV2A_CPU_LIVE_T0;
+	store_plan.stages = 1;
+	store_plan.sphere = 1;
+	store_plan.scaled = 0;
+	vertex_terms = _gx_psh_vertices_program;
+	subdivide_piece_seen = subdivide_check_seen;
+	/* (the pool of middles, as draw_run_subdivided makes it) */
+	subdivide_vertices = malloc((SUBDIVIDE_MOST_VERTICES + SUBDIVIDE_POOL) * sizeof(*subdivide_vertices));
+	subdivide_pool = subdivide_vertices + SUBDIVIDE_MOST_VERTICES;
+	for (which = 0; which < sizeof(corners) / sizeof(corners[0]); which++)
+	{
+		struct subdivide_vertex corner[3];
+		struct gx_vertex whole[3];
+		float plain, after = 0.0f;
+		unsigned piece, seen, once;
+		int c;
+
+		for (c = 0; c < 3; c++)
+		{
+			subdivide_check_corner(corners[which][c][0], corners[which][c][1], &projection, &corner[c]);
+			whole[c] = corner[c].sent;
+		}
+		plain = subdivide_check_piece(whole, whole, corner);
+		subdivide_check_piece_count = 0;
+		subdivide_budget = SUBDIVIDE_MOST_PIECES;
+		/* (a region of its own: `count --scene subdivide` counts each
+		triangle's instructions) */
+		print("region subdivide frame=%u draw=%u indices=3\n", which, which);
+		bench_region_begin();
+		subdivide_triangle(&corner[0], &corner[1], &corner[2], &projection, FALSE, 1);
+		bench_region_end();
+		for (piece = 0; piece < subdivide_check_piece_count; piece++)
+		{
+			float off = subdivide_check_piece(subdivide_check_pieces[piece], whole, corner);
+
+			if (off > after)
+				after = off;
+		}
+		subdivide_check_cover(whole, corner, &seen, &once);
+		print("subdivide: triangle %u: %u pieces sent, off by %.4f of the map in sight (%.4f drawn whole); "
+			"%u of its %u points in sight in exactly one piece\n", which, subdivide_check_piece_count, after, plain, once,
+			seen);
+		if (once != seen || after > SUBDIVIDE_CHECK_ERROR)
+			failed = 1;
+	}
+	subdivide_piece_seen = NULL;
+	print("subdivide: %s\n", failed ? "FAILED" : "passed");
+	return failed;
+}
+
 int main(int argc, char **argv)
 {
 	IDirect3DDevice8 *d3d_device;
@@ -930,10 +1166,12 @@ int main(int argc, char **argv)
 		programs_list();
 		return 0;
 	}
+	if (!strcmp(scene, "subdivide"))
+		return subdivide_check();
 	if (!all && strcmp(scene, "environment") && strcmp(scene, "rigid") && strcmp(scene, "skinned") &&
 		strcmp(scene, "unlit") && strcmp(scene, "fogged"))
 	{
-		print("usage: draw_bench programs|environment|rigid|skinned|unlit|fogged|all [frames] [record]\n");
+		print("usage: draw_bench programs|subdivide|environment|rigid|skinned|unlit|fogged|all [frames] [record]\n");
 		return 1;
 	}
 	recording = argc > 3 && !strcmp(argv[3], "record");
