@@ -1296,8 +1296,10 @@ and pixel shaders.
   ```
 
   Each draw, the processor's and GX's alike, and each clear, is numbered and described: `draw N
-  (GX's transform, program 3f6a2f54, target the back buffer): prim, count, screen extent, D0 |
-  blend, alpha test, depth`, then its projection, a vertex's outputs, the pixel shader's
+  (GX's transform, program 3f6a2f54, target the back buffer): prim, count, screen extent, D0`,
+  then its blend, alpha test, depth test and write, colour write and cull mode on a line of
+  their own, its projection (with the w range and the screen extent of all of its vertices, and
+  how many lie before the near plane and past the far), the last vertex's outputs, the pixel shader's
   combiners and constants and each texture (`t0 256x256/14d@<its data's address>`). After each
   draw to the back buffer the points are read back (GX drawn to that point first, so the frame
   is slow), and each change is logged, `pixel (x, y) changed by draw N: r g b a, was r g b a`;

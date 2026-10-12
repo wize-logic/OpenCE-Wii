@@ -3420,8 +3420,10 @@ static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct d
 	int length = 0, stage;
 	UINT vertex;
 
+	/* (every vertex: the logged frame is one, and a box or w range of the
+	first few misleads, as the sea's reach did) */
 	inputs_seed(inputs);
-	for (vertex = 0; vertex < count && vertex < 64; vertex++)
+	for (vertex = 0; vertex < count; vertex++)
 	{
 		fetch(context, vertex, inputs);
 		nv2a_cpu_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size, &out);
@@ -3444,20 +3446,27 @@ static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct d
 				(unsigned long)entry->data);
 	}
 	draw_log_state.draws++;
-	platform_log("draw %lu (%s, program %08lx, target %s): prim %d x%u %s screen %.0f,%.0f-%.0f,%.0f d0 %.2f %.2f %.2f %.2f | blend %lu %lu>%lu atest %lu %lu/%lu z %lu/%lu/%lu wr %lx",
+	/* (the state in a line of its own: the log keeps some 200 characters of
+	a line) */
+	platform_log("draw %lu (%s, program %08lx, target %s): prim %d x%u %s screen %.0f,%.0f-%.0f,%.0f d0 %.2f %.2f %.2f %.2f",
 		draw_log_state.draws, hardware ? "GX's transform" : "the processor's", program->hash,
 		device.render_target == &device.back_buffer ? "the back buffer" : "a texture", (int)primitive_type, count,
 		projection->perspective ? "persp" : "ortho", minimum[0], minimum[1], maximum[0], maximum[1],
-		out.d0[0], out.d0[1], out.d0[2], out.d0[3],
+		out.d0[0], out.d0[1], out.d0[2], out.d0[3]);
+	platform_log("  blend %lu %lu>%lu atest %lu %lu/%lu z %lu/%lu/%lu wr %lx cull %lu",
 		(unsigned long)D3D__RenderState[D3DRS_ALPHABLENDENABLE], (unsigned long)D3D__RenderState[D3DRS_SRCBLEND],
 		(unsigned long)D3D__RenderState[D3DRS_DESTBLEND], (unsigned long)D3D__RenderState[D3DRS_ALPHATESTENABLE],
 		(unsigned long)D3D__RenderState[D3DRS_ALPHAFUNC], (unsigned long)D3D__RenderState[D3DRS_ALPHAREF],
 		(unsigned long)D3D__RenderState[D3DRS_ZENABLE], (unsigned long)D3D__RenderState[D3DRS_ZFUNC],
-		(unsigned long)D3D__RenderState[D3DRS_ZWRITEENABLE], (unsigned long)D3D__RenderState[D3DRS_COLORWRITEENABLE]);
+		(unsigned long)D3D__RenderState[D3DRS_ZWRITEENABLE], (unsigned long)D3D__RenderState[D3DRS_COLORWRITEENABLE],
+		(unsigned long)D3D__RenderState[D3DRS_CULLMODE]);
 	{
 		float w_minimum = 1.0e30f, w_maximum = -1.0e30f;
+		/* (the vertices behind the near plane, depth below 0, and past the
+		far plane, above 1: GX clips at the one, and the device at neither) */
+		unsigned long nearer = 0, farther = 0;
 
-		for (vertex = 0; vertex < count && vertex < 64; vertex++)
+		for (vertex = 0; vertex < count; vertex++)
 		{
 			fetch(context, vertex, inputs);
 			nv2a_cpu_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size, &out);
@@ -3465,10 +3474,19 @@ static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct d
 				w_minimum = out.clip[3];
 			if (out.clip[3] > w_maximum)
 				w_maximum = out.clip[3];
+			if (projection->perspective)
+			{
+				float depth = out.clip[3] > 0.0f ? projection->a + projection->b / out.clip[3] : -1.0f;
+
+				if (depth < 0.0f)
+					nearer++;
+				else if (depth > 1.0f)
+					farther++;
+			}
 		}
-		platform_log("  projection: %s, %s a %.6f b %.4f, w %.4f to %.4f (clip %d)",
+		platform_log("  projection: %s, %s a %.6f b %.4f, w %.4f to %.4f (clip %d), %lu before the near plane, %lu past the far",
 			projection->perspective ? "perspective" : "screen", projection->fitted ? "fitted" : "the last fit's",
-			projection->a, projection->b, w_minimum, w_maximum, out.clip_captured);
+			projection->a, projection->b, w_minimum, w_maximum, out.clip_captured, nearer, farther);
 	}
 	platform_log("  a vertex: t0 %.3f %.3f %.3f %.3f t1 %.3f %.3f t2 %.3f %.3f t3 %.3f %.3f d1 %.2f %.2f %.2f %.2f fog %.2f",
 		out.t[0][0], out.t[0][1], out.t[0][2], out.t[0][3], out.t[1][0], out.t[1][1], out.t[2][0], out.t[2][1],
