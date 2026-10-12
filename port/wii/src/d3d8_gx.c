@@ -209,6 +209,55 @@ static struct
 /* (changed with any of device.vertex_constants: constants_hash) */
 static unsigned long constants_generation = 1;
 
+/* each constant row's hash, two 32-bit lanes of its index and words, kept
+as the rows are set (constant_rows_changed), and the exclusive or of every
+row's: a set of rows is hashed by the exclusive or of theirs, a row at a
+time (constants_hash), not a word at a time each draw */
+static u32 constant_row_hashes[VERTEX_CONSTANT_COUNT][2];
+static u32 constant_rows_all[2];
+static BOOL constant_rows_ready;
+
+static inline u32 hash_mix(u32 value)
+{
+	value ^= value >> 16;
+	value *= 0x7FEB352DU;
+	value ^= value >> 15;
+	value *= 0x846CA68BU;
+	value ^= value >> 16;
+	return value;
+}
+
+static void constant_rows_changed(unsigned long first, unsigned long count)
+{
+	unsigned long row, end = first + count, word;
+
+	if (!constant_rows_ready)
+	{
+		/* (every row the first time, the old hashes zero) */
+		constant_rows_ready = TRUE;
+		first = 0;
+		end = VERTEX_CONSTANT_COUNT;
+	}
+	for (row = first; row < end && row < VERTEX_CONSTANT_COUNT; row++)
+	{
+		const u32 *words = (const u32 *)device.vertex_constants[row];
+		u32 a = 0x9E3779B9U * (u32)(row + 1), b = 0x85EBCA6BU ^ (u32)row;
+
+		for (word = 0; word < 4; word++)
+		{
+			a = (a ^ words[word]) * 0x01000193U;
+			b = (b + words[word]) * 0xC2B2AE35U;
+			b ^= b >> 13;
+		}
+		a = hash_mix(a);
+		b = hash_mix(b ^ a);
+		constant_rows_all[0] ^= constant_row_hashes[row][0] ^ a;
+		constant_rows_all[1] ^= constant_row_hashes[row][1] ^ b;
+		constant_row_hashes[row][0] = a;
+		constant_row_hashes[row][1] = b;
+	}
+}
+
 /* ---------- the vertical blank
 
 A thread waits for each of the video interface's retraces, counts it,
@@ -312,6 +361,7 @@ static void viewport_update_constants(void)
 	{
 		memcpy(device.vertex_constants[VERTEX_CONSTANT_BIAS - 38], device.viewport_scale, sizeof(device.viewport_scale));
 		memcpy(device.vertex_constants[VERTEX_CONSTANT_BIAS - 37], device.viewport_offset, sizeof(device.viewport_offset));
+		constant_rows_changed(VERTEX_CONSTANT_BIAS - 38, 2);
 		constants_generation++;
 	}
 }
@@ -751,6 +801,7 @@ void WINAPI D3DDevice_SetVertexShaderConstant(INT reg, CONST void *constant_data
 	if (first + (long)constant_count > VERTEX_CONSTANT_COUNT)
 		constant_count = (DWORD)(VERTEX_CONSTANT_COUNT - first);
 	memcpy(device.vertex_constants[first], constant_data, constant_count * 4 * sizeof(float));
+	constant_rows_changed((unsigned long)first, constant_count);
 	constants_generation++;
 }
 
@@ -3356,25 +3407,45 @@ static unsigned long long constants_hash(const struct vertex_shader_object *shad
 	} hashes[CONSTANTS_HASHES];
 	static unsigned next;
 	const struct nv2a_cpu_dependencies *dependencies = &shader->dependencies;
-	unsigned long long hash = 14695981039346656037ULL ^ (unsigned long)program;
-	unsigned long row, word;
+	unsigned long long hash;
+	u32 lanes[2] = { 0, 0 };
+	unsigned long part;
 	unsigned which;
 
 	for (which = 0; which < CONSTANTS_HASHES; which++)
 		if (hashes[which].generation == constants_generation && hashes[which].shader == shader &&
 			hashes[which].program == program)
 			return hashes[which].hash;
-	hash = (hash ^ (unsigned long)shader) * 1099511628211ULL;
-	for (row = 0; row < NV2A_CPU_CONSTANT_COUNT; row++)
-		if (dependencies->relative || (dependencies->constants[row / 32] & (1UL << (row % 32))) ||
-			row == VERTEX_CONSTANT_BIAS - 38 || row == VERTEX_CONSTANT_BIAS - 37)
+	if (!constant_rows_ready)
+		constant_rows_changed(0, VERTEX_CONSTANT_COUNT);
+	/* the rows read (every row for a program that indexes them, a0), and the
+	viewport's: the exclusive or of their hashes, each row once */
+	if (dependencies->relative)
+	{
+		lanes[0] = constant_rows_all[0];
+		lanes[1] = constant_rows_all[1];
+	}
+	else
+		for (part = 0; part < NV2A_CPU_CONSTANT_COUNT / 32; part++)
 		{
-			const unsigned long *words = (const unsigned long *)device.vertex_constants[row];
+			unsigned long bits = dependencies->constants[part];
 
-			hash = (hash ^ row) * 1099511628211ULL;
-			for (word = 0; word < 4; word++)
-				hash = (hash ^ words[word]) * 1099511628211ULL;
+			if (part == (VERTEX_CONSTANT_BIAS - 38) / 32)
+				bits |= 1UL << ((VERTEX_CONSTANT_BIAS - 38) % 32);
+			if (part == (VERTEX_CONSTANT_BIAS - 37) / 32)
+				bits |= 1UL << ((VERTEX_CONSTANT_BIAS - 37) % 32);
+			while (bits)
+			{
+				unsigned long row = part * 32 + (unsigned long)__builtin_ctzl(bits);
+
+				lanes[0] ^= constant_row_hashes[row][0];
+				lanes[1] ^= constant_row_hashes[row][1];
+				bits &= bits - 1;
+			}
 		}
+	/* (and the program and declaration) */
+	hash = ((unsigned long long)hash_mix(lanes[0] ^ (u32)(unsigned long)program) << 32 |
+		hash_mix(lanes[1] ^ (u32)(unsigned long)shader * 0x9E3779B9U)) ^ (unsigned long long)dependencies->relative;
 	which = next++ % CONSTANTS_HASHES;
 	hashes[which].generation = constants_generation;
 	hashes[which].shader = shader;
