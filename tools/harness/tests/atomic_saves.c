@@ -805,7 +805,7 @@ static void regenerated_nothing_left(const char *path)
 int main(int argc, char **argv)
 {
 	const char *case_name;
-	char *name;
+	const char *name;
 	char template_path[] = "/tmp/halo-atomic-XXXXXX";
 
 	CHECK(argc == 2, "case name");
