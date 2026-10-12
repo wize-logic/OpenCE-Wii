@@ -95,6 +95,43 @@ The maps must be the Xbox's (cache version 5), converted by `tools/wii_convert_m
 and Custom Edition's maps don't run. A converted map is uncompressed, about the size the Xbox
 inflated it to, and the Wii reads it where it is.
 
+### Saves
+
+A save survives a reset, a power-off or a pulled card. Each file the game opens for writing under
+`apps/halo/saves` (the profiles, the saved games, each profile's `savegame.bin`, the checkpoint the
+game keeps for Save and Quit) is written beside itself as `<file>.wtmp`, and takes the file's place
+when the game closes it (`xbox_files.c`, "saves that survive a cut"): the data is synced, then the
+copy is renamed over the old file. libfat cannot rename over a file, so there the old one goes
+aside as `<file>.wold` for the moment between the two renames. A cut at any call leaves the old file
+or the new one, whole.
+
+- A file the game writes whole from its start (a profile; the checkpoint) is not copied into its
+  copy first; one written in part (a patch in the middle, an append, a resize) is.
+- The next start sweeps the save folders (`shadow_sweep`): a `.wold` is put back where its file is
+  missing (the cut came between the two renames) and goes where it is not, and a `.wtmp` goes. The
+  game's directory listings never show either. A file with a copy that is still open when the
+  console leaves is not replaced: the old one stays.
+- Not shadowed: `z:\savegame.bin` opened unbuffered and kept open (the game state's revert buffer,
+  of no use after the game ends), and files outside `saves` (`d:\core`).
+- A full card, a read-only card, a card that is gone: the call that fails tells the game with the
+  error it knows (`ERROR_DISK_FULL`, `ERROR_ACCESS_DENIED`, not found), as on the Xbox, and the
+  game's handlers run (`failed to write player profile to file`, `failed to write to persistent
+  storage`, where the game deletes the checkpoint it was writing). The old file stays, whatever the
+  failure, no copy is left, and the log says `save: <file> ...` and why. A write that takes no bytes
+  and sets no error (libfat does that with no room left) is a full disk, not a call to repeat.
+- Writes still go through the gate the shutdown uses (`wii_files_quiesce`): the ones under way
+  finish, the ones that would start wait; so does the replacing at close.
+
+Checked on the host: `python -m pytest -q tools/harness/tests/test_atomic_saves.py` runs the
+game's own sequences (a profile written whole, the checkpoint with its header last, a patch, an
+append, a file made, emptied and written, grown) on a real directory with the card modelled, cut
+before each call that changes it (and half-way through each write), on a card that renames over a
+file and on FAT's, then sweeps and checks that the file is the old one or the new one, no copy
+is left, and that a copy renamed over a file was synced after its last change; and the same
+sequences on a full card (a write that errs, one that takes no bytes), a read-only card, a card that
+is gone and a rename that fails. Ten faults put into the code are each caught. Needs a
+checkpoint on a real card (below): power off during a save, and a card pulled.
+
 ## How the port operates
 
 - **Compiler.** The game is compiled with clang `--target=powerpc-unknown-eabi -mcpu=750` against
@@ -169,8 +206,9 @@ inflated it to, and the Wii reads it where it is.
      switch a motor on again), then the files (xbox_files.c, `wii_files_quiesce`): the game's
      writes under way finish (the wait is at most three seconds), the ones that would start wait,
      and the files open for writing are synced. A save is several writes with the header written
-     last (`game_state_xbox.c`), so one cut between two writes is not valid, and the one before it
-     stays; no single write is cut;
+     last (`game_state_xbox.c`), and a file under `saves` replaces the old one only when it is
+     closed whole (Game data, "Saves"), so a cut leaves the old save or the new, and no single
+     write is cut;
   2. the audio output is stopped (`wl_platform_audio_stop`) and every Remote's and GameCube
      controller's motor (`wl_platform_input_stop_rumble`);
   3. the log is flushed and closed, and the SD card and the USB drive are unmounted, so that
