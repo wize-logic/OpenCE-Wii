@@ -682,20 +682,58 @@ void gx_lighting_view_frame(const struct gx_lighting_space *space, const float t
 	int row, column;
 
 	length = nv2a_sqrtf(dot3(toward, toward));
+	if (step > 0.0f && length > 1.0e-12f)
+	{
+		/* (rounded in the world: its elevation and azimuth to the nearest
+		step, its x level, so that the frame is the same whichever way the
+		camera turns, and a view's sphere map is drawn again only when the
+		draw's direction from the eye crosses a step) */
+		float world[3], elevation, azimuth, across;
+
+		for (column = 0; column < 3; column++)
+			world[column] = (space->world_to_eye[0][column] * toward[0] + space->world_to_eye[1][column] * toward[1] +
+				space->world_to_eye[2][column] * toward[2]) / (space->sigma * length);
+		elevation = asinf(world[2] < -1.0f ? -1.0f : world[2] > 1.0f ? 1.0f : world[2]);
+		azimuth = atan2f(world[1], world[0]);
+		elevation = step * floorf(elevation / step + 0.5f);
+		azimuth = step * floorf(azimuth / step + 0.5f);
+		across = cosf(elevation);
+		z[0] = across * cosf(azimuth);
+		z[1] = across * sinf(azimuth);
+		z[2] = sinf(elevation);
+		if (across > 1.0e-3f)
+		{
+			x[0] = -sinf(azimuth);
+			x[1] = cosf(azimuth);
+			x[2] = 0.0f;
+		}
+		else
+		{
+			x[0] = 1.0f;
+			x[1] = x[2] = 0.0f;
+		}
+		/* (y = z x x) */
+		y[0] = z[1] * x[2] - z[2] * x[1];
+		y[1] = z[2] * x[0] - z[0] * x[2];
+		y[2] = z[0] * x[1] - z[1] * x[0];
+		for (column = 0; column < 3; column++)
+		{
+			frame[0][column] = x[column];
+			frame[1][column] = y[column];
+			frame[2][column] = z[column];
+		}
+		if (turn)
+			for (row = 0; row < 3; row++)
+				for (column = 0; column < 3; column++)
+					turn[row][column] = (frame[row][0] * space->world_to_eye[column][0] +
+						frame[row][1] * space->world_to_eye[column][1] + frame[row][2] * space->world_to_eye[column][2]) /
+						space->sigma;
+		return;
+	}
 	if (!(length > 1.0e-12f) || !(toward[2] > 0.0f))
 	{
 		z[0] = z[1] = 0.0f;
 		z[2] = 1.0f;
-	}
-	else if (step > 0.0f)
-	{
-		/* (its angles about E's y and x, to the nearest step) */
-		z[0] = tanf(step * floorf(atan2f(toward[0], toward[2]) / step + 0.5f));
-		z[1] = tanf(step * floorf(atan2f(toward[1], toward[2]) / step + 0.5f));
-		z[2] = 1.0f;
-		length = nv2a_sqrtf(dot3(z, z));
-		for (row = 0; row < 3; row++)
-			z[row] /= length;
 	}
 	else
 		for (row = 0; row < 3; row++)

@@ -4866,7 +4866,8 @@ coordinates from the normal (gx_lighting.c says how, and how close it is):
   position matrix is), into a sphere map of the view: drawn from the
   world's in the EFB's rows below the back buffer (sphere_bake), for each
   cube map and direction of a draw from the eye (rounded to
-  LIT_SPHERE_STEP), and kept while the view turns no further. */
+  LIT_SPHERE_STEP in the world: gx_lighting_view_frame), and kept while
+  the draws' directions stay in their steps, however the camera turns. */
 
 /* (config.toml's display.gx_lighting; -1 not read yet) */
 static int gx_lighting_on = -1;
@@ -4886,8 +4887,11 @@ typedef char lit_sphere_rows_short_of_identity[57 + 2 <= GX_IDENTITY && 45 > GX_
 /* the view's sphere maps kept (a buffer can be drawn again in the frame:
 GX copies into it after the draws before it have read it), the most drawn
 in a frame, and how far a view's frame may turn and still keep one (in its
-rows' components: about a tenth of a degree) */
-#define SPHERE_BAKES 8
+rows' components: about a tenth of a degree). The frames are rounded in the
+world (gx_lighting_view_frame), so a map is kept while the camera turns;
+there are as many as a frame's draws of different cube maps and directions
+from the eye use, in the contiguous window (9 KB each). */
+#define SPHERE_BAKES 32
 #define SPHERE_BAKES_A_FRAME 48
 #define SPHERE_BAKE_KEPT 2.0e-3f
 /* the first row of the EFB below the back buffer, where they are drawn */
@@ -4967,10 +4971,21 @@ static BOOL sphere_bake(const struct texture_entry *world, const float frame[3][
 	{
 		if (sphere_bakes_in_frame >= SPHERE_BAKES_A_FRAME)
 			return FALSE;
+		/* (an empty one, else the one drawn longest ago) */
 		which = sphere_bakes_next++ % SPHERE_BAKES;
+		for (row = 0; row < SPHERE_BAKES; row++)
+		{
+			if (!sphere_bakes[row].buffer)
+			{
+				which = row;
+				break;
+			}
+			if (sphere_bakes[row].frame_number < sphere_bakes[which].frame_number)
+				which = row;
+		}
 		if (!sphere_bakes[which].buffer)
 		{
-			sphere_bakes[which].buffer = aligned_alloc(32, SIZE * SIZE * 4);
+			sphere_bakes[which].buffer = platform_contiguous_alloc(SIZE * SIZE * 4, 32, PLATFORM_ANY_PHYSICAL_ADDRESS, 0);
 			if (!sphere_bakes[which].buffer)
 				return FALSE;
 		}
