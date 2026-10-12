@@ -1428,6 +1428,30 @@ Black switches grenade type, White is the flashlight, a click of the left stick 
 click of the right zooms, Back shows the scores, Start pauses. In the menus A accepts, B and Back
 go back, and the D-pad or the left stick moves.
 
+**Every report of a frame.** A Wii Remote reports about every 5 ms, six or seven times in a 30
+frames-a-second frame, and libogc queues them. WiiLibs reads them all each poll and gives the game
+one reading (`wl/platform/input_reports.h`): a button pressed in any report is pressed for the frame,
+so a tap that comes and goes inside one frame is not lost (it is released in the next frame, so the
+game sees the press and the release), and the pointer is the mean of the reports that had a pointer
+(a report without one is left out, not counted as a corner). The largest acceleration of the frame
+is kept (`accel_peak`) for gestures; the game does not use it yet. The sticks are the last report's.
+Reading the reports costs about 330 instructions each (counted under qemu), a few microseconds for
+a Remote's seven.
+
+**The pointer's steadiness.** After the averaging the pointer holds still while it moves less than
+a radius from where it is held, and a larger move takes it to the reading at once (no lag on a
+deliberate move). The radius is `input.pointer_steadiness`, a share of half the screen: `0.03`
+(about 10 of the 640 pixels across), `0` for none, `0.25` the most (`xinput_wii_map.c`,
+`wii_pointer_steadiness`). It is the hand's tremor at the edge of the aim's box (the view rests while the pointer is within 0.35
+of the half screen from the middle, and turns beyond it, slowly then faster to the edge) that it takes
+out: without it the view turns by fits and starts there. The box and the turn ramp are as before.
+A pointer found again after the sensor bar was lost starts at its reading.
+
+**The GameCube controller's errors.** libogc hands back a controller whose transfer failed with
+nothing pressed, which released a held trigger for a frame. A controller that answers
+`PAD_ERR_TRANSFER` or `PAD_ERR_NOT_READY` keeps its last good state; after ten polls in a row of
+errors it counts as unplugged (the game's pause), and plugged in again with its next good read.
+
 Sticks and triggers arrive from WiiLibs over their whole travel (the GameCube's sticks are
 full at the end of their gates, its triggers run from 30 to 180 as `PAD_Clamp` takes them, the
 Classic Controller's five-bit triggers are scaled to a byte). The game applies its own dead zone
@@ -1551,12 +1575,15 @@ overlay, the font, the audio fade and the simulated buttons (`test_platform_over
 Checking the mapping: `tools/wii_input_check.py` builds `tests/wii_input_check.c` for the host
 with WiiLibs' `input_shape.c` and maps synthetic input states, comparing the Xbox gamepad with
 this table (each button on its own in play and in the menus, every Xbox control reachable from
-each controller, the sticks' signs and extremes, the triggers, the pointer's turn and its loss) and the rumble's duty cycle (the fraction of ticks
+each controller, the sticks' signs and extremes, the triggers, the pointer's turn, its loss and its steadiness: tremor
+at the box's edge turns the view steadily with the radius and by fits without) and the rumble's duty cycle (the fraction of ticks
 on for nine strengths at 60 and 30 ticks a second, at most a hundred switches a second at ticks a
 millisecond apart, zero stopping the motor at once).
 WiiLibs' own tests cover the reading (`test_platform_input_wii`: the backend against stand-ins
-for libogc's, with the sticks' and triggers' ranges and a Remote's drop-out) and the shaping
-(`test_platform_input_shape`). On a run (Dolphin or the console) `debug.input_log = true`
+for libogc's, with the sticks' and triggers' ranges, a Remote's drop-out, the reports of a frame
+(a tap inside one, the pointer's mean with and without a pointer, the acceleration's peak, an
+error report) and a GameCube controller's errors), the folding (`test_platform_input_reports`) and the shaping
+(`test_platform_input_shape`, with the pointer's play radius). On a run (Dolphin or the console) `debug.input_log = true`
 (`HALO_INPUT_LOG=1`) writes each controller's gamepad state to the log whenever it changes, and
 `tools/wii_input_log.py LOG --expect classic|remote|gamecube` decodes those lines into button
 names and checks that pressing each button in turn gave what the table says. What the host cannot
@@ -1603,7 +1630,11 @@ misses it loses its time.
    seconds, then the game's own "controller unplugged" pause; a Nunchuk plugged in and out in play
    does not remove the controller. The pointer (a Remote with a Nunchuk, the sensor bar in place)
    needs a person: the view rests within the middle of the screen, turns toward the pointer outside it,
-   slowly then at the profile's look speed at the screen's edge, is not jittery, stops 150 ms after
+   slowly then at the profile's look speed at the screen's edge, is not jittery (hold the Remote at
+   the box's edge with a steady hand: the view must not turn by fits; then try `input.pointer_steadiness`
+   `0` and `0.1` and say which feels right, and whether a quick aim across the screen lags), taps of
+   A and B much shorter than a frame (a quick flick) still jump and fire once, and a held trigger of
+   a GameCube controller is not released for a frame now and then; stops 150 ms after
    the sensor bar is lost (cover it), and the aim magnetism holds a target. The Wii U Pro Controller
    is not supported; say whether it does anything. Remote batteries: `remote N battery code C` in the
    log against the percent the HOME menu shows, with a Remote that is full and one nearly spent

@@ -400,6 +400,50 @@ static void check_pointer_loss(void)
 		"a long loss ends the tracking");
 }
 
+/* the pointer's play radius: a hand's tremor near the box's edge, which turns the view by fits and starts
+without it, turns it steadily (or not at all) with it, and a deliberate move is followed at once */
+static void check_pointer_steadiness(void)
+{
+	/* (the readings, 640 across: the box's edge is at 320 + 0.35 * 320 = 432) */
+	static const int tremor[] = {434, 437, 433, 436, 435, 438, 433, 436};
+	WlRawRemote remote = remote_state(WL_EXT_NUNCHUK);
+	WlPointer steady;
+	WlPointer loose;
+	float turn_steady_min = 1e9f, turn_steady_max = -1e9f, turn_loose_min = 1e9f, turn_loose_max = -1e9f;
+	float yaw, pitch;
+	int i;
+
+	CHECK(wii_pointer_steadiness(0.03) == 0.03f && wii_pointer_steadiness(0.0) == 0.0f, "the setting as written");
+	CHECK(wii_pointer_steadiness(-1.0) == WII_POINTER_STEADINESS_DEFAULT, "a negative setting is the default");
+	CHECK(wii_pointer_steadiness(0.0 / 0.0) == WII_POINTER_STEADINESS_DEFAULT, "a setting that is no number is the default");
+	CHECK(wii_pointer_steadiness(5.0) == WII_POINTER_STEADINESS_MAX, "a large setting is the most");
+
+	memset(&steady, 0, sizeof(steady));
+	memset(&loose, 0, sizeof(loose));
+	remote.ir_valid = TRUE;
+	remote.ir_y = 240;
+	for (i = 0; i < COUNT(tremor); i++)
+	{
+		remote.ir_x = (short)tremor[i];
+		wl_pointer_update_steady(&steady, &remote, 1000000 + (uint64_t)i * 33000, WII_POINTER_HOLD_US, WII_POINTER_STEADINESS_DEFAULT);
+		wl_pointer_update_steady(&loose, &remote, 1000000 + (uint64_t)i * 33000, WII_POINTER_HOLD_US, 0.0f);
+		wii_map_pointer_look(steady.x, steady.y, 0.033f, 2.6f, 1.4f, &yaw, &pitch);
+		turn_steady_min = yaw < turn_steady_min ? yaw : turn_steady_min;
+		turn_steady_max = yaw > turn_steady_max ? yaw : turn_steady_max;
+		wii_map_pointer_look(loose.x, loose.y, 0.033f, 2.6f, 1.4f, &yaw, &pitch);
+		turn_loose_min = yaw < turn_loose_min ? yaw : turn_loose_min;
+		turn_loose_max = yaw > turn_loose_max ? yaw : turn_loose_max;
+	}
+	CHECK(turn_steady_max == turn_steady_min, "tremor at the box's edge turns a steady %f..%f", turn_steady_min,
+		turn_steady_max);
+	CHECK(turn_loose_max != turn_loose_min, "without the radius the same tremor varies the turn");
+
+	/* a deliberate move: the pointer is where the reading is, in the same read */
+	remote.ir_x = 500;
+	wl_pointer_update_steady(&steady, &remote, 2000000, WII_POINTER_HOLD_US, WII_POINTER_STEADINESS_DEFAULT);
+	CHECK(fabsf(steady.x - (500.0f - 320.0f) / 320.0f) < 1e-6f, "a move beyond the radius is followed at once: %f", steady.x);
+}
+
 /* the rumble's duty cycle: the fraction of ticks the motor is on, the
 switches a second, and that zero stops it at once */
 
@@ -539,6 +583,7 @@ int main(void)
 	check_combined();
 	check_pointer_look();
 	check_pointer_loss();
+	check_pointer_steadiness();
 	check_rumble();
 	printf("wii_input_check: %d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
