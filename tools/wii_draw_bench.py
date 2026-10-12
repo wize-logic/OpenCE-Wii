@@ -283,7 +283,7 @@ def main() -> int:
     sub = parser.add_subparsers(dest="mode", required=True)
     for name in ("count", "record", "programs"):
         command = sub.add_parser(name)
-        command.add_argument("--scene", default="all", help="environment, rigid, skinned, unlit or all")
+        command.add_argument("--scene", default="all", help="environment, rigid, skinned, unlit, fogged or all")
         command.add_argument("--frames", type=int, default=4)
         command.add_argument("--device", help="another copy of port/wii/src (with tools/ beside it) to build instead")
         if name == "count":

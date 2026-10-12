@@ -55,6 +55,12 @@ void gx_stand_in_states(void (*each)(const char *name, uint32_t selector, uint64
 	(void)each;
 }
 
+void gx_stand_in_trace(unsigned gen, void (*each)(float s))
+{
+	(void)gen;
+	(void)each;
+}
+
 #else
 
 /* ---------- recording */
@@ -252,6 +258,16 @@ static float component(const unsigned char *data, unsigned type, unsigned frac)
 	}
 }
 
+/* the traced texture coordinate (gx_stand_in_trace) */
+static unsigned trace_gen = 99;
+static void (*trace_each)(float s);
+
+void gx_stand_in_trace(unsigned gen, void (*each)(float s))
+{
+	trace_gen = gen;
+	trace_each = each;
+}
+
 /* one vertex read from data as state describes it, digested */
 static uint64_t vertex_digest(uint64_t hash, const struct vertex_state *state, unsigned format, const unsigned char **data)
 {
@@ -333,6 +349,36 @@ static uint64_t vertex_digest(uint64_t hash, const struct vertex_state *state, u
 			matrix = indices[1 + gen];
 		input = source == GX_TG_POS ? values[GX_VA_POS] : source == GX_TG_NRM ? values[GX_VA_NRM] :
 			source >= GX_TG_TEX0 && source <= GX_TG_TEX7 ? values[GX_VA_TEX0 + source - GX_TG_TEX0] : values[0];
+		if (gen == trace_gen && trace_each)
+		{
+			float in[4] = { input[0], input[1], input[2], 1.0f }, out[3] = { input[0], input[1], 1.0f };
+			unsigned rows_used = state->texgen[gen].type == GX_TG_MTX2x4 ? 2u : 3u, column;
+
+			if (source != GX_TG_POS && source != GX_TG_NRM)
+				in[2] = 1.0f;
+			if (matrix != GX_IDENTITY)
+				for (row = 0; row < rows_used && matrix + row < MATRIX_ROWS; row++)
+				{
+					out[row] = 0.0f;
+					for (column = 0; column < 4; column++)
+						out[row] += state->rows[matrix + row][column] * in[column];
+				}
+			if (rows_used == 2)
+				out[2] = 1.0f;
+			if (state->texgen[gen].post != GX_DTTIDENTITY)
+			{
+				uint32_t post = state->texgen[gen].post - GX_DTTMTX0;
+				float again[4] = { out[0], out[1], out[2], 1.0f };
+
+				for (row = 0; row < 3 && post + row < MATRIX_ROWS; row++)
+				{
+					out[row] = 0.0f;
+					for (column = 0; column < 4; column++)
+						out[row] += state->post_rows[post + row][column] * again[column];
+				}
+			}
+			trace_each(rows_used == 3 && out[2] != 0.0f ? out[0] / out[2] : out[0]);
+		}
 		hash = hash_bytes(hash, kind, sizeof(kind));
 		hash = hash_bytes(hash, input, 3 * sizeof(float));
 		if (matrix == GX_IDENTITY)

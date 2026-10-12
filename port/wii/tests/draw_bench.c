@@ -499,6 +499,10 @@ static void camera_set(int frame)
 	D3DDevice_SetVertexShaderConstant(-96, C(-96), 28);
 }
 
+/* (the fogged scene's: the final combiner blends r0 to the fog's colour by
+its factor, as the game's atmospheric fog does) */
+static BOOL bench_fog;
+
 /* a pixel shader of one combiner: r0 = A B + C D (rgb), A B (alpha), then
 the final combiner's r0 */
 static void pixel_shader_set(DWORD texture_modes, DWORD rgb_inputs, DWORD rgb_outputs, DWORD alpha_inputs)
@@ -509,8 +513,11 @@ static void pixel_shader_set(DWORD texture_modes, DWORD rgb_inputs, DWORD rgb_ou
 	D3D__RenderState[D3DRS_PSRGBOUTPUTS0] = rgb_outputs;
 	D3D__RenderState[D3DRS_PSALPHAINPUTS0] = alpha_inputs;
 	D3D__RenderState[D3DRS_PSALPHAOUTPUTS0] = 0x000000C0;
-	D3D__RenderState[D3DRS_PSFINALCOMBINERINPUTSABCD] = 0x0000000C;
+	D3D__RenderState[D3DRS_PSFINALCOMBINERINPUTSABCD] = bench_fog ? 0x130C0300 : 0x0000000C;
 	D3D__RenderState[D3DRS_PSFINALCOMBINERINPUTSEFG] = 0x00001C00;
+	D3D__RenderState[D3DRS_FOGENABLE] = bench_fog;
+	D3D__RenderState[D3DRS_FOGCOLOR] = 0x00406080;
+	D3D__RenderState[D3DRS_FOGTABLEMODE] = D3DFOG_NONE;
 }
 
 /* ---------- drawing, counted or recorded */
@@ -828,6 +835,13 @@ static void rigid_draw(int frame)
 	}
 }
 
+/* (BENCH_TRACE: each vertex's fog coordinate, texture coordinate 4, as
+GX makes it, to compare GX's path with the processor's, BENCH_CPU) */
+static void trace_value(float s)
+{
+	print("  fog %.5f\n", s);
+}
+
 static void skinned_draw(int frame, const char *scene)
 {
 	unsigned model, part;
@@ -869,12 +883,14 @@ int main(int argc, char **argv)
 		return 0;
 	}
 	if (!all && strcmp(scene, "environment") && strcmp(scene, "rigid") && strcmp(scene, "skinned") &&
-		strcmp(scene, "unlit"))
+		strcmp(scene, "unlit") && strcmp(scene, "fogged"))
 	{
-		print("usage: draw_bench programs|environment|rigid|skinned|unlit|all [frames] [record]\n");
+		print("usage: draw_bench programs|environment|rigid|skinned|unlit|fogged|all [frames] [record]\n");
 		return 1;
 	}
 	recording = argc > 3 && !strcmp(argv[3], "record");
+	if (recording && getenv("BENCH_TRACE"))
+		gx_stand_in_trace(GX_PSH_FOG_TEXCOORD, trace_value);
 	environment_make();
 	models_make();
 	for (frame = 0; frame < frames; frame++)
@@ -894,6 +910,14 @@ int main(int argc, char **argv)
 			gx_lighting_on = 0;
 			skinned_draw(frame, "unlit");
 			gx_lighting_on = -1;
+		}
+		/* (the characters in the atmospheric fog: their lit pass's fog from
+		their nodes) */
+		if (all || !strcmp(scene, "fogged"))
+		{
+			bench_fog = TRUE;
+			skinned_draw(frame, "fogged");
+			bench_fog = FALSE;
 		}
 		D3DDevice_Present(NULL, NULL, NULL, NULL);
 		if (recording)

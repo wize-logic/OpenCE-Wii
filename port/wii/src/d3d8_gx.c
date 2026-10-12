@@ -5359,12 +5359,13 @@ static void lit_state(BOOL keyed, const struct draw_projection *projection, cons
 
 /* the vertices of a draw in hardware of which the processor computes nothing:
 each index's matrix indices (keyed: its value's position matrix, and with
-sphere_matrices its normal's sphere map matrix, with fog_matrices its fog
-ramp coordinate's), its position and texture coordinates by index, and a
+sphere_matrices its normal's sphere map matrix, with fog_post_matrices its
+fog's (fog_post_matrix), with fog_matrices its planar fog ramp
+coordinate's), its position and texture coordinates by index, and a
 lit draw's normal. A loop for each case, so that an index costs only what
 it sends. */
 static void emit_indices(const WORD *indices, UINT first, UINT count, unsigned texture_count, BOOL keyed, BOOL normals,
-	BOOL sphere_matrices, BOOL fog_matrices)
+	BOOL sphere_matrices, BOOL fog_post_matrices, BOOL fog_matrices)
 {
 	UINT base = indices ? device.base_vertex_index : first, vertex;
 
@@ -5421,6 +5422,8 @@ static void emit_indices(const WORD *indices, UINT first, UINT count, unsigned t
 			GX_MatrixIndex1x8((u8)(GX_PNMTX1 + 3 * key));
 			if (sphere_matrices)
 				GX_MatrixIndex1x8(lit_sphere_rows[key]);
+			if (fog_post_matrices)
+				GX_MatrixIndex1x8((u8)(GX_PNMTX1 + 3 * key));
 			if (fog_matrices)
 				GX_MatrixIndex1x8((u8)(GX_PNMTX1 + 3 * key));
 		}
@@ -5437,6 +5440,96 @@ static void emit_indices(const WORD *indices, UINT first, UINT count, unsigned t
 	);
 #undef EMIT_EACH
 }
+
+/* ---------- a model's fog from its nodes
+
+The fog of a model's vertex is a function of where its nodes put it: one
+texture matrix of its position does not serve every node's vertices. But it
+is a function of the world position, which each node's position matrix
+(GX_PNMTX1 on: the device's (x w, y w, -w), or a lit draw's E) maps the
+vertex to by an affine map the camera makes invertible: so the fog is one
+affine function of that matrix's result, for every node and for the
+processor's own vertices (through GX_PNMTX0, the same space). Texture
+coordinate 4 is then made from the position through the vertex's own
+position matrix (its matrix index, as the planar fog's ramp's coordinate is:
+lit_fog_ramp) and the post-transform matrix GX_DTTMTX1, that function. It is
+solved from the first node's (the matrix loaded and the fog's row in the
+model's space, stage_rows[4]) and checked against the program at a vertex
+of each other node; FALSE where it does not hold (the draw is then the
+processor's). */
+
+/* the post-transform rows of the fog's ramp coordinate (row 0; row 1 none,
+row 2 the q of 1) from the first key's position rows and fog row */
+static BOOL fog_post_matrix(const float rows[3][4], const float fog_row[4], Mtx post)
+{
+	float a = rows[0][0], b = rows[0][1], c = rows[0][2], d = rows[1][0], e = rows[1][1], f = rows[1][2];
+	float g = rows[2][0], h = rows[2][1], i = rows[2][2], determinant, inverse[3][3];
+	int row, column;
+
+	determinant = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+	if (!(fabsf(determinant) > 1.0e-20f))
+		return FALSE;
+	inverse[0][0] = (e * i - f * h) / determinant;
+	inverse[0][1] = (c * h - b * i) / determinant;
+	inverse[0][2] = (b * f - c * e) / determinant;
+	inverse[1][0] = (f * g - d * i) / determinant;
+	inverse[1][1] = (a * i - c * g) / determinant;
+	inverse[1][2] = (c * d - a * f) / determinant;
+	inverse[2][0] = (d * h - e * g) / determinant;
+	inverse[2][1] = (b * g - a * h) / determinant;
+	inverse[2][2] = (a * e - b * d) / determinant;
+	memset(post, 0, sizeof(Mtx));
+	/* (the fog's row of the model's position through the rows' inverse:
+	fog = g . (R p + t) for g = f R^-1, and its constant f3 - g . t) */
+	for (column = 0; column < 3; column++)
+		for (row = 0; row < 3; row++)
+			post[0][column] += fog_row[row] * inverse[row][column];
+	post[0][3] = fog_row[3];
+	for (row = 0; row < 3; row++)
+		post[0][3] -= post[0][row] * rows[row][3];
+	post[2][3] = 1.0f;
+	return TRUE;
+}
+
+/* whether the post-transform rows give each key's fog: at its
+representative vertex, the program's against the rows' (to a ramp's texel) */
+static BOOL fog_post_check(const Mtx post, const Mtx *key_rows, struct nv2a_cpu_program *program, void *fetch,
+	int position_register, float point_size)
+{
+	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
+	struct nv2a_cpu_output out;
+	unsigned key;
+
+	inputs_seed(inputs);
+	for (key = 0; key < draw_keys.count; key++)
+	{
+		const float *p;
+		float place[3], predicted, actual;
+		int row;
+
+		stream_fetch(fetch, draw_keys.representative[key], inputs);
+		nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
+			&out, NV2A_CPU_LIVE_FOG);
+		p = inputs[position_register];
+		for (row = 0; row < 3; row++)
+			place[row] = key_rows[key][row][0] * p[0] + key_rows[key][row][1] * p[1] + key_rows[key][row][2] * p[2] +
+				key_rows[key][row][3];
+		predicted = post[0][0] * place[0] + post[0][1] * place[1] + post[0][2] * place[2] + post[0][3];
+		/* (as the ramp clamps it) */
+		if (!(predicted > 0.5f / 256.0f))
+			predicted = 0.5f / 256.0f;
+		if (predicted > 255.5f / 256.0f)
+			predicted = 255.5f / 256.0f;
+		actual = fog_coordinate(out.fog);
+		if (!(fabsf(predicted - actual) < 1.0f / 256.0f))
+			return FALSE;
+	}
+	return TRUE;
+}
+
+/* in the statistics' window: draws whose model's fog went through the nodes'
+matrices (fog_post_matrix) */
+static unsigned long fog_post_draws;
 
 /* why a program's draws stay on the processor: once a program, for the log */
 static BOOL hardware_rejected(const struct nv2a_cpu_program *program, const char *reason)
@@ -5816,6 +5909,9 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	/* (position_read: a stage reads a coordinate GX makes from the position,
 	which a vertex the processor transforms does not give it) */
 	BOOL fogged = FALSE, cpu_colors = FALSE, position_read = FALSE, keyed, lit_on, pad_color = FALSE, plain;
+	/* (the fog through each vertex's position matrix: fog_post_matrix) */
+	BOOL fog_post = FALSE;
+	Mtx fog_post_rows;
 	/* (what a static buffer's kept outputs give of what the processor would
 	compute: static_outputs_find) */
 	struct static_outputs *kept = NULL;
@@ -5925,8 +6021,10 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 			if (!stage_unread[stage] && !(cpu_spheres & (1U << stage)) &&
 				((general->t[stage][0] | general->t[stage][1]) & draw_uniform.mask))
 				return hardware_rejected(program, "a texture coordinate from a model's nodes");
-		if (fogged && (general->fog & draw_uniform.mask))
-			return hardware_rejected(program, "the fog from a model's nodes");
+		/* (the fog from the nodes, or with the processor's vertices: through
+		each vertex's position matrix, fog_post_matrix) */
+		if (fogged && ((general->fog & draw_uniform.mask) || draw_keys.processor))
+			fog_post = TRUE;
 		for (component = 0; component < 2; component++)
 		{
 			const unsigned long *color = component ? general->d1 : general->d0;
@@ -5940,8 +6038,8 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 			}
 		}
 	}
-	if (draw_keys.processor && (position_read || fogged))
-		return hardware_rejected(program, "a texture coordinate or the fog from the position, with blended vertices");
+	if (draw_keys.processor && position_read)
+		return hardware_rejected(program, "a texture coordinate from the position, with blended vertices");
 	/* (the colours and reflection GX's lights and normals can make:
 	display.gx_lighting) */
 	lit_on = lit_choose(program, shader, fetch, cpu_colors, cpu_spheres);
@@ -6095,6 +6193,14 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		if (lit.reflection)
 			cpu_spheres &= ~8U;
 	}
+	if (fog_post)
+	{
+		const Mtx *key_rows = lit_on ? (const Mtx *)lit.rows : (const Mtx *)draw_keys.rows;
+
+		if (!fog_post_matrix((const float (*)[4])key_rows[0], stage_rows[4][0], fog_post_rows) ||
+			!fog_post_check((const float (*)[4])fog_post_rows, key_rows, program, fetch, position_register, point_size))
+			return hardware_rejected(program, "the fog from a model's nodes, not one function of its matrices' results");
+	}
 	if (!keyed && !lit_on && (cpu_spheres || cpu_colors))
 	{
 		kept = static_outputs_find(program, shader, fetch, count, indices, first, most, cpu_spheres, cpu_colors,
@@ -6197,6 +6303,15 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		hardware_sphere_draws++;
 	if (lit_on)
 		lit_state(keyed, &projection, base.d1);
+	if (fog_post)
+	{
+		/* (texture coordinate 4: the position through the vertex's own matrix,
+		then the fog's row; q 1) */
+		GX_LoadTexMtxImm(fog_post_rows, GX_DTTMTX1, GX_MTX3x4);
+		GX_SetTexCoordGen2(GX_TEXCOORD0 + GX_PSH_FOG_TEXCOORD, GX_TG_MTX3x4, GX_TG_POS, GX_PNMTX1, GX_FALSE, GX_DTTMTX1);
+		GX_SetVtxDesc(GX_VA_TEX0MTXIDX + GX_PSH_FOG_TEXCOORD, GX_DIRECT);
+		fog_post_draws++;
+	}
 	if (lit_on && lit.colors)
 	{
 		/* (the colours: GX's lights, lit_state) */
@@ -6290,7 +6405,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	gx_begin(gx_primitive(primitive_type), HARDWARE_VERTEX_FORMAT, (u16)count);
 	if (plain)
 		emit_indices(indices, first, count, texture_count + kept_count, keyed, lit_on, lit_on && lit.reflection && keyed,
-			lit_on && lit.fog_ramped && keyed);
+			fog_post, lit_on && lit.fog_ramped && keyed);
 	else
 		for (vertex = 0; vertex < count; vertex++)
 		{
@@ -6303,6 +6418,8 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 				GX_MatrixIndex1x8((u8)(processor ? GX_PNMTX0 : GX_PNMTX1 + 3 * draw_key_of[vertex]));
 			if (lit_on && lit.reflection && keyed)
 				GX_MatrixIndex1x8(lit_sphere_rows[processor ? draw_keys.count : draw_key_of[vertex]]);
+			if (fog_post)
+				GX_MatrixIndex1x8((u8)(processor ? GX_PNMTX0 : GX_PNMTX1 + 3 * draw_key_of[vertex]));
 			if (lit_on && lit.fog_ramped && keyed)
 				GX_MatrixIndex1x8((u8)(processor ? GX_PNMTX0 : GX_PNMTX1 + 3 * draw_key_of[vertex]));
 			if (processor || cpu_colors || cpu_spheres)
@@ -6777,9 +6894,11 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			kept_draws = kept_vertices = kept_computed = kept_refused = 0;
 		}
 		platform_log("Direct3D: lit by GX (display.gx_lighting): %lu draws, %lu vertices, %lu refused; %lu view sphere "
-			"maps drawn; the planar fog by GX's ramp in %lu draws (%lu ramps written), the processor's in %lu",
-			lit_draws, lit_vertices, lit_refused, sphere_bakes_made, lit_fog_draws, fog_ramps_made, lit_fog_refused);
-		lit_draws = lit_vertices = lit_refused = sphere_bakes_made = 0;
+			"maps drawn; the planar fog by GX's ramp in %lu draws (%lu ramps written), the processor's in %lu; "
+			"a model's fog through its nodes' matrices in %lu draws",
+			lit_draws, lit_vertices, lit_refused, sphere_bakes_made, lit_fog_draws, fog_ramps_made, lit_fog_refused,
+			fog_post_draws);
+		lit_draws = lit_vertices = lit_refused = sphere_bakes_made = fog_post_draws = 0;
 		lit_fog_draws = fog_ramps_made = lit_fog_refused = 0;
 		platform_log("Direct3D: textures not drawn: %lu without data, %lu of a shape, %lu of a format, "
 			"%lu without memory, %lu not decoded; %lu converted bitmaps found", texture_failures[_failure_no_data],
