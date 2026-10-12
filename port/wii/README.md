@@ -915,9 +915,5 @@ Dolphin runs the game, but these need the console:
    - not big-endian: a shadow's bounding radius left unset in the mirror's window, which the
      object shadow pass then read (a NaN halted c40).
 4. Real hardware, from the Homebrew Channel (`ninja wii-package`).
-5. CI. The workflow's `wii` job passes when run locally in the devkitpro/devkitppc image against
-   the local WiiLibs. On GitHub it checks out WiiLibs' `dolphin-tests-and-fixed-claims` branch,
-   which lacks what this port now needs from it: `wl/platform/tev.h` (the TEV programs and
-   their fixes) and the thread functions (`__wrap_sched_yield`, `wl_platform_run_on_stack`).
-   Against that branch the host check stops at "WiiLibs not found" and the build at
-   `gx_psh.h`. WiiLibs' threads, codec, TEV and TEV-fix commits must be pushed first.
+5. CI. The workflow's `wii` job checks out WiiLibs' `main` branch, which holds everything the
+   port takes from it (the TEV programs, the threads, the codec, the present).
