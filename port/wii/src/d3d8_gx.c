@@ -147,6 +147,11 @@ struct frame_timing
 	/* the draws' time by path: GX's transform (its matrices, then its
 	vertices), the processor's, immediate mode */
 	uint64_t hardware_setup, hardware_vertices, processor, immediate;
+	/* GX's transform's setup by part: what the draw depends on and its
+	indices' range (with a model's node keys), the matrices (and each node's),
+	a lit draw's lights and view sphere map, a static buffer's kept outputs,
+	and GX's state (with the streams' flushes) */
+	uint64_t setup_keys, setup_matrices, setup_lit, setup_kept, setup_state, setup_draws;
 	/* the processor's vertices' steps, in timebase ticks (60.75 a microsecond) */
 	unsigned long long fetch_ticks, program_ticks, store_ticks, emit_ticks;
 	/* the part of present spent waiting for GX to finish the frame's draws
@@ -6172,6 +6177,8 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	struct static_outputs *kept = NULL;
 	unsigned kept_spheres = 0, kept_count = 0;
 	BOOL kept_colors = FALSE;
+	/* (the setup's parts' ends: timing.setup_*) */
+	uint64_t keys_done, matrices_done, lit_done, kept_done;
 	const unsigned char *position_stream;
 	UINT position_stride;
 	unsigned long long key;
@@ -6304,6 +6311,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	most = draw_range.most;
 	if (most > 0xFFFF)
 		return hardware_rejected(program, "an index past 16 bits");
+	keys_done = wl_platform_time_us();
 
 	/* the matrices, as an earlier draw of the same program, constants and
 	state made them, or else: the outputs for no input, then for each
@@ -6436,11 +6444,13 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	is the cache's) */
 	if (keyed && !position_keys(shader, program, fetch, position_register, point_size))
 		return hardware_rejected(program, "no depth to fit for a model's node");
+	matrices_done = wl_platform_time_us();
 	if (lit_on && !lit_prepare(shader, fetch, position_register, keyed, 0))
 	{
 		lit_on = FALSE;
 		lit_refused++;
 	}
+	lit_done = wl_platform_time_us();
 	if (lit_on)
 	{
 		if (lit.colors)
@@ -6472,6 +6482,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 					kept_count++;
 		}
 	}
+	kept_done = wl_platform_time_us();
 	position_stream = fetch->streams[position_element->stream & (MAXIMUM_STREAMS - 1)] + position_element->offset;
 	position_stride = device.streams[position_element->stream & (MAXIMUM_STREAMS - 1)].stride;
 	if (position_stride > 255)
@@ -6848,6 +6859,12 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		hardware_blended_draws++;
 	timing.hardware_setup += emitting - started;
 	timing.hardware_vertices += wl_platform_time_us() - emitting;
+	timing.setup_keys += keys_done - started;
+	timing.setup_matrices += matrices_done - keys_done;
+	timing.setup_lit += lit_done - matrices_done;
+	timing.setup_kept += kept_done - lit_done;
+	timing.setup_state += emitting - kept_done;
+	timing.setup_draws++;
 	return TRUE;
 }
 
@@ -7215,6 +7232,14 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 					(unsigned long)(timing.hardware_vertices / 1000 / STATISTICS_FRAMES),
 					(unsigned long)(timing.processor / 1000 / STATISTICS_FRAMES),
 					(unsigned long)(timing.immediate / 1000 / STATISTICS_FRAMES));
+				platform_log("Direct3D: GX's transform's setup, a frame (tenths of a ms): what the draw depends on %lu, "
+					"the matrices %lu, the lights and sphere maps %lu, the kept outputs %lu, GX's state %lu; %lu draws",
+					(unsigned long)(timing.setup_keys / 100 / STATISTICS_FRAMES),
+					(unsigned long)(timing.setup_matrices / 100 / STATISTICS_FRAMES),
+					(unsigned long)(timing.setup_lit / 100 / STATISTICS_FRAMES),
+					(unsigned long)(timing.setup_kept / 100 / STATISTICS_FRAMES),
+					(unsigned long)(timing.setup_state / 100 / STATISTICS_FRAMES),
+					(unsigned long)(timing.setup_draws / STATISTICS_FRAMES));
 				platform_log("Direct3D: the processor's indexed vertices: fetch %lu ms, program %lu, store %lu, emit %lu",
 					(unsigned long)(timing.fetch_ticks / 60750 / STATISTICS_FRAMES),
 					(unsigned long)(timing.program_ticks / 60750 / STATISTICS_FRAMES),
