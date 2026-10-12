@@ -14,14 +14,10 @@ powerpc-linux C library and run under qemu-ppc.
             its arrays and matrices, and the state): --save FILE keeps them, --compare FILE
             checks another build of the device draws the same
   programs  the game's vertex programs, their declarations and dependencies
-  subdivide a sphere map read across big triangles (d3d8_gx.c's subdivide_triangle): a flat
-            sea's triangles, their pieces against each point's own direction; exits 1 where
-            they are off or do not cover the triangle
 
 usage: tools/wii_draw_bench.py count [--scene all] [--frames 4]
        tools/wii_draw_bench.py record --save build/wii/bench/before.txt
        tools/wii_draw_bench.py record --compare build/wii/bench/before.txt
-       tools/wii_draw_bench.py subdivide
 
 Needs devkitPPC (/opt/devkitpro, or DEVKITPRO), WiiLibs (WIILIBS, else ../WiiLibs), clang,
 powerpc-linux-gnu-gcc and qemu-ppc, and a configured `ninja wii` (its
@@ -282,15 +278,10 @@ def programs(args) -> int:
     return 0
 
 
-def subdivide(args) -> int:
-    binary = build(record=False, device=args.device)
-    return subprocess.run(["qemu-ppc", str(binary), "subdivide"]).returncode
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="mode", required=True)
-    for name in ("count", "record", "programs", "subdivide"):
+    for name in ("count", "record", "programs"):
         command = sub.add_parser(name)
         command.add_argument("--scene", default="all", help="environment, rigid, skinned, unlit, fogged or all")
         command.add_argument("--frames", type=int, default=4)
@@ -305,7 +296,7 @@ def main() -> int:
             command.add_argument("--compare", help="compare with the digests this file kept")
     args = parser.parse_args()
     os.chdir(ROOT)
-    return {"count": count, "record": record, "programs": programs, "subdivide": subdivide}[args.mode](args)
+    return {"count": count, "record": record, "programs": programs}[args.mode](args)
 
 
 if __name__ == "__main__":
