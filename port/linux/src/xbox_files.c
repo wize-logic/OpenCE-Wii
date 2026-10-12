@@ -29,6 +29,7 @@ matched case-insensitively, like the Xbox's FATX volumes.
 #include <unistd.h>
 #ifdef HALO_WII
 #include <pthread.h>
+#include "wl/platform/posix.h"
 #endif
 
 #ifdef HALO_WII
@@ -36,6 +37,92 @@ matched case-insensitively, like the Xbox's FATX volumes.
 when it has no maps folder, and the files' part of leaving it */
 void wii_stop_no_maps(void);
 static void shadow_sweep(const char *root);
+#endif
+
+#ifdef HALO_WII
+/* ---------- where the card's time goes
+
+port: the calls that reach the SD card or the USB drive are timed, by kind,
+and the totals are logged (about every two seconds while there are any), so
+that a slow start or a slow load can be read from the log: "files: 3210 ms in
+167 calls: ..." names the kinds that took most. One call of 25 ms or more is
+logged by itself (the first 64 of them). */
+enum
+{
+	_card_translate,
+	_card_open, /* CreateFileA, with the copy's making */
+	_card_directory, /* mkdir, rmdir, a listing's opening */
+	_card_attributes, /* stat, chmod */
+	_card_write,
+	_card_sync, /* fsync */
+	_card_close, /* close of a descriptor */
+	_card_replace, /* the copy's rename over its file, and the unlink of the old */
+	_card_unlink,
+	NUMBER_OF_CARD_KINDS
+};
+
+static const char *const card_kind_names[NUMBER_OF_CARD_KINDS] =
+{
+	"paths", "open", "directories", "attributes", "writes", "syncs", "closes", "replacing", "deleting"
+};
+
+static unsigned long card_microseconds[NUMBER_OF_CARD_KINDS];
+static unsigned long card_calls[NUMBER_OF_CARD_KINDS];
+static unsigned long card_reported_microseconds;
+static unsigned long card_slow_logged;
+static unsigned long card_last_report_ms;
+
+static unsigned long long card_now(void)
+{
+	LARGE_INTEGER counter, frequency;
+
+	QueryPerformanceCounter(&counter);
+	QueryPerformanceFrequency(&frequency);
+	return (unsigned long long)counter.QuadPart * 1000000ULL / (unsigned long long)frequency.QuadPart;
+}
+
+static void card_report(unsigned long long now)
+{
+	unsigned long total = 0, calls = 0;
+	char line[320];
+	int used = 0;
+	int kind;
+
+	for (kind = 0; kind < NUMBER_OF_CARD_KINDS; kind++)
+	{
+		total += card_microseconds[kind];
+		calls += card_calls[kind];
+	}
+	if (total == card_reported_microseconds)
+		return;
+	card_reported_microseconds = total;
+	card_last_report_ms = (unsigned long)(now / 1000);
+	used = snprintf(line, sizeof(line), "files: %lu ms in %lu calls:", total / 1000, calls);
+	for (kind = 0; kind < NUMBER_OF_CARD_KINDS && used < (int)sizeof(line) - 40; kind++)
+	{
+		if (card_calls[kind])
+			used += snprintf(line + used, sizeof(line) - (size_t)used, " %s %lu ms (%lu)", card_kind_names[kind],
+				card_microseconds[kind] / 1000, card_calls[kind]);
+	}
+	platform_log("%s", line);
+}
+
+/* what a call of this kind took, from card_now() before it */
+static void card_end(int kind, unsigned long long started, const char *path)
+{
+	unsigned long long now = card_now();
+	unsigned long microseconds = (unsigned long)(now - started);
+
+	__sync_fetch_and_add(&card_microseconds[kind], microseconds);
+	__sync_fetch_and_add(&card_calls[kind], 1);
+	if (microseconds >= 25000 && card_slow_logged < 64)
+	{
+		card_slow_logged++;
+		platform_log("files: %s took %lu ms (%s)", card_kind_names[kind], microseconds / 1000, path ? path : "");
+	}
+	if ((unsigned long)(now / 1000) - card_last_report_ms >= 2000)
+		card_report(now);
+}
 #endif
 
 /* ---------- paths */
@@ -242,11 +329,110 @@ const char *platform_custom_edition_root(void)
 	return root;
 }
 
+/* the next component of an Xbox path, with its separators skipped: FALSE at
+the end. . and .. (and Windows' spellings of them, with trailing dots and
+spaces) are skipped: FATX names are never only dots, and .. would leave the
+root */
+static BOOL next_path_component(const char **cursor, char *component, unsigned long size)
+{
+	for (;;)
+	{
+		unsigned long length = 0;
+
+		while (**cursor == '\\' || **cursor == '/')
+			(*cursor)++;
+		if (!**cursor)
+			return FALSE;
+		while (**cursor && **cursor != '\\' && **cursor != '/' && length + 1 < size)
+			component[length++] = *(*cursor)++;
+		component[length] = '\0';
+		if (length && strspn(component, ". ") != length)
+			return TRUE;
+	}
+}
+
+/* adds a component to a host path, in the spelling the directory has it (the
+Xbox's volumes did not tell the cases apart) */
+static void append_path_component(char *resolved, unsigned long size, const char *component)
+{
+	char on_disk[256];
+	unsigned long length;
+
+	if (posix_find_entry_case_insensitive(resolved, component, on_disk, sizeof(on_disk)))
+	{
+		/* prefer an exact match when several spellings exist */
+		char exact[1100];
+		struct posix_file_information information;
+
+		snprintf(exact, sizeof(exact), "%s/%s", resolved, component);
+		if (posix_stat(exact, &information) == 0)
+			snprintf(on_disk, sizeof(on_disk), "%s", component);
+	}
+	else
+	{
+		snprintf(on_disk, sizeof(on_disk), "%s", component);
+	}
+	length = strlen(resolved);
+	snprintf(resolved + length, size - length, "/%s", on_disk);
+}
+
+#ifdef HALO_WII
+/* port: a path that is there as it is written needs no look into the
+directories (each of those opens a directory of the card and reads all of its
+entries, once for every part of the path, at every open): one stat of the
+whole path, or when the file is not there yet (it is to be made) one of its
+folder and one look into that folder for the file's own spelling. The result
+is the same as the look at every part gives, which prefers the spelling as
+written where it exists. Returns whether the host path is made; resolved is
+spoilt when it is not. */
+static BOOL translate_as_written(char *resolved, unsigned long size, const char *cursor, char *host_path,
+	unsigned long host_path_size)
+{
+	char component[256];
+	char last[256];
+	unsigned long parent_length = 0;
+	unsigned long length;
+	struct posix_file_information information;
+	BOOL any = FALSE;
+
+	last[0] = '\0';
+	while (next_path_component(&cursor, component, sizeof(component)))
+	{
+		length = strlen(resolved);
+		if (length + 1 + strlen(component) + 1 > size)
+			return FALSE;
+		parent_length = length;
+		snprintf(resolved + length, size - length, "/%s", component);
+		snprintf(last, sizeof(last), "%s", component);
+		any = TRUE;
+	}
+	if (!any)
+		return FALSE;
+	if (posix_stat(resolved, &information) == 0)
+	{
+		snprintf(host_path, host_path_size, "%s", resolved);
+		return TRUE;
+	}
+	resolved[parent_length] = '\0';
+	if (parent_length && posix_stat(resolved, &information) == 0 && (information.flags & _posix_file_is_directory))
+	{
+		append_path_component(resolved, size, last);
+		snprintf(host_path, host_path_size, "%s", resolved);
+		return TRUE;
+	}
+	return FALSE;
+}
+#endif
+
 void platform_translate_path(const char *xbox_path, char *host_path, unsigned long host_path_size)
 {
 	char resolved[1024];
+	char component[256];
 	const char *cursor = xbox_path;
-	unsigned long length;
+#ifdef HALO_WII
+	char root[1024];
+	unsigned long long started = card_now();
+#endif
 
 	snprintf(resolved, sizeof(resolved), "%s", platform_data_root());
 	if (((cursor[0] >= 'a' && cursor[0] <= 'z') || (cursor[0] >= 'A' && cursor[0] <= 'Z')) && cursor[1] == ':')
@@ -268,42 +454,21 @@ void platform_translate_path(const char *xbox_path, char *host_path, unsigned lo
 		}
 		cursor += 2;
 	}
-
-	while (*cursor)
+#ifdef HALO_WII
+	snprintf(root, sizeof(root), "%s", resolved);
+	if (translate_as_written(resolved, sizeof(resolved), cursor, host_path, host_path_size))
 	{
-		char component[256];
-		char on_disk[256];
-		unsigned long component_length = 0;
-
-		while (*cursor == '\\' || *cursor == '/')
-			cursor++;
-		while (*cursor && *cursor != '\\' && *cursor != '/' && component_length + 1 < sizeof(component))
-			component[component_length++] = *cursor++;
-		component[component_length] = '\0';
-		/* . and .. (and Windows' spellings of them, with trailing dots and
-		spaces) are skipped: FATX names are never only dots, and .. would
-		leave the root */
-		if (!component_length || strspn(component, ". ") == component_length)
-			continue;
-
-		if (posix_find_entry_case_insensitive(resolved, component, on_disk, sizeof(on_disk)))
-		{
-			/* prefer an exact match when several spellings exist */
-			char exact[1100];
-			struct posix_file_information information;
-
-			snprintf(exact, sizeof(exact), "%s/%s", resolved, component);
-			if (posix_stat(exact, &information) == 0)
-				snprintf(on_disk, sizeof(on_disk), "%s", component);
-		}
-		else
-		{
-			snprintf(on_disk, sizeof(on_disk), "%s", component);
-		}
-		length = strlen(resolved);
-		snprintf(resolved + length, sizeof(resolved) - length, "/%s", on_disk);
+		card_end(_card_translate, started, NULL);
+		return;
 	}
+	snprintf(resolved, sizeof(resolved), "%s", root);
+#endif
+	while (next_path_component(&cursor, component, sizeof(component)))
+		append_path_component(resolved, sizeof(resolved), component);
 	snprintf(host_path, host_path_size, "%s", resolved);
+#ifdef HALO_WII
+	card_end(_card_translate, started, NULL);
+#endif
 }
 
 /* ---------- file handles */
@@ -315,8 +480,21 @@ struct platform_file
 #ifdef HALO_WII
 	int shadow; /* _shadow_* below */
 	BOOL damaged; /* a write or a resize failed: the old file is kept */
+	BOOL modified; /* a write or a resize was made (to the copy, when there is one) */
 	unsigned long long original_size;
 	char temporary_path[1032];
+	/* a file the game makes again at every start ("files made again", below) */
+	BOOL regenerated;
+	BOOL regenerated_for_write; /* the descriptor can write (the file is opened for reading until it differs) */
+	BOOL truncate_pending; /* it was to be emptied (CREATE_ALWAYS): cut to what is written at the close */
+	unsigned long long written_end;
+	/* a handle only read at offsets (a map's) keeps its place, so that the next read in line needs no seek */
+	BOOL positioned_only; /* the reader has the descriptor */
+	WlPlacedReader reader;
+	/* what it has been read for, logged when it closes */
+	unsigned long reads;
+	unsigned long long read_bytes;
+	unsigned long long read_microseconds;
 #endif
 };
 
@@ -535,8 +713,11 @@ static int shadow_open(const char *path, int flags, BOOL existed, int *state, un
 		*state = _shadow_active;
 		return descriptor;
 	}
-	/* (read as well: the old contents are copied from it) */
-	descriptor = open(path, (flags & ~O_ACCMODE) | O_RDWR | O_CLOEXEC, 0644);
+	/* (for reading only: the old contents are copied from it, and nothing is
+	written to it; a descriptor that can write may cost a flush of the card
+	at its close, which the game's listing of its saves would pay for every
+	file it opens to check) */
+	descriptor = open(path, (flags & ~O_ACCMODE) | O_RDONLY | O_CLOEXEC, 0644);
 	if (descriptor >= 0)
 	{
 		*state = _shadow_deferred;
@@ -637,15 +818,30 @@ every write went through, and is dropped (the old file stays) when one failed */
 static void shadow_finish(struct platform_file *file)
 {
 	int error = 0;
+	unsigned long long started;
 
 	write_begin();
 	if (file->damaged)
+	{
 		error = -1;
-	else if (fsync(file->descriptor) != 0)
-		error = errno ? errno : EIO;
+	}
+	else if (file->modified)
+	{
+		/* (a copy nothing was written to, a file made empty, has nothing to sync) */
+		started = card_now();
+		if (fsync(file->descriptor) != 0)
+			error = errno ? errno : EIO;
+		card_end(_card_sync, started, file->path);
+	}
+	started = card_now();
 	close(file->descriptor);
+	card_end(_card_close, started, file->path);
 	if (!error)
+	{
+		started = card_now();
 		error = shadow_replace(file->temporary_path, file->path);
+		card_end(_card_replace, started, file->path);
+	}
 	if (error)
 	{
 		unlink(file->temporary_path);
@@ -706,6 +902,163 @@ static void shadow_sweep(const char *root)
 	for (guard = 0; guard < 1000 && shadow_sweep_directory(root, 0); guard++)
 		;
 }
+
+/* ---------- files made again
+
+port: the game writes its default player profiles and default game variants
+(z:\saved\player_profiles\default_profile\, z:\saved\playlists\default_playlist\)
+at every start: it empties their folder, then makes each file and writes the
+same block into it (source/saved games/playlist_profile.c and player_profile.c).
+Nothing in them is lost to a cut (the next start writes them again), so they
+are not written beside themselves and synced, and what is already there is
+left alone: DeleteFileA does not take them away, a file made again keeps its
+contents until the game writes something else (a file opened to be emptied is
+cut to what is written at its close), a write of the bytes the file holds is
+not made, and a file is opened for reading until a write differs. A start
+after the first writes nothing to the card for them; the first writes each
+file once. */
+static BOOL regenerated_wanted(const char *path)
+{
+	static const char *const folders[] =
+	{
+		"/z/saved/playlists/default_playlist/",
+		"/z/saved/player_profiles/default_profile/"
+	};
+	const char *root = platform_save_root();
+	size_t length = strlen(root);
+	int index;
+
+	if (!length || strncmp(path, root, length))
+		return FALSE;
+	for (index = 0; index < 2; index++)
+	{
+		if (!strncasecmp(path + length, folders[index], strlen(folders[index])))
+			return TRUE;
+	}
+	return FALSE;
+}
+
+/* the file's descriptor is made one that can write, at the place it stood: 0
+or the errno */
+static int regenerated_upgrade(struct platform_file *file)
+{
+	int descriptor;
+	off_t place;
+
+	if (file->regenerated_for_write)
+		return 0;
+	place = lseek(file->descriptor, 0, SEEK_CUR);
+	descriptor = open(file->path, O_RDWR | O_CLOEXEC, 0644);
+	if (descriptor < 0)
+		return errno ? errno : EIO;
+	if (lseek(descriptor, place < 0 ? 0 : place, SEEK_SET) < 0)
+	{
+		int error = errno ? errno : EIO;
+
+		close(descriptor);
+		return error;
+	}
+	close(file->descriptor);
+	file->descriptor = descriptor;
+	file->regenerated_for_write = TRUE;
+	return 0;
+}
+
+/* whether the file holds these bytes where they are to go */
+static BOOL regenerated_holds(const struct platform_file *file, const void *buffer, DWORD count,
+	unsigned long long offset)
+{
+	unsigned char held[512];
+	DWORD done = 0;
+
+	while (done < count)
+	{
+		DWORD step = count - done < sizeof(held) ? count - done : (DWORD)sizeof(held);
+		ssize_t result = pread(file->descriptor, held, step, (off_t)(offset + done));
+
+		if (result < (ssize_t)step || memcmp(held, (const char *)buffer + done, step))
+			return FALSE;
+		done += step;
+	}
+	return TRUE;
+}
+
+/* the file the game last made empty with CREATE_ALWAYS and closed without a write (file_create): the next
+open of it for writing is the one that is to find it empty */
+static char regenerated_emptied[1024];
+
+/* the close of such a file: one that was to be emptied and was written is cut to what was written */
+static void regenerated_finish(struct platform_file *file)
+{
+	struct posix_file_information information;
+
+	if (file->truncate_pending && !file->modified)
+		snprintf(regenerated_emptied, sizeof(regenerated_emptied), "%s", file->path);
+
+	if (file->truncate_pending && file->modified && posix_fstat(file->descriptor, &information) == 0 &&
+		information.size_high == 0 && information.size_low > file->written_end &&
+		regenerated_upgrade(file) == 0)
+		ftruncate(file->descriptor, (off_t)file->written_end);
+}
+
+/* ---------- how the files are read
+
+port: the reads are counted by kind and logged about every two seconds while
+there are any ("files: reads in 2.0 s: ..."), and a file that was read much
+logs what it was read for as it closes. A read that is small, one into a
+buffer that is not a multiple of 32 bytes in address, or from an offset that
+is not a multiple of 512 (a sector) costs the card's driver more than one that
+is none of these; one that is not next in line costs a seek, which on FAT
+follows the file's chain of clusters from the one it stood at. */
+static struct
+{
+	unsigned long reads, bytes, microseconds;
+	unsigned long small; /* under 4 KB */
+	unsigned long misaligned_buffer;
+	unsigned long unaligned_offset;
+	unsigned long seeks;
+	unsigned long largest;
+	unsigned long long reported;
+} read_window;
+
+static void read_counted(struct platform_file *file, const void *buffer, size_t count, unsigned long long offset,
+	BOOL positioned, unsigned long microseconds, unsigned long long now)
+{
+	__sync_fetch_and_add(&read_window.reads, 1);
+	__sync_fetch_and_add(&read_window.bytes, (unsigned long)count);
+	__sync_fetch_and_add(&read_window.microseconds, microseconds);
+	if (count < 4096)
+		__sync_fetch_and_add(&read_window.small, 1);
+	if (((unsigned long)buffer & 31) != 0)
+		__sync_fetch_and_add(&read_window.misaligned_buffer, 1);
+	if (positioned && (offset & 511) != 0)
+		__sync_fetch_and_add(&read_window.unaligned_offset, 1);
+	if (count > read_window.largest)
+		read_window.largest = (unsigned long)count;
+	file->reads++;
+	file->read_bytes += count;
+	file->read_microseconds += microseconds;
+	if (!read_window.reported)
+		read_window.reported = now;
+	if (now - read_window.reported >= 2000000ULL)
+	{
+		platform_log("files: reads in %lu ms: %lu, %lu KB in %lu ms (largest %lu KB; %lu under 4 KB, %lu into a buffer "
+			"not on 32 bytes, %lu from an offset not on 512, %lu seeks)",
+			(unsigned long)((now - read_window.reported) / 1000), read_window.reads, read_window.bytes / 1024,
+			read_window.microseconds / 1000, read_window.largest / 1024, read_window.small,
+			read_window.misaligned_buffer, read_window.unaligned_offset, read_window.seeks);
+		memset(&read_window, 0, sizeof(read_window));
+		read_window.reported = now;
+	}
+}
+
+static void file_report_reads(const struct platform_file *file)
+{
+	if (file->read_bytes >= 1024 * 1024)
+		platform_log("files: %s closed after %lu reads, %lu KB in %lu ms (%lu KB a read)", file->path, file->reads,
+			(unsigned long)(file->read_bytes / 1024), (unsigned long)(file->read_microseconds / 1000),
+			(unsigned long)(file->read_bytes / 1024 / (file->reads ? file->reads : 1)));
+}
 #endif
 
 static void file_destroy(struct platform_handle *handle)
@@ -714,11 +1067,24 @@ static void file_destroy(struct platform_handle *handle)
 
 #ifdef HALO_WII
 	writable_unregister(file);
+	wl_posix_placed_close(&file->reader); /* (before the descriptor goes: it puts the position back) */
 	if (file->shadow == _shadow_active)
+	{
 		shadow_finish(file);
+	}
 	else
-#endif
+	{
+		unsigned long long started = card_now();
+
+		if (file->regenerated)
+			regenerated_finish(file);
+		file_report_reads(file);
+		close(file->descriptor);
+		card_end(_card_close, started, file->path);
+	}
+#else
 	close(file->descriptor);
+#endif
 	free(file);
 }
 
@@ -744,6 +1110,10 @@ HANDLE WINAPI CreateFileA(LPCSTR file_name, DWORD desired_access, DWORD share_mo
 	int shadow = _shadow_none;
 	unsigned long long original_size = 0;
 	char temporary_path[1032] = "";
+	BOOL regenerated = FALSE;
+	BOOL regenerated_for_write = FALSE;
+	BOOL truncate_pending = FALSE;
+	unsigned long long started = card_now();
 #endif
 
 	(void)share_mode;
@@ -791,7 +1161,23 @@ HANDLE WINAPI CreateFileA(LPCSTR file_name, DWORD desired_access, DWORD share_mo
 	}
 
 #ifdef HALO_WII
-	if ((flags & O_ACCMODE) != O_RDONLY && !(flags_and_attributes & FILE_FLAG_NO_BUFFERING) &&
+	if ((flags & O_ACCMODE) == O_WRONLY && !(flags_and_attributes & FILE_FLAG_NO_BUFFERING) &&
+		(existed || (flags & O_CREAT)) && regenerated_wanted(path))
+	{
+		/* a file the game makes again at every start (xbox_files.c, "files made again") */
+		if (existed && creation_disposition == CREATE_NEW)
+		{
+			SetLastError(ERROR_ALREADY_EXISTS);
+			return INVALID_HANDLE_VALUE;
+		}
+		regenerated = TRUE;
+		truncate_pending = existed && ((flags & O_TRUNC) || !strcmp(path, regenerated_emptied));
+		regenerated_emptied[0] = '\0';
+		flags &= ~O_TRUNC;
+		regenerated_for_write = !existed;
+		descriptor = existed ? open(path, O_RDONLY | O_CLOEXEC, 0644) : open(path, flags | O_CLOEXEC, 0644);
+	}
+	else if ((flags & O_ACCMODE) != O_RDONLY && !(flags_and_attributes & FILE_FLAG_NO_BUFFERING) &&
 		(existed || (flags & O_CREAT)) && shadow_wanted(path))
 	{
 		if (existed && creation_disposition == CREATE_NEW)
@@ -836,8 +1222,16 @@ HANDLE WINAPI CreateFileA(LPCSTR file_name, DWORD desired_access, DWORD share_mo
 	file->shadow = shadow;
 	file->original_size = original_size;
 	snprintf(file->temporary_path, sizeof(file->temporary_path), "%s", temporary_path);
+	file->regenerated = regenerated;
+	file->regenerated_for_write = regenerated_for_write;
+	file->truncate_pending = truncate_pending;
+	/* a map and the like: read at offsets only, from a handle opened for it */
+	if ((flags & O_ACCMODE) == O_RDONLY && (flags_and_attributes & FILE_FLAG_OVERLAPPED) &&
+		wl_posix_placed_open(&file->reader, descriptor) == WL_OK)
+		file->positioned_only = TRUE;
 	if ((flags & O_ACCMODE) != O_RDONLY)
 		writable_register(file);
+	card_end(_card_open, started, path);
 #endif
 
 	/* Win32 reports whether an OPEN_ALWAYS/CREATE_ALWAYS target existed */
@@ -848,9 +1242,42 @@ HANDLE WINAPI CreateFileA(LPCSTR file_name, DWORD desired_access, DWORD share_mo
 
 #define READ_BOUNCE_SIZE 0x40000UL
 
+#ifdef HALO_WII
+/* port: a handle only read at offsets keeps its place: a read that starts where
+the last ended (the map's tags, then its bitmaps in the order they were asked
+for) is a read and nothing else, where pread (WiiLibs' wl_posix_pread) is a
+seek to the offset, the read, and a seek back to where the handle stood, each
+of them a walk along the file's chain of clusters on FAT. WiiLibs' reader
+(WlPlacedReader) does it; the handle's own position is put back when something
+that uses it comes (file_end_positioned). */
+static ssize_t read_at_place(struct platform_file *file, void *buffer, size_t count, unsigned long long offset)
+{
+	uint32_t seeks = file->reader.seeks;
+	ssize_t result = wl_posix_placed_pread(&file->reader, buffer, count, (int64_t)offset);
+
+	__sync_fetch_and_add(&read_window.seeks, file->reader.seeks - seeks);
+	return result;
+}
+
+/* the handle is used by position, or written: the descriptor stands where a handle never read by offset stands */
+static void file_end_positioned(struct platform_file *file)
+{
+	if (!file->positioned_only)
+		return;
+	file->positioned_only = FALSE;
+	wl_posix_placed_release(&file->reader);
+}
+#endif
+
 static ssize_t read_some(struct platform_file *file, void *buffer, size_t count, BOOL positioned,
 	unsigned long long offset)
 {
+#ifdef HALO_WII
+	if (positioned && file->positioned_only)
+		return read_at_place(file, buffer, count, offset);
+	/* (pread: three seeks) */
+	__sync_fetch_and_add(&read_window.seeks, positioned ? 3 : 0);
+#endif
 	return positioned ?
 		pread(file->descriptor, buffer, count, (off_t)offset) :
 		read(file->descriptor, buffer, count);
@@ -876,6 +1303,11 @@ static BOOL read_at(struct platform_file *file, LPVOID buffer, DWORD count, LPDW
 #endif
 	LARGE_INTEGER started, ended, frequency;
 	char *staging = bounce ? malloc(count < READ_BOUNCE_SIZE ? count : READ_BOUNCE_SIZE) : NULL;
+
+#ifdef HALO_WII
+	if (!positioned)
+		file_end_positioned(file);
+#endif
 
 	if (bounce && !staging)
 	{
@@ -921,6 +1353,12 @@ static BOOL read_at(struct platform_file *file, LPVOID buffer, DWORD count, LPDW
 	QueryPerformanceFrequency(&frequency);
 	platform_file_reads.microseconds += (unsigned long long)(ended.QuadPart - started.QuadPart) * 1000000ULL /
 		(unsigned long long)frequency.QuadPart;
+#ifdef HALO_WII
+	read_counted(file, buffer, total, offset, positioned,
+		(unsigned long)((unsigned long long)(ended.QuadPart - started.QuadPart) * 1000000ULL /
+			(unsigned long long)frequency.QuadPart),
+		(unsigned long long)ended.QuadPart * 1000000ULL / (unsigned long long)frequency.QuadPart);
+#endif
 	return TRUE;
 }
 
@@ -972,9 +1410,41 @@ static BOOL write_at(struct platform_file *file, LPCVOID buffer, DWORD count, LP
 	BOOL positioned, unsigned long long offset)
 {
 	BOOL result;
+	unsigned long long started = card_now();
 
 	write_begin();
-	if (shadow_before_write(file, positioned, offset, count, FALSE))
+	file->modified = TRUE;
+	if (file->regenerated)
+	{
+		/* (xbox_files.c, "files made again": the bytes the file holds are not written again) */
+		unsigned long long at = offset;
+		int error = 0;
+
+		if (!positioned)
+		{
+			off_t place = lseek(file->descriptor, 0, SEEK_CUR);
+
+			at = place < 0 ? 0 : (unsigned long long)place;
+		}
+		if (regenerated_holds(file, buffer, count, at))
+		{
+			if (!positioned && lseek(file->descriptor, (off_t)(at + count), SEEK_SET) < 0)
+				error = errno ? errno : EIO;
+			result = error == 0;
+			if (bytes_written)
+				*bytes_written = error ? 0 : count;
+		}
+		else
+		{
+			error = regenerated_upgrade(file);
+			result = error == 0 && write_at_ungated(file, buffer, count, bytes_written, positioned, offset);
+		}
+		if (error)
+			platform_set_last_error_from_errno(error);
+		if (result && at + count > file->written_end)
+			file->written_end = at + count;
+	}
+	else if (shadow_before_write(file, positioned, offset, count, FALSE))
 	{
 		result = write_at_ungated(file, buffer, count, bytes_written, positioned, offset);
 	}
@@ -990,6 +1460,7 @@ static BOOL write_at(struct platform_file *file, LPCVOID buffer, DWORD count, LP
 		platform_log("save: a write to %s failed (error %lu)", file->path, (unsigned long)GetLastError());
 	}
 	write_end();
+	card_end(_card_write, started, file->path);
 	return result;
 }
 #endif
@@ -1113,6 +1584,9 @@ DWORD WINAPI SetFilePointer(HANDLE handle, LONG distance, PLONG distance_high, D
 		SetLastError(ERROR_INVALID_PARAMETER);
 		return INVALID_SET_FILE_POINTER;
 	}
+#ifdef HALO_WII
+	file_end_positioned(file);
+#endif
 	if (posix_seek(file->descriptor, distance,
 		distance_high ? *distance_high : (distance < 0 ? -1 : 0), whence, &low, &high) != 0)
 	{
@@ -1153,7 +1627,8 @@ BOOL WINAPI SetEndOfFile(HANDLE handle)
 #ifdef HALO_WII
 	/* port: the resize goes to the copy of a file saved with one (xbox_files.c, "saves that survive a cut") */
 	write_begin();
-	if (!shadow_before_write(file, FALSE, 0, 0, TRUE))
+	file->modified = TRUE;
+	if (file->regenerated ? regenerated_upgrade(file) != 0 : !shadow_before_write(file, FALSE, 0, 0, TRUE))
 	{
 		file->damaged = TRUE;
 		write_end();
@@ -1244,6 +1719,20 @@ static void fill_attribute_data(const struct posix_file_information *information
 	data->nFileSizeLow = information->size_low;
 }
 
+/* posix_stat, timed on the Wii (the kind "attributes") */
+static int timed_stat(const char *path, struct posix_file_information *information)
+{
+#ifdef HALO_WII
+	unsigned long long started = card_now();
+	int result = posix_stat(path, information);
+
+	card_end(_card_attributes, started, path);
+	return result;
+#else
+	return posix_stat(path, information);
+#endif
+}
+
 DWORD WINAPI GetFileAttributesA(LPCSTR file_name)
 {
 	struct posix_file_information information;
@@ -1251,7 +1740,7 @@ DWORD WINAPI GetFileAttributesA(LPCSTR file_name)
 	char path[1024];
 
 	platform_translate_path(file_name, path, sizeof(path));
-	if (posix_stat(path, &information) != 0)
+	if (timed_stat(path, &information) != 0)
 	{
 		platform_set_last_error_from_errno(errno);
 		return (DWORD)-1;
@@ -1271,7 +1760,7 @@ BOOL WINAPI GetFileAttributesExA(LPCSTR file_name, GET_FILEEX_INFO_LEVELS level,
 		return FALSE;
 	}
 	platform_translate_path(file_name, path, sizeof(path));
-	if (posix_stat(path, &information) != 0)
+	if (timed_stat(path, &information) != 0)
 	{
 		platform_set_last_error_from_errno(errno);
 		return FALSE;
@@ -1286,12 +1775,17 @@ BOOL WINAPI SetFileAttributesA(LPCSTR file_name, DWORD attributes)
 	struct posix_file_information information;
 
 	platform_translate_path(file_name, path, sizeof(path));
-	if (posix_stat(path, &information) != 0)
+	if (timed_stat(path, &information) != 0)
 	{
 		platform_set_last_error_from_errno(errno);
 		return FALSE;
 	}
 	/* only the read-only bit has a POSIX equivalent */
+	/* port: the bit as it is already is not written again (the game makes a
+	file ordinary before it deletes it; on FAT a change of the bit is a write
+	of the card) */
+	if (((information.flags & _posix_file_is_read_only) != 0) == ((attributes & FILE_ATTRIBUTE_READONLY) != 0))
+		return TRUE;
 	if (posix_set_read_only(path, (attributes & FILE_ATTRIBUTE_READONLY) != 0) != 0)
 	{
 		platform_set_last_error_from_errno(errno);
@@ -1303,13 +1797,28 @@ BOOL WINAPI SetFileAttributesA(LPCSTR file_name, DWORD attributes)
 BOOL WINAPI DeleteFileA(LPCSTR file_name)
 {
 	char path[1024];
+#ifdef HALO_WII
+	struct posix_file_information information;
+	unsigned long long started;
+#endif
 
 	platform_translate_path(file_name, path, sizeof(path));
+#ifdef HALO_WII
+	/* port: a file the game makes again at every start stays where it is
+	(xbox_files.c, "files made again") */
+	if (regenerated_wanted(path) && posix_stat(path, &information) == 0 &&
+		!(information.flags & _posix_file_is_directory))
+		return TRUE;
+	started = card_now();
+#endif
 	if (unlink(path) != 0)
 	{
 		platform_set_last_error_from_errno(errno);
 		return FALSE;
 	}
+#ifdef HALO_WII
+	card_end(_card_unlink, started, path);
+#endif
 	return TRUE;
 }
 
@@ -1426,14 +1935,23 @@ BOOL WINAPI CopyFileA(LPCSTR existing_file_name, LPCSTR new_file_name, BOOL fail
 BOOL WINAPI CreateDirectoryA(LPCSTR path_name, LPSECURITY_ATTRIBUTES security_attributes)
 {
 	char path[1024];
+#ifdef HALO_WII
+	unsigned long long started;
+#endif
 
 	(void)security_attributes;
 	platform_translate_path(path_name, path, sizeof(path));
+#ifdef HALO_WII
+	started = card_now();
+#endif
 	if (posix_make_directory(path) != 0)
 	{
 		platform_set_last_error_from_errno(errno);
 		return FALSE;
 	}
+#ifdef HALO_WII
+	card_end(_card_directory, started, path);
+#endif
 	return TRUE;
 }
 
@@ -1569,6 +2087,9 @@ HANDLE WINAPI FindFirstFileA(LPCSTR file_name, LPWIN32_FIND_DATAA data)
 	struct platform_handle *handle;
 	char xbox_directory[MAX_PATH];
 	const char *separator = strrchr(file_name, '\\');
+#ifdef HALO_WII
+	unsigned long long started;
+#endif
 
 	if (!find)
 	{
@@ -1588,7 +2109,13 @@ HANDLE WINAPI FindFirstFileA(LPCSTR file_name, LPWIN32_FIND_DATAA data)
 		snprintf(find->pattern, sizeof(find->pattern), "%s", file_name);
 	}
 	platform_translate_path(xbox_directory, find->directory_path, sizeof(find->directory_path));
+#ifdef HALO_WII
+	started = card_now();
+#endif
 	find->directory = posix_directory_open(find->directory_path);
+#ifdef HALO_WII
+	card_end(_card_directory, started, find->directory_path);
+#endif
 	if (!find->directory)
 	{
 		platform_set_last_error_from_errno(errno);

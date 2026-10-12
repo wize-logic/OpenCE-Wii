@@ -42,6 +42,8 @@ gone): the game is told, the old file stays, no copy remains.
 #include <stdarg.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <strings.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include "posix.h"
@@ -115,6 +117,18 @@ static void platform_log(const char *format, ...)
 	va_end(arguments);
 	strcat(log_text, "\n");
 }
+
+/* the card's timing (xbox_files.c, "where the card's time goes"): not what is tested here */
+enum { _card_translate, _card_open, _card_directory, _card_attributes, _card_write, _card_sync, _card_close,
+	_card_replace, _card_unlink };
+static unsigned long long card_now(void) { return 0; }
+static void card_end(int kind, unsigned long long started, const char *path) { (void)kind; (void)started; (void)path; }
+
+/* WiiLibs' reader of a descriptor by offsets (the maps'): not what is tested here */
+typedef struct WlPlacedReader { int taken; } WlPlacedReader;
+static void wl_posix_placed_close(WlPlacedReader *reader) { (void)reader; }
+#define WL_OK 0
+static int wl_posix_placed_open(WlPlacedReader *reader, int descriptor) { (void)reader; (void)descriptor; return WL_OK; }
 
 static char save_root[512];
 static char data_root[512];
@@ -721,6 +735,73 @@ static void write_fails(int number, int error, DWORD game_wants)
 	CHECK(strstr(log_text, "save: "), "a failed save is not in the log");
 }
 
+/* ---------- files made again (the default profiles and game variants, written at every start) */
+
+#define REGEN_DIRECTORY "z:\\saved\\playlists\\default_playlist\\00"
+#define REGEN_FILE REGEN_DIRECTORY "\\blam.lst"
+
+static unsigned char block_a[512], block_b[300];
+
+/* the game's sequence for one default variant (playlist_profile.c): the folder's files deleted, the file made
+and closed, opened and written whole, closed */
+static void regenerated_game(const unsigned char *bytes, long size)
+{
+	HANDLE file;
+	char host[1100];
+
+	/* (the folder is emptied: what is in it is deleted) */
+	platform_translate_path(REGEN_FILE, host, sizeof(host));
+	if (access(host, F_OK) == 0)
+		DeleteFileA(REGEN_FILE);
+	file = CreateFileA(REGEN_FILE, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	CHECK(file != INVALID_HANDLE_VALUE, "the file is not made");
+	CloseHandle(file);
+	file = CreateFileA(REGEN_FILE, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	CHECK(file != INVALID_HANDLE_VALUE, "the file is not opened");
+	game_seek(file, 0, FILE_BEGIN);
+	game_write(file, bytes, size);
+	CloseHandle(file);
+	CHECK(!game_failed, "the sequence fails (error %lu)", game_error);
+}
+
+/* a card with the folder (and the file, when it has bytes); returns the file's host path */
+static const char *regenerated_card(const unsigned char *bytes, long size)
+{
+	static char path[1100];
+	char directory[1100];
+	char *slash;
+
+	card(0);
+	platform_translate_path(REGEN_FILE, path, sizeof(path));
+	snprintf(directory, sizeof(directory), "%s", path);
+	slash = strrchr(directory, '/');
+	*slash = '\0';
+	make_directory(directory);
+	if (bytes)
+		write_file(path, bytes, size);
+	operations = 0;
+	game_failed = 0;
+	return path;
+}
+
+static void regenerated_nothing_left(const char *path)
+{
+	char directory[1100];
+	char *slash;
+	DIR *stream;
+	struct dirent *entry;
+
+	snprintf(directory, sizeof(directory), "%s", path);
+	slash = strrchr(directory, '/');
+	*slash = '\0';
+	stream = opendir(directory);
+	CHECK(stream != NULL, "directory");
+	while ((entry = readdir(stream)))
+		CHECK(!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..") || !strcmp(entry->d_name, "blam.lst"),
+			"%s was left", entry->d_name);
+	closedir(stream);
+}
+
 int main(int argc, char **argv)
 {
 	const char *case_name;
@@ -871,6 +952,76 @@ int main(int argc, char **argv)
 		CHECK(shadow_name_has_suffix("a.sav.wold", SHADOW_OLD_SUFFIX), "suffix");
 		CHECK(!shadow_name_has_suffix("a.sav", SHADOW_OLD_SUFFIX), "suffix");
 		CHECK(!shadow_name_has_suffix(".wold", SHADOW_OLD_SUFFIX), "a name that is only the suffix");
+	}
+	CASE("regen-first")
+	{
+		/* a card with none of them: made and written whole once, with no copy, no sync and no rename */
+		const char *path;
+		int number;
+
+		fill(block_a, sizeof(block_a), 3);
+		path = regenerated_card(NULL, 0);
+		regenerated_game(block_a, sizeof(block_a));
+		CHECK(file_is(path, block_a, sizeof(block_a)), "the file is not written");
+		regenerated_nothing_left(path);
+		for (number = 1; number <= operations; number++)
+			CHECK(kinds[number] == 'o' || kinds[number] == 'w' || kinds[number] == 'u', "a call of kind %c on a file made again",
+				kinds[number]);
+	}
+	CASE("regen-again")
+	{
+		/* a start after the first: the same bytes are there, and nothing is written to the card */
+		const char *path;
+
+		fill(block_a, sizeof(block_a), 3);
+		path = regenerated_card(block_a, sizeof(block_a));
+		regenerated_game(block_a, sizeof(block_a));
+		CHECK(operations == 0, "%d calls changed the card for a file already there", operations);
+		CHECK(file_is(path, block_a, sizeof(block_a)), "the file changed");
+		regenerated_nothing_left(path);
+	}
+	CASE("regen-changed")
+	{
+		/* other bytes, and fewer: the file is the new ones and no longer */
+		const char *path;
+
+		fill(block_a, sizeof(block_a), 3);
+		fill(block_b, sizeof(block_b), 4);
+		path = regenerated_card(block_a, sizeof(block_a));
+		regenerated_game(block_b, sizeof(block_b));
+		CHECK(file_is(path, block_b, sizeof(block_b)), "the file is not the new bytes");
+		regenerated_nothing_left(path);
+	}
+	CASE("regen-count")
+	{
+		/* not a check: the calls that change the card for one default variant, on a card with none (a start
+		for the first time) and on one that has it (every start after), on FAT's kind of card */
+		int counts[2][6];
+		const char *kinds_named = "owfrut";
+		int run, number;
+		const char *path;
+
+		fill(block_a, sizeof(block_a), 3);
+		for (run = 0; run < 2; run++)
+		{
+			path = regenerated_card(run ? block_a : NULL, run ? sizeof(block_a) : 0);
+			fat = 1;
+			regenerated_game(block_a, sizeof(block_a));
+			memset(counts[run], 0, sizeof(counts[run]));
+			for (number = 1; number <= operations; number++)
+				counts[run][strchr(kinds_named, kinds[number]) - kinds_named]++;
+			CHECK(file_is(path, block_a, sizeof(block_a)), "the file is not written");
+			printf("%s: %d calls: %d opens, %d writes, %d syncs, %d renames, %d unlinks, %d resizes\n",
+				run ? "start after the first" : "first start", operations, counts[run][0], counts[run][1],
+				counts[run][2], counts[run][3], counts[run][4], counts[run][5]);
+		}
+	}
+	CASE("regen-other-deleted")
+	{
+		/* any other file is deleted when the game says so */
+		card(0);
+		CHECK(DeleteFileA(SAVE_FILE), "not deleted");
+		CHECK(access(file_path, F_OK) != 0, "the file is still there");
 	}
 	remove_tree(template_path);
 	return 0;

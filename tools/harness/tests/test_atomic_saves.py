@@ -17,17 +17,18 @@ CUT_CASES = [f"{sequence}:{kind}" for sequence in SEQUENCES for kind in ("cut", 
 FAILURE_CASES = [f"{sequence}:{kind}" for sequence in ("profile", "patch", "create")
                  for kind in ("full", "no-room", "read-only", "missing", "rename-fails")] + ["savegame:full-later"]
 OTHER_CASES = ["profile:not-shadowed", "profile:two-writers", "profile:create-new", "profile:sweep",
-               "profile:find-skips-copies"]
+               "profile:find-skips-copies", "profile:regen-first", "profile:regen-again", "profile:regen-changed",
+               "profile:regen-other-deleted"]
 
 # a fault in the saves, and a case that must catch it (its exit status is not 0; a hang is killed by the case's alarm)
 NEGATIVE_CONTROLS = {
     "written-in-place": (("	return length && !strncmp(path, root, length) && path[length] == '/';",
                           "	return 0 && length && !strncmp(path, root, length) && path[length] == '/';"), "profile:cut"),
-    "not-synced": (("	else if (fsync(file->descriptor) != 0)\n		error = errno ? errno : EIO;",
-                    "	else if (0)\n		error = errno ? errno : EIO;"), "profile:cut"),
+    "not-synced": (("		if (fsync(file->descriptor) != 0)\n			error = errno ? errno : EIO;",
+                    "		if (0)\n			error = errno ? errno : EIO;"), "profile:cut"),
     "unlink-first": (("	if (rename(path, old_path) != 0)\n		return errno ? errno : EIO;",
                       "	if (unlink(path) != 0)\n		return errno ? errno : EIO;"), "profile:cut-fat"),
-    "failed-write-kept": (("	if (file->damaged)\n		error = -1;", "	if (0)\n		error = -1;"), "profile:full"),
+    "failed-write-kept": (("	if (file->damaged)\n	{\n		error = -1;", "	if (0)\n	{\n		error = -1;"), "profile:full"),
     "no-sweep": (("guard < 1000 && shadow_sweep_directory(root, 0)", "guard < 0 && shadow_sweep_directory(root, 0)"),
                  "profile:cut-fat"),
     "zero-write-repeats": (("		if (result == 0)\n		{\n			/* port: a card with no room",
@@ -36,6 +37,17 @@ NEGATIVE_CONTROLS = {
                                  "head:cut"),
     "partial-write-not-copied": (("resize || offset != 0 || count < file->original_size", "0"), "patch:cut"),
     "copy-shared": (("	if (shadow_busy(file, temporary_path))\n		return EBUSY;", ""), "profile:two-writers"),
+    "regenerated-written-again": (("		if (regenerated_holds(file, buffer, count, at))",
+                                   "		if (0 && regenerated_holds(file, buffer, count, at))"), "profile:regen-again"),
+    "regenerated-deleted": (("	if (regenerated_wanted(path) && posix_stat(path, &information) == 0 &&",
+                             "	if (0 && regenerated_wanted(path) && posix_stat(path, &information) == 0 &&"),
+                            "profile:regen-again"),
+    "regenerated-not-cut": (("		information.size_high == 0 && information.size_low > file->written_end &&",
+                             "		0 && information.size_high == 0 && information.size_low > file->written_end &&"),
+                            "profile:regen-changed"),
+    "regenerated-copied": (("(existed || (flags & O_CREAT)) && regenerated_wanted(path))\n	{",
+                            "(existed || (flags & O_CREAT)) && 0 && regenerated_wanted(path))\n	{"),
+                           "profile:regen-first"),
     "copies-listed": (("	return length > suffix_length && !strcmp(name + length - suffix_length, suffix);",
                        "	return length >= suffix_length && !strcmp(name + length - suffix_length, suffix);"),
                       "profile:find-skips-copies"),
@@ -52,7 +64,8 @@ def generated(fault=None):
     start = text.index("struct platform_file\n{")
     code = "#define HALO_WII 1\n" + text[start:text.index("};", start) + 2] + "\n"
     code += gate
-    code += "\n".join(function(text, name) for name in ("file_destroy", "file_from_handle", "CreateFileA")) + "\n"
+    code += "static void file_end_positioned(struct platform_file *file) { (void)file; }\n"  # (reads by offset are not tested here)
+    code += "\n".join(function(text, name) for name in ("file_destroy", "file_from_handle", "CreateFileA", "DeleteFileA")) + "\n"
     code += writes
     code += function(text, "overlapped_offset") + "\n"
     code += "\n".join(function(text, name) for name in ("WriteFile", "SetFilePointer", "SetEndOfFile")) + "\n"
@@ -64,7 +77,7 @@ def generated(fault=None):
                                                                 "ERROR_ACCESS_DENIED", "ERROR_SUCCESS"})
     names += ["GENERIC_READ", "GENERIC_WRITE", "CREATE_NEW", "CREATE_ALWAYS", "OPEN_EXISTING", "OPEN_ALWAYS",
               "TRUNCATE_EXISTING", "FILE_ATTRIBUTE_NORMAL", "FILE_FLAG_NO_BUFFERING", "FILE_FLAG_SEQUENTIAL_SCAN",
-              "FILE_BEGIN", "FILE_CURRENT", "FILE_END", "INVALID_SET_FILE_POINTER"]
+              "FILE_BEGIN", "FILE_CURRENT", "FILE_END", "INVALID_SET_FILE_POINTER", "FILE_FLAG_OVERLAPPED"]
     constants = ""
     for name in names:
         match = re.search(r"^#define\s+" + name + r"\s+(.*)$", win32, re.M)
