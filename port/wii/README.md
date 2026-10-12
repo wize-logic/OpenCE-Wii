@@ -1606,6 +1606,28 @@ SAVE AND QUIT from the pause menu, the profile's settings, and the saved game lo
   `tools/wii_input_check.py` runs the verbs against the real `test_input.c` on the host.
 - The x86 Linux build plays the same script (`HALO_MENUS=xbox HALO_TEST_INPUT=script:...`, headless
   or on a virtual display with `debug.screenshot_every`) to the same screens and places.
+- Controllers 2 to 4 (split screen and co-op, which need more than one controller) have verbs too,
+  the same on the Wii and on x86:
+
+  ```
+  player <n>                  the steps after it (press, select, hold, stick, walk, bot <seconds>, objective)
+                              drive controller n (1 to 4) until the next player line; 1 at the start
+  <n>: <step>                 one step on controller n ("2: press a")
+  connect <n> [real]          controller n (2 to 4) appears to the game: XGetDeviceChanges reports it, XInputOpen
+                              opens it, and it has nothing pressed unless a step presses it; real: as the machine has it
+  disconnect <n>              controller n is gone, even if a Remote or pad is there (the game's own "controller
+                              unplugged" handling)
+  bot <n> <seed>              controller n plays as the bot of that seed, on the game's ticks, alongside the steps
+  bot <n> off
+  ```
+
+  On the Wii they act in `xinput_wii.c` (`port_connected`, `XInputGetState`), on x86 in `xinput_sdl.c`
+  (`connected_gamepads`); `remote <port> on` still makes a Remote of its own, below the port. The waits
+  (`screen`, `focus`) read the first player's menus only, so the steps go one controller at a time.
+  `tests/splitscreen.txt` goes from the main menu through MULTIPLAYER, SPLIT SCREEN with a second controller
+  to Blood Gulch with both players as the bot, for 90 seconds of the game's time; `tests/coop.txt` through
+  MULTIPLAYER, CO-OP CAMPAIGN to a10, both players out of their cryo tubes and as the bot. Both start with an
+  empty saves folder and the Xbox's menus, and both end with `quit`.
 
 ### Every level from start to end
 

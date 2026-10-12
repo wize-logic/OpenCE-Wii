@@ -6,7 +6,8 @@ input_gesture.c); the HOME menu's state machine (port/wii/tests/wii_home_check.c
 port/wii/src/wii_home.c, against fake controllers, a fake game and a clock; the wrist strap reminder's state machine
 (port/wii/tests/wii_strap_check.c, with port/wii/src/wii_strap.c); and the script verbs that drive those
 on a run without a person (port/wii/tests/wii_script_check.c, with port/linux/src/test_input.c: home, remote,
-extension, battery, event). WiiLibs' input_shape.c comes from
+extension, battery, event; and the other controllers' player, N:, connect, disconnect and bot N, four controllers
+read in order a frame at a time). WiiLibs' input_shape.c comes from
 WiiLibs' checkout: WIILIBS, else ./WiiLibs (the CI's), else ../WiiLibs.
 
 The check includes a stand-in for the Xbox gamepad's declarations (port/wii/tests/host_input/platform.h); this
@@ -82,9 +83,12 @@ def script_check(flags: list, tests: Path) -> int:
     status = 0
     with tempfile.TemporaryDirectory() as folder:
         script = os.path.join(folder, "script.txt")
-        runs = [["good"]] + [["bad", line] for line in (
+        runs = [["good"], ["players"]] + [["bad", line] for line in (
             "remote 4 off", "remote 0 maybe", "remote off", "extension 0 plaid", "extension 9 none", "battery 0 101",
-            "battery 0 -1", "battery 0 many", "event restart", "event", "home now")]
+            "battery 0 -1", "battery 0 many", "event restart", "event", "home now",
+            "connect 1", "connect 5", "connect", "connect 2 maybe", "disconnect 1", "disconnect 2 real", "disconnect",
+            "player 0", "player 5", "player", "player 1 2", "5: press a", "2:", "bot 5 1", "bot 0 1", "bot 2 many",
+            "bot 2 -1", "bot 2 3 4")]
         for run in runs:
             status |= subprocess.run([str(output), script, *run]).returncode
     return status

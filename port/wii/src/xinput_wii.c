@@ -244,7 +244,8 @@ static BOOL input_logging(void)
 	return on;
 }
 
-/* (the scripted player of the automated tests is controller 1:
+/* (the scripted player of the automated tests is controller 1, and a
+script's connect and disconnect add and take away the others:
 port/linux/src/test_input.c) */
 static BOOL scripted_port(const WlRawInput *raw, int port)
 {
@@ -255,11 +256,21 @@ static BOOL scripted_port(const WlRawInput *raw, int port)
 	if (port == 0 && test_input_remote_override(0, &script) && script.connected == 0)
 		return FALSE;
 	(void)raw;
+	if (port > 0)
+		return test_input_controller(port) == 1;
 	return port == 0 && test_input_active();
+}
+
+/* a script's disconnect: the controller is gone, whatever the console has there */
+static BOOL script_removed(int port)
+{
+	return port > 0 && test_input_controller(port) == 0;
 }
 
 static BOOL port_connected(const WlRawInput *raw, int port)
 {
+	if (script_removed(port))
+		return FALSE;
 	return raw->remotes[port].connected || raw->pads[port].connected || scripted_port(raw, port);
 }
 
@@ -341,6 +352,11 @@ DWORD WINAPI XInputGetState(HANDLE device, PXINPUT_STATE state)
 	if (port < 0)
 		return ERROR_DEVICE_NOT_CONNECTED;
 	raw = input_read();
+	if (script_removed(port))
+	{
+		motors[port].strength = 0;
+		return ERROR_DEVICE_NOT_CONNECTED;
+	}
 	if (raw->remotes[port].connected)
 	{
 		if (raw->remotes[port].extension == WL_EXT_CLASSIC)
@@ -363,9 +379,9 @@ DWORD WINAPI XInputGetState(HANDLE device, PXINPUT_STATE state)
 		motors[port].strength = 0;
 		return ERROR_DEVICE_NOT_CONNECTED;
 	}
+	test_input_gamepad_port(port, &state->Gamepad, wl_platform_time_ms());
 	if (port == 0)
 	{
-		test_input_gamepad(&state->Gamepad, wl_platform_time_ms());
 		/* (the scripted controller steers the HOME menu, if it is up) */
 		script_navigation = test_input_active() ? wii_home_pad_navigation(&state->Gamepad) : 0;
 	}
