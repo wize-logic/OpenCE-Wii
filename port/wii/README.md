@@ -632,7 +632,8 @@ and pixel shaders.
   - Constants read as 0 or 1 need no register. Those needed in every channel take the four konst
     registers first, and any beyond four are set in TEV registers kept for them.
   - The fog register reads the vertex's fog factor, sent as a fifth texture coordinate into a
-    ramp texture whose intensity is its coordinate, and `D3DRS_FOGCOLOR` as a constant.
+    ramp texture whose intensity is its coordinate (WiiLibs' `wl_gx_ramp_bind`), and
+    `D3DRS_FOGCOLOR` as a constant.
   - A program that doesn't fit GX's 16 stages and 4 registers is translated again with these
     simplified, and each approximation says why. One that still doesn't fit draws its first
     texture times its diffuse colour.
@@ -643,8 +644,12 @@ and pixel shaders.
 - **Culling.** `D3DRS_CULLMODE` names the screen winding to discard. Both vertex paths keep the
   screen's winding. GX's own convention is measured once at start-up: the device draws a
   clockwise triangle with `GX_CULL_FRONT` and reads the pixel back.
-- **Render targets.** A draw into another surface takes over the EFB:
-  - The back buffer's colour and depth are parked in MEM2.
+- **Render targets.** A draw into another surface takes over the EFB. WiiLibs does it
+  (`wl/platform/gx_target.h`: the owner, the copies, the quads); the device says which surface
+  each draw goes to, records the targets that were copied, and sets its own vertex and texture
+  coordinate state again after a quad:
+  - The back buffer's colour and depth are parked (in the contiguous window where there is room,
+    else the heap).
   - The target is drawn at the EFB's origin and copied into its own memory in GX's format, where
     its texture is bound from.
   - The back buffer returns through a quad that writes the parked colour, and the parked depth
