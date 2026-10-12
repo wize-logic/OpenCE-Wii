@@ -263,16 +263,18 @@ extern struct cache_file_tag_instance *global_tag_instances;
 the table (port/linux/game/menu_tags.c); the map's tag header keeps its own,
 which a Custom Edition map's loader goes on reading. */
 static long global_tag_count;
-/* port: tag_loaded's answers, each the first tag of a group and name
-(tag_loaded); the generation changes wherever the tags' table is loaded,
-replaced or let go */
-#define TAG_LOADED_CACHE_SIZE 256
+/* port: tag_loaded's answers: the first tag of a group and name, or none
+(with the name it was asked for); the generation changes wherever the tags'
+table is loaded, replaced or let go (tag_loaded) */
+#define TAG_LOADED_CACHE_SIZE 128
+#define TAG_LOADED_CACHE_NAME_SIZE 64
 static struct
 {
 	long group_tag;
 	unsigned long name_hash;
 	long absolute_index;
 	unsigned long generation;
+	char name[TAG_LOADED_CACHE_NAME_SIZE];
 } tag_loaded_cache[TAG_LOADED_CACHE_SIZE];
 static unsigned long tag_loaded_generation = 1;
 static char const *data_00316820[] =
@@ -679,6 +681,14 @@ void cache_files_set_tag_instances(
 	tag_loaded_generation++; /* (tag_loaded_cache) */
 }
 
+/* port: a tag of the table named or renamed in place (the menus' tags,
+menu_tags.c): tag_loaded's answers are forgotten */
+void cache_files_tag_instances_changed(
+	void)
+{
+	tag_loaded_generation++;
+}
+
 void tag_files_open(
 	void)
 {
@@ -738,8 +748,9 @@ long tag_loaded(
 		as _stricmp compares): it is the first that does, as the walk would
 		find, since the tags before it are as they were when it was found
 		(the table has not been loaded, replaced or let go since: the
-		generation) and none of them had the name. A name not found is not
-		kept. */
+		generation) and none of them had the name. A name found in no tag is
+		found in none again while the table stays as it was: that answer is
+		kept with the name (one that fits), and given for the same name. */
 		if (name)
 		{
 			char const *character;
@@ -756,12 +767,19 @@ long tag_loaded(
 			absolute_index = tag_loaded_cache[slot].absolute_index;
 			if (tag_loaded_cache[slot].generation == tag_loaded_generation &&
 				tag_loaded_cache[slot].group_tag == group_tag &&
-				tag_loaded_cache[slot].name_hash == name_hash &&
-				absolute_index < global_tag_count &&
-				global_tag_instances[absolute_index].group_tag == group_tag &&
-				!_stricmp(name, global_tag_instances[absolute_index].name))
+				tag_loaded_cache[slot].name_hash == name_hash)
 			{
-				return global_tag_instances[absolute_index].tag_index;
+				if (absolute_index == NONE)
+				{
+					if (!_stricmp(name, tag_loaded_cache[slot].name))
+						return NONE;
+				}
+				else if (absolute_index < global_tag_count &&
+					global_tag_instances[absolute_index].group_tag == group_tag &&
+					!_stricmp(name, global_tag_instances[absolute_index].name))
+				{
+					return global_tag_instances[absolute_index].tag_index;
+				}
 			}
 		}
 
@@ -783,6 +801,15 @@ long tag_loaded(
 				}
 				break;
 			}
+		}
+		/* port: (none found: kept with the name, if it fits) */
+		if (result == NONE && slot != NONE && csstrlen(name) < TAG_LOADED_CACHE_NAME_SIZE)
+		{
+			tag_loaded_cache[slot].group_tag = group_tag;
+			tag_loaded_cache[slot].name_hash = name_hash;
+			tag_loaded_cache[slot].absolute_index = NONE;
+			tag_loaded_cache[slot].generation = tag_loaded_generation;
+			csstrcpy(tag_loaded_cache[slot].name, name);
 		}
 	}
 

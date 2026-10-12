@@ -60,6 +60,7 @@ boolean network_game_is_active(void);
 /* cache_files.c's (port) */
 void *cache_files_tag_instances(long *count);
 void cache_files_set_tag_instances(void *instances, long count);
+void cache_files_tag_instances_changed(void);
 
 /* the game's (port) */
 char *tag_get_name(long tag_index);
@@ -1425,6 +1426,8 @@ static void instance_set(struct cache_file_tag_instance *instances, long group_t
 	fails the build) */
 	instance->name = copy ? copy : "";
 	instance->base_address = definition;
+	/* (tag_loaded's answers forgotten: the table may be the game's) */
+	cache_files_tag_instances_changed();
 }
 
 static void menu_tags_release(void)
