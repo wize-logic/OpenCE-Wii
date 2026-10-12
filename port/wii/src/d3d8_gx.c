@@ -56,6 +56,7 @@ int: libogc's is renamed while its headers are read) */
 #include "wl/platform/heap_overflow.h"
 #include "wl/platform/mem.h"
 #include "wl/platform/platform.h"
+#include "wl/platform/timebase.h"
 
 void wii_heap_usage(unsigned long *used, unsigned long *free_bytes);
 
@@ -140,7 +141,8 @@ struct stream_source
 	UINT stride;
 };
 
-/* where a frame's time goes, in microseconds (logged with the statistics) */
+/* where a frame's time goes, in time base ticks (60.75 a microsecond: timing_now,
+converted only when the statistics are logged: timing_frame) */
 struct frame_timing
 {
 	uint64_t window_start;
@@ -153,12 +155,31 @@ struct frame_timing
 	a lit draw's lights and view sphere map, a static buffer's kept outputs,
 	and GX's state (with the streams' flushes) */
 	uint64_t setup_keys, setup_matrices, setup_lit, setup_kept, setup_state, setup_draws;
-	/* the processor's vertices' steps, in timebase ticks (60.75 a microsecond) */
+	/* the processor's vertices' steps */
 	unsigned long long fetch_ticks, program_ticks, store_ticks, emit_ticks;
 	/* the part of present spent waiting for GX to finish the frame's draws
 	(the rest: the copy to the display and its retrace) */
 	uint64_t present_gx;
 };
+
+/* the time base now (a draw reads it a few times: no conversion) */
+static inline uint64_t timing_now(void)
+{
+	return wl_timebase_read();
+}
+
+/* ticks in units of unit ticks (60750 a millisecond, 6075 a tenth), a
+frame's of the statistics' window: without 64-bit division */
+static unsigned long timing_frame(uint64_t ticks, uint32_t unit)
+{
+	return (unsigned long)wl_udiv64_16(wl_udiv64_16(ticks, unit, NULL), STATISTICS_FRAMES, NULL);
+}
+
+/* ticks in milliseconds */
+static unsigned long timing_ms(uint64_t ticks)
+{
+	return (unsigned long)wl_timebase_ms(ticks);
+}
 
 struct draw_statistics
 {
@@ -3798,7 +3819,7 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 	vertex_fetch_proc fetch, void *context, const WORD *indices, const struct vertex_shader_object *shader)
 {
 	int position_register = -1;
-	uint64_t started = wl_platform_time_us();
+	uint64_t started = timing_now();
 	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
 	struct nv2a_cpu_output out;
 	struct draw_projection projection = { FALSE, 0.0f, 0.0f };
@@ -3955,7 +3976,7 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 	}
 	program_statistics_add(program, count);
 	{
-		uint64_t spent = wl_platform_time_us() - started;
+		uint64_t spent = timing_now() - started;
 
 		timing.draws += spent;
 		if (shader)
@@ -4179,13 +4200,13 @@ static BOOL draw_prepare(void)
 		device.draws_elsewhere++;
 	states_apply();
 	{
-		uint64_t started = wl_platform_time_us();
+		uint64_t started = timing_now();
 		unsigned stages = textures_bind();
-		uint64_t bound = wl_platform_time_us();
+		uint64_t bound = timing_now();
 
 		tev_setup(stages);
 		timing.textures += bound - started;
-		timing.pixel_shaders += wl_platform_time_us() - bound;
+		timing.pixel_shaders += timing_now() - bound;
 	}
 	return TRUE;
 }
@@ -6770,7 +6791,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	/* (fetch's elements for what the processor computes of a vertex) */
 	struct stream_fetch vertex_fetch;
 	int sphere_list[4], sphere_count = 0;
-	uint64_t started = wl_platform_time_us(), emitting;
+	uint64_t started = timing_now(), emitting;
 	float fog_base = 0.0f, fog_slope = 0.0f;
 
 	if (gpu_transform < 0)
@@ -6895,7 +6916,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	most = draw_range.most;
 	if (most > 0xFFFF)
 		return hardware_rejected(program, "an index past 16 bits");
-	keys_done = wl_platform_time_us();
+	keys_done = timing_now();
 
 	/* the matrices, as an earlier draw of the same program, constants and
 	state made them, or else: the outputs for no input, then for each
@@ -7028,7 +7049,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	is the cache's) */
 	if (keyed && !position_keys(shader, program, fetch, position_register, point_size))
 		return hardware_rejected(program, "no depth to fit for a model's node");
-	matrices_done = wl_platform_time_us();
+	matrices_done = timing_now();
 	if (lit_on && !lit_prepare(shader, fetch, position_register, keyed, 0))
 	{
 		lit_on = FALSE;
@@ -7037,7 +7058,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	/* (the normals by index, where no vertex sends its own: the processor's
 	blended ones) */
 	lit.normals_indexed = lit_on && !draw_keys.processor && kept_normals_find(shader, least, most);
-	lit_done = wl_platform_time_us();
+	lit_done = timing_now();
 	if (lit_on)
 	{
 		if (lit.colors)
@@ -7069,7 +7090,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 					kept_count++;
 		}
 	}
-	kept_done = wl_platform_time_us();
+	kept_done = timing_now();
 	position_stream = fetch->streams[position_element->stream & (MAXIMUM_STREAMS - 1)] + position_element->offset;
 	position_stride = device.streams[position_element->stream & (MAXIMUM_STREAMS - 1)].stride;
 	if (position_stride > 255)
@@ -7326,7 +7347,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		h->fetch = &vertex_fetch;
 	}
 
-	emitting = wl_platform_time_us();
+	emitting = timing_now();
 	gx_begin(gx_primitive(primitive_type), HARDWARE_VERTEX_FORMAT, (u16)count);
 	if (plain)
 		emit_indices(indices, first, count, texture_count + kept_count, keyed,
@@ -7358,7 +7379,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	if (draw_keys.processor)
 		hardware_blended_draws++;
 	timing.hardware_setup += emitting - started;
-	timing.hardware_vertices += wl_platform_time_us() - emitting;
+	timing.hardware_vertices += timing_now() - emitting;
 	timing.setup_keys += keys_done - started;
 	timing.setup_matrices += matrices_done - keys_done;
 	timing.setup_lit += lit_done - matrices_done;
@@ -7389,11 +7410,11 @@ static void draw_streams(D3DPRIMITIVETYPE primitive_type, UINT count, const WORD
 	}
 	stream_fetch_plan(&fetch);
 	{
-		uint64_t started = wl_platform_time_us();
+		uint64_t started = timing_now();
 
 		if (draw_hardware(program, primitive_type, count, indices, first, &fetch))
 		{
-			timing.draws += wl_platform_time_us() - started;
+			timing.draws += timing_now() - started;
 			return;
 		}
 	}
@@ -7544,7 +7565,7 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 	(void)unused2;
 	if (device.gx_ready)
 	{
-		uint64_t started = wl_platform_time_us();
+		uint64_t started = timing_now();
 
 		frame_begin(device.clear_color);
 		/* (the back buffer back, if a render target has the EFB) */
@@ -7563,7 +7584,7 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		buffer, not for the retrace; the retrace interrupt shows the frame) */
 		if (!wl_gx_sync())
 			gx_stall_log("the frame's draws");
-		timing.present_gx += wl_platform_time_us() - started;
+		timing.present_gx += timing_now() - started;
 		/* the display copy's own state, whatever the frame's copies to
 		textures and drawing below the back buffer (sphere_bake) left */
 		display_copy_restore();
@@ -7602,7 +7623,7 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		kept_normals_frame_drawn();
 		/* (GX's texture cache emptied once a frame, whatever was written) */
 		texture_memory_changed = TRUE;
-		timing.present += wl_platform_time_us() - started;
+		timing.present += timing_now() - started;
 	}
 	flip_count++;
 	device.frames++;
@@ -7621,24 +7642,24 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		static uint64_t last_frame;
 		static unsigned slow_frames;
 		static struct platform_file_reads last_reads;
-		uint64_t now = wl_platform_time_us();
+		uint64_t now = timing_now();
 
-		if (last_frame && now - last_frame > 500000 && slow_frames < 40)
+		if (last_frame && now - last_frame > 500UL * 60750UL && slow_frames < 40)
 		{
 			slow_frames++;
 			platform_log("Direct3D: frame %lu: %lu file reads, %lu KB in %lu ms", device.frames,
 				platform_file_reads.calls - last_reads.calls,
 				(unsigned long)((platform_file_reads.bytes - last_reads.bytes) / 1024),
-				(unsigned long)((platform_file_reads.microseconds - last_reads.microseconds) / 1000));
+				(unsigned long)wl_udiv64_16(platform_file_reads.microseconds - last_reads.microseconds, 1000, NULL));
 			platform_log("Direct3D: frame %lu took %lu ms: draws %lu, textures %lu, pixel shaders %lu, the end %lu, "
-				"the game %lu", device.frames, (unsigned long)((now - last_frame) / 1000),
-				(unsigned long)((timing.draws - last_timing.draws) / 1000),
-				(unsigned long)((timing.textures - last_timing.textures) / 1000),
-				(unsigned long)((timing.pixel_shaders - last_timing.pixel_shaders) / 1000),
-				(unsigned long)((timing.present - last_timing.present) / 1000),
-				(unsigned long)((now - last_frame - (timing.draws - last_timing.draws) -
+				"the game %lu", device.frames, timing_ms(now - last_frame),
+				timing_ms(timing.draws - last_timing.draws),
+				timing_ms(timing.textures - last_timing.textures),
+				timing_ms(timing.pixel_shaders - last_timing.pixel_shaders),
+				timing_ms(timing.present - last_timing.present),
+				timing_ms(now - last_frame - (timing.draws - last_timing.draws) -
 					(timing.textures - last_timing.textures) - (timing.pixel_shaders - last_timing.pixel_shaders) -
-					(timing.present - last_timing.present)) / 1000));
+					(timing.present - last_timing.present)));
 		}
 		last_frame = now;
 		last_timing = timing;
@@ -7763,42 +7784,42 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			shaders_last = shaders;
 		}
 		{
-			uint64_t now = wl_platform_time_us();
+			uint64_t now = timing_now();
 
 			if (timing.window_start)
 			{
 				platform_log("Direct3D: a frame's draws: GX's transform %lu ms (matrices %lu, vertices %lu), the "
-					"processor's %lu, immediate %lu", (unsigned long)((timing.hardware_setup + timing.hardware_vertices) /
-					1000 / STATISTICS_FRAMES), (unsigned long)(timing.hardware_setup / 1000 / STATISTICS_FRAMES),
-					(unsigned long)(timing.hardware_vertices / 1000 / STATISTICS_FRAMES),
-					(unsigned long)(timing.processor / 1000 / STATISTICS_FRAMES),
-					(unsigned long)(timing.immediate / 1000 / STATISTICS_FRAMES));
+					"processor's %lu, immediate %lu", timing_frame(timing.hardware_setup + timing.hardware_vertices, 60750),
+					timing_frame(timing.hardware_setup, 60750),
+					timing_frame(timing.hardware_vertices, 60750),
+					timing_frame(timing.processor, 60750),
+					timing_frame(timing.immediate, 60750));
 				platform_log("Direct3D: GX's transform's setup, a frame (tenths of a ms): what the draw depends on %lu, "
 					"the matrices %lu, the lights and sphere maps %lu",
-					(unsigned long)(timing.setup_keys / 100 / STATISTICS_FRAMES),
-					(unsigned long)(timing.setup_matrices / 100 / STATISTICS_FRAMES),
-					(unsigned long)(timing.setup_lit / 100 / STATISTICS_FRAMES));
+					timing_frame(timing.setup_keys, 6075),
+					timing_frame(timing.setup_matrices, 6075),
+					timing_frame(timing.setup_lit, 6075));
 				platform_log("Direct3D: GX's transform's setup, a frame (tenths of a ms): the kept outputs %lu, GX's "
-					"state %lu; %lu draws", (unsigned long)(timing.setup_kept / 100 / STATISTICS_FRAMES),
-					(unsigned long)(timing.setup_state / 100 / STATISTICS_FRAMES),
-					(unsigned long)(timing.setup_draws / STATISTICS_FRAMES));
+					"state %lu; %lu draws", timing_frame(timing.setup_kept, 6075),
+					timing_frame(timing.setup_state, 6075),
+					(unsigned long)wl_udiv64_16(timing.setup_draws, STATISTICS_FRAMES, NULL));
 				platform_log("Direct3D: the processor's indexed vertices: fetch %lu ms, program %lu, store %lu, emit %lu",
-					(unsigned long)(timing.fetch_ticks / 60750 / STATISTICS_FRAMES),
-					(unsigned long)(timing.program_ticks / 60750 / STATISTICS_FRAMES),
-					(unsigned long)(timing.store_ticks / 60750 / STATISTICS_FRAMES),
-					(unsigned long)(timing.emit_ticks / 60750 / STATISTICS_FRAMES));
+					timing_frame(timing.fetch_ticks, 60750),
+					timing_frame(timing.program_ticks, 60750),
+					timing_frame(timing.store_ticks, 60750),
+					timing_frame(timing.emit_ticks, 60750));
 				platform_log("Direct3D: a frame takes %lu ms: draws %lu, textures %lu, pixel shaders %lu, the end of "
 					"the frame %lu (waiting for GX), the game %lu",
-					(unsigned long)((now - timing.window_start) / 1000 / STATISTICS_FRAMES),
-					(unsigned long)(timing.draws / 1000 / STATISTICS_FRAMES),
-					(unsigned long)(timing.textures / 1000 / STATISTICS_FRAMES),
-					(unsigned long)(timing.pixel_shaders / 1000 / STATISTICS_FRAMES),
-					(unsigned long)(timing.present / 1000 / STATISTICS_FRAMES),
-					(unsigned long)((now - timing.window_start - timing.draws - timing.textures - timing.pixel_shaders -
-						timing.present) / 1000 / STATISTICS_FRAMES));
+					timing_frame(now - timing.window_start, 60750),
+					timing_frame(timing.draws, 60750),
+					timing_frame(timing.textures, 60750),
+					timing_frame(timing.pixel_shaders, 60750),
+					timing_frame(timing.present, 60750),
+					timing_frame(now - timing.window_start - timing.draws - timing.textures - timing.pixel_shaders -
+						timing.present, 60750));
 				platform_log("Direct3D: the end of the frame: GX's draws %lu ms, the copy and a free display buffer %lu",
-					(unsigned long)(timing.present_gx / 1000 / STATISTICS_FRAMES),
-					(unsigned long)((timing.present - timing.present_gx) / 1000 / STATISTICS_FRAMES));
+					timing_frame(timing.present_gx, 60750),
+					timing_frame(timing.present - timing.present_gx, 60750));
 				{
 					static WlVideoStats last;
 					WlVideoStats video;
@@ -7808,8 +7829,8 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 						"last; %lu waits for a free buffer, %lu ms in all, the longest %lu",
 						(unsigned long)(video.shown - last.shown), (unsigned long)(video.late - last.late),
 						(unsigned long)video.last_gap, (unsigned long)(video.buffer_waits - last.buffer_waits),
-						(unsigned long)((video.buffer_wait_us - last.buffer_wait_us) / 1000),
-						(unsigned long)(video.buffer_wait_us_max / 1000));
+						(unsigned long)wl_udiv64_16(video.buffer_wait_us - last.buffer_wait_us, 1000, NULL),
+						(unsigned long)wl_udiv64_16(video.buffer_wait_us_max, 1000, NULL));
 					last = video;
 				}
 			}
