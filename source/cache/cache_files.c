@@ -263,6 +263,18 @@ extern struct cache_file_tag_instance *global_tag_instances;
 the table (port/linux/game/menu_tags.c); the map's tag header keeps its own,
 which a Custom Edition map's loader goes on reading. */
 static long global_tag_count;
+/* port: tag_loaded's answers, each the first tag of a group and name
+(tag_loaded); the generation changes wherever the tags' table is loaded,
+replaced or let go */
+#define TAG_LOADED_CACHE_SIZE 256
+static struct
+{
+	long group_tag;
+	unsigned long name_hash;
+	long absolute_index;
+	unsigned long generation;
+} tag_loaded_cache[TAG_LOADED_CACHE_SIZE];
+static unsigned long tag_loaded_generation = 1;
 static char const *data_00316820[] =
 {
 	"d:\\maps_de\\",
@@ -644,6 +656,7 @@ void scenario_tags_unload(
 	cache_file_globals.tags_loaded = FALSE;
 	global_tag_instances = NULL;
 	global_tag_count = 0;
+	tag_loaded_generation++; /* port: (tag_loaded_cache) */
 
 	return;
 }
@@ -663,6 +676,7 @@ void cache_files_set_tag_instances(
 {
 	global_tag_instances = instances;
 	global_tag_count = count;
+	tag_loaded_generation++; /* (tag_loaded_cache) */
 }
 
 void tag_files_open(
@@ -706,6 +720,9 @@ long tag_loaded(
 	0x7FFF, and the walk never ended) */
 	long absolute_index;
 	long result = NONE;
+	/* port: where this group and name are kept (tag_loaded_cache) */
+	unsigned long name_hash = 2166136261UL;
+	long slot = NONE;
 
 	if (cache_file_globals.tags_loaded)
 	{
@@ -713,6 +730,40 @@ long tag_loaded(
 			"c:\\halo\\SOURCE\\cache\\cache_files.c",
 			346,
 			global_tag_instances);
+
+		/* port: the HUD asks for its bitmaps by name every frame (through
+		verify_tag_reference), and each ask walked the table, comparing the
+		name of every tag of the group. A tag found before is given again
+		where it is still of the group and still has the name (case aside,
+		as _stricmp compares): it is the first that does, as the walk would
+		find, since the tags before it are as they were when it was found
+		(the table has not been loaded, replaced or let go since: the
+		generation) and none of them had the name. A name not found is not
+		kept. */
+		if (name)
+		{
+			char const *character;
+
+			for (character = name; *character; character++)
+			{
+				unsigned char c = (unsigned char)*character;
+
+				if (c >= 'A' && c <= 'Z')
+					c = (unsigned char)(c - 'A' + 'a');
+				name_hash = (name_hash ^ c) * 16777619UL;
+			}
+			slot = (long)((name_hash ^ (unsigned long)group_tag) % TAG_LOADED_CACHE_SIZE);
+			absolute_index = tag_loaded_cache[slot].absolute_index;
+			if (tag_loaded_cache[slot].generation == tag_loaded_generation &&
+				tag_loaded_cache[slot].group_tag == group_tag &&
+				tag_loaded_cache[slot].name_hash == name_hash &&
+				absolute_index < global_tag_count &&
+				global_tag_instances[absolute_index].group_tag == group_tag &&
+				!_stricmp(name, global_tag_instances[absolute_index].name))
+			{
+				return global_tag_instances[absolute_index].tag_index;
+			}
+		}
 
 		for (absolute_index = 0;
 			absolute_index < global_tag_count;
@@ -722,6 +773,14 @@ long tag_loaded(
 				!_stricmp(name, global_tag_instances[absolute_index].name))
 			{
 				result = global_tag_instances[absolute_index].tag_index;
+				/* port: (kept: tag_loaded_cache) */
+				if (slot != NONE)
+				{
+					tag_loaded_cache[slot].group_tag = group_tag;
+					tag_loaded_cache[slot].name_hash = name_hash;
+					tag_loaded_cache[slot].absolute_index = absolute_index;
+					tag_loaded_cache[slot].generation = tag_loaded_generation;
+				}
 				break;
 			}
 		}
@@ -1241,6 +1300,7 @@ long scenario_tags_load(
 			global_tag_instances = cache_file_globals.tag_header->tag_instances;
 			global_tag_count = cache_file_globals.tag_header->tag_count;
 			cache_file_globals.tags_loaded = TRUE;
+			tag_loaded_generation++; /* port: (tag_loaded_cache) */
 			/* (the menus' tags, as for this build's maps below) */
 			{
 				extern void menu_tags_loaded(char const *map_name);
@@ -1330,6 +1390,7 @@ long scenario_tags_load(
 			global_tag_count = cache_file_globals.tag_header->tag_count;
 			tags_header_register_vertex_and_index_buffers(cache_file_globals.tag_header);
 			cache_file_globals.tags_loaded = TRUE;
+			tag_loaded_generation++; /* port: (tag_loaded_cache) */
 			/* port: a PAL map played as the NTSC maps are (port/linux/game/pal_tags.c) */
 			{
 				extern void pal_tags_loaded(char const *build);
