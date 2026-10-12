@@ -370,7 +370,7 @@ static int eval_compare(const struct gx_psh_program *p, const struct inputs_set 
 /* the TEV stages of the random programs translated */
 static unsigned long stages_made, programs_made;
 /* the stages whose cube maps are sampled as sphere maps (for the game's) */
-static unsigned check_cube;
+static unsigned check_cube, check_reflected;
 static int check(const DWORD *state, unsigned present, const char *name, int verbose)
 {
 	struct gx_psh_textures textures; struct gx_psh_program program;
@@ -378,6 +378,7 @@ static int check(const DWORD *state, unsigned present, const char *name, int ver
 	textures.cube = check_cube & present;
 	textures.bumped = check_bumped;
 	textures.vertex_color = check_vertex_color;
+	textures.reflected = check_reflected;
 	textures.fog = (unsigned char)fog_on;
 	textures.fog_color = fog_color & 0x00FFFFFFUL;
 	textures.d0_alpha_map = (unsigned char)check_d0_alpha_map;
@@ -792,9 +793,18 @@ static int game_programs(void)
 	static const DWORD g_ao[] = {0, 0, 0, 0x00000C00, 0};
 	static const DWORD g_c0[8] = {0x00406080, 0, 0, 0x80C0C0C0};
 	static const DWORD g_c1[8] = {0, 0, 0, 0xFFFFFFFF};
+	/* (the water's reflection, rasterizer_xbox_water.c: t3 its cube map at
+	the reflection, the flat normal's on GX, squared and tinted by c0; with
+	the atmospheric fog, two combiners more) */
+	static const DWORD w_ri[] = {0x0B0B0120, 0x0C0C0000};
+	static const DWORD w_ro[] = {0x000000CD, 0x000000C0};
+	static const DWORD wf_ri[] = {0x0B0B0120, 0x0C0C0000, 0x0C0C0000, 0x2D0C0D0B};
+	static const DWORD wf_ro[] = {0x000000CD, 0x000000C0, 0x000000C0, 0x00000C00};
+	static const DWORD w_none[4] = {0};
+	static const DWORD w_c0[8] = {0x0080A0C0};
 	static const DWORD no_constants[8] = {0};
 	struct { DWORD count, abcd, efg; const DWORD *ri, *ro, *ai, *ao; const DWORD *c0, *c1; unsigned present;
-		DWORD final0; unsigned cube; const char *what; unsigned bumped, vertex_color; }
+		DWORD final0; unsigned cube; const char *what; unsigned bumped, vertex_color, reflected, fogged; }
 		programs[] = {
 		{ 0x00011008, 0x340f010d, 0x0c111800, a_ri, a_ro, a_ai, a_ao, NULL, NULL, 7, 0, 0, "the menu's planet" },
 		{ 0x00011107, 0x0000000c, 0x00001c00, b_ri, b_ro, b_ai, b_ao, NULL, NULL, 7, 0, 0, "the menu's" },
@@ -816,6 +826,10 @@ static int game_programs(void)
 		through GX's indirect unit, and t2, its normal, colour 1) */
 		{ 0x00011005, 0x0C0F0000, 0x1C200000, g_ri, g_ro, g_ai, g_ao, g_c0, g_c1, 0x9, 0, 0x8,
 			"reflection, bumped cube map", 0x8, 0x4 },
+		{ 0x00000002, 0x2D0F0B00, 0x0C0C0000, w_ri, w_ro, w_none, w_none, w_c0, no_constants, 0x9, 0, 0x8,
+			"the water's reflection, flat", 0, 0, 0x8 },
+		{ 0x00000004, 0x330C0000, 0x00000000, wf_ri, wf_ro, w_none, w_none, w_c0, no_constants, 0x9, 0, 0x8,
+			"the water's reflection, flat, fogged", 0, 0, 0x8, 1 },
 	};
 	int failures = 0;
 
@@ -833,6 +847,8 @@ static int game_programs(void)
 			textures.cube = programs[index].cube;
 			textures.bumped = programs[index].bumped;
 			textures.vertex_color = programs[index].vertex_color;
+			textures.reflected = programs[index].reflected;
+			textures.fog = (unsigned char)programs[index].fogged;
 			textures.separate_alpha = separate & programs[index].present;
 			state[D3DRS_PSCOMBINERCOUNT] = programs[index].count;
 			state[D3DRS_PSFINALCOMBINERCONSTANT0] = programs[index].final0;
@@ -884,14 +900,23 @@ static int game_programs(void)
 				int agrees;
 
 				snprintf(name, sizeof(name), "game program %d", index);
-				fog_on = 0;
+				fog_on = (int)programs[index].fogged;
 				check_cube = programs[index].cube;
 				check_bumped = programs[index].bumped;
 				check_vertex_color = programs[index].vertex_color;
+				check_reflected = programs[index].reflected;
 				agrees = check(state, programs[index].present, name, 1);
+				check_reflected = 0;
 				check_cube = check_bumped = check_vertex_color = 0;
 				if (programs[index].bumped && !bumped_structure(&program, programs[index].bumped, name))
 					failures++;
+				/* (a flat reflection: its coordinates the device's, as a bumped one's) */
+				if (programs[index].reflected && (program.vertices != _gx_psh_vertices_bumped_reflection ||
+					!(program.texcoords & 8)))
+				{
+					printf("%s: the flat reflection's coordinates not asked of the device\n", name);
+					failures++;
+				}
 				printf("game program %d (%s): %u stages, %s%s%s\n", index, programs[index].what, program.tev.stage_count,
 					program.approximate ? "approximate: " : "exact",
 					program.approximate && program.approximation ? program.approximation : "",

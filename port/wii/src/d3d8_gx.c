@@ -2344,7 +2344,8 @@ static void tev_setup(unsigned stages)
 	const struct gx_psh_program *program;
 	BOOL usable, translated;
 	DWORD stage;
-	BOOL bumped_reflection;
+	BOOL bumped_reflection, flat_reflection;
+	DWORD modes = D3D__RenderState[D3DRS_PSTEXTUREMODES];
 
 	/* the desktop ports' debug views (port_config.c): the diffuse colour
 	alone, or the first texture alone, opaque */
@@ -2380,9 +2381,31 @@ static void tev_setup(unsigned stages)
 	bumped_reflection = bumped_highlights() && (D3D__RenderState[D3DRS_PSTEXTUREMODES] & 0xFFFE0UL) == (0x11UL << 5 | 0x0BUL << 10 | 0x0CUL << 15) &&
 		(stages & 1) && bound_entries[0] && bound_entries[0]->gx_format == GX_TF_CI8 && (stages & 8) &&
 		bound_entries[3] && bound_entries[3]->sphere;
+	/* a reflection whose bump GX cannot follow (the water's: DOTPRODUCT in
+	stages 1 and 2, its bump map drawn each frame, not a palette of
+	normals; or with display.bumped_highlights off): the cube map's sphere
+	map at the flat normal's reflection, which the device computes per
+	vertex as a bumped reflection's (bumped_reflection_vertex) */
+	flat_reflection = !bumped_reflection && ((modes >> 5) & 0x1f) == 0x11 &&
+		(((modes >> 10) & 0x1f) == 0x11 || ((modes >> 10) & 0x1f) == 0x0B) && ((modes >> 15) & 0x1f) == 0x0C &&
+		(stages & 8) && bound_entries[3] && bound_entries[3]->sphere;
 	for (stage = 0; stage < GX_PSH_TEXTURES; stage++)
 	{
-		DWORD mode = (D3D__RenderState[D3DRS_PSTEXTUREMODES] >> (5 * stage)) & 0x1f;
+		DWORD mode = (modes >> (5 * stage)) & 0x1f;
+
+		if (flat_reflection && stage == 2 && mode == 0x0B)
+		{
+			textures.vertex_color |= 1U << stage;
+			continue;
+		}
+		if (flat_reflection && stage == 3)
+		{
+			textures.present |= 1U << stage;
+			textures.cube |= 1U << stage;
+			textures.reflected |= 1U << stage;
+			textures.contents[stage] = bound_entries[stage]->channels;
+			continue;
+		}
 
 		if (bumped_reflection && stage == 2)
 		{
@@ -2751,6 +2774,10 @@ static void store_plan_set(void)
 	if (emit_attributes & 0x40)
 		store_plan.live |= NV2A_CPU_LIVE_FOG;
 	store_plan.stages = (emit_attributes >> 2) & 15;
+	/* (a bumped reflection's terms read the frame's rows, coordinates 1 to 3:
+	bumped_reflection_vertex) */
+	if (vertex_terms == _gx_psh_vertices_bumped_reflection)
+		store_plan.live |= NV2A_CPU_LIVE_T0 << 1 | NV2A_CPU_LIVE_T0 << 2 | NV2A_CPU_LIVE_T0 << 3;
 	store_plan.sphere = sphere_stages & store_plan.stages;
 	store_plan.scaled = 0;
 	for (stage = 0; stage < 4; stage++)

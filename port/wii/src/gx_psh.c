@@ -3212,7 +3212,7 @@ static BOOL specular_lightmap_match(const DWORD *state, const struct gx_psh_text
 		return FALSE;
 	/* (the bump map, the lightmap, and the two directions' sphere maps) */
 	if ((textures->present & 0xF) != 0xF || (textures->cube & 0xC) != 0xC || (textures->cube & 3) ||
-		textures->separate_alpha || textures->bumped || textures->vertex_color ||
+		textures->separate_alpha || textures->bumped || textures->vertex_color || textures->reflected ||
 		textures->contents[0] != _gx_psh_texture_all || textures->contents[1] == _gx_psh_texture_alpha ||
 		textures->fog || textures->d0_alpha_map)
 		return FALSE;
@@ -3621,7 +3621,7 @@ BOOL gx_psh_translate(const DWORD *render_state, const struct gx_psh_textures *t
 				if (program->indirect[stage] != _gx_psh_indirect_none)
 					program->texcoords |= 1u << 0 | 1u << GX_PSH_BUMP_TEXCOORD_S | 1u << GX_PSH_BUMP_TEXCOORD_T;
 			}
-			if (textures->bumped || textures->vertex_color)
+			if (textures->bumped || textures->vertex_color || textures->reflected)
 				program->vertices = _gx_psh_vertices_bumped_reflection;
 			return TRUE;
 		}
