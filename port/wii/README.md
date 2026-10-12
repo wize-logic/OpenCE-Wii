@@ -896,7 +896,9 @@ and pixel shaders.
       (`tests/host/gx_stand_in.c`), draws synthetic scenes the game's way (a structure's
       sections, rigid, skinned, unlit and fogged characters) and runs under `qemu-ppc`: `count`
       gives the instructions a draw by function, `record` a digest of what GX would draw
-      (`--save`, `--compare`, `--device` another copy of the device's sources). Later frames'
+      (`--save`, `--compare`, `--device` another copy of the device's sources), `subdivide` the
+      check of a sea's big triangles drawn in pieces on a sphere map (`count --scene subdivide`
+      their instructions, a triangle a region). Later frames'
       draws, `wii-port` at a5581ec6 then now: the structure's 164,076 instructions then 43,304,
       the rigid models' 92,971 then 25,154, the skinned characters' 225,373 then 171,176, the
       fogged ones' 292,638 then 174,271. With `BENCH_PROBE` it lists the GX state an immediate
@@ -1195,6 +1197,30 @@ and pixel shaders.
       reflection, its coordinates computed per vertex as above (`gx_psh_textures.reflected`).
       Without it the water's reflection pass added nothing, and b30's far sea, where nothing
       lies under the water, was black.
+    - Coordinates on a sphere map computed per vertex and interpolated across a big triangle
+      read directions it does not face: the map bends, and a straight line on it between two
+      directions passes nearer the middle (straight up). The sky's water (the sky model's sea, a
+      disc from radius 1,200 to the horizon at the sky's eye level, drawn without depth) is
+      triangles from an octagon near the eye to a ring at the horizon, the eye's reflection
+      along each near the horizon but at directions apart around it: interpolated, the
+      coordinates read the sky well above the horizon, a violet band under b30's horizon (its
+      white line) where the Xbox's sky water reflects the haze and meets the structure's sea.
+      A processor's draw of up to 256 vertices whose stages read a sphere map, and that neither
+      tests nor writes depth, is drawn in pieces where an edge's ends lie apart on the map
+      (`subdivide_triangle`): a triangle is halved across the edge whose middle's coordinates
+      lie furthest (over a texel) from its ends' mean, the middle's outputs the ends' mixed (its
+      position the edge's middle, exactly) and its coordinates its own direction's. An edge is
+      halved by its ends alone, so no crack opens; pieces out of sight are not sent. A draw in
+      hardware of up to 64 indices whose sphere map's coordinates the processor computes, and
+      free of depth, is the processor's, so that it can be. A draw that reads or writes depth is
+      drawn whole: a piece's depth, interpolated from its own corners, differs from the whole
+      triangle's by GX's rounding, and the surface's other passes then fail their tests pixel by
+      pixel (b30's sea in pieces, its reflection pass `LESSEQUAL` over its opacity pass's depth,
+      was hatched, and drawn nearer, white). The sea's own reflection keeps its per-vertex error
+      (3 to 16 texels of 64, bluer far off) until its passes can be cut alike.
+      `tools/wii_draw_bench.py subdivide` checks a sea's triangles: within a texel (1.4 in the
+      worst, a triangle from the eye's feet to the horizon), every point in sight in exactly one
+      piece, at about 2,000 instructions a piece.
   - (1 - x)p + xq is TEV's lerp, one stage.
   - Constants read as 0 or 1 need no register. Those needed in every channel take the four konst
     registers first, and any beyond four are set in TEV registers kept for them.

@@ -925,6 +925,13 @@ void GX_PeekARGB(u16 x, u16 y, GXColor *color)
 	(void)y;
 	memset(color, 0, sizeof(*color));
 }
+void GX_PeekZ(u16 x, u16 y, u32 *z)
+{
+	calls++;
+	(void)x;
+	(void)y;
+	*z = 0;
+}
 
 /* a texture object: its arguments, as GX_LoadTexObj digests them */
 void GX_InitTexObj(GXTexObj *object, void *image, u16 width, u16 height, u8 format, u8 wrap_s, u8 wrap_t, u8 mipmap)

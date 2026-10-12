@@ -4201,6 +4201,467 @@ static void program_statistics_log(void)
 	memset(program_statistics, 0, sizeof(program_statistics));
 }
 
+/* ---------- a sphere map read across a big triangle
+
+A cube map's sphere map is read at coordinates the device computes at each
+vertex (sphere_coordinates, of the program's direction or of a reflection:
+bumped_reflection_vertex), which GX interpolates across the triangle, where
+the Xbox looks the cube map up at each pixel's own direction. Where a
+triangle's directions differ much the two part, for the mapping bends: the
+coordinates interpolated read directions the triangle does not face. b30's
+sea is triangles of a few hundred units seen from some 30 above, across
+which the reflection goes from steeply up near the eye to the horizon far
+off; the interpolated coordinates read the sky well above the horizon over
+most of it, darker and bluer than the haze the Xbox's sea reflects (the
+mapping's radius is half the sine of half the angle from straight up, so a
+straight line between two directions on the map passes nearer its middle).
+
+So a processor's draw of a few triangles whose stages read a sphere map,
+and that neither tests nor writes depth, is drawn in smaller triangles where
+it needs them: the sky's water (the sky model's sea, a disc from under the
+eye to the horizon, drawn with no depth), whose triangles run from an
+octagon near the eye to a ring at the horizon; across them the coordinates
+passed near the map's middle and read the sky straight up, a violet band
+under b30's horizon where the Xbox's reflects the haze. A draw that reads or
+writes depth is drawn whole: a piece's depth, interpolated from its own
+corners, differs from the whole triangle's by GX's rounding, and the
+surface's other passes then fail their tests pixel by pixel (b30's sea in
+pieces, its reflection over its opacity pass's depth, LESSEQUAL, was
+hatched; drawn nearer, the reflection covered the sea white). An edge whose ends lie
+apart on the map (SUBDIVIDE_SPREAD) is looked at: its middle is made, the
+program's outputs at its ends mixed half and half (its position, in clip
+space or the model's, then the edge's middle exactly; what GX would have
+interpolated there of the rest) through vertex_store, which computes its
+coordinates on the map from its own direction; how far they lie off the
+mean of its ends' is its error. A triangle is halved across its edge of
+the largest error, where that is more than SUBDIVIDE_ERROR (a texel of a
+64-texel map), and its halves again, at most SUBDIVIDE_DEPTH times down any
+path and SUBDIVIDE_MOST_PIECES times in a draw, each half keeping what is
+known of the edge it shares with the triangle; the pieces are sent as one
+list of triangles, those wholly outside one side of the view not at all.
+An edge is halved or not by its two ends alone, so the triangles on either
+side of it halve it alike, and no crack opens between them (but where one
+of them reaches a limit first). A draw none of whose edges lies apart on
+the map is sent as it came, as is a triangle bound to two matrices, and a
+draw of more than SUBDIVIDE_MOST_VERTICES vertices is draw_run's (a10's
+walls: their triangles are small). The draw bench's check (tools/
+wii_draw_bench.py subdivide) draws a sea's big triangles so: what was 3 to
+16 texels off is within one, 1.4 in the worst, a triangle from the eye's
+feet to the horizon, at about 2,000 instructions a piece. */
+#define SUBDIVIDE_MOST_VERTICES 256
+#define SUBDIVIDE_SPREAD (1.0f / 32.0f)
+#define SUBDIVIDE_ERROR (1.0f / 64.0f)
+#define SUBDIVIDE_DEPTH 13
+#define SUBDIVIDE_MOST_PIECES 2048
+/* (the most edges looked at in a triangle: their middles' room) */
+#define SUBDIVIDE_POOL 512
+/* (a draw in hardware of at most this many indices, its sphere map's
+coordinates the processor's and no depth read or written, is draw_run's:
+draw_hardware) */
+#define SUBDIVIDE_HARDWARE_MOST 64
+
+struct subdivide_vertex
+{
+	struct nv2a_cpu_output out;
+	/* (the position in the model, where GX's matrix transforms it) */
+	float raw[4];
+	struct gx_vertex sent;
+	/* (run already; its position the processor's, through GX_PNMTX0) */
+	BOOL filled, processor;
+};
+
+/* each of the draw's vertices (by its index less the least); the middles
+of one triangle's edges looked at (SUBDIVIDE_POOL of them, given back when
+it is sent); and its pieces waiting to be looked at: each with its depth and
+what is known of each of its edges (edge n runs from corner n to the next):
+whether it was looked at, how far its middle is off, and the middle */
+static struct subdivide_vertex *subdivide_vertices, *subdivide_pool;
+static unsigned subdivide_pool_used;
+struct subdivide_edge
+{
+	BOOL known;
+	float error;
+	const struct subdivide_vertex *middle;
+};
+static struct
+{
+	const struct subdivide_vertex *corner[3];
+	struct subdivide_edge edge[3];
+	unsigned depth;
+} subdivide_stack[SUBDIVIDE_DEPTH + 2];
+/* the pieces the draw may still make (SUBDIVIDE_MOST_PIECES at its start) */
+static unsigned long subdivide_budget;
+/* the pieces of the triangle to send: their corners, sent as one primitive
+when the triangle is done (or this is full) */
+#define SUBDIVIDE_SENT 192
+static const struct subdivide_vertex *subdivide_sent[3 * SUBDIVIDE_SENT];
+static unsigned subdivide_sent_count;
+/* in the statistics' window: the draws subdivided, their triangles halved,
+and the triangles sent for them */
+static unsigned long subdivide_draws, subdivide_halvings, subdivide_triangles;
+/* (the draw bench's check of the pieces: each one sent, as GX takes it) */
+static void (*subdivide_piece_seen)(const struct gx_vertex *corner);
+
+/* whether the draw neither tests nor writes depth: its pieces can differ
+in depth from its whole triangles (GX's rounding) without changing a pixel */
+static BOOL subdivide_depth_free(void)
+{
+	return !D3D__RenderState[D3DRS_ZENABLE] ||
+		(D3D__RenderState[D3DRS_ZFUNC] == D3DCMP_ALWAYS && !D3D__RenderState[D3DRS_ZWRITEENABLE]);
+}
+
+/* the texture coordinates on a sphere map the draw's vertices carry */
+static unsigned subdivide_coordinates(void)
+{
+	return store_plan.sphere | (vertex_terms == _gx_psh_vertices_bumped_reflection ? 1U << 3 : 0);
+}
+
+static void subdivide_mix(const struct subdivide_vertex *a, const struct subdivide_vertex *b,
+	const struct draw_projection *projection, BOOL raw, struct subdivide_vertex *out)
+{
+	int index, stage;
+
+#define MIX4(field) for (index = 0; index < 4; index++) out->out.field[index] = 0.5f * (a->out.field[index] + b->out.field[index])
+	MIX4(position);
+	MIX4(clip);
+	MIX4(d0);
+	MIX4(d1);
+	for (stage = 0; stage < 4; stage++)
+		MIX4(t[stage]);
+#undef MIX4
+	out->out.clip_captured = a->out.clip_captured;
+	out->out.fog = 0.5f * (a->out.fog + b->out.fog);
+	out->out.point_size = a->out.point_size;
+	for (index = 0; index < 4; index++)
+		out->raw[index] = 0.5f * (a->raw[index] + b->raw[index]);
+	vertex_store(&out->out, projection, raw && !a->processor ? out->raw : NULL, &out->sent);
+	out->sent.matrix = a->sent.matrix;
+	out->filled = TRUE;
+	out->processor = a->processor;
+}
+
+/* how far apart two vertices lie on the map (the most of any coordinate) */
+static float subdivide_spread(const struct gx_vertex *a, const struct gx_vertex *b, unsigned coordinates)
+{
+	float most = 0.0f;
+	int stage, axis;
+
+	for (stage = 0; stage < 4; stage++)
+	{
+		if (!(coordinates & (1U << stage)))
+			continue;
+		for (axis = 0; axis < 2; axis++)
+		{
+			float apart = fabsf(a->texcoord[stage][axis] - b->texcoord[stage][axis]);
+
+			if (apart > most)
+				most = apart;
+		}
+	}
+	return most;
+}
+
+/* whether a triangle lies wholly outside one side of the view */
+static BOOL subdivide_outside(const struct subdivide_vertex *const *corner)
+{
+	int side;
+
+	for (side = 0; side < 5; side++)
+	{
+		int outside = 0, which;
+
+		for (which = 0; which < 3; which++)
+		{
+			const float *clip = corner[which]->out.clip;
+
+			switch (side)
+			{
+			case 0: outside += clip[0] > clip[3]; break;
+			case 1: outside += clip[0] < -clip[3]; break;
+			case 2: outside += clip[1] > clip[3]; break;
+			case 3: outside += clip[1] < -clip[3]; break;
+			default: outside += !(clip[3] > 0.0f); break;
+			}
+		}
+		if (outside == 3)
+			return TRUE;
+	}
+	return FALSE;
+}
+
+/* an edge looked at: its middle, and how far that is off the mean of its
+ends on the map (0 where they lie close, SUBDIVIDE_SPREAD, or the pool of
+middles is full) */
+static void subdivide_edge_look(const struct subdivide_vertex *p, const struct subdivide_vertex *q,
+	const struct draw_projection *projection, BOOL raw, unsigned coordinates, struct subdivide_edge *edge)
+{
+	struct subdivide_vertex *middle;
+	int stage, axis;
+
+	edge->known = TRUE;
+	edge->error = 0.0f;
+	edge->middle = NULL;
+	if (subdivide_pool_used >= SUBDIVIDE_POOL || subdivide_spread(&p->sent, &q->sent, coordinates) <= SUBDIVIDE_SPREAD)
+		return;
+	middle = &subdivide_pool[subdivide_pool_used++];
+	subdivide_mix(p, q, projection, raw, middle);
+	edge->middle = middle;
+	for (stage = 0; stage < 4; stage++)
+		if (coordinates & (1U << stage))
+			for (axis = 0; axis < 2; axis++)
+			{
+				float off = fabsf(middle->sent.texcoord[stage][axis] -
+					0.5f * (p->sent.texcoord[stage][axis] + q->sent.texcoord[stage][axis]));
+
+				if (off > edge->error)
+					edge->error = off;
+			}
+}
+
+/* the pieces kept to send, sent */
+static void subdivide_send(void)
+{
+	unsigned which;
+
+	if (!subdivide_sent_count)
+		return;
+	gx_begin(GX_TRIANGLES, DEVICE_VERTEX_FORMAT, (u16)(3 * subdivide_sent_count));
+	for (which = 0; which < 3 * subdivide_sent_count; which++)
+		vertex_emit(&subdivide_sent[which]->sent);
+	GX_End();
+	subdivide_triangles += subdivide_sent_count;
+	subdivide_sent_count = 0;
+}
+
+/* one of the draw's triangles, in as many pieces as its map needs, sent
+as one list of triangles (the pieces wholly outside the view not at all) */
+static void subdivide_triangle(const struct subdivide_vertex *a, const struct subdivide_vertex *b,
+	const struct subdivide_vertex *c, const struct draw_projection *projection, BOOL raw, unsigned coordinates)
+{
+	unsigned waiting = 1, which;
+
+	subdivide_pool_used = 0;
+	subdivide_stack[0].corner[0] = a;
+	subdivide_stack[0].corner[1] = b;
+	subdivide_stack[0].corner[2] = c;
+	subdivide_stack[0].edge[0].known = subdivide_stack[0].edge[1].known = subdivide_stack[0].edge[2].known = FALSE;
+	subdivide_stack[0].depth = 0;
+	if (a->sent.matrix != b->sent.matrix || a->sent.matrix != c->sent.matrix || a->processor != b->processor ||
+		a->processor != c->processor)
+		subdivide_stack[0].depth = SUBDIVIDE_DEPTH;
+	while (waiting)
+	{
+		unsigned top = waiting - 1, depth = subdivide_stack[top].depth, edge = 3;
+		float worst = SUBDIVIDE_ERROR;
+
+		/* (a piece out of sight: neither halved nor sent) */
+		if (subdivide_outside(subdivide_stack[top].corner))
+		{
+			waiting--;
+			continue;
+		}
+		if (depth < SUBDIVIDE_DEPTH && subdivide_budget >= 2)
+			for (which = 0; which < 3; which++)
+			{
+				struct subdivide_edge *known = &subdivide_stack[top].edge[which];
+
+				if (!known->known)
+					subdivide_edge_look(subdivide_stack[top].corner[which], subdivide_stack[top].corner[(which + 1) % 3],
+						projection, raw, coordinates, known);
+				if (known->error > worst)
+				{
+					worst = known->error;
+					edge = which;
+				}
+			}
+		if (edge < 3)
+		{
+			/* the halves, both with the corner across the edge, turning as
+			the triangle did: (p, m, r) above (m, q, r) on the stack, each
+			keeping the edge it shares with the triangle, and the edge
+			between them (m to r in the one, r to m in the other) looked at
+			once for both */
+			unsigned p = edge, q = (edge + 1) % 3, r = (edge + 2) % 3;
+			const struct subdivide_vertex *corner_p = subdivide_stack[top].corner[p],
+				*corner_q = subdivide_stack[top].corner[q], *corner_r = subdivide_stack[top].corner[r],
+				*middle = subdivide_stack[top].edge[edge].middle;
+			struct subdivide_edge rp = subdivide_stack[top].edge[r], qr = subdivide_stack[top].edge[q], between;
+
+			subdivide_edge_look(middle, corner_r, projection, raw, coordinates, &between);
+			subdivide_stack[top].corner[0] = middle;
+			subdivide_stack[top].corner[1] = corner_q;
+			subdivide_stack[top].corner[2] = corner_r;
+			subdivide_stack[top].edge[0].known = FALSE;
+			subdivide_stack[top].edge[1] = qr;
+			subdivide_stack[top].edge[2] = between;
+			subdivide_stack[top].depth = depth + 1;
+			subdivide_stack[waiting].corner[0] = corner_p;
+			subdivide_stack[waiting].corner[1] = middle;
+			subdivide_stack[waiting].corner[2] = corner_r;
+			subdivide_stack[waiting].edge[0].known = FALSE;
+			subdivide_stack[waiting].edge[1] = between;
+			subdivide_stack[waiting].edge[2] = rp;
+			subdivide_stack[waiting].depth = depth + 1;
+			waiting++;
+			subdivide_halvings++;
+			subdivide_budget--;
+			continue;
+		}
+		if (subdivide_sent_count == SUBDIVIDE_SENT)
+			subdivide_send();
+		for (which = 0; which < 3; which++)
+			subdivide_sent[3 * subdivide_sent_count + which] = subdivide_stack[top].corner[which];
+		subdivide_sent_count++;
+		if (subdivide_piece_seen)
+		{
+			struct gx_vertex piece[3];
+
+			for (which = 0; which < 3; which++)
+				piece[which] = subdivide_stack[top].corner[which]->sent;
+			subdivide_piece_seen(piece);
+		}
+		waiting--;
+	}
+	subdivide_send();
+}
+
+/* a processor's draw of triangles on a sphere map, subdivided where the map
+needs it (after draw_run's projection and log); FALSE where it is not such a
+draw, which draw_run then draws */
+static BOOL draw_run_subdivided(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitive_type, UINT count,
+	vertex_fetch_proc fetch, void *context, const WORD *indices, const struct vertex_shader_object *shader,
+	int position_register, BOOL keyed, const struct draw_projection *projection, float point_size)
+{
+	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
+	unsigned least = 0, most = 0, coordinates, live, pass;
+	UINT vertex, triangle, triangles;
+
+	if (!projection->perspective || count < 3 || count > 3 * SUBDIVIDE_MOST_VERTICES ||
+		(primitive_type != D3DPT_TRIANGLELIST && primitive_type != D3DPT_TRIANGLESTRIP &&
+		primitive_type != D3DPT_TRIANGLEFAN) || !subdivide_depth_free())
+		return FALSE;
+	if (indices)
+	{
+		least = 0xFFFF;
+		for (vertex = 0; vertex < count; vertex++)
+		{
+			if (indices[vertex] < least)
+				least = indices[vertex];
+			if (indices[vertex] > most)
+				most = indices[vertex];
+		}
+	}
+	else
+		most = count - 1;
+	if (most - least >= SUBDIVIDE_MOST_VERTICES)
+		return FALSE;
+	/* (what store_plan_set and subdivide_coordinates read: the stages' state
+	and the attributes sent) */
+	transform_software();
+	if (position_register >= 0)
+	{
+		position_matrix_load();
+		emit_matrix_index = keyed;
+	}
+	if (shader)
+		emit_attributes_set();
+	store_plan_set();
+	coordinates = subdivide_coordinates();
+	if (!coordinates)
+		return FALSE;
+	if (!subdivide_vertices)
+	{
+		subdivide_vertices = malloc((SUBDIVIDE_MOST_VERTICES + SUBDIVIDE_POOL) * sizeof(*subdivide_vertices));
+		if (!subdivide_vertices)
+			return FALSE;
+		subdivide_pool = subdivide_vertices + SUBDIVIDE_MOST_VERTICES;
+	}
+	/* each vertex once: every output vertex_store reads, and the clip-space
+	position, which the view's sides are tested by */
+	live = store_plan.live | NV2A_CPU_LIVE_POSITION;
+	subdivide_budget = SUBDIVIDE_MOST_PIECES;
+	for (vertex = 0; vertex <= most - least; vertex++)
+		subdivide_vertices[vertex].filled = FALSE;
+	inputs_seed(inputs);
+	for (vertex = 0; vertex < count; vertex++)
+	{
+		unsigned slot = indices ? indices[vertex] - least : vertex;
+		struct subdivide_vertex *kept = &subdivide_vertices[slot];
+		BOOL processor = keyed && draw_key_of[vertex] == KEY_PROCESSOR;
+
+		if (kept->filled)
+			continue;
+		fetch(context, vertex, inputs);
+		nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
+			point_size, &kept->out, live);
+		memcpy(kept->raw, inputs[position_register >= 0 ? position_register : 0], sizeof(kept->raw));
+		vertex_store(&kept->out, projection, position_register >= 0 && !processor ? kept->raw : NULL, &kept->sent);
+		/* (a draw of one matrix sends none: draw_run's) */
+		kept->sent.matrix = (u8)(!keyed ? GX_PNMTX1 : processor ? GX_PNMTX0 : GX_PNMTX1 + 3 * draw_key_of[vertex]);
+		kept->filled = TRUE;
+		kept->processor = processor;
+		device.statistics.vertices_run++;
+	}
+	/* (a draw none of whose edges lies far apart on the map, the most, is
+	sent as it came, as draw_run sends it) */
+	triangles = primitive_type == D3DPT_TRIANGLELIST ? count / 3 : count - 2;
+	for (pass = 0; pass < 2; pass++)
+	{
+		for (triangle = 0; triangle < triangles; triangle++)
+		{
+			UINT at[3];
+			const struct subdivide_vertex *corner[3];
+			int which;
+
+			if (primitive_type == D3DPT_TRIANGLELIST)
+			{
+				at[0] = 3 * triangle;
+				at[1] = 3 * triangle + 1;
+				at[2] = 3 * triangle + 2;
+			}
+			else if (primitive_type == D3DPT_TRIANGLEFAN)
+			{
+				at[0] = 0;
+				at[1] = triangle + 1;
+				at[2] = triangle + 2;
+			}
+			else
+			{
+				/* (a strip's odd triangles turn the other way: GX's strip
+				reverses them as Direct3D's does) */
+				at[0] = triangle + (triangle & 1);
+				at[1] = triangle + 1 - (triangle & 1);
+				at[2] = triangle + 2;
+			}
+			for (which = 0; which < 3; which++)
+				corner[which] = &subdivide_vertices[indices ? indices[at[which]] - least : at[which]];
+			/* (a strip's joins: two corners the same vertex) */
+			if (corner[0] == corner[1] || corner[1] == corner[2] || corner[0] == corner[2])
+				continue;
+			if (pass == 0)
+			{
+				for (which = 0; which < 3; which++)
+					if (subdivide_spread(&corner[which]->sent, &corner[(which + 1) % 3]->sent, coordinates) > SUBDIVIDE_SPREAD)
+						break;
+				if (which < 3)
+					break;
+				continue;
+			}
+			subdivide_triangle(corner[0], corner[1], corner[2], projection, position_register >= 0, coordinates);
+		}
+		if (pass == 0 && triangle == triangles)
+		{
+			gx_begin(gx_primitive(primitive_type), DEVICE_VERTEX_FORMAT, (u16)count);
+			for (vertex = 0; vertex < count; vertex++)
+				vertex_emit(&subdivide_vertices[indices ? indices[vertex] - least : vertex].sent);
+			GX_End();
+			return TRUE;
+		}
+	}
+	subdivide_draws++;
+	return TRUE;
+}
+
 static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitive_type, UINT count,
 	vertex_fetch_proc fetch, void *context, const WORD *indices, const struct vertex_shader_object *shader)
 {
@@ -4215,7 +4676,7 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 	BOOL logged = draw_logging();
 	/* (whether the vertices carry a matrix index, KEY_PROCESSOR's the
 	identity; the outputs of a vertex whose position GX computes) */
-	BOOL keyed = FALSE;
+	BOOL keyed = FALSE, subdivided;
 	unsigned live_gx;
 
 	memcpy(&point_size, &D3D__RenderState[D3DRS_POINTSIZE], sizeof(point_size));
@@ -4241,7 +4702,9 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 	projection_load(&projection);
 	if (logged)
 		draw_log(primitive_type, count, &projection, fetch, context, program, point_size, FALSE, indices);
-	if (indices && count > 3 && !vertex_memo)
+	subdivided = draw_run_subdivided(program, primitive_type, count, fetch, context, indices, shader, position_register,
+		keyed, &projection, point_size);
+	if (!subdivided && indices && count > 3 && !vertex_memo)
 	{
 		vertex_memo = malloc(VERTEX_MEMO_SIZE * sizeof(*vertex_memo));
 		vertex_memo_stamps = calloc(VERTEX_MEMO_SIZE, sizeof(*vertex_memo_stamps));
@@ -4254,7 +4717,7 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 			indices = NULL;
 		}
 	}
-	if (indices && count > 3 && vertex_memo)
+	if (!subdivided && indices && count > 3 && vertex_memo)
 	{
 		WORD least = 0xFFFF, most = 0;
 
@@ -4319,7 +4782,7 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 	}
 	else
 		indices = NULL;
-	if (!indices)
+	if (!subdivided && !indices)
 	{
 		transform_software();
 		if (position_register >= 0)
@@ -7983,6 +8446,14 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 			texture_registers[texture_count++] = reg;
 		stage_source[stage] = index;
 	}
+	/* (a few triangles reading a sphere map at their own directions, which
+	may be big ones, as the sky's water is, and free of depth: the
+	processor's, to draw them in pieces where the map needs it,
+	subdivide_triangle) */
+	if (cpu_spheres && count <= SUBDIVIDE_HARDWARE_MOST && subdivide_depth_free() &&
+		(primitive_type == D3DPT_TRIANGLELIST || primitive_type == D3DPT_TRIANGLESTRIP ||
+		primitive_type == D3DPT_TRIANGLEFAN))
+		return hardware_rejected(program, "a sphere map across a few triangles, drawn in pieces where it needs them");
 	for (component = 0; component < 2; component++)
 	{
 		const unsigned long *color = component ? dependencies->d1 : dependencies->d0;
@@ -8875,6 +9346,9 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		platform_log("Direct3D: in hardware with the processor's sphere map coordinates: %lu draws (%lu lit by GX), "
 			"%lu vertices run", hardware_sphere_draws, hardware_sphere_lit_draws, hardware_spheres_run);
 		hardware_sphere_draws = hardware_sphere_lit_draws = hardware_spheres_run = 0;
+		platform_log("Direct3D: sphere maps across big triangles: %lu draws subdivided, %lu triangles halved, %lu sent",
+			subdivide_draws, subdivide_halvings, subdivide_triangles);
+		subdivide_draws = subdivide_halvings = subdivide_triangles = 0;
 		{
 			/* (the kinds of hardware_emit's draws, most indices first) */
 			char line[320];
