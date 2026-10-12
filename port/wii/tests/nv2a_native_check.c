@@ -206,7 +206,7 @@ int main(int argc, char **argv)
 		inputs[NV2A_CPU_INPUT_COUNT][4];
 	static struct nv2a_cpu_program program;
 	unsigned long count = 0, position, checked = 0, differ = 0, native = 0, one_node_checked = 0, inputs_checked = 0;
-	unsigned long constant_free_programs = 0, constant_free_checked = 0;
+	unsigned long constant_free_programs = 0, constant_free_checked = 0, positions_checked = 0;
 	char line[512];
 	int in_comment = 0;
 	FILE *in;
@@ -319,6 +319,44 @@ int main(int argc, char **argv)
 					differ++;
 					break;
 				}
+			}
+			/* its positions function (the skinned programs'): each of four
+			points' clip-space and screen-space positions the same, to the bit,
+			as a run for the position with v0 that point (d3d8_gx.c's position
+			matrices, and their axes: 0 and 1 among the points) */
+			if (program.native_positions)
+			{
+				float points[4][4], clips[4][4], screens[4][4], saved[4];
+				int point;
+
+				for (point = 0; point < 4; point++)
+					for (component = 0; component < 4; component++)
+						points[point][component] = trial & 1 ? random_float() :
+							component == 3 ? 1.0f : component + 1 == point ? 1.0f : 0.0f;
+				memset(clips, 0x3C, sizeof(clips));
+				nv2a_cpu_run_positions(&program, (const float (*)[4])constants, (const float (*)[4])inputs,
+					(const float (*)[4])points, clips, screens);
+				memcpy(saved, inputs[0], sizeof(saved));
+				for (point = 0; point < 4; point++)
+				{
+					struct nv2a_cpu_output one;
+
+					memcpy(inputs[0], points[point], sizeof(inputs[0]));
+					nv2a_cpu_run_live(&program, (const float (*)[4])constants, (const float (*)[4])inputs, 1.0f, &one,
+						NV2A_CPU_LIVE_POSITION);
+					positions_checked++;
+					if (memcmp(one.clip, clips[point], sizeof(one.clip)) ||
+						memcmp(one.position, screens[point], sizeof(one.position)))
+					{
+						printf("program %08lx: its positions function differs at point %d\n",
+							nv2a_cpu_hash(instructions, instruction_count), point);
+						differ++;
+						break;
+					}
+				}
+				memcpy(inputs[0], saved, sizeof(saved));
+				if (point < 4)
+					break;
 			}
 			/* the components that read no constant: the same for other
 			constants, on the interpreter and as its function computes the
@@ -439,6 +477,7 @@ int main(int argc, char **argv)
 	}
 	printf("%lu programs with functions, %lu runs compared, %lu vertices on one node, %lu runs of the inputs read alone, "
 		"%lu differ\n", native, checked, one_node_checked, inputs_checked, differ);
+	printf("%lu positions of four at once compared with runs\n", positions_checked);
 	printf("%lu programs with outputs the vertex's alone; %lu components that read no constant compared with other "
 		"constants\n", constant_free_programs, constant_free_checked);
 	differ += arithmetic_check();

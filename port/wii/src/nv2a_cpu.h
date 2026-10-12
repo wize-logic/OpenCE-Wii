@@ -48,6 +48,12 @@ typedef void (*nv2a_cpu_live_proc)(const float (*constants)[4], const float (*in
 /* ... and its colours alone */
 typedef void (*nv2a_cpu_native_proc)(const float (*constants)[4], const float (*inputs)[4],
 	struct nv2a_cpu_output *output);
+/* ... and its position alone, for four values of v0 (points) at once, the
+other inputs those given: each one's clip-space position (clip, as the
+program captures it) and screen-space position, the same to the bit as
+four runs for the position (nv2a_cpu_run_positions) */
+typedef void (*nv2a_cpu_positions_proc)(const float (*constants)[4], const float (*inputs)[4],
+	const float (*points)[4], float (*clips)[4], float (*positions)[4]);
 
 /* the outputs a draw reads (nv2a_cpu_run_live): the others are left as they
 were, or hold what the instructions computed on the way */
@@ -75,6 +81,8 @@ struct nv2a_cpu_program
 	/* (the compiled program's colours and fog alone; NULL on the
 	interpreter) */
 	nv2a_cpu_native_proc native_colors;
+	/* (its position for four values of v0; NULL on the interpreter) */
+	nv2a_cpu_positions_proc native_positions;
 	struct nv2a_cpu_instruction instructions[NV2A_CPU_MAXIMUM_INSTRUCTIONS];
 };
 
@@ -139,5 +147,11 @@ void nv2a_cpu_run(const struct nv2a_cpu_program *program, const float (*constant
 the same, bit for bit, the others undefined */
 void nv2a_cpu_run_live(const struct nv2a_cpu_program *program, const float (*constants)[4], const float (*inputs)[4],
 	float point_size, struct nv2a_cpu_output *output, unsigned live);
+/* the clip-space and screen-space positions for four values of v0 (points;
+the other inputs as given), as four nv2a_cpu_run_live for the position give
+them, to the bit: FALSE (nothing done) for a program without its compiled
+function */
+int nv2a_cpu_run_positions(const struct nv2a_cpu_program *program, const float (*constants)[4],
+	const float (*inputs)[4], const float (*points)[4], float (*clips)[4], float (*positions)[4]);
 
 #endif

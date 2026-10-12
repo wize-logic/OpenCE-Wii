@@ -3430,6 +3430,9 @@ static void matrix_inputs(const struct vertex_shader_object *shader, float (*inp
 }
 
 static Mtx position_matrix_rows;
+/* in the statistics' window: the position matrices' runs of a program's four
+at once, and of one at a time */
+static unsigned long position_lanes_runs, position_single_runs;
 /* the depth's a + b / w for the same constants (position_matrix): from the
 program's outputs for the origin and the axes, not from a draw's vertices,
 so every draw of these constants has the same, to the bit */
@@ -3518,29 +3521,48 @@ static unsigned long long constants_hash(const struct vertex_shader_object *shad
 	return hash;
 }
 
+/* a key's hash and a word more: two lanes of 32-bit FNV-1 (the processor
+multiplies 64 bits in some twenty instructions, 32 in one) */
+static inline unsigned long long hash_step(unsigned long long hash, u32 word)
+{
+	u32 low = ((u32)hash ^ word) * 16777619U, high = ((u32)(hash >> 32) ^ word) * 2246822519U;
+
+	return (unsigned long long)high << 32 | low;
+}
+
+static unsigned long long hash_words(unsigned long long hash, const void *data, unsigned long bytes)
+{
+	const u32 *words = data;
+	unsigned long index;
+
+	for (index = 0; index < bytes / 4; index++)
+		hash = hash_step(hash, words[index]);
+	return hash;
+}
+
 static unsigned long long constants_key(const struct vertex_shader_object *shader, const struct nv2a_cpu_program *program)
 {
 	unsigned long long hash = constants_hash(shader, program);
 	unsigned long row, word;
 
-	hash = (hash ^ draw_uniform.mask) * 1099511628211ULL;
+	hash = hash_step(hash, (u32)draw_uniform.mask);
 	for (row = 0; row < NV2A_CPU_INPUT_COUNT; row++)
 		if (draw_uniform.mask & (1UL << row))
 		{
 			const unsigned long *words = (const unsigned long *)draw_uniform.values[row];
 
 			for (word = 0; word < 4; word++)
-				hash = (hash ^ words[word]) * 1099511628211ULL;
+				hash = hash_step(hash, (u32)words[word]);
 		}
 	/* (and the registers no stream gives: draw_unstreamed) */
-	hash = (hash ^ draw_unstreamed) * 1099511628211ULL;
+	hash = hash_step(hash, (u32)draw_unstreamed);
 	for (row = 0; row < NV2A_CPU_INPUT_COUNT; row++)
 		if (draw_unstreamed & (1UL << row))
 		{
 			const unsigned long *words = (const unsigned long *)device.vertex_registers[row];
 
 			for (word = 0; word < 4; word++)
-				hash = (hash ^ words[word]) * 1099511628211ULL;
+				hash = hash_step(hash, (u32)words[word]);
 		}
 	return hash ? hash : 1;
 }
@@ -3570,6 +3592,37 @@ static BOOL position_matrix(const struct vertex_shader_object *shader, struct nv
 	return TRUE;
 }
 
+/* the program's clip-space and screen-space positions for up to four
+values of the position's register (points), the other inputs as given: its
+compiled function for four at once where it has one and the position is v0
+(nv2a_cpu_run_positions, the same to the bit), else a run for each */
+static void position_runs(struct nv2a_cpu_program *program, float (*inputs)[4], int reg, float point_size,
+	const float (*points)[4], int count, float (*clips)[4], float (*screens)[4])
+{
+	float saved[4];
+	int point;
+
+	if (reg == 0 && nv2a_cpu_run_positions(program, (const float (*)[4])device.vertex_constants,
+		(const float (*)[4])inputs, points, clips, screens))
+	{
+		position_lanes_runs++;
+		return;
+	}
+	memcpy(saved, inputs[reg], sizeof(saved));
+	for (point = 0; point < count; point++)
+	{
+		struct nv2a_cpu_output out;
+
+		memcpy(inputs[reg], points[point], sizeof(inputs[reg]));
+		nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
+			&out, NV2A_CPU_LIVE_POSITION);
+		memcpy(clips[point], out.clip, sizeof(clips[point]));
+		memcpy(screens[point], out.position, sizeof(screens[point]));
+	}
+	memcpy(inputs[reg], saved, sizeof(saved));
+	position_single_runs += (unsigned long)count;
+}
+
 static BOOL position_matrix_compute(const struct vertex_shader_object *shader, struct nv2a_cpu_program *program,
 	int reg, float point_size, BOOL fit)
 {
@@ -3577,31 +3630,33 @@ static BOOL position_matrix_compute(const struct vertex_shader_object *shader, s
 	const float *scale = device.vertex_constants[VERTEX_CONSTANT_BIAS - 38];
 	const float *offset = device.vertex_constants[VERTEX_CONSTANT_BIAS - 37];
 	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
-	struct nv2a_cpu_output base, column;
+	/* (the origin, then each axis: the base and the columns) */
+	float points[4][4], clips[4][4], screens[4][4];
 	int component;
 
 	/* (the program for its position alone: the same, bit for bit) */
 	matrix_inputs(shader, inputs);
-	nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
-		&base, NV2A_CPU_LIVE_POSITION);
 	for (component = 0; component < 4; component++)
 	{
-		float x = base.clip[0], y = base.clip[1], w = base.clip[3];
+		memcpy(points[component], inputs[reg], sizeof(points[component]));
+		if (component)
+			points[component][component - 1] = 1.0f;
+	}
+	position_runs(program, inputs, reg, point_size, (const float (*)[4])points, 4, clips, screens);
+	for (component = 0; component < 4; component++)
+	{
+		float x = clips[0][0], y = clips[0][1], w = clips[0][3];
 
 		if (component < 3)
 		{
-			inputs[reg][component] = 1.0f;
-			nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
-				point_size, &column, NV2A_CPU_LIVE_POSITION);
-			inputs[reg][component] = 0.0f;
-			x = column.clip[0] - base.clip[0];
-			y = column.clip[1] - base.clip[1];
-			w = column.clip[3] - base.clip[3];
+			x = clips[1 + component][0] - clips[0][0];
+			y = clips[1 + component][1] - clips[0][1];
+			w = clips[1 + component][3] - clips[0][3];
 		}
 		position_matrix_rows[0][component] = x * scale[0] + (offset[0] + 0.5f) * w;
 		position_matrix_rows[1][component] = y * scale[1] + (offset[1] + 0.5f) * w;
 		position_matrix_rows[2][component] = -w;
-		ws[component] = component < 3 ? column.clip[3] : base.clip[3];
+		ws[component] = component < 3 ? clips[1 + component][3] : clips[0][3];
 	}
 	/* two points along w's gradient, at w 1 and 1000, give the fit (draw_run's
 	projection_fit, for points of the program's own choosing) */
@@ -3620,19 +3675,20 @@ static BOOL position_matrix_compute(const struct vertex_shader_object *shader, s
 			return TRUE;
 		if (!(length > 1.0e-12f))
 			return FALSE;
+		for (point = 0; point < 4; point++)
+		{
+			float t = (targets[point & 1] - ws[3]) / length;
+
+			memcpy(points[point], inputs[reg], sizeof(points[point]));
+			for (component = 0; component < 3; component++)
+				points[point][component] = t * gradient[component];
+		}
+		position_runs(program, inputs, reg, point_size, (const float (*)[4])points, 2, clips, screens);
 		for (point = 0; point < 2; point++)
 		{
-			float t = (targets[point] - ws[3]) / length;
-
-			for (component = 0; component < 3; component++)
-				inputs[reg][component] = t * gradient[component];
-			nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
-				point_size, &column, NV2A_CPU_LIVE_POSITION);
-			d[point] = column.position[2] / 16777215.0f;
-			v[point] = column.clip[3];
+			d[point] = screens[point][2] / 16777215.0f;
+			v[point] = clips[point][3];
 		}
-		for (component = 0; component < 3; component++)
-			inputs[reg][component] = 0.0f;
 		if (!(fabsf(v[0]) > 1.0e-6f) || !(fabsf(v[1]) > 1.0e-6f) || !(fabsf(1.0f / v[1] - 1.0f / v[0]) > 1.0e-6f))
 			return FALSE;
 		position_projection.b = (d[1] - d[0]) / (1.0f / v[1] - 1.0f / v[0]);
@@ -4871,16 +4927,6 @@ struct hardware_matrices
 };
 static struct hardware_matrices hardware_cache[HARDWARE_CACHE_ENTRIES];
 static unsigned long hardware_cache_hits;
-
-static unsigned long long hash_words(unsigned long long hash, const void *data, unsigned long bytes)
-{
-	const unsigned long *words = data;
-	unsigned long index;
-
-	for (index = 0; index < bytes / 4; index++)
-		hash = (hash ^ words[index]) * 1099511628211ULL;
-	return hash;
-}
 
 static unsigned long long hardware_key(const struct vertex_shader_object *shader, const struct nv2a_cpu_program *program)
 {
@@ -7393,6 +7439,9 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			hardware_blended_draws, hardware_vertices);
 		platform_log("Direct3D: in hardware, the processor's: colours of %lu vertices, positions of %lu in models' draws",
 			hardware_colors_run, processor_positions);
+		platform_log("Direct3D: position matrices' program runs: %lu of four points at once, %lu of one",
+			position_lanes_runs, position_single_runs);
+		position_lanes_runs = position_single_runs = 0;
 		hardware_draws = hardware_vertices = hardware_colors_run = hardware_cache_hits = hardware_keyed_draws = 0;
 		hardware_blended_draws = processor_positions = 0;
 		platform_log("Direct3D: draws' index ranges: %lu taken as kept, %lu found; models' node keys: %lu taken as "
