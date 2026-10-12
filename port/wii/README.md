@@ -15,7 +15,8 @@ This port is in bring-up. In Dolphin, the game boots from the SD card and loads 
   `debug.network_test = "solo:levels\\a30\\a30,levels\\b30\\b30"` with
   `debug.network_test_tour` seconds of game time in each). In Dolphin a10's frame takes about
   116 ms and b30's about 580 ms (the frame's split in the log; the aim is 33 ms, 30 frames a
-  second). On the Wii, `display.bumped_highlights` is off by default (bumped specular and bumped
+  second; measured on 10 October, and not timed since the draw-cost work of the 12th, which
+  cut the processor's work per draw). On the Wii, `display.bumped_highlights` is off by default (bumped specular and bumped
   reflections: their passes' vertices run on the processor, about two fifths of a10's frame),
   `display.object_shadows` is off by default (each object's shadow draws it again, a pass of
   skinned vertices), `display.model_detail` is 0.5 and `display.environment_reflections` is
@@ -57,8 +58,10 @@ and an icon drawn by the packager. It holds no game data. `tools/wii_package.py`
 wrapper: it calls WiiLibs' `tools/wii_package.py` (the checkout the build uses, `--wiilibs`) with
 the port's name, the version (the repository's description), the icon's lettering and the long
 description, which is in `package_description.txt` beside this file. The `wii` job in
-`.github/workflows/build.yml` runs the three host checks, builds the zip in devkitPro's devkitPPC
-image (with WiiLibs checked out into `./WiiLibs`) and keeps it as an artifact.
+`.github/workflows/build.yml` runs the four host checks (`wii_gx_psh_check.py`, `wii_nv2a_check.py`,
+`wii_input_check.py`, `wii_gx_texel_check.py`) and the profile tool's test
+(`tools/test_wii_profile.py`), builds the zip in devkitPro's devkitPPC image (with WiiLibs checked out
+into `./WiiLibs`) and keeps it as an artifact.
 
 `tools/wii_dolphin.py` runs WiiLibs' Dolphin runner (`tools/dolphin_run.py` there) on the build:
 
@@ -133,7 +136,7 @@ file and on FAT's, then sweeps and checks that the file is the old one or the ne
 is left, and that a copy renamed over a file was synced after its last change; and the same
 sequences on a full card (a write that errs, one that takes no bytes), a read-only card, a card that
 is gone and a rename that fails. Fourteen faults put into the code are each caught. Needs a
-checkpoint on a real card (below): power off during a save, and a card pulled.
+checkpoint on a real card (item 6 of "What only a real Wii can show"): power off during a save, and a card pulled.
 
 ### Files the game makes again, and the start-up
 
@@ -277,7 +280,10 @@ will tell which it was, from the `files:` lines and the times on them.)
   calls the game's `main` (`source/shell/shell_xbox.c`):
   - claims the fixed memory
   - starts WiiLibs: system buttons, log, crash report, the text console (`wl_platform_console_start`),
-    heaps, then the buttons' watcher thread (`src/wii_system.c`), IOS 58, SD and USB
+    heaps, then the buttons' watcher thread (`src/wii_system.c`), IOS 58, SD and USB, and then the
+    log's file on the card: `sd:/apps/halo/logs/log-NN.log` when that folder exists (the first call
+    of `wl_platform_log_init` precedes the mounts and gives the ring and the debug port only; the
+    second opens the file)
   - turns on the game's heap in MEM2 (the overflow of MEM1's malloc)
   - starts the network in the background
 
@@ -292,12 +298,16 @@ will tell which it was, from the `files:` lines and the times on them.)
   | `wii_platform.c` | log, messages (the stop screen when the maps are missing) and quitting |
   | `wii_system.c` | the reset and power buttons, and leaving the game properly: a watcher thread, the shutdown hooks |
   | `wii_posix.c` | names for the shared files over WiiLibs: where the game's folder is (`wl_platform_fs_find_app_dir`), random bytes (`wl_platform_random_bytes`), thread priorities (`wl_posix_thread_set_relative_priority`), the heap report |
+  | `wii_boot.c` | what runs before the game's `main`: the memory, WiiLibs, the log's file, the game's thread |
+  | `wii_memory.c` | the fixed memory ranges the game is linked to (MEM1's game state, MEM2's window) |
+  | `wii_video.c` | the TV's mode from the console's settings, the 4:3 picture on a 16:9 screen, 30 frames a second at 50 Hz |
+  | `wii_profile.c` | arms WiiLibs' sampling profiler and hardware counters when `profile.txt` or `hwcount.txt` is in the game's folder |
   | `xinput_wii.c` | XInput over the Wii Remote with Nunchuk or Classic Controller, and the GameCube controller; the pointer's aim |
   | `xinput_wii_map.c` | what each button and stick of those controllers is as the Xbox gamepad (checked on the host) |
   | `wii_home.c` | the HOME button's menu and the Wii's notices as a state machine apart from the game (checked on the host) |
   | `wii_home_game.c` | that machine joined to the game (its pause, WiiLibs' sound fade and exit) and the overlay it draws over the frame |
   | `posix_net_wii.c` | sockets over WiiLibs' network layer, for system link |
-  | `d3d8_gx.c` | the Direct3D device |
+  | `d3d8_gx.c` | the Direct3D device on GX, with `gx_psh.c` and `gx_psh_cache.c` (pixel shaders to TEV), `gx_lighting.c` (lights and sphere maps for GX), `nv2a_cpu.c` (the vertex programs on the processor) and `wii_bitmap_texel.c` (the processor's reads of GX's textures) |
   | `wii_extras.c` | the desktop additions the Wii goes without |
 
   `tools/wii_link.py` (WiiLibs' `tools/link_stubs.py`) stubs any symbol still missing with a
@@ -741,7 +751,8 @@ and pixel shaders.
     a program reads are hashed once while none is set, where each node's matrix hashed them again
     (about 10,000 instructions for a skinned program, which reads all 192).
   - In a10, 4.0 of 6.5 million vertices a minute go to GX. The CPU runs 1.6 million programs where
-    it ran 7.9 million, and a frame takes about 160 ms in Dolphin (it took 200 to 450).
+    it ran 7.9 million, and a frame took about 160 ms in Dolphin then (it took 200 to 450; the introduction has
+    the latest figures).
     `debug.gpu_transform = false` keeps every program on the CPU.
   - What is the same from draw to draw is kept, not found again (a draw's cost is mostly its
     setup):
@@ -1216,7 +1227,7 @@ data misses and mispredicts; miss stall cycles; L2; branch stalls; the instructi
 GPU group (the XF/RAS busy and wait clocks, or a pair of metrics: transform or lighting clocks,
 vertices, texels, triangles, quads, texture-memory stalls, texture-cache misses, vertex-cache
 stalls); the groups take turns, so a rotation is 42 frames and a metric is sampled about five times
-a second. A block, once a second, in the log (Dolphin's console or the SD log) under the tag `hw`:
+a second. A block, once a second, in the log (Dolphin's console, or `apps/halo/logs` on a console: item 1 of "What only a real Wii can show") under the tag `hw`:
 
 ```
 [hw] block 12: 30 frames, frame 38.10 ms (worst 52.40 ms), cpu waits: gpu 1.20 ms display 0.00 ms | gpu done at 14.30 ms
@@ -1476,88 +1487,211 @@ show is in the next section.
 
 ## What only a real Wii can show
 
-Dolphin runs the game, but these need the console:
-- **Speed.** Dolphin's emulated timing does not follow this code's cost (a
-  short function can measure several times its instruction count); a
-  frame's time, and where it goes (the log's "a frame's draws" lines, and
-  the sampling profiler's tables, above, and the hardware counters' verdict,
-  "The hardware counters"), on the console.
-- **Alignment exceptions.** The PowerPC 750 can trap a floating-point load
-  from an address that is not a multiple of 4; Dolphin does not. The
-  compressed animations' floats are read a byte at a time for this, and the
-  script stack's values start at a multiple of 4 (`HS_STACK_PADDING`,
-  `source/hs/hs_runtime.c`). The rest was audited with an x86 build compiled
-  with clang's `-fsanitize=alignment` (a handler that logs each site), played
-  by the bot through every campaign level and the 13 multiplayer maps
-  (25,000 to 470,000 ticks each): of the misaligned accesses it reported,
-  only the script stack's are floating-point loads or stores in the Wii's
-  objects (the others are integer loads and stores, which the 750 completes
-  without a trap: the script stack's frames and longs, the debug allocator's
-  headers, the recorded animations' shorts, the breakable surfaces' flags and
-  the tag validator's read of compressed animations), and the game's objects
-  have no `lmw` or `stmw` (their one `lwarx` is on an aligned pointer). Code
-  the bot did not reach,
-  the menus past the title, saved games and network play were not covered;
-  any other crash report ("CRASH: alignment exception") names the place.
-- **The square root's estimate.** The vertex programs' square root starts
-  from `frsqrte`, checked on the host for estimates as coarse as the 750's
-  documented 1/32; Broadway's own is not documented.
-- **The SD card and USB drive's speed** (a level loads in about 11 seconds
-  in Dolphin) and **the controllers** ("The controllers", above: that the sticks'
-  and triggers' real ranges are the ones read, a Remote's drop-outs, the pointer's feel and
-  look speed, the Classic Controller Pro's triggers, whether the Wii U Pro Controller and the
-  Home button need handling beyond its menu; the menu itself needs the console to show that HOME
-  opens and closes it from a Remote and a Classic Controller, the dimming, the text's legibility on a
-  television and the fade, and a Remote's battery codes against the percent the notice shows, which
-  the log has (`remote N battery code C`); `debug.input_log` writes each state to the log).
-- **Reset, Power and the Remote's power button** (needs a checkpoint run in Dolphin, which has
-  emulated Reset and Power buttons on its menu and a Remote that can be disconnected, and the
-  console): each while a map loads and in play; the log ends with "leaving (loader)" or "leaving
-  (power off)" and the Dolphin run ends there; a save made just before is intact (the next start
-  loads it), and the motors are still. The missing-maps screen: start with the SD card without
-  `apps/halo/maps`; HOME returns to the loader.
-- **Saves cut short** (Dolphin for the first two, the console for the card): (1) play to a
-  checkpoint, Save and Quit, and in the next run Continue: the checkpoint loads; (2) the same with
-  the run stopped (Dolphin's Stop, or Reset) while the log says the save is being written (`begin
-  player profile write`, the checkpoint's `persistent storage`): the next start's log has `save:
-  ... put back after an interrupted write` or nothing, `apps/halo/saves` holds no `.wtmp` or
-  `.wold`, and Continue loads the old checkpoint or the new; (3) on the console, power off during
-  Save and Quit, and again with the card pulled: the same, and that the card's FAT is clean (the
-  card read on a computer); (4) a card with no room left, and a card with its lock switch on: Save
-  and Quit says it could not save (the profile's and checkpoint's messages in the log, `save: ...`
-  lines naming the cause), the game goes on to the menu, nothing hangs.
-- **The sound setting.** The console set to mono, stereo and surround (Wii Settings, Sound): the
-  log says `audio: playing in mono` only for the first, and a mono game sounds the same in both
-  ears.
-- **The reverb.** Indoors (b30, a30's halls and corridors) and outdoors: the log's `audio:` report
-  (mixing time a block, underruns) with `audio.reverb` on and off, a battle indoors; that the room
-  sounds like a room (a decay that follows the place) and not metallic or muffled; and that going
-  through a door fades to the next room's without a click. The harness counts +113 an output
-  frame in a busy scene (0.7% of the processor).
-- **Rumble.** Whether the duty cycle feels like a strength and not a buzz (the switching is 62 Hz
-  at most), that it stops with a pause, a disconnect and a quit, and that Remote vibration off in
-  the console's settings means none.
-- **The GX FIFO in MEM1.** That the peak fill and the overflows count are as on Dolphin; Dolphin
-  does not mind a FIFO in either memory.
-- **Memory.** MEM1 and MEM2 as the console's IOS leaves them, with the
-  Homebrew Channel's loader: the memory report's window line says where libogc's MEM2 began
-  (the window reaches down to it), and WiiLibs' `[mem]` lines what its heaps were given.
-- **TEV's arithmetic.** The bump mapping's signed sums rely on TEV's lerp with a bias of -1/2,
-  its scale, and results kept unclamped between stages (-4 to 4); it has been checked only
-  against the host check's simulation of the documented rules in 8-bit steps, not on the console
-  (and a Dolphin look at the bumped surfaces is still to make). Look at the environment's bumped
-  lighting (the lightmap's bump term, a light's diffuse) for banding or the wrong sign.
-- **The indirect unit's offsets.** A bumped reflection's offset is taken as the texture coordinate
-  times the indirect texel less 128, over 256, times 2 to matrix 0's scale (as Dolphin computes
-  GX's dynamic S and T matrices; `BUMP_OFFSET_SCALE` in `d3d8_gx.c`), and the coordinate as
-  scaled by the size of the map given with `GX_TEXMAP_DISABLE`. If the console's bumps move the
-  reflection too far or too little, that scale is what differs.
+Dolphin runs the game, but these need the console. The list is in the order to do them in: the
+set-up first, then what shows whether the game can be used at all, then the rest. For each item:
+what to set up, what to do, and what the log or the screen should show. Report each with its
+number and, where the item says so, the level's name. The requirement behind all of it is 30 frames
+a second (33 ms a frame) on every level; items 12 to 14 are the ones that say where a level that
+misses it loses its time.
 
-- **GX's lighting.** The Fresnel colour (D1) takes a light with a negative attenuation (k0 of -1)
-  where the reflection is brighter at grazing angles, as Dolphin computes it; if the console
-  clamps an attenuation at 0, the models' reflections lose their grazing brightness (compare
-  `display.gx_lighting = false`). GX makes the lit normal unit length (as Dolphin does), and
-  the view's sphere maps are drawn in the EFB's rows 480 to 527, below the back buffer.
+1. **Set-up and the log.** Copy `build/wii/halo-wii.zip`'s `apps/halo` to the SD card (the Homebrew
+   Channel's folder), the converted maps to `apps/halo/maps`, and make an empty folder
+   `apps/halo/logs`. With that folder the game writes its log to `apps/halo/logs/log-NN.log` (NN
+   the first number not used, 00 to 99, then 00 again; opened by `wii_boot.c` after the SD card and
+   the USB drive are mounted, so the first lines, up to the "IOS" line, are on the debug port only;
+   written 4 KB at a time and when the game leaves, stops or reports a crash, so a cut power loses
+   the last lines); without the folder it writes nothing to the card, and a console has no other
+   way to give the log back, so every item below that says "the log" needs it. Delete old logs now
+   and then. `apps/halo/config.toml` is where the settings go (`port/linux/README.md` has every
+   setting and its default).
+   Look for: the Homebrew Channel starts the game; the log has the `video:` line (item 8), the
+   memory report every 240 frames (`memory: MEM1 heap`, `memory: MEM2 window`, the `[mem]` lines;
+   no `malloc(N) failed`), and `a frame takes N ms` every 60 frames; the menu is up with its music;
+   a stop screen instead names its cause (missing maps, the fixed memory, a stub).
+2. **The controllers in the hand.** `debug.input_log = true` in `config.toml`, a run that only
+   goes to the menu and in play, then for each controller (Wii Remote with Nunchuk, Wii Remote with
+   a Classic Controller or Classic Controller Pro, and a GameCube controller on a port with no
+   Remote on that player's number) press every button in turn, slowly, and move each stick to
+   its gate and each trigger through its travel. Copy the log to a computer and run
+   `tools/wii_input_log.py LOG --expect remote|classic|gamecube`: it must report every press as the
+   table in "The controllers" says. Look for: the sticks reach their ends (the log's `left` and
+   `right` values at the extremes are the Xbox's full range, and are 0 at rest, with no drift that
+   the game's dead zone does not cover); the triggers' analog values rise through their travel
+   (the Classic Controller's) and are full when the digital button is down (the Pro's); a
+   Remote's drop-out (turn the Remote away for a moment) leaves the player in place for up to two
+   seconds, then the game's own "controller unplugged" pause; a Nunchuk plugged in and out in play
+   does not remove the controller. The pointer (a Remote with a Nunchuk, the sensor bar in place)
+   needs a person: the view rests within the middle of the screen, turns toward the pointer outside it,
+   slowly then at the profile's look speed at the screen's edge, is not jittery, stops 150 ms after
+   the sensor bar is lost (cover it), and the aim magnetism holds a target. The Wii U Pro Controller
+   is not supported; say whether it does anything. Remote batteries: `remote N battery code C` in the
+   log against the percent the HOME menu shows, with a Remote that is full and one nearly spent
+   (the notice appears once below 10%).
+3. **The HOME menu.** In the menu and in play, press HOME on a Remote and on a Classic Controller
+   (a GameCube controller has none). Look for: the menu opens over the paused game with its three
+   items and the batteries' line (every connected Remote), the sound fades out over 300 ms and back
+   in, nothing is rumbling, the pointer turns nothing, the text is legible on a television; A
+   chooses, B, 1 or HOME resumes; the button that chose Resume does nothing in the game until it
+   is let go; "Reset to title" reaches the main menu (not offered when a menu is up); "Return to
+   the loader" asks first (Cancel chosen) and then leaves for the Homebrew Channel with the log's
+   `leaving (loader)`. The notice for a Remote with no Nunchuk or Classic Controller (seven seconds,
+   once) and the weak battery notice.
+4. **Rumble.** In a level (a firefight, grenades, a vehicle) with a Remote and with a GameCube
+   controller. Look for: the duty cycle (62 switches a second at most) feels like a strength and
+   not a buzz, half strength is not full strength; it stops at a pause, the HOME menu, a
+   disconnect, a quit and a map loading; the console's setting for Remote vibration set to off means
+   no rumble at all, the GameCube controller's included.
+5. **Reset, Power and the Remote's power button.** Each of them (a) while a map loads, (b) in
+   play, (c) at the menu, and (d) at the stop screen (missing maps: start once with `apps/halo/maps`
+   renamed; HOME returns to the loader). Look for: Reset returns to the Homebrew Channel, Power and the
+   Remote's power button put the console into standby; the log's last lines are `leaving (loader)` or
+   `leaving (power off)` (tag `system`), no motor is left running, the SD card's folder is intact
+   (the card on a computer shows no `.wtmp` or `.wold` in `apps/halo/saves` after the next start has
+   swept them, and the file system is clean).
+6. **Saves, loads and cut saves.** (a) Play a campaign level to a checkpoint, SAVE AND QUIT, start
+   again and Continue: the checkpoint loads and plays. (b) Power off (the console's button) during
+   SAVE AND QUIT, as the log says the save is written (`begin player profile write`, the
+   checkpoint's `persistent storage`); then with the card pulled during it; start again each
+   time: the log has `save: ... put back after an interrupted write` or nothing, Continue loads
+   the old checkpoint or the new one, never a broken one, and the card's FAT is clean when read on a
+   computer. (c) A card with no room left (fill it), and a card with its lock switch on: SAVE AND
+   QUIT says it could not save (the profile's and the checkpoint's messages, `save: <file> ...`
+   naming the cause), the game goes on to the menu and nothing hangs. (d) The first start with an
+   empty `apps/halo/saves` (the default profiles are written once; the `files:` lines say how
+   long, the second start writes none). The files the game makes again at every start are in "Files
+   the game makes again".
+7. **Sound.** The console's Wii Settings, Sound: mono, stereo and surround, one run each. Look for:
+   the log's `audio: playing in mono` only for mono, and a mono game sounds the same in both
+   ears; stereo and surround play stereo; `audio.speakers = "stereo"` and `"mono"` override the
+   console's. The log's `audio:` report every 240 frames has no underruns (blocks played against
+   mixed), a mixing time a block (`mixing N us a block`; about 0.6 ms in the menu in Dolphin) that leaves the
+   processor its share of the frame, and a
+   peak below 32767 (the report's `peak N of 32767`). The reverb (`audio.reverb`, on): indoors (b30, a30's halls and
+   corridors) and outdoors, a battle indoors, with it on and off: the room sounds like a room (a
+   decay that follows the place) and not metallic or muffled, going through a door fades to the
+   next room's without a click, and the mixing time rises by about 0.7% of the processor's (the harness's count). Music,
+   dialogue and effects all heard; the volume settings do what they say.
+8. **The picture on each TV.** The console's settings (Wii Settings, Screen), a run to the menu
+   and into a level each time, and the first lines of the log: `video: ...` must name the mode the
+   table in "The picture on each TV" gives.
+   - 4:3 and 16:9: on the 16:9 setting `display.wii_widescreen` `"pillarbox"` (the default) shows a
+     round circle (the HUD's and the pause menu's) in the middle three quarters with black at the
+     sides, the HOME menu included; `"stretch"` fills the screen, a third too wide. No flicker
+     at the picture's edges.
+   - 480p: progressive scan on with a component cable: the `video:` line says progressive, the picture is steady
+     (no interlace flicker), 30 frames a second.
+   - PAL: EuRGB60 on (the log says 480 lines at 59.94 Hz, the game's speed is right and the frames
+     even); EuRGB60 off (576i at 50 Hz; the 480 rows of the picture scaled to the 576 lines, nothing of the
+     48 scratch rows below them on the screen, the game's speed right, and the frame lengths
+     alternating two and one retraces: 30 a second).
+   - The display position (Wii Settings, Screen, Display Position) moved to its extremes: the
+     picture moves with it and nothing is cut that the television shows; a 16:9 setting allows 8
+     pixels.
+9. **The SD card's read speed and the loading of a level.** From the menu, load a10, b30 and the
+   largest, b40 or c20, and a saved game, on the SD card and (if you have one) a USB drive. Look for:
+   the `files:` lines (about every two seconds while reads go on): the reads' count and sizes
+   (`reads in 2000 ms: N, K KB in M ms`) give the card's real MB/s (the converter's maps are 33 to
+   36 MB a level), the three counts `B`, `U`, `S` (buffers not on 32 bytes, offsets not on 512,
+   reads under 4 KB) say whether the card's driver likes the reads, and the longest `files:` call
+   (`writes took N ms` lines); the load's time from the log (the long frame, `frame N took N ms`,
+   and the time of the next `a frame takes`). Dolphin's 11 seconds is not the console's; report the
+   card's brand and class. A load that takes much more than the card's speed explains is the
+   game's own work (tags, structure, objects).
+10. **Alignment exceptions.** Play every level (a tour: `debug.network_test` with a list of levels,
+    `debug.network_test_tour` seconds in each, `debug.test_input = "bot:1"`, as in "The
+    playthrough check"), the menus (the settings screens, the profile, the campaign menus), a saved
+    game, and the multiplayer maps if they are reached. Look for: no `*** CRASH: alignment exception`
+    (nor any other `*** CRASH`, which has the registers and the callers for `addr2line` on
+    `build/wii/halo.elf`) in the log. The 750 can trap a floating-point load from an address that is
+    not a multiple of 4; Dolphin does not. The compressed animations' floats are read a byte at a
+    time for this, and the script stack's values start at a multiple of 4 (`HS_STACK_PADDING`,
+    `source/hs/hs_runtime.c`). The rest was audited with an x86 build compiled with clang's
+    `-fsanitize=alignment` (a handler that logs each site), played by the bot through every campaign
+    level and the 13 multiplayer maps (25,000 to 470,000 ticks each): of the misaligned accesses it
+    reported, only the script stack's are floating-point loads or stores in the Wii's objects (the
+    others are integer loads and stores, which the 750 completes without a trap: the script
+    stack's frames and longs, the debug allocator's headers, the recorded animations' shorts, the
+    breakable surfaces' flags and the tag validator's read of compressed animations), and the
+    game's objects have no `lmw` or `stmw` (their one `lwarx` is on an aligned pointer). Code the
+    bot did not reach (the menus past the title, saved games, network play) is what a report would
+    name.
+11. **GPU hangs.** The same tour. Look for: no `GX did not finish in time` (it says where GX
+    stood when it gave up: the status flags, the GP FIFO's pointers and fill, the last token), no
+    frame that takes seconds. The flush after an EFB copy, a token or a draw-done
+    (`debug.gpu_xf_flush_safe`, on: eight vertices of zeros, which draw nothing) is the remedy
+    libogc names for a hang of GX's transform unit on a clipped primitive after them; if a hang does
+    show, run the level again with it `false` to say whether it is the cause. The FIFO in MEM1: the
+    log's `FIFO fill peaked at N of 524256 bytes` (by 64 KB steps and at shutdown) and `GX FIFO
+    overflows so far` (none): the peak and the overflows are as on Dolphin, and a FIFO that fills
+    makes the processor wait.
+12. **The hardware counters, per level.** `apps/halo/hwcount.txt` with the line `raw 1` (the file
+    is "name value" lines, the defaults in "The hardware counters"), `profile.txt` removed (one file at a time, so that the profiler's interrupts are not in the
+    counters' frames), the tour of item 10 (`debug.network_test_tour` 40 or more: `first 60` frames are let go by, then
+    every second has a block). First, once, the self-test: the `[hw]` lines at the start must say
+    `gp: counters count (drew 6 vertices; slots read 6 0 6 0; perf0 on slot 0, perf1 on slot 2)`
+    and not `cpu: no counters` or `gp: no counters`, and the `raw` lines show which slot moves
+    for every group; `clk 243.0 MHz` is the GP's measured clock (far from 243 and the pairs' shares
+    are wrong: say what it was). Then for each level, with the level's name: the block's `frame`
+    and `worst` against 33.3 ms, `cpu waits`, the verdict at the slowest and fastest moment and the
+    three or four numbers that decided it (the rules are in "The hardware counters"), and the
+    `marks` line if one is set. Verdicts: CPU-bound with memory stalls (a data-layout problem),
+    with compute (fewer instructions), transform-, fill/TEV-, texture- or vertex-fetch-bound (see
+    that section for what each wants). If the verdict disagrees with the numbers above it, send
+    both: the thresholds (`wl_hwcount_thresholds_default`) are starting values.
+13. **The sampling profile, per level.** Remove `hwcount.txt`; `tools/wii_profile.py setup --note
+    b30 --repeat 10` (or by hand: `apps/halo/profile.txt` with `seconds 20`, `after 10`, `skip 1`,
+    `repeat N`), and the tour of item 10 with the levels in the order of the tour: `profile<N>.txt`
+    appears beside `profile.txt` for each level and the log has the samples (`log 1`). On a
+    computer: `tools/wii_profile.py report profile1.txt --top 40 --callers update --tree 2
+    --timeline` (the ELF is `build/wii/halo.elf`, of the build that was run). Look for: the
+    functions the console waits in that Dolphin does not show (the profile counts where the
+    processor waits as well, Dolphin's only instructions): the game's thread is the busiest, and
+    the top functions on the console against Dolphin's. Send each `profile<N>.txt` with its level's
+    name.
+14. **The frame rate.** With neither file, the settings of the person's choice (the defaults first):
+    each level from its start to its end, and the multiplayer maps, as a person plays it (the
+    scripted playthrough or by hand). Look for: the log's `a frame takes N ms` lines (every 60
+    frames: draws, textures, pixel shaders, the end of the frame, the rest) against 33 ms, the
+    slowest second of each level and where it is (a battle, a vehicle, the beach's water, a10's
+    cryo bay), and a picture that moves smoothly. The settings that trade look for time:
+    `display.model_detail`, `display.object_shadows`, `display.bumped_highlights`,
+    `display.environment_reflections`, `display.bumped_lightmaps`, `display.gx_lighting`: run the
+    slowest level with each changed from its default and report which brought the frame under 33 ms.
+15. **TEV's arithmetic (the bump mapping).** The bump mapping's signed sums rely on TEV's lerp with
+    a bias of -1/2, its scale, and results kept unclamped between stages (-4 to 4); the host
+    check (`tools/wii_gx_psh_check.py`) simulates the documented rules in 8-bit steps, and the
+    console is not checked. With `display.bumped_lightmaps = true` (the default): in a10's cryo bay
+    floors and walls, and b30's metal, look for banding or the wrong sign in the lightmaps' bump
+    term (a light on a bumped wall lighting the side that faces it, not the opposite), then the same
+    place with `false` (flat lightmap) for the difference; a screenshot of each (a camera or the
+    television) with the level's name.
+16. **The indirect unit's offsets (the bumped reflections).** With `display.bumped_highlights =
+    true` and `display.environment_reflections = true` (they cost the frame its time, so for the
+    look only): the bumped reflection's offset is the coordinate times the indirect texel less 128,
+    over 256, times 2 to the matrix's scale (`BUMP_OFFSET_SCALE` in `d3d8_gx.c`, as Dolphin
+    computes it), and the coordinate as scaled by the map given with `GX_TEXMAP_DISABLE`. In
+    a10's cryo bay floors and b30's metal, look at whether the reflection moves too far or too little
+    over the bumps; if the console differs from Dolphin, that scale is what to change.
+17. **GX's lighting.** `display.gx_lighting = true` (the Wii's default) against `false` (the
+    processor's per vertex, as the Xbox's programs): the Fresnel colour (D1) takes a light with
+    a negative attenuation (k0 of -1) where the reflection is brighter at grazing angles, as Dolphin
+    computes it. If the console clamps an attenuation at 0 the models' reflections lose their grazing
+    brightness (the models' reflections at a low angle: compare the two settings). GX makes the lit normal unit length (as Dolphin does); the view's
+    sphere maps are drawn in the EFB's rows 480 to 527, below the back buffer: no stripe of them
+    on the television, in any video mode (item 8).
+18. **The square root's estimate.** The vertex programs' square root starts from `frsqrte`, checked
+    on the host for estimates as coarse as the 750's documented 1/32; Broadway's own is not
+    documented. Run WiiLibs' `tests/console/wl_console_tests.dol` from the Homebrew Channel (it is
+    built with WiiLibs: `cmake --build build/wii`; its `sqrt` suite, `tests/gfx/suite_sqrt.c`, runs
+    the real `frsqrte`): the suite passes, and no fall to the integer root is counted. If it fails,
+    the first failing input and its estimate are the evidence.
+19. **Memory.** In the tour of item 10, the memory report's peaks: MEM1 and MEM2 as the console's
+    IOS leaves them with the Homebrew Channel's loader. The window line says where libogc's MEM2
+    began (the window reaches down to it) and WiiLibs'
+    `[mem]` lines say what its heaps were given; look for: no `malloc(N) failed`, the game's stack
+    well under its 512 KB, the largest free run of the window not shrinking level over level, and no
+    allocation refused (the profiler's ring is 700 KB). A level that fails here is run again
+    alone, to tell a leak from a peak.
 
 ## What is next
 
@@ -1581,8 +1715,8 @@ Dolphin runs the game, but these need the console:
    path (a10's cryo bay floors, b30's metal). A dynamic light's specular pass reads a 3D
    texture and draws nothing (its attenuation could be the vertices').
    Sampling the cube maps put the environment's lit pass (`10c30c53`, whose cube map direction
-   comes from the tangent frame) back on the CPU: a10's frame takes about 200 ms in Dolphin (150
-   without them).
+   comes from the tangent frame) back on the CPU: a10's frame took about 200 ms in Dolphin (150
+   without them) when that was measured; the introduction has the latest figures.
 3. Playing on. The campaign beyond a10's opening, and the lockstep check over longer sessions and
    more levels. Big-endian faults found so far:
    - plain char's sign (fixed with `-fsigned-char`);

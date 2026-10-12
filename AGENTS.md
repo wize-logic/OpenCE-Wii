@@ -26,7 +26,7 @@ end.
 | `port/assets/` | What the builds embed or ship: high-res HUD (`hud/`), fonts, titles, menus (`menus/`), icons, network brokers |
 | `port/third_party/` | Vendored libraries, each with a README naming its upstream, version and checksum |
 | `port/tools/` | Stand-alone tools (`cache_file_report.c`) |
-| `tools/` | Build scripts (`linux_build.py`, `windows_build.py`, `android_build.py`, `web_build.py`, `ci_build.py`, `web_serve.py`), generators (`ce_menus.py`, `port_settings.py`, `hud_assets.py`, `title_assets.py`, `embed_assets.py`, `xdk_headers.py`), the Wii's (`wii_build.py`, `wii_link.py`, `wii_package.py`, `wii_convert_maps.py`, `wii_tag_layout.py`, `wii_gx_textures.py`, `wii_dolphin.py`, `lockstep_compare.py`, `wii_input_log.py`, and the host checks `wii_gx_psh_check.py`, `wii_nv2a_check.py`, `wii_input_check.py`, `wii_gx_texel_check.py`, and on converted maps `wii_animation_check.py`, `wii_data_check.py`, `wii_placeholder_check.py`) and tests |
+| `tools/` | Build scripts (`linux_build.py`, `windows_build.py`, `android_build.py`, `web_build.py`, `ci_build.py`, `web_serve.py`), generators (`ce_menus.py`, `port_settings.py`, `hud_assets.py`, `title_assets.py`, `embed_assets.py`, `xdk_headers.py`), the Wii's (`wii_build.py`, `wii_link.py`, `wii_package.py`, `wii_convert_maps.py`, `wii_tag_layout.py`, `wii_gx_textures.py`, `wii_dolphin.py`, `wii_profile.py`, `wii_draw_bench.py`, `wii_fp_check.py`, `lockstep_compare.py`, `wii_input_log.py`, and the host checks `wii_gx_psh_check.py`, `wii_nv2a_check.py`, `wii_input_check.py`, `wii_gx_texel_check.py`, and on converted maps `wii_animation_check.py`, `wii_data_check.py`, `wii_placeholder_check.py`) and tests |
 | `docs/` | Longer design notes (`custom_edition_caches.md`) |
 | `pgo/` | Profile-guided optimisation profiles |
 | `assets/` | Game data for local runs (gitignored: `maps/`, `custom_maps/`) |
@@ -242,7 +242,9 @@ converted, how it draws, and the lockstep check.
   programs: it finds WiiLibs in `WIILIBS`, `./WiiLibs` or `../WiiLibs`) and
   `python3 tools/wii_nv2a_check.py` (the generated vertex programs against
   the interpreter) and `python3 tools/wii_input_check.py` (the controllers'
-  mapping to the Xbox gamepad), all in the CI's `wii` job. `tools/wii_animation_check.py`
+  mapping to the Xbox gamepad) and `python3 tools/wii_gx_texel_check.py` (the
+  processor's reads of GX's textures), and `WIILIBS=WiiLibs python3 -m unittest
+  tools/test_wii_profile.py` (the profile tool), all in the CI's `wii` job. `tools/wii_animation_check.py`
   (every animation of the Xbox's maps against the converted ones) and
   `tools/wii_data_check.py` (the other data blocks and the bitmaps) need the
   maps, so they are not in the CI.
