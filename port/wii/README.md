@@ -131,8 +131,90 @@ before each call that changes it (and half-way through each write), on a card th
 file and on FAT's, then sweeps and checks that the file is the old one or the new one, no copy
 is left, and that a copy renamed over a file was synced after its last change; and the same
 sequences on a full card (a write that errs, one that takes no bytes), a read-only card, a card that
-is gone and a rename that fails. Ten faults put into the code are each caught. Needs a
+is gone and a rename that fails. Fourteen faults put into the code are each caught. Needs a
 checkpoint on a real card (below): power off during a save, and a card pulled.
+
+### Files the game makes again, and the start-up
+
+The game writes its default player profiles and default game variants
+(`z:\saved\player_profiles\default_profile\`, `z:\saved\playlists\default_playlist\`: about
+thirty files) at every start, and the menus take no input until the start-up thread has done it
+(`filesystem_initialization_thread_proc`, `source/interface/ui_widget.c`; on the Xbox the intro
+movie covers it, and the Wii has no Bink). It empties the folder, makes each file (`file_create`,
+an empty file), opens it and writes one block into it. With the saves' copy-and-rename above that
+was, for one variant on FAT, 11 calls that change the card (2 opens, 1 write, 2 syncs, 4 renames, 2
+unlinks) on the first start and 12 on every start after; over thirty files that is the 4.5 s the
+first Dolphin run showed. These files lose nothing to a cut (the next start writes them again), so
+(`xbox_files.c`, "files made again"):
+
+- They are not written beside themselves and not synced.
+- `DeleteFileA` leaves them where they are, and a file made again keeps its contents until the
+  game writes something else into it; a file the game emptied and then wrote is cut to what was
+  written when it closes.
+- A file is opened for reading until a write differs from what it holds: a write of the same bytes
+  is not made, and the descriptor that can write is opened only for a write that differs.
+- The first start writes each variant once (2 calls: the file made, one write), and every start
+  after writes nothing to the card for them (0 calls). `python3 -m pytest
+  tools/harness/tests/test_atomic_saves.py` has the cases (`regen-first`, `regen-again`,
+  `regen-changed`, with the sequence of calls counted: `atomic_saves profile:regen-count` prints the
+  numbers above) and four faults that must be caught.
+
+Smaller changes with the same aim: a copy that nothing was written to (a file made empty) is
+renamed without a sync; a file opened for reading and writing that the game then only reads (the
+listing of the saves opens every one to check its sum) is opened for reading, and gets its copy
+at the first write; `SetFileAttributesA` does not write the read-only bit when it is already as
+asked (the game makes a file ordinary before it deletes it); and a path that is there as it is
+written is translated with one `stat` where it had a look into every directory along it
+(`translate_as_written`: each look opens a directory of the card and reads all its entries, once
+for every part of the path, at every open; the answer is the same, which `tools/harness/tests/test_path_translation.py` checks
+against the look at every part, and it counts the directories looked into).
+
+What was measured, and what was not: the call counts above are exact (the host test counts the
+calls that change a modelled card). The time is for a checkpoint run: the log now says where the
+card's time goes. About every two seconds while files are used, and when a call takes 25 ms or
+more (the first 64), `files:` lines appear:
+
+```
+files: 410 ms in 187 calls: paths 12 ms (95) open 120 ms (30) directories 35 ms (31) writes 210 ms (30) ...
+files: writes took 83 ms (sd:/apps/halo/saves/z/saved/playlists/default_playlist/03/blam.lst)
+```
+
+(`paths` the translation of Xbox paths, `open` the opening of a file with its copy, `directories`
+mkdir and the opening of a listing, `attributes` stat, `writes`, `syncs`, `closes`, `replacing` the
+copy's rename over its file, `deleting`). The start-up's cost is the total on the line after the
+last default variant.
+
+### Reading the maps
+
+A level load reads the map through `ReadFile` and `ReadFileEx` with an offset; the Xbox's overlapped
+reads finish where they are issued here (there is no read in flight to wait for), so there is no
+asynchronous read to add. Two things are the platform's:
+
+- A handle opened for reading only with `FILE_FLAG_OVERLAPPED` (the maps) keeps its place: a read
+  that starts where the last one ended is a `read` and nothing else. Before, each was WiiLibs'
+  `pread`, which is a seek to the offset, the read and a seek back to where the handle stood; on
+  FAT a seek walks the file's chain of clusters from the cluster it stands at (or from the start,
+  when it goes backwards), and the one back to the handle's old place made every read walk the
+  chain from the start. The handle's own position is put back when something that uses it comes
+  (`SetFilePointer`, a read without an offset).
+- The reads are counted: about every two seconds, `files: reads in 2000 ms: N, K KB in M ms
+  (largest L KB; S under 4 KB, B into a buffer not on 32 bytes, U from an offset not on 512, X
+  seeks)`, and a file that was read much says, as it closes, `files: <path> closed after N reads, K
+  KB in M ms`. The three counts say whether the reads reach the card's driver as it likes them:
+  libogc's SD driver reads straight into a buffer that is on 32 bytes (the DMA's alignment), and
+  is believed to go by a copy for one that is not (the checkpoint's counts will say whether
+  that matters); libfat hands it the buffer shifted by the offset's place in its sector, so what
+  counts is the address less the offset, modulo 32.
+
+The a10 and b30 loads in the earlier Dolphin runs (`build/wii/ck_*.log`) are, in the emulated
+clock the log's times are in: the menu's map 0.7 s and then 253 reads, 12 MB in 0.69 s; a level
+123 to 125 reads, 33 to 36 MB in 0.38 s of a 1.2 s frame whose other 0.8 s is the game's own work
+(tags fixed up, the structure, the first objects); a saved game's load 120 reads, 36 MB in 0.40 s.
+Dolphin reads the host's disk, which is faster than an SD card by an order of magnitude, so on
+the console the same 36 MB are what the load waits for (at 5 to 10 MB/s, 4 to 7 s), and the reads'
+number and size are what to cut there. (A load that takes 11 s of wall-clock time against 1.2 s in
+the log's clock would mean Dolphin runs the load at a fraction of real time; the checkpoint run
+will tell which it was, from the `files:` lines and the times on them.)
 
 ## How the port operates
 
