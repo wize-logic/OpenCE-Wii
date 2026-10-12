@@ -689,6 +689,13 @@ static const struct config_setting config_settings[] =
 	{ "debug.gx_display_lists", _config_boolean, "true", "HALO_GX_DISPLAY_LISTS", _environment_value, _platform_all,
 		"The Wii: the structure's draws whose vertices are their indices alone are\n"
 		"written once into GX display lists and called; false sends the indices each draw." },
+	{ "debug.draw_log_tick", _config_integer, "-1", "HALO_DRAW_LOG_TICK", _environment_value, _platform_wii,
+		"The Wii: every draw of the frame drawn after this game tick (the first such\n"
+		"frame; with fixed_ticks, a frame a tick) described in the log; -1 none." },
+	{ "debug.draw_log_points", _config_string, "\"\"", "HALO_DRAW_LOG_POINTS", _environment_value, _platform_wii,
+		"The Wii: with draw_log_tick, pixels of the back buffer (640 by 480), \"x,y;x,y\",\n"
+		"read back after each draw of that frame, each change logged with the draw\n"
+		"that made it (at most 16)." },
 	{ "debug.gpu_xf_flush_safe", _config_boolean, "true", "HALO_GPU_XF_FLUSH_SAFE", _environment_value, _platform_all,
 		"The Wii: after an EFB copy, a draw-sync token or a draw-done, the next\n"
 		"primitive is preceded by a few vertices that draw nothing, which flush\n"

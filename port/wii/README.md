@@ -1256,10 +1256,24 @@ and pixel shaders.
   of a matrix index and nothing else read send their first colour as 0. A build with assertions
   checks every primitive's descriptor (`vertex_shape_check`).
 - **Debugging.** The desktop ports' `debug.gpu_debug_flat` and `debug.gpu_debug_texture0` (in
-  `config.toml`) show the diffuse colour, or the first texture, alone. One frame's draws are
-  described in the log (`DRAW_LOG_FRAME`, a frame number, defined when `src/d3d8_gx.c` is built),
-  the processor's draws and GX's alike, each with the pixels at `DRAW_LOG_POINTS` (`{ x, y, x, y
-  ... }`) read back after it: which draw makes a pixel what it is.
+  `config.toml`) show the diffuse colour, or the first texture, alone. The draw log, a setting of
+  any build, describes every draw of one frame and names the draws that make a pixel what it is:
+
+  ```toml
+  [debug]
+  fixed_ticks = true            # a frame a tick, the same frame on every run
+  draw_log_tick = 300           # the frame drawn after game tick 300; -1 (the default) none
+  draw_log_points = "320,190;60,90;560,250"   # back buffer pixels (640 by 480), at most 16
+  ```
+
+  Each draw, the processor's and GX's alike, and each clear, is numbered and described: `draw N
+  (GX's transform, program 3f6a2f54, target the back buffer): prim, count, screen extent, D0 |
+  blend, alpha test, depth`, then its projection, a vertex's outputs, the pixel shader's
+  combiners and constants and each texture (`t0 256x256/14d@<its data's address>`). After each
+  draw to the back buffer the points are read back (GX drawn to that point first, so the frame
+  is slow), and each change is logged, `pixel (x, y) changed by draw N: r g b a, was r g b a`;
+  render target changes are logged too. When the frame is shown, `draw log: frame F: N draws`
+  and each point's last eight writers close it. Off, a draw pays a load and a compare.
 
 ### What the frame draws
 
