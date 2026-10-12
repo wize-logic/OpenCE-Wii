@@ -1476,7 +1476,13 @@ test_input = "script:level_b30.txt"
 and on x86, headless, the same with `SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
 HALO_NULL_RENDERER=1 HALO_HIDDEN_WINDOW=1 HALO_NETWORK_TEST='solo:levels\b30\b30' HALO_FIXED_TICKS=1
 HALO_LOCKSTEP_LOG=30 HALO_TEST_INPUT=script:level_b30.txt` and the script in the data folder.
-`tools/lockstep_compare.py x86.log wii.log` then names the first tick that differs. A run on x86
+`tools/lockstep_compare.py x86.log wii.log` then names the first tick that differs.
+
+Where they stand on x86 (the debug build, headless; two runs of a build end at the same tick): a10
+ends at tick 52868, a30 at 70536, a50 at 52823, b30 at 61456, b40 at 89355, d20 at 24697. Open:
+c10 (its lifts, which the BSP changes ride on), c20 (the library's lifting platforms, and the
+monitor's command lists that open its doors), c40 (its distances, which want the banshee, over 12
+BSPs) and d40 (the engine room's manifolds, then the timed warthog run). A run on x86
 takes a few minutes per level (the null renderer runs the game at hundreds of ticks a second); on
 the Wii in Dolphin, a level of 50,000 to 90,000 ticks takes as long as the game at the emulated
 frame rate.
