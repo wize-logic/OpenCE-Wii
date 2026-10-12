@@ -258,6 +258,13 @@ converted, how it draws, and the lockstep check.
 
 ## Specialized agents
 
+Two versions of the same team. The lean one, three agents at a time, is the
+default. The full one, six agents at a time, is used when the person asks
+for it; its roles are the lean ones' split finer. Either chooses its work as
+"Choosing the work" says.
+
+### The lean version: three agents
+
 Three roles for the Wii port, divided by the files each owns so that all
 three can run at once without meeting. Each is given to an agent (Claude
 Code's `Agent` tool, a general-purpose agent whose prompt starts with the
@@ -275,7 +282,7 @@ for one task, to the agent the task's prompt gives it to. Each agent
 describes its own change in the README section it concerns; the platform
 agent keeps the documents as a whole true to the code.
 
-### Running them
+#### Running them
 
 - Three at once, one per role. When one finishes, the main session reviews
   its report, merges its branch once its checks pass (after a Dolphin
@@ -289,6 +296,171 @@ agent keeps the documents as a whole true to the code.
   branch named for its task. Agents do not launch Dolphin: they ask the
   main session for a checkpoint run, naming what it should show. Merges
   from upstream are the main session's.
+
+#### renderer
+
+Draws what the Xbox drew, at 30 frames a second.
+- A change to GX's transform is checked by an A/B of the same moment with
+  `debug.gpu_transform = false` (a checkpoint run).
+- Speed is counted as the log's work (the processor's vertices, `vertex
+  programs run most`, draws, bytes flushed) and qemu instruction counts, as
+  well as Dolphin's milliseconds, which do not track the console.
+- Builds with `ninja wii`. Runs `tools/wii_gx_psh_check.py` and
+  `tools/wii_nv2a_check.py` after any change to the translation or the
+  vertex programs.
+- A render-only shortcut (fused multiply-adds, estimates) never reaches
+  game state.
+
+#### game
+
+Makes the Wii's game the x86 game, tick for tick, from start to end.
+- The converter swaps every tag field by the layouts `build/wii/halo.elf`
+  gives, relocates pointers, and converts the data blocks that are not
+  plain fields. Its checks (`wii_animation_check.py`, `wii_data_check.py`,
+  `wii_placeholder_check.py`) report nothing on the 24 maps. Output goes to
+  a scratch folder, never the repository.
+- The lockstep check: it builds and runs the x86 side headless in Docker
+  (port/wii/README.md, "The lockstep check"), and the Wii side is a
+  checkpoint run. It names the first tick that differs and traces it to its
+  cause. Its report keeps a table of levels: the ticks that agree, the
+  first that does not.
+- Playthroughs: scripts (`debug.test_input`) that play the menus and every
+  level from start to end as a person would.
+- Between tasks, read-only sweeps for big-endian hazards: widths, unions,
+  byte order, bitfields over file data, mismatched prototypes. Each finding
+  gives its file and line and why it matters.
+
+#### platform
+
+Makes it a Wii program a person can use, and keeps the branch healthy.
+- WiiLibs: what the port works out that any Wii program could use moves
+  there, with its tests (host `ctest`, `ppc-be` under qemu, the Wii compile
+  check). The port then takes it from WiiLibs.
+- The Wii's platform: the controllers, the system buttons, HOME, saving,
+  video modes, start-up.
+- Health: the CI's jobs run locally in their images from a clean export
+  (`git archive`), and the READMEs and this file are checked against the
+  code.
+
+### The full version: six agents
+
+Six roles for the Wii port. Each is given to an agent (Claude Code's
+`Agent` tool, a general-purpose agent whose prompt starts with the role
+below) together with a concrete task, at the model and effort its role's
+table row gives (the tool's `model` and `effort` parameters). An agent that edits files works in
+its own git worktree, commits there on a branch named for its task, and
+reports what it changed and how it checked it; the main session reviews
+and merges. Agents do not launch Dolphin: they ask the main session for a
+checkpoint run, naming what it should show.
+
+| Role | Model | Effort | Why (from each role's first run) |
+| --- | --- | --- | --- |
+| map-converter | opus | high | Binary formats where one wrong width corrupts data silently: it found a section-sizing bug in compressed animations by reading the game's decoder, and wrote a check of every animation in 24 maps |
+| endian-auditor | opus | high | Whole-codebase reasoning about layouts and widths, cross-checked against the debug information; a missed or false finding is costly |
+| gx-renderer | opus | high | Performance work that must stay bit-identical: it halved the processor's instructions per vertex and proved the output unchanged under qemu |
+| lockstep-runner | opus | high | Mostly waiting on Docker and Dolphin, but its value is tracing a divergence to its cause across systems (identifier salts to a needle's wander and a tree's frame) |
+| wiilibs-steward | sonnet | high | Bounded library work with clear conventions (an API, tests on three targets, CMake); its scoping was good without needing more |
+| ci-steward | sonnet | high | Procedure (running the CI jobs, checking documents against code) where care, not depth, finds the faults |
+
+#### Running them
+
+- Keep six agents running at once. When one finishes, the main session
+  reviews its report (and merges its branch once its checks pass, after a
+  Dolphin checkpoint if it changes what is drawn or played), records what
+  needs a checkpoint, and starts the next task at once.
+- No two running agents edit the same files; editing agents work in their
+  own worktrees.
+- The next task is chosen as "Choosing the work" says, for whichever role
+  it fits; a role may run twice at once on unrelated tasks.
+
+#### map-converter
+
+Owns the map conversion: `tools/wii_convert_maps.py`,
+`tools/wii_tag_layout.py`, `tools/wii_gx_textures.py`.
+- The converter swaps every tag field by the layouts the Wii build's debug
+  information gives (`build/wii/halo.elf`), relocates pointers, rewrites
+  bitmaps in GX's formats, and converts the data blocks whose contents are
+  not plain fields (vertices, animations, recorded animations, script
+  syntax, cluster visibility).
+- Its checks: `tools/wii_animation_check.py` (every animation, value by
+  value, against the game's own reading); every map converts (`--output`
+  into a scratch folder, never the repository); the notes it prints (fields left as they are that hold
+  data, data not reached by the walk); a converted structure read back
+  against the game's own reading of it (`tools/wii_animation_check.py`,
+  `tools/wii_data_check.py`: nothing may differ on the 24 maps); and
+  `tools/wii_placeholder_check.py`: the game reads none of the bytes left
+  as they are that hold data (by its declarations and clang's AST of the
+  build; it must report nothing on the 24 maps).
+- A field the game reads through another structure than its tag's (as the
+  contrail's shader) is listed in `Schema.EMBEDDED`.
+
+#### endian-auditor
+
+Read-only. Finds big-endian hazards in `source/` and `port/linux/game/`:
+values written at one width and read at another (a narrow value in a
+32-bit cell, `halo_cells.h`), unions of different widths, byte-order
+assumptions, C bitfields over data from maps or files, mismatched
+prototypes across files. Reports each finding with its file and line, the
+expression, why it differs on a big-endian machine, and how likely it is
+to matter in play; confirms with the lockstep check's results where it
+can. Fixes are made by the main session or a `gx-renderer` or
+`map-converter` agent.
+
+#### gx-renderer
+
+Owns the Wii's Direct3D device: `port/wii/src/d3d8_gx.c`, `gx_psh.c`,
+`nv2a_cpu.c`, `nv2a_cpu.h`, `nv2a_cpu_native.h`,
+`port/wii/tools/nv2a_codegen.c`.
+- Drawing must match the processor's path: a change to GX's transform is
+  checked by an A/B of the same moment with `debug.gpu_transform = false`
+  (a checkpoint run the main session makes).
+- Speed is measured as the processor's vertices (`vertices (N run)` and
+  `vertex programs run most` in the log) as well as Dolphin's milliseconds,
+  which do not track real hardware.
+- Builds with `ninja wii`; runs the host checks after any change to the
+  translation or the vertex programs.
+
+#### lockstep-runner
+
+Owns the lockstep check (`debug.fixed_ticks`, `debug.lockstep_log`,
+`debug.lockstep_detail`, `tools/lockstep_compare.py`; port/wii/README.md,
+"The lockstep check").
+- Builds and runs the x86 Linux side headless in Docker, as that section
+  says, for any level and number of ticks; the Wii's side is a checkpoint
+  run the main session makes with the same settings.
+- Compares the logs, names the first tick that differs, has both sides
+  list their objects at that tick, and traces the difference to its cause
+  in the code (a log line added for the purpose is removed once found).
+- Keeps a table in its report of each level checked: the ticks that agree
+  and the first that does not.
+
+#### wiilibs-steward
+
+Owns the give-and-take with WiiLibs (`/home/bcolb/GitHub/WiiLibs`, branch
+`Xbox`): what the port works out that any Wii
+program could use goes into WiiLibs, with its tests, and the port then
+takes it from there.
+- Works in its own git worktree of WiiLibs, on a branch named for its task,
+  off `Xbox`; follows WiiLibs' own conventions
+  and runs its tests (host `ctest`, the big-endian `ppc-be` build under
+  qemu, and the Wii compile check; `ctest -L dolphin` only through a
+  checkpoint run of the main session).
+- Reports what it moved, the tests that cover it, and the port's change
+  that would take it from WiiLibs.
+
+#### ci-steward
+
+Owns what keeps the branch healthy: `.github/workflows/build.yml`, the
+build scripts' CI paths (`tools/ci_build.py`, `tools/wii_build.py`,
+`tools/wii_package.py`), merges from upstream, and the documents.
+- Runs the CI's jobs locally in their own images with Docker (the `wii`
+  job in `devkitpro/devkitppc`, the `linux` job in `archlinux`) on the
+  branch's head, from a clean export (`git archive`), and reports what
+  fails and why.
+- Checks that the READMEs and AGENTS.md say what the code does (settings,
+  commands, file names), and lists what is stale.
+- Changes go in its own worktree and branch; a merge from upstream is the
+  main session's.
 
 ### Choosing the work
 
@@ -319,9 +491,10 @@ serves that, and work that brings it nearer comes first. In order:
 3. **What is drawn wrong or not at all**, shown by a Dolphin screenshot or
    A/B: text, the HUD, menus, then the README's "What is next" (bumped
    specular, bumped reflections), and anything a checkpoint run shows broken.
-4. **Faults found by reading.** The game agent's endian sweeps of code not
-   yet covered (its reports list what was checked), and its checks of
-   converted data not yet verified value by value.
+4. **Faults found by reading.** Endian sweeps of code not yet covered (the
+   game agent's, or the endian-auditor's; their reports list what was
+   checked), and checks of converted data not yet verified value by value
+   (the game agent's, or the map-converter's).
 5. **Health**: the CI's jobs, upstream merges, documents, WiiLibs taking
    what the port worked out.
 
@@ -330,51 +503,6 @@ the person, with what to look for, in port/wii/README.md: timings, the
 processor's alignment exceptions, frsqrte's accuracy, the SD card's speed,
 the controllers. Prefer a task whose result a host check, the lockstep
 check or a Dolphin A/B can confirm; say in the report how it was confirmed.
-
-### renderer
-
-Draws what the Xbox drew, at 30 frames a second.
-- A change to GX's transform is checked by an A/B of the same moment with
-  `debug.gpu_transform = false` (a checkpoint run).
-- Speed is counted as the log's work (the processor's vertices, `vertex
-  programs run most`, draws, bytes flushed) and qemu instruction counts, as
-  well as Dolphin's milliseconds, which do not track the console.
-- Builds with `ninja wii`. Runs `tools/wii_gx_psh_check.py` and
-  `tools/wii_nv2a_check.py` after any change to the translation or the
-  vertex programs.
-- A render-only shortcut (fused multiply-adds, estimates) never reaches
-  game state.
-
-### game
-
-Makes the Wii's game the x86 game, tick for tick, from start to end.
-- The converter swaps every tag field by the layouts `build/wii/halo.elf`
-  gives, relocates pointers, and converts the data blocks that are not
-  plain fields. Its checks (`wii_animation_check.py`, `wii_data_check.py`,
-  `wii_placeholder_check.py`) report nothing on the 24 maps. Output goes to
-  a scratch folder, never the repository.
-- The lockstep check: it builds and runs the x86 side headless in Docker
-  (port/wii/README.md, "The lockstep check"), and the Wii side is a
-  checkpoint run. It names the first tick that differs and traces it to its
-  cause. Its report keeps a table of levels: the ticks that agree, the
-  first that does not.
-- Playthroughs: scripts (`debug.test_input`) that play the menus and every
-  level from start to end as a person would.
-- Between tasks, read-only sweeps for big-endian hazards: widths, unions,
-  byte order, bitfields over file data, mismatched prototypes. Each finding
-  gives its file and line and why it matters.
-
-### platform
-
-Makes it a Wii program a person can use, and keeps the branch healthy.
-- WiiLibs: what the port works out that any Wii program could use moves
-  there, with its tests (host `ctest`, `ppc-be` under qemu, the Wii compile
-  check). The port then takes it from WiiLibs.
-- The Wii's platform: the controllers, the system buttons, HOME, saving,
-  video modes, start-up.
-- Health: the CI's jobs run locally in their images from a clean export
-  (`git archive`), and the READMEs and this file are checked against the
-  code.
 
 ## Documents
 
