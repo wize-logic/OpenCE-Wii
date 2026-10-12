@@ -928,7 +928,8 @@ int main(int argc, char **argv)
 		}
 	}
 	if (recording)
-		print("errors: %lu vertex writes outside a primitive or primitives left short\n", gx_stand_in_errors());
+		print("errors: %lu vertex writes outside a primitive or primitives left short; %lu primitives whose stages "
+			"read a coordinate or channel not generated\n", gx_stand_in_errors(), gx_stand_in_unread());
 #ifdef INDEX_RECORDS
 	print("index records: ranges %lu kept, %lu found; node keys %lu kept, %lu made; %lu bytes\n", ranges_kept,
 		ranges_found, key_records_kept, key_records_made, index_record_bytes);

@@ -1005,6 +1005,23 @@ a colour of 0 in their place, which no channel reads (vertex_shape_check) */
 #define EMIT_PAD 0x80
 static unsigned emit_attributes = EMIT_ALL;
 
+/* the pixel engine's state states_apply set last (blend, colour and alpha
+updates, depth, alpha test and the depth test's place, culling): each is
+written only when it changes, a write of the same value being a pipeline
+flush on GX for nothing. Unknown (states_shadow_reset) after anything else
+set them: a frame's beginning, WiiLibs' quads (a target's put back, a
+clear), a view's sphere map, the cull's measure. */
+static struct
+{
+	BOOL known;
+	u8 blend[4], color_update, alpha_update, z[3], alpha_compare[3], z_before, cull;
+} states_shadow;
+
+static void states_shadow_reset(void)
+{
+	states_shadow.known = FALSE;
+}
+
 static void transform_software(void)
 {
 	if (!transform_hardware)
@@ -1029,6 +1046,10 @@ static void transform_software(void)
 	GX_SetTexCoordGen(GX_TEXCOORD2, GX_TG_MTX2x4, GX_TG_TEX2, GX_IDENTITY);
 	GX_SetTexCoordGen(GX_TEXCOORD3, GX_TG_MTX2x4, GX_TG_TEX3, GX_IDENTITY);
 	GX_SetTexCoordGen(GX_TEXCOORD4, GX_TG_MTX2x4, GX_TG_TEX4, GX_IDENTITY);
+	/* (a draw in hardware sets only the coordinates and channels its stages
+	read: draw_hardware) */
+	GX_SetNumTexGens(5);
+	GX_SetNumChans(2);
 }
 
 static void frame_begin(D3DCOLOR clear_color)
@@ -1039,6 +1060,7 @@ static void frame_begin(D3DCOLOR clear_color)
 		return;
 	/* ARGB to the RGBA WiiLibs takes (and the back buffer has the EFB) */
 	wl_gx_begin_frame((clear_color << 8) | (clear_color >> 24));
+	states_shadow_reset();
 	device.frame_open = TRUE;
 	/* (the last frame's display copy, token and draw-done, and this one's
 	clearing copy) */
@@ -1135,6 +1157,7 @@ static void cull_measure(void)
 		GX_End();
 	}
 	GX_SetCullMode(GX_CULL_NONE);
+	states_shadow_reset();
 	GX_DrawDone();
 	xf_flush_after();
 	GX_PeekARGB(2, 2, &read);
@@ -1182,60 +1205,89 @@ static u8 gx_blend_factor(DWORD factor, BOOL source)
 
 static void states_apply(void)
 {
+	static int cull_on = -1;
 	DWORD write = D3D__RenderState[D3DRS_COLORWRITEENABLE];
+	u8 blend[4], color_update, alpha_update, z[3], alpha_compare[3], z_before, cull;
+	BOOL known = states_shadow.known;
 
 	if (D3D__RenderState[D3DRS_ALPHABLENDENABLE])
 	{
 		DWORD operation = D3D__RenderState[D3DRS_BLENDOP];
 
-		GX_SetBlendMode(operation == D3DBLENDOP_REVSUBTRACT ? GX_BM_SUBTRACT : GX_BM_BLEND,
-			gx_blend_factor(D3D__RenderState[D3DRS_SRCBLEND], TRUE),
-			gx_blend_factor(D3D__RenderState[D3DRS_DESTBLEND], FALSE), GX_LO_CLEAR);
+		blend[0] = operation == D3DBLENDOP_REVSUBTRACT ? GX_BM_SUBTRACT : GX_BM_BLEND;
+		blend[1] = gx_blend_factor(D3D__RenderState[D3DRS_SRCBLEND], TRUE);
+		blend[2] = gx_blend_factor(D3D__RenderState[D3DRS_DESTBLEND], FALSE);
 	}
 	else
 	{
-		GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+		blend[0] = GX_BM_NONE;
+		blend[1] = GX_BL_ONE;
+		blend[2] = GX_BL_ZERO;
 	}
-	GX_SetColorUpdate((write & (D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE)) ?
-		GX_TRUE : GX_FALSE);
-	GX_SetAlphaUpdate((write & D3DCOLORWRITEENABLE_ALPHA) ? GX_TRUE : GX_FALSE);
+	blend[3] = GX_LO_CLEAR;
+	color_update = (write & (D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE)) ?
+		GX_TRUE : GX_FALSE;
+	alpha_update = (write & D3DCOLORWRITEENABLE_ALPHA) ? GX_TRUE : GX_FALSE;
 	/* (no depth buffer: no depth test, as Direct3D) */
 	if (device.depth_stencil)
-		GX_SetZMode(D3D__RenderState[D3DRS_ZENABLE] ? GX_TRUE : GX_FALSE, gx_compare(D3D__RenderState[D3DRS_ZFUNC]),
-			D3D__RenderState[D3DRS_ZWRITEENABLE] ? GX_TRUE : GX_FALSE);
+	{
+		z[0] = D3D__RenderState[D3DRS_ZENABLE] ? GX_TRUE : GX_FALSE;
+		z[1] = gx_compare(D3D__RenderState[D3DRS_ZFUNC]);
+		z[2] = D3D__RenderState[D3DRS_ZWRITEENABLE] ? GX_TRUE : GX_FALSE;
+	}
 	else
-		GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+	{
+		z[0] = GX_FALSE;
+		z[1] = GX_ALWAYS;
+		z[2] = GX_FALSE;
+	}
 	if (D3D__RenderState[D3DRS_ALPHATESTENABLE])
 	{
-		GX_SetAlphaCompare(gx_compare(D3D__RenderState[D3DRS_ALPHAFUNC]), (u8)D3D__RenderState[D3DRS_ALPHAREF],
-			GX_AOP_AND, GX_ALWAYS, 0);
+		alpha_compare[0] = gx_compare(D3D__RenderState[D3DRS_ALPHAFUNC]);
+		alpha_compare[1] = (u8)D3D__RenderState[D3DRS_ALPHAREF];
 		/* (the test before the depth write) */
-		GX_SetZCompLoc(GX_FALSE);
+		z_before = GX_FALSE;
 	}
 	else
 	{
-		GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
-		GX_SetZCompLoc(GX_TRUE);
+		alpha_compare[0] = GX_ALWAYS;
+		alpha_compare[1] = 0;
+		z_before = GX_TRUE;
 	}
+	alpha_compare[2] = 0;
 	/* the cull mode names the screen winding to discard (as the OpenGL
 	port reads it); the vertices keep their screen winding on both paths */
+	if (cull_on < 0)
+		cull_on = config_boolean("debug.gpu_cull") ? 1 : 0;
+	switch (cull_on ? D3D__RenderState[D3DRS_CULLMODE] : D3DCULL_NONE)
 	{
-		static int cull = -1;
-
-		if (cull < 0)
-			cull = config_boolean("debug.gpu_cull") ? 1 : 0;
-		if (!cull)
-		{
-			GX_SetCullMode(GX_CULL_NONE);
-			return;
-		}
+	case D3DCULL_CW: cull = gx_cull_clockwise; break;
+	case D3DCULL_CCW: cull = gx_cull_clockwise == GX_CULL_FRONT ? GX_CULL_BACK : GX_CULL_FRONT; break;
+	default: cull = GX_CULL_NONE; break;
 	}
-	switch (D3D__RenderState[D3DRS_CULLMODE])
-	{
-	case D3DCULL_CW: GX_SetCullMode(gx_cull_clockwise); break;
-	case D3DCULL_CCW: GX_SetCullMode(gx_cull_clockwise == GX_CULL_FRONT ? GX_CULL_BACK : GX_CULL_FRONT); break;
-	default: GX_SetCullMode(GX_CULL_NONE); break;
-	}
+	/* (each written where it changed) */
+	if (!known || memcmp(blend, states_shadow.blend, sizeof(blend)))
+		GX_SetBlendMode(blend[0], blend[1], blend[2], blend[3]);
+	if (!known || color_update != states_shadow.color_update)
+		GX_SetColorUpdate(color_update);
+	if (!known || alpha_update != states_shadow.alpha_update)
+		GX_SetAlphaUpdate(alpha_update);
+	if (!known || memcmp(z, states_shadow.z, sizeof(z)))
+		GX_SetZMode(z[0], z[1], z[2]);
+	if (!known || memcmp(alpha_compare, states_shadow.alpha_compare, sizeof(alpha_compare)))
+		GX_SetAlphaCompare(alpha_compare[0], alpha_compare[1], GX_AOP_AND, GX_ALWAYS, alpha_compare[2]);
+	if (!known || z_before != states_shadow.z_before)
+		GX_SetZCompLoc(z_before);
+	if (!known || cull != states_shadow.cull)
+		GX_SetCullMode(cull);
+	memcpy(states_shadow.blend, blend, sizeof(blend));
+	states_shadow.color_update = color_update;
+	states_shadow.alpha_update = alpha_update;
+	memcpy(states_shadow.z, z, sizeof(z));
+	memcpy(states_shadow.alpha_compare, alpha_compare, sizeof(alpha_compare));
+	states_shadow.z_before = z_before;
+	states_shadow.cull = cull;
+	states_shadow.known = TRUE;
 }
 
 /* ---------- textures
@@ -3985,6 +4037,7 @@ and the vertices the processor's draws send, are put back */
 static void efb_device_state(void)
 {
 	projection_valid = FALSE;
+	states_shadow_reset();
 	GX_SetNumChans(2);
 	GX_SetNumTexGens(5);
 	transform_hardware = TRUE;
@@ -4006,6 +4059,8 @@ static void efb_take(void)
 		if (before)
 			indirect_apply(NULL);
 		resolved = wl_gx_target_use(NULL);
+		if (before)
+			states_shadow_reset();
 	}
 	else
 	{
@@ -4013,6 +4068,7 @@ static void efb_take(void)
 
 		render_target_describe(surface, &target);
 		resolved = wl_gx_target_use(&target);
+		states_shadow_reset();
 	}
 	if (resolved)
 		render_target_resolved(resolved);
@@ -5029,6 +5085,7 @@ static BOOL sphere_bake(const struct texture_entry *world, const float frame[3][
 		GX_SetColorUpdate(GX_TRUE);
 		GX_SetAlphaUpdate(GX_TRUE);
 		GX_SetCullMode(GX_CULL_NONE);
+		states_shadow_reset();
 		indirect_apply(NULL);
 		GX_SetNumTevStages(1);
 		GX_SetTevSwapModeTable(GX_TEV_SWAP0, GX_CH_RED, GX_CH_GREEN, GX_CH_BLUE, GX_CH_ALPHA);
@@ -6500,6 +6557,17 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	}
 	if (cpu_spheres)
 		hardware_sphere_draws++;
+	/* (only the coordinates and channels the stages read: each coordinate
+	generated costs GX's transform a few cycles a vertex; transform_software
+	takes all of them back, a lit draw's planar fog its sixth) */
+	{
+		unsigned coordinates = 0, channels = (tev_channels & 2) ? 2 : (tev_channels & 1) ? 1 : 0;
+
+		while (coordinates < 5 && (tev_texcoords >> coordinates))
+			coordinates++;
+		GX_SetNumTexGens(coordinates || channels ? coordinates : 1);
+		GX_SetNumChans((u8)channels);
+	}
 	if (lit_on)
 		lit_state(keyed, &projection, base.d1);
 	if (fog_post)
@@ -6972,6 +7040,7 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		}
 		/* (the device set GX behind WiiLibs' shadow) */
 		wl_gx_invalidate_shadow();
+		states_shadow_reset();
 		/* (GX's draws finished first, timed apart from the copy to the
 		display, which wl_gx_end_frame makes: it waits for a free display
 		buffer, not for the retrace; the retrace interrupt shows the frame) */

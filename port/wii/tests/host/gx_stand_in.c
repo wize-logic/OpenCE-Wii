@@ -8,6 +8,7 @@ tools/wii_draw_bench.py writes, whose vertex writes call wg_record_*.
 */
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define BOOL GCBOOL
@@ -17,6 +18,44 @@ tools/wii_draw_bench.py writes, whose vertex writes call wg_record_*.
 #undef BOOL
 
 #include "gx_stand_in.h"
+
+/* what the TEV stages read, and the coordinates and channels generated:
+every primitive's stages must read only those (gx_stand_in_unread) */
+static struct
+{
+	unsigned char texcoord[16], channel[16], indirect_texcoord[4];
+	unsigned stages, indirect_stages, texgens, channels;
+} stage_reads = { .stages = 1, .texgens = 8, .channels = 2 };
+static unsigned long unread_primitives;
+
+static void stage_reads_check(void)
+{
+	unsigned stage;
+
+	for (stage = 0; stage < stage_reads.stages && stage < 16; stage++)
+	{
+		unsigned char texcoord = stage_reads.texcoord[stage], channel = stage_reads.channel[stage];
+
+		if ((texcoord != 0xFF && texcoord >= stage_reads.texgens) ||
+			((channel == 0 || channel == 2 || channel == 4) && stage_reads.channels < 1) ||
+			((channel == 1 || channel == 3 || channel == 5) && stage_reads.channels < 2))
+		{
+			unread_primitives++;
+			return;
+		}
+	}
+	for (stage = 0; stage < stage_reads.indirect_stages && stage < 4; stage++)
+		if (stage_reads.indirect_texcoord[stage] >= stage_reads.texgens)
+		{
+			unread_primitives++;
+			return;
+		}
+}
+
+unsigned long gx_stand_in_unread(void)
+{
+	return unread_primitives;
+}
 
 static unsigned long calls;
 
@@ -258,6 +297,8 @@ static float component(const unsigned char *data, unsigned type, unsigned frac)
 	}
 }
 
+static int all_coordinates = -1;
+
 /* the traced texture coordinate (gx_stand_in_trace) */
 static unsigned trace_gen = 99;
 static void (*trace_each)(float s);
@@ -271,6 +312,8 @@ void gx_stand_in_trace(unsigned gen, void (*each)(float s))
 /* one vertex read from data as state describes it, digested */
 static uint64_t vertex_digest(uint64_t hash, const struct vertex_state *state, unsigned format, const unsigned char **data)
 {
+	if (all_coordinates < 0)
+		all_coordinates = getenv("GX_STAND_IN_ALL_COORDINATES") != NULL;
 	unsigned char indices[9];
 	float values[ATTRIBUTES][3];
 	unsigned char colors[2][4];
@@ -339,7 +382,10 @@ static uint64_t vertex_digest(uint64_t hash, const struct vertex_state *state, u
 		hash = hash_bytes(hash, colors[1], 4);
 	/* each texture coordinate generated: its source's values through its
 	matrix (the vertex's, else the generation's) */
-	for (gen = 0; gen < state->texgens && gen < 8; gen++)
+	/* (GX_STAND_IN_ALL_COORDINATES: at least the five the device's draws
+	generate, whatever count a draw sets, to compare draws that differ only
+	in coordinates no stage reads) */
+	for (gen = 0; gen < (all_coordinates && state->texgens < 5 ? 5u : state->texgens) && gen < 8; gen++)
 	{
 		uint32_t source = state->texgen[gen].source, matrix = state->texgen[gen].matrix;
 		const float *input;
@@ -574,6 +620,7 @@ void GX_CallDispList(void *list, u32 size) { (void)list; (void)size; calls++; }
 
 void GX_Begin(u8 primitive, u8 format, u16 count)
 {
+	stage_reads_check();
 	BEGIN(primitive, format, count);
 }
 
@@ -683,6 +730,7 @@ void GX_SetCurrentMtx(u32 matrix)
 void GX_SetNumTexGens(u32 count)
 {
 	calls++;
+	stage_reads.texgens = count;
 #ifdef GX_STAND_IN_RECORD
 	vs.texgens = count;
 #else
@@ -784,7 +832,17 @@ static uint32_t color_value(GXColor color)
 }
 void GX_SetChanAmbColor(s32 channel, GXColor color) { CALL("ambient", channel, color_value(color)); }
 void GX_SetChanMatColor(s32 channel, GXColor color) { CALL("material", channel, color_value(color)); }
-void GX_SetNumChans(u8 count) { CALL("chans", 0, count); }
+void GX_SetNumChans(u8 count)
+{
+	stage_reads.channels = count;
+	/* (GX_STAND_IN_ALL_COORDINATES: the channels' count left out too) */
+	if (getenv("GX_STAND_IN_ALL_COORDINATES"))
+	{
+		calls++;
+		return;
+	}
+	CALL("chans", 0, count);
+}
 void GX_SetTevOp(u8 stage, u8 mode) { CALL("tev op", stage, mode); }
 void GX_SetTevColor(u8 reg, GXColor color) { CALL("tev color", reg, color_value(color)); }
 void GX_SetTevKColor(u8 reg, GXColor color) { CALL("tev konst", reg, color_value(color)); }
@@ -798,8 +856,20 @@ void GX_SetTevAlphaOp(u8 stage, u8 op, u8 bias, u8 scale, u8 clamp, u8 reg)
 {
 	CALL("tev alpha op", stage, op, bias, scale, clamp, reg);
 }
-void GX_SetTevOrder(u8 stage, u8 texcoord, u32 texmap, u8 color) { CALL("tev order", stage, texcoord, texmap, color); }
-void GX_SetNumTevStages(u8 count) { CALL("tev stages", 0, count); }
+void GX_SetTevOrder(u8 stage, u8 texcoord, u32 texmap, u8 color)
+{
+	if (stage < 16)
+	{
+		stage_reads.texcoord[stage] = texcoord;
+		stage_reads.channel[stage] = color;
+	}
+	CALL("tev order", stage, texcoord, texmap, color);
+}
+void GX_SetNumTevStages(u8 count)
+{
+	stage_reads.stages = count;
+	CALL("tev stages", 0, count);
+}
 void GX_SetTevKColorSel(u8 stage, u8 select) { CALL("tev kcsel", stage, select); }
 void GX_SetTevKAlphaSel(u8 stage, u8 select) { CALL("tev kasel", stage, select); }
 void GX_SetTevSwapMode(u8 stage, u8 rasterized, u8 texture) { CALL("tev swap", stage, rasterized, texture); }
@@ -810,8 +880,17 @@ void GX_SetTevIndirect(u8 stage, u8 indirect, u8 format, u8 bias, u8 matrix, u8 
 }
 void GX_SetTevDirect(u8 stage) { CALL("tev indirect", stage, 0, 0, 0, 0, 0, 0, 0, 0, 0); }
 void GX_SetTevIndRepeat(u8 stage) { CALL("tev indirect", stage, 0xFFFFFFFFU); }
-void GX_SetNumIndStages(u8 count) { CALL("ind stages", 0, count); }
-void GX_SetIndTexOrder(u8 stage, u8 texcoord, u8 texmap) { CALL("ind order", stage, texcoord, texmap); }
+void GX_SetNumIndStages(u8 count)
+{
+	stage_reads.indirect_stages = count;
+	CALL("ind stages", 0, count);
+}
+void GX_SetIndTexOrder(u8 stage, u8 texcoord, u8 texmap)
+{
+	if (stage < 4)
+		stage_reads.indirect_texcoord[stage] = texcoord;
+	CALL("ind order", stage, texcoord, texmap);
+}
 void GX_SetIndTexCoordScale(u8 stage, u8 s, u8 t) { CALL("ind scale", stage, s, t); }
 void GX_SetIndTexMatrix(u8 matrix, f32 offsets[2][3], s8 scale)
 {

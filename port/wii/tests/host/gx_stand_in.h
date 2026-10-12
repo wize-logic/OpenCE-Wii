@@ -35,6 +35,9 @@ void gx_stand_in_states(void (*each)(const char *name, uint32_t selector, uint64
 /* (recording) each vertex's texture coordinate gen's s as GX makes it,
 through its matrix and post-transform matrix, passed to each; NULL: none */
 void gx_stand_in_trace(unsigned gen, void (*each)(float s));
+/* primitives whose TEV stages read a texture coordinate or colour channel
+not generated (GX_SetNumTexGens, GX_SetNumChans) */
+unsigned long gx_stand_in_unread(void);
 /* calls to GX's functions (not the vertex writes) since the last take */
 unsigned long gx_stand_in_calls(void);
 
