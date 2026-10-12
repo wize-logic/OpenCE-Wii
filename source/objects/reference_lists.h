@@ -51,7 +51,13 @@ __inline long reference_list_get_next_datum_index(
 
 	if (*reference_index!=NONE)
 	{
-		reference = (struct data_reference *)datum_get(array, *reference_index);
+		/* port: without a call where datum_get would say nothing
+		(datum_get_fast, data.h): each step of the clusters' object lists */
+		reference = (struct data_reference *)datum_get_fast(array, *reference_index);
+		if (!reference)
+		{
+			reference = (struct data_reference *)datum_get(array, *reference_index);
+		}
 		*reference_index = reference->next_reference_index;
 		result = reference->datum_index;
 	}

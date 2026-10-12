@@ -237,6 +237,9 @@ static struct cache_file_tag_instance *cache_get_tag_instance(
 	long tag_index);
 static struct cache_file_tag_instance *cache_empty_tag_instance(
 	long tag_index);
+static void *tag_get_checked(
+	long group_tag,
+	long tag_index) __attribute__((noinline));
 static boolean cache_file_region_contains(
 	void const *region,
 	unsigned long region_size,
@@ -1524,6 +1527,35 @@ void scenario_structure_bsp_unload(
 }
 
 void *tag_get(
+	long group_tag,
+	long tag_index)
+{
+	short absolute_index = (short)tag_index;
+	struct cache_file_tag_instance *tag_instance;
+
+	/* port: the tag's data found without a call where nothing in tag_get or
+	cache_get_tag_instance would say anything (a loaded tag of the group, or
+	of a group it inherits from, with data); their checks only where
+	something would */
+	if (cache_file_globals.tags_loaded && global_tag_instances &&
+		absolute_index >= 0 && absolute_index < global_tag_count)
+	{
+		tag_instance = &global_tag_instances[absolute_index];
+		if ((!(tag_index & 0xFFFF0000) || tag_instance->tag_index == tag_index) &&
+			(tag_instance->group_tag == group_tag ||
+				tag_instance->parent_group_tags[0] == group_tag ||
+				tag_instance->parent_group_tags[1] == group_tag) &&
+			tag_instance->base_address)
+		{
+			return tag_instance->base_address;
+		}
+	}
+
+	return tag_get_checked(group_tag, tag_index);
+}
+
+/* port: tag_get as it was, for a tag the above does not find */
+static void *tag_get_checked(
 	long group_tag,
 	long tag_index)
 {

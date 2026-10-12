@@ -152,6 +152,10 @@ void network_coop_note_attach(long parent_index, char const *parent_marker_name,
 void network_coop_note_detach(long parent_index, long child_index);
 boolean network_coop_active(void);
 
+static void *object_get_and_verify_type_checked(long object_index, unsigned long valid_type_flags)
+	__attribute__((noinline));
+static void *object_header_block_get_checked(long object_index, struct object_header_block_reference *reference)
+	__attribute__((noinline));
 static void object_connect_lights(long object_index, boolean disconnect, boolean reconnect);
 static void object_name_list_allocate(void);
 static void object_name_list_free(void);
@@ -281,6 +285,25 @@ void *object_try_and_get_and_verify_type(
 }
 
 void *object_get_and_verify_type(
+	long object_index,
+	unsigned long valid_type_flags)
+{
+	/* port: the object found without another call where nothing in
+	object_get_and_verify_type_checked would say anything (datum_get_fast,
+	data.h): the game's most frequent lookup */
+	struct object_header_datum *header = (struct object_header_datum *)datum_get_fast(object_header_data, object_index);
+
+	if (header && TEST_FLAG(valid_type_flags, header->datum->object.type))
+	{
+		return header->datum;
+	}
+
+	return object_get_and_verify_type_checked(object_index, valid_type_flags);
+}
+
+/* port: object_get_and_verify_type as it was, for an object the above does
+not find */
+static void *object_get_and_verify_type_checked(
 	long object_index,
 	unsigned long valid_type_flags)
 {
@@ -666,6 +689,28 @@ void object_beautify(
 }
 
 void *object_header_block_get(
+	long object_index,
+	struct object_header_block_reference *reference)
+{
+	/* port: the block found with one lookup and no other call where nothing
+	in object_header_block_get_checked would say anything (datum_get_fast,
+	data.h) */
+	struct object_header_datum *object_header = (struct object_header_datum *)datum_get_fast(object_header_data, object_index);
+
+	if (object_header &&
+		TEST_FLAG(_object_mask_all, object_header->datum->object.type) &&
+		reference->offset>0 &&
+		reference->offset+reference->size<=object_header->data_size)
+	{
+		return (byte *)object_header->datum + reference->offset;
+	}
+
+	return object_header_block_get_checked(object_index, reference);
+}
+
+/* port: object_header_block_get as it was, for a block the above does not
+find */
+static void *object_header_block_get_checked(
 	long object_index,
 	struct object_header_block_reference *reference)
 {
@@ -2486,6 +2531,10 @@ void object_compute_node_matrices(
 		short node_count;
 		short node_index;
 		long unknown_var;
+		/* port: the root node's matrix found valid where it was computed: it is
+		not checked again below (nothing changes it in between; a matrix found
+		bad is checked again, as it was) */
+		boolean root_node_matrix_valid = FALSE;
 
 		struct object_type_definition *object_type_definition = object_type_definition_get(object->object.type);
 		
@@ -2765,7 +2814,8 @@ void object_compute_node_matrices(
 					object_nodes[node_stack_index] = node_matrix;
 				}
 
-				if (!valid_real_matrix4x3(&object_nodes[node_stack_index]))
+				root_node_matrix_valid = valid_real_matrix4x3(&object_nodes[node_stack_index]);
+				if (!root_node_matrix_valid)
 				{
 					real_matrix4x3 const *validated_root_node_matrix;
 
@@ -2888,7 +2938,7 @@ void object_compute_node_matrices(
 			if (node_stack_index==0)
 			{
 				real_matrix4x3 *final_matrix = &object_nodes[node_stack_index];
-				if (!valid_real_matrix4x3(final_matrix))
+				if (!root_node_matrix_valid && !valid_real_matrix4x3(final_matrix))
 				{
 					char *name2 = tag_get_name(object->definition_index);
 					char *string = name2;

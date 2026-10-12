@@ -74,6 +74,8 @@ symbols in this file:
 /* ---------- prototypes */
 
 static void datum_initialize(struct data_array *data, struct datum_header *header);
+static void *datum_get_checked(struct data_array *data, long index, void const *caller)
+	__attribute__((noinline));
 static boolean data_usable(struct data_array *data, void const *caller);
 void platform_log(const char *format, ...);
 
@@ -146,6 +148,26 @@ void *datum_get(
 	struct data_array *data,
 	long index)
 {
+	/* port: the datum found without a call where nothing below would say
+	anything (datum_get_fast, data.h); the checks only where something would */
+	void *datum = datum_get_fast(data, index);
+
+	if (datum)
+	{
+		return datum;
+	}
+
+	return datum_get_checked(data, index, __builtin_return_address(0));
+}
+
+/* port: datum_get as it was, for an index datum_get_fast finds no datum for
+(and an array that is not valid, or an identifier of zero where zero is none:
+the asserts' cases), with datum_get's caller for the release build's message */
+static void *datum_get_checked(
+	struct data_array *data,
+	long index,
+	void const *caller)
+{
 	struct datum_header *header;
 	short identifier;
 	short absolute_index;
@@ -181,7 +203,7 @@ void *datum_get(
 			data->name,
 			index&0xFFFF,
 			index,
-			__builtin_return_address(0));
+			caller);
 		release_assert_failed(message, "c:\\halo\\SOURCE\\memory\\data.c", 412, TRUE);
 	}
 #else
