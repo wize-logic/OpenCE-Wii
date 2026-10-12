@@ -102,7 +102,9 @@ def build(test, generated):
         (work / name).write_text(text)
     executable = work / test
     command = [os.environ.get("CC", "clang"), "-m32", "-std=gnu99", "-O2", "-Wall", "-Werror", "-Wno-unused-function",
-               "-Wno-unused-variable", "-I", str(HARNESS / "include"), "-I", str(work)] + \
+               # WiiLibs' sources set _POSIX_C_SOURCE themselves; the tests' _GNU_SOURCE has glibc set it already
+               # (to a later value, on Arch's), and the second setting is meant
+               "-Wno-unused-variable", "-Wno-macro-redefined", "-I", str(HARNESS / "include"), "-I", str(work)] + \
         (["-I", str(wiilibs())] if wiilibs() else []) + [
                str(HARNESS / "tests" / f"{test}.c"), "-o", str(executable), "-lm"]
     result = subprocess.run(command, capture_output=True, text=True)
