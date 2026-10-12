@@ -2235,8 +2235,10 @@ static void level_run_aid_teleport(
 	down.i = 0.0f;
 	down.j = 0.0f;
 	down.k = -20.0f;
-	if (!collision_test_vector(FLAG(_collision_test_front_facing_surfaces_bit) | FLAG(_collision_test_structure_bit),
-		&above, &down, NONE, &collision))
+	/* (the floor may be a machine's: a lift's platform, b40's) */
+	if (!collision_test_vector(FLAG(_collision_test_front_facing_surfaces_bit) | FLAG(_collision_test_structure_bit) |
+		FLAG(_collision_test_objects_bit) | FLAG(_collision_test_objects_machines_bit) | FLAG(_collision_test_objects_scenery_bit),
+		&above, &down, mover_index, &collision))
 	{
 		/* (a volume in the air, a lift's shaft or a gap: held in it, as passing
 		through it would, until its script or the BSP has seen him; then he
