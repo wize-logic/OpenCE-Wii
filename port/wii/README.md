@@ -682,6 +682,16 @@ and pixel shaders.
   their equal-depth tests whichever path each pass took.
 - **Frame buffer.** The EFB has an alpha channel (RGBA6_Z24), because the game blends by
   destination alpha.
+- **GX kept from hanging.** GX's transform unit can hang on a clipped primitive that follows an
+  EFB copy, a draw-sync token or a draw-done. libogc's `GX_SetMisc(GX_MT_XF_FLUSH,
+  GX_XF_FLUSH_SAFE)` names the remedy, and the device sets it, but libogc's `GX_Begin` sends
+  nothing for it (its `gx.o`, disassembled: the value is only kept). So after each of those the
+  device's next primitive is preceded by eight vertices of zeros in its own vertex format (its
+  size from libogc's vertex descriptor and the formats the device set), which are one point and
+  draw nothing (`gx_begin`; `debug.gpu_xf_flush_safe`, on by default). Where WiiLibs' GX wait (250
+  ms) runs out, at the frame's draws or its display copy, the log says where GX stood: its status
+  flags, the GP FIFO's read and write pointers and fill, the CPU FIFO's write pointer, the last
+  token passed and the flushes sent (`GX did not finish in time`).
 - **Debugging.** The desktop ports' `debug.gpu_debug_flat` and `debug.gpu_debug_texture0` (in
   `config.toml`) show the diffuse colour, or the first texture, alone. One frame's draws are
   described in the log (`DRAW_LOG_FRAME`).

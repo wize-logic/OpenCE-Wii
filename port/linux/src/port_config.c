@@ -656,6 +656,11 @@ static const struct config_setting config_settings[] =
 	{ "debug.gpu_transform", _config_boolean, "true", "HALO_GPU_TRANSFORM", _environment_value, _platform_all,
 		"The Wii: draws whose vertex programs GX's own transform can compute go to it;\n"
 		"false runs every program on the processor." },
+	{ "debug.gpu_xf_flush_safe", _config_boolean, "true", "HALO_GPU_XF_FLUSH_SAFE", _environment_value, _platform_all,
+		"The Wii: after an EFB copy, a draw-sync token or a draw-done, the next\n"
+		"primitive is preceded by a few vertices that draw nothing, which flush\n"
+		"GX's transform unit (it can hang on a clipped primitive there); false\n"
+		"sends none." },
 	{ "debug.input_log", _config_boolean, "false", "HALO_INPUT_LOG", _environment_set_is_true, _platform_all,
 		"The Wii: each controller's gamepad state (buttons, triggers and sticks) is logged\n"
 		"whenever it changes, to check the mapping." },
