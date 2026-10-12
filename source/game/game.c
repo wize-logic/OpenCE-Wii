@@ -640,29 +640,6 @@ boolean game_load(
 void network_distributed_new_game(void);
 void network_objects_placed(void);
 
-/* port: the Wii's loading screen drawn between the load's steps
-(progress_bar.c) */
-#ifdef HALO_WII
-#define GAME_PORT_LOADING_PUMP() progress_bar_port_pump()
-#else
-#define GAME_PORT_LOADING_PUMP()
-#endif
-
-/* port: the progress of the Wii's loading screen, and its end, the game
-made (progress_bar.c) */
-void game_port_set_loading_progress(
-	real progress)
-{
-	game_globals->loading_progress = progress;
-}
-
-void game_port_loading_end(
-	void)
-{
-	game_globals->map_load_in_progress = FALSE;
-	game_globals->loading_progress = 1.0f;
-}
-
 void game_initialize_for_new_map(
 	void)
 {
@@ -680,16 +657,13 @@ void game_initialize_for_new_map(
 	game_engine_initialize(&game_variant_global);
 	real_math_reset_precision();
 	rasterizer_initialize_for_new_map();
-	GAME_PORT_LOADING_PUMP();
 	game_state_initialize_for_new_map();
-	GAME_PORT_LOADING_PUMP();
 	game_time_initialize_for_new_map();
 	interface_initialize_for_new_map();
 	game_allegiance_initialize_for_new_map();
 	players_initialize_for_new_map();
 	scenario_initialize_for_new_map();
 	objects_initialize_for_new_map();
-	GAME_PORT_LOADING_PUMP();
 	/* nothing of the distributed netcode's carried into the new game
 	(port/linux/game/network_distributed.c), before anything of the map
 	makes an object: a client makes the map's objects, and the game type's
@@ -698,9 +672,7 @@ void game_initialize_for_new_map(
 	network_distributed_new_game();
 	render_interpolation_reset();
 	render_initialize_for_new_map();
-	GAME_PORT_LOADING_PUMP();
 	structures_initialize_for_new_map();
-	GAME_PORT_LOADING_PUMP();
 	breakable_surfaces_initialize_for_new_map();
 	decals_initialize_for_new_map();
 	director_initialize_for_new_map();
@@ -708,10 +680,8 @@ void game_initialize_for_new_map(
 	contrails_initialize_for_new_map();
 	particles_initialize_for_new_map();
 	effects_initialize_for_new_map();
-	GAME_PORT_LOADING_PUMP();
 	particle_systems_initialize_for_new_map();
 	sound_initialize_for_new_map();
-	GAME_PORT_LOADING_PUMP();
 	sound_classes_initialize_for_new_map();
 	game_sound_initialize_for_new_map();
 	weather_particle_systems_initialize_for_new_map();
@@ -723,22 +693,17 @@ void game_initialize_for_new_map(
 	rumble_initialize_for_new_map();
 	player_effect_initialize_for_new_map();
 	ai_initialize_for_new_map();
-	GAME_PORT_LOADING_PUMP();
 	console_initialize_for_new_map();
 	editor_initialize_for_new_map();
 	cinematic_initialize_for_new_map();
 	hs_initialize_for_new_map();
-	GAME_PORT_LOADING_PUMP();
 	recorded_animations_initialize_for_new_map();
-	GAME_PORT_LOADING_PUMP();
 	cheats_initialize_for_new_map();
 
 	game_globals->active = TRUE;
 	objects_place();
-	GAME_PORT_LOADING_PUMP();
 	if (!game_in_editor())
 		ai_place();
-	GAME_PORT_LOADING_PUMP();
 	/* (the map's objects, placed as on the host: a distributed client's own
 	from now on go elsewhere, port/linux/game/network_objects.c) */
 	network_objects_placed();
@@ -906,14 +871,7 @@ void game_precache_new_map(
 			}
 			while (!map_status);
 
-#ifdef HALO_WII
-			/* port: on the Wii the loading screen goes on through the load
-			that follows, until main_new_map has made the game
-			(progress_bar.c's progress_bar_port_pump) */
-			progress_bar_port_load_begin();
-#else
 			progress_bar_end();
-#endif
 			ui_widgets_close_all();
 			if (map_status == _cached_map_file_failed)
 				display_error_damaged_media();
@@ -923,10 +881,8 @@ void game_precache_new_map(
 				0x11A,
 				cache_files_precache_map_loaded(map_name));
 			globals = game_globals;
-#ifndef HALO_WII /* port: the Wii's load ends in main_new_map (progress_bar.c) */
 			globals->map_load_in_progress = FALSE;
 			globals->loading_progress = 1.0f;
-#endif
 		}
 	}
 

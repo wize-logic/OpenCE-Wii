@@ -40,19 +40,6 @@ void progress_bar_display(
 boolean progress_bar_is_stuff_ready(
 	void);
 
-#ifdef HALO_WII
-/* port: the Wii's loading screen kept moving through a level's load: begun
-when the precache is done (game_precache_new_map), drawn at most every 33
-ms from where the load waits or between its steps (progress_bar_port_pump),
-ended when main_new_map has made the game */
-void progress_bar_port_load_begin(
-	void);
-void progress_bar_port_load_end(
-	void);
-void progress_bar_port_pump(
-	void);
-#endif
-
 /* ---------- globals */
 
 /* ---------- public code */
