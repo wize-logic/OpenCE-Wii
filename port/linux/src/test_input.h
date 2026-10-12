@@ -2,7 +2,8 @@
 TEST_INPUT.H
 
 The scripted player for automated tests (debug.test_input): controller 1's
-state made up from the time (test_input.c), on every port that reads one.
+state made up from the time (test_input.c), on every port that reads one;
+in a script, the other controllers' too.
 */
 
 #ifndef __TEST_INPUT_H
@@ -24,6 +25,15 @@ void test_input_observe_menus_inhibited(int inhibited);
 /* the scripted player's buttons and sticks, added to a gamepad's state;
 milliseconds is any clock that counts them */
 void test_input_gamepad(XINPUT_GAMEPAD *pad, unsigned long long milliseconds);
+/* the same for controller port (0 to 3): a script's steps for that player
+and its bot ("player", "N:" and "bot N <seed>" lines, test_input.c). The
+first controller's read runs the script, and must come first in a frame */
+void test_input_gamepad_port(int port, XINPUT_GAMEPAD *pad, unsigned long long milliseconds);
+/* whether a script has controller port (1 to 3; the script's 2 to 4) appear
+or go ("connect", "disconnect"): 1 there, 0 gone, -1 (and for any other port)
+as the machine has it. The port's XGetDeviceChanges and XInputGetState
+follow it */
+int test_input_controller(int port);
 /* the automated tests (port/linux/game/network_test.c): standing still, the
 action button held from a second on */
 void test_input_hold_action(int hold);

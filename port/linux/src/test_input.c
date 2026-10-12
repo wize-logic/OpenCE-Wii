@@ -54,6 +54,30 @@ the script with a line in the log saying where it was.
 	                                is and faces in a game
 	quit                            the game quits, as its menus' Quit does
 
+The other controllers (split screen, co-op; they cannot be told from a
+person's second, third and fourth controller by the game):
+
+	player <n>                      the steps that follow (press, select, hold,
+	                                stick, walk, bot <seconds>, objective)
+	                                drive controller n, 1 to 4, until the next
+	                                player line (the script starts with 1)
+	<n>: <step>                     the one step on controller n: "2: press a"
+	connect <n> [real]              controller n, 2 to 4, appears to the game
+	                                (the Xbox's insertion, XGetDeviceChanges
+	                                and XInputOpen), with nothing pressed unless
+	                                a step presses it; real: as the machine
+	                                has it
+	disconnect <n>                  controller n is gone, even if one is there
+	bot <n> <seed>                  controller n plays as the bot of that seed
+	                                (as bot:<seed>, on the game's ticks in a
+	                                game) alongside the steps, until
+	bot <n> off                     (it is meant for a game: the bot presses
+	                                A and the triggers in the menus too)
+
+The steps wait for and read the first player's screen (the menus of the
+other players are not observed): they are written in the order a person
+would do them, one controller at a time.
+
 The Wii's (they change the controllers' raw input before the port reads it,
 the same way the console's would; port/wii/README.md, "The controllers"):
 
@@ -204,6 +228,7 @@ static void test_input_bot(XINPUT_GAMEPAD *pad, unsigned long long milliseconds,
 
 /* ---------- the script */
 
+#define SCRIPT_CONTROLLERS 4
 #define SCRIPT_MAXIMUM_STEPS 1024
 #define SCRIPT_MAXIMUM_NESTING 8
 #define SCRIPT_TEXT_SIZE 128
@@ -236,6 +261,9 @@ enum
 	_step_destroy,
 	_step_log,
 	_step_quit,
+	/* the other controllers' (connect, disconnect, bot <n>) */
+	_step_controller,
+	_step_bot_player,
 	/* the Wii's verbs (script_parse_wii) */
 	_step_wii,
 	/* (only while the file is read: repeat <count> ... end) */
@@ -256,6 +284,8 @@ struct script_step
 	double sticks[4];
 	unsigned short digital;
 	unsigned char analog;
+	/* the controller the step drives, 0 to 3 */
+	unsigned char player;
 };
 
 static struct
@@ -292,6 +322,14 @@ static struct
 	/* the first player's unit (test_input.h), if placed */
 	int placed;
 	float place[6];
+	/* the controllers (connect, disconnect, bot <n>): 0 as the machine has
+	them, 1 gone, 2 there; the bots' seeds plus one (0 for none) */
+	int connected[SCRIPT_CONTROLLERS];
+	int bots[SCRIPT_CONTROLLERS];
+	/* what the current step presses, and on which controller: made on the
+	first controller's read, given to that controller's */
+	XINPUT_GAMEPAD output;
+	int output_player;
 } script;
 
 static const struct
@@ -521,12 +559,25 @@ BOOL test_input_home_pressed(void)
 	return TRUE;
 }
 
+/* the controller the steps are for, as the last "player <n>" line said */
+static int script_parse_player;
+
+/* the controller of "2" in "connect 2", "player 2" and the like, from
+minimum to 4; 0 for any other text */
+static int script_parse_controller(const char *text, int minimum)
+{
+	if (text[0] < '0' + minimum || text[0] > '0' + SCRIPT_CONTROLLERS || text[1])
+		return 0;
+	return text[0] - '0';
+}
+
 /* one line into a step: 0 for a blank line or a comment, -1 for a fault */
 static int script_parse_line(char *line, int number, struct script_step *step)
 {
 	char *words[8];
 	char *cursor;
 	int count = 0, index;
+	int player = script_parse_player;
 
 	cursor = strchr(line, '#');
 	if (cursor)
@@ -539,6 +590,16 @@ static int script_parse_line(char *line, int number, struct script_step *step)
 		return 0;
 	memset(step, 0, sizeof(*step));
 	step->line = number;
+	/* ("2: press a": the one step is the controller's) */
+	if (cursor[0] >= '1' && cursor[0] <= '0' + SCRIPT_CONTROLLERS && cursor[1] == ':')
+	{
+		player = cursor[0] - '1';
+		for (cursor += 2; *cursor && (unsigned char)*cursor <= ' '; cursor++)
+			;
+		if (!*cursor)
+			return -1;
+	}
+	step->player = (unsigned char)player;
 	snprintf(step->text, sizeof(step->text), "%s", cursor);
 	/* (log keeps the rest of its line as it is) */
 	if (!strncmp(cursor, "log", 3) && (unsigned char)cursor[3] <= ' ')
@@ -625,6 +686,36 @@ static int script_parse_line(char *line, int number, struct script_step *step)
 		if (count == 4)
 			step->number = atof(words[3]);
 	}
+	else if (!strcmp(words[0], "player") && count == 2 && script_parse_controller(words[1], 1))
+	{
+		/* (no step: the lines that follow are the controller's) */
+		script_parse_player = script_parse_controller(words[1], 1) - 1;
+		return 0;
+	}
+	else if ((!strcmp(words[0], "connect") && (count == 2 || (count == 3 && !strcmp(words[2], "real")))) ||
+		(!strcmp(words[0], "disconnect") && count == 2))
+	{
+		int controller = script_parse_controller(words[1], 2);
+
+		if (!controller)
+			return -1;
+		step->kind = _step_controller;
+		step->sticks[0] = controller - 1;
+		step->sticks[1] = words[0][0] == 'd' ? 1 : count == 3 ? 0 : 2;
+	}
+	else if (!strcmp(words[0], "bot") && count == 3 && strcmp(words[2], "checkpoint"))
+	{
+		/* (bot <n> <seed>|off, not bot <seconds> checkpoint) */
+		char *end;
+		long seed = strtol(words[2], &end, 10);
+		int controller = script_parse_controller(words[1], 1);
+
+		if (!controller || (strcmp(words[2], "off") && (*end || seed < 0 || seed > 1000000)))
+			return -1;
+		step->kind = _step_bot_player;
+		step->sticks[0] = controller - 1;
+		step->sticks[1] = !strcmp(words[2], "off") ? 0 : (double)seed + 1;
+	}
 	else if (!strcmp(words[0], "bot") && (count == 2 || (count == 3 && !strcmp(words[2], "checkpoint"))))
 	{
 		step->kind = _step_bot;
@@ -681,6 +772,7 @@ static void script_load(void)
 	int repeat_start[SCRIPT_MAXIMUM_NESTING], repeat_count[SCRIPT_MAXIMUM_NESTING];
 
 	script.loaded = 1;
+	script_parse_player = 0;
 	/* (in the data folder, unless absolute: "/...", or a drive's "sd:/...") */
 	if (test_input_script_path[0] == '/' || strchr(test_input_script_path, ':'))
 		snprintf(path, sizeof(path), "%s", test_input_script_path);
@@ -839,6 +931,7 @@ static void script_gamepad(XINPUT_GAMEPAD *pad, unsigned long long milliseconds)
 	while (!script.finished && script.observed)
 	{
 		step = &script.steps[script.current];
+		script.output_player = step->player;
 		if (!script.started)
 		{
 			script.started = 1;
@@ -849,7 +942,11 @@ static void script_gamepad(XINPUT_GAMEPAD *pad, unsigned long long milliseconds)
 			script.phase_polls = 0;
 			script.phase_milliseconds = milliseconds;
 			script.presses = 0;
-			platform_log("test_input: line %d (%.1f s): %s", step->line, (double)script.clock / 1000.0, step->text);
+			if (step->player)
+				platform_log("test_input: line %d (%.1f s): controller %d: %s", step->line, (double)script.clock / 1000.0,
+					step->player + 1, step->text);
+			else
+				platform_log("test_input: line %d (%.1f s): %s", step->line, (double)script.clock / 1000.0, step->text);
 			if (step->kind == _step_objective)
 			{
 				level_run_begin();
@@ -1085,6 +1182,12 @@ static void script_gamepad(XINPUT_GAMEPAD *pad, unsigned long long milliseconds)
 			script_next();
 			platform_request_quit();
 			return;
+		case _step_controller:
+			script.connected[(int)step->sticks[0]] = (int)step->sticks[1];
+			break;
+		case _step_bot_player:
+			script.bots[(int)step->sticks[0]] = (int)step->sticks[1];
+			break;
 		case _step_wii:
 			script_wii_step(step);
 			break;
@@ -1123,17 +1226,72 @@ void test_input_observe(const char *screen, const char *focus, long tick, long c
 	script.observed = 1;
 }
 
+/* what the steps press, on the controller they are for, and a bot's play,
+added to what the machine reports of the controller */
+static void script_controller(int port, XINPUT_GAMEPAD *pad, unsigned long long milliseconds)
+{
+	int analog;
+
+	if (port == 0)
+	{
+		/* (the steps run on the first controller's read, which the game
+		makes before the others': the others take what it made) */
+		memset(&script.output, 0, sizeof(script.output));
+		script.output_player = 0;
+		script_gamepad(&script.output, milliseconds);
+	}
+	if (script.output_player == port)
+	{
+		const XINPUT_GAMEPAD *made = &script.output;
+
+		pad->wButtons |= made->wButtons;
+		for (analog = 0; analog < 8; analog++)
+		{
+			if (made->bAnalogButtons[analog] > pad->bAnalogButtons[analog])
+				pad->bAnalogButtons[analog] = made->bAnalogButtons[analog];
+		}
+		if (made->sThumbLX)
+			pad->sThumbLX = made->sThumbLX;
+		if (made->sThumbLY)
+			pad->sThumbLY = made->sThumbLY;
+		if (made->sThumbRX)
+			pad->sThumbRX = made->sThumbRX;
+		if (made->sThumbRY)
+			pad->sThumbRY = made->sThumbRY;
+	}
+	if (script.bots[port])
+	{
+		/* (in a game, the game's ticks: the same input at the same tick) */
+		test_input_bot(pad, script.tick >= 0 ? (unsigned long long)script.tick * 1000ULL / 30ULL + 1 : milliseconds,
+			script.bots[port] - 1, 0);
+	}
+}
+
+int test_input_controller(int port)
+{
+	if (port < 1 || port >= SCRIPT_CONTROLLERS || !test_input_scripted())
+		return -1;
+	return script.connected[port] - 1;
+}
+
 void test_input_gamepad(XINPUT_GAMEPAD *pad, unsigned long long milliseconds)
+{
+	test_input_gamepad_port(0, pad, milliseconds);
+}
+
+void test_input_gamepad_port(int port, XINPUT_GAMEPAD *pad, unsigned long long milliseconds)
 {
 	static int fixed_ticks = -1;
 
-	if (!test_input_active())
+	if (!test_input_active() || port < 0 || port >= SCRIPT_CONTROLLERS)
 		return;
 	if (test_input_mode == _test_input_script)
 	{
-		script_gamepad(pad, milliseconds);
+		script_controller(port, pad, milliseconds);
 		return;
 	}
+	if (port != 0)
+		return;
 	/* (with debug.fixed_ticks, the game's ticks are the clock in a game: the
 	same input at the same tick on every machine, for a lockstep check) */
 	if (fixed_ticks < 0)

@@ -199,6 +199,114 @@ static void check_good(void)
 	CHECK(quit_requested == 0, "and nothing quits");
 }
 
+/* ---------- the other controllers' verbs */
+
+static XINPUT_GAMEPAD pads[4];
+
+/* a frame: the four controllers read in order, a tenth of a second on */
+static void read_frame(void)
+{
+	int port;
+
+	clock_ms += 100;
+	for (port = 0; port < 4; port++)
+	{
+		memset(&pads[port], 0, sizeof(pads[port]));
+		test_input_gamepad_port(port, &pads[port], clock_ms);
+	}
+}
+
+static void check_players(void)
+{
+	int frame, port;
+	/* what was seen: the stick step on port 1 (and on no other), x held on port 3, the bot on port 2, a on port 0 */
+	int stick_seen = 0, stick_elsewhere = 0, hold_seen = 0, hold_elsewhere = 0, bot_seen = 0, bot_after_off = 0;
+	int press_seen = 0, press_elsewhere = 0, press_b_seen = 0, press_b_elsewhere = 0, connected_at = -1, removed_at = -1, real_at = -1;
+
+	write_script(
+		"# the other controllers\n"
+		"connect 2\n"
+		"connect 4\n"
+		"bot 3 5\n"
+		"player 2\n"
+		"stick 0 1 0 0 0.5\n"
+		"player 4\n"
+		"hold x 0.5\n"
+		"player 1\n"
+		"disconnect 2\n"
+		"connect 4 real\n"
+		"bot 3 off\n"
+		"wait 0.5\n"
+		"3: press b\n"
+		"press a\n"
+		"wait 0.3\n");
+	test_input_observe("", "", -1, 0, NULL);
+	CHECK(test_input_scripted(), "the script is played");
+	for (port = 0; port < 4; port++)
+		CHECK(test_input_controller(port) == -1, "controller %d as the machine has it before the script says", port + 1);
+	CHECK(test_input_controller(-1) == -1 && test_input_controller(4) == -1, "and no port outside 0 to 3");
+	for (frame = 0; frame < 80; frame++)
+	{
+		read_frame();
+		if (connected_at < 0 && test_input_controller(1) == 1)
+		{
+			connected_at = frame;
+			CHECK(test_input_controller(3) == 1, "connect 4: port 3 there");
+			CHECK(test_input_controller(2) == -1 && test_input_controller(0) == -1, "ports 2 and 0 untouched");
+		}
+		if (removed_at < 0 && test_input_controller(1) == 0)
+			removed_at = frame;
+		if (real_at < 0 && connected_at >= 0 && test_input_controller(3) == -1)
+			real_at = frame;
+		for (port = 0; port < 4; port++)
+		{
+			if (pads[port].sThumbLY == 32767)
+			{
+				if (port == 1)
+					stick_seen++;
+				else
+					stick_elsewhere++;
+			}
+			if (pads[port].bAnalogButtons[XINPUT_GAMEPAD_X] == 255)
+			{
+				if (port == 3)
+					hold_seen++;
+				else
+					hold_elsewhere++;
+			}
+			if (pads[port].bAnalogButtons[XINPUT_GAMEPAD_B] == 255)
+			{
+				if (port == 2)
+					press_b_seen++;
+				else
+					press_b_elsewhere++;
+			}
+			if (pads[port].bAnalogButtons[XINPUT_GAMEPAD_A] == 255 && removed_at >= 0 && real_at >= 0)
+			{
+				if (port == 0)
+					press_seen++;
+				else
+					press_elsewhere++;
+			}
+		}
+		if (removed_at < 0 && (pads[2].sThumbLY || pads[2].sThumbLX))
+			bot_seen++;
+		if (removed_at >= 0 && real_at >= 0 && (pads[2].sThumbLY || pads[2].sThumbLX))
+			bot_after_off++;
+	}
+	CHECK(connected_at >= 0 && connected_at < 10, "connect 2 and 4 take effect at once (frame %d)", connected_at);
+	CHECK(removed_at > connected_at, "disconnect 2: port 1 gone (frame %d)", removed_at);
+	CHECK(real_at > connected_at, "connect 4 real: port 3 as the machine has it (frame %d)", real_at);
+	CHECK(test_input_controller(1) == 0, "port 1 stays gone");
+	CHECK(stick_seen >= 4 && stick_elsewhere == 0, "player 2's stick moves port 1 only (%d, %d elsewhere)", stick_seen, stick_elsewhere);
+	CHECK(hold_seen >= 4 && hold_elsewhere == 0, "player 4's hold of x is on port 3 only (%d, %d elsewhere)", hold_seen, hold_elsewhere);
+	CHECK(bot_seen >= 8, "bot 3 5 plays port 2 (%d frames)", bot_seen);
+	CHECK(bot_after_off == 0, "bot 3 off stops it (%d frames after)", bot_after_off);
+	CHECK(press_seen >= 1 && press_elsewhere == 0, "player 1's press of a is on port 0 only (%d, %d elsewhere)", press_seen, press_elsewhere);
+	CHECK(press_b_seen >= 1 && press_b_elsewhere == 0, "the prefix 3: press b is on port 2 only (%d, %d elsewhere)", press_b_seen, press_b_elsewhere);
+	CHECK(!strstr(log_text, "not a step"), "no line of the script was refused");
+}
+
 /* the line is a fault: the script is refused and nothing is set */
 static int check_bad(const char *line)
 {
@@ -224,6 +332,8 @@ int main(int argc, char **argv)
 	snprintf(script_path, sizeof(script_path), "%s", argv[1]);
 	if (!strcmp(argv[2], "good"))
 		check_good();
+	else if (!strcmp(argv[2], "players"))
+		check_players();
 	else if (argc == 4)
 		check_bad(argv[3]);
 	printf("wii_script_check %s: %d checks, %d failures\n", argv[2], checks, failures);

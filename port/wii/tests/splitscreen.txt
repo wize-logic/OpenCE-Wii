@@ -1,0 +1,91 @@
+# A two-player split-screen game on Blood Gulch, for debug.test_input =
+# "script:splitscreen.txt" (port/linux/src/test_input.c lists the steps;
+# port/wii/README.md, "The playthrough check"), with the Xbox's menus
+# (display.menus = "xbox", the Wii's only ones) and an empty saves folder.
+# Controller 2 is made to appear with "connect 2" (the Xbox's device insertion:
+# XGetDeviceChanges and XInputOpen; on the Wii xinput_wii.c's port_connected),
+# so the run needs no second Remote or pad. Every line the log gets starts
+# "test_input:"; each "step" below is one of the checkpoint's steps.
+#
+# The Xbox's 4-way join screen, as the port runs it: the controller that chose
+# SPLIT SCREEN (1) joins with A. The others' presses go first to controller 1's
+# quarter (ui_widget.c, widget_takes_any_controller: no second player yet), and
+# a press that sets a profile there is taken and goes no further; so controller
+# 2 presses A with the list on its first entry, a default profile with no name,
+# which is refused (the error message, dismissed with A) and lets the press
+# on to controller 2's own quarter, which joins it. Its own profile list then
+# takes controller 2's presses (New001 is the third entry, after two defaults)
+# and controller 1's A goes on to the map. The x86 log shows "requesting a
+# player addition (controller index #1)" in the data folder's debug.txt.
+
+# the main menu: a profile first (the multiplayer lobby wants one, with a name)
+screen main_menu\main_menu 300
+wait 2
+log step 1: the first profile (CAMPAIGN makes it), back to the main menu
+press a
+screen new_campaign_creating_profile 60
+wait 2
+press a
+screen difficulty_select 120
+wait 2
+press b
+wait 3
+screen main_menu\main_menu 60
+
+# MULTIPLAYER, SPLIT SCREEN: the controllers join
+log step 2: MULTIPLAYER, SPLIT SCREEN
+select main_menu_item_multiplayer
+press a
+wait 2
+select multiplayer_type_split_item
+press a
+screen 4way_start2join_screen 60
+wait 2
+connect 2
+wait 2
+log step 3: controller 1 joins (A), controller 2 joins (A: its profile is refused, which still joins it)
+press a
+wait 3
+2: press a
+wait 3
+2: press a
+wait 3
+
+# controller 2's own profile list, then controller 1's A to go on
+log step 4: controller 2 chooses a profile, controller 1 goes on
+2: press right
+wait 1
+2: press right
+wait 1
+2: press a
+wait 3
+press a
+
+# BLOOD GULCH is the tenth map of the list; the first gametype (slayer)
+screen splitscreen_map_select 60
+wait 2
+log step 5: the map, Blood Gulch
+repeat 9
+press right
+wait 0.5
+end
+press a
+screen gametype_select 60
+wait 2
+log step 6: the gametype
+press a
+screen splitscreen_pregame 60
+wait 2
+log step 7: the pregame lobby, both players in it
+press a
+
+# the game: both players are the bot (bot:1 and bot:2), for 2,700 ticks (90 s)
+play 300
+log step 8: the game plays
+bot 1 1
+bot 2 2
+repeat 9
+ticks 300
+log step 9: both players play
+end
+quit

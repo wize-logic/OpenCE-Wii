@@ -826,7 +826,10 @@ static DWORD connected_gamepads(void)
 	/* the first pad shares port 0 with the keyboard (port_gamepad) */
 	for (port = 1; port < PORT_COUNT; port++)
 	{
-		if (port_gamepad(gamepads, count, port))
+		/* (a script's connect and disconnect: test_input.c) */
+		int scripted = test_input_controller(port);
+
+		if (scripted == 1 || (scripted < 0 && port_gamepad(gamepads, count, port)))
 			mask |= 1UL << port;
 	}
 	return mask;
@@ -933,7 +936,7 @@ DWORD WINAPI XInputGetState(HANDLE device, PXINPUT_STATE state)
 		}
 		if (port_gamepad(gamepads, count, 0))
 			sdl_gamepad_state(gamepads[0], &state->Gamepad);
-		test_input_gamepad(&state->Gamepad, (unsigned long long)SDL_GetTicks());
+		test_input_gamepad_port(0, &state->Gamepad, (unsigned long long)SDL_GetTicks());
 		touch_input_gamepad(&state->Gamepad);
 #if defined(HALO_ANDROID) || defined(HALO_WEB)
 		touch_input_controls(&state->Gamepad, input.menus);
@@ -946,9 +949,12 @@ DWORD WINAPI XInputGetState(HANDLE device, PXINPUT_STATE state)
 			pthread_mutex_unlock(&mouse_lock);
 		}
 	}
-	else if (port_gamepad(gamepads, count, port))
+	else
 	{
-		sdl_gamepad_state(port_gamepad(gamepads, count, port), &state->Gamepad);
+		if (port_gamepad(gamepads, count, port) && test_input_controller(port) != 0)
+			sdl_gamepad_state(port_gamepad(gamepads, count, port), &state->Gamepad);
+		/* (the script's steps and bots for this controller) */
+		test_input_gamepad_port(port, &state->Gamepad, (unsigned long long)SDL_GetTicks());
 	}
 
 	if (memcmp(&state->Gamepad, &controllers[port].previous, sizeof(state->Gamepad)))
