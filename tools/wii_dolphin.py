@@ -4,7 +4,9 @@
 The SD card is a folder synced in by Dolphin, build/wii/sd unless --sd says otherwise; the game
 looks for its data in apps/halo there (port/wii/README.md). The screenshot goes to
 build/wii/dolphin.png. Every other option is the runner's (--until, --fail, --seconds,
---dump-frames, --dolphin).
+--dump-frames, --dolphin, and --sd-out DIR: what the game wrote to the card, which Dolphin writes
+back to the runner's own copy, is copied to DIR when the run ends; with an empty folder
+build/wii/sd/apps/halo/logs that is the game's log file, logs/log-NN.log).
 
 usage: tools/wii_dolphin.py [--wiilibs DIR] [runner options] [build/wii/halo.dol]
 """
