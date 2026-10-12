@@ -34,6 +34,7 @@ game does not have while it runs.
 
 #include <stdio.h>
 
+#include "wl/platform/hwcount.h"
 #include "wl/platform/platform.h"
 #include "wl/platform/profile_arm.h"
 
@@ -137,11 +138,16 @@ static void profile_issue(void *user, WlProfileArmIssue issue, const char *key, 
 }
 
 /* from __wrap_main (wii_boot.c), once the SD card and the USB drive are
-mounted: reads profile.txt and, if it is there, starts the watcher */
+mounted: reads profile.txt and, if it is there, starts the watcher; and
+hwcount.txt, which arms WiiLibs' hardware counters (wl/platform/hwcount.h:
+the processor's performance monitor and GX's counters, read each frame by
+wl_gx_begin_frame and wl_gx_end_frame, a verdict logged a second under the
+tag "hw"; see port/wii/README.md, "The hardware counters") */
 void wii_profile_arm(void)
 {
 	WlProfileArmConfig config;
 
+	(void)wl_hwcount_arm(wii_game_folder()); /* (not found: not armed) */
 	if (wl_profile_arm_config_load(&config, wii_game_folder(), profile_issue, NULL) != WL_OK)
 		return;
 	config.hooks.ready = profile_ready;

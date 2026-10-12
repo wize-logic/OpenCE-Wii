@@ -845,6 +845,94 @@ Dolphin it counts instructions executed (about one cycle each, no cache or bus w
 is taken at the end of a translated block); on the console it counts where the processor waits as
 well. Use Dolphin's profile to find what the game does, and the console's to find what it costs.
 
+### The hardware counters (what the frame waits for)
+
+The profiler says which functions; the counters say which part of the console the frame waits for,
+and so name the bottleneck of a frame that misses its 33 ms: the processor (and whether its memory,
+its branches or its instruction count) or the GPU (transform, fill and TEV, textures, vertex fetch).
+They are WiiLibs' `wl/platform/hwcount.h` (its README section "Hardware counters" has the registers,
+the groups and the verdict's rules), armed here by a second control file, `hwcount.txt` beside
+`profile.txt` (`sd:/apps/halo/hwcount.txt`, or the USB drive's); `src/wii_profile.c` calls
+`wl_hwcount_arm` at start-up and `wl_gx_begin_frame` and `wl_gx_end_frame` do the rest. Without the
+file a run is unchanged. It needs a console: Dolphin does not model the counters, and the log then
+says `cpu: no counters` and `gp: no counters` (and prints the frame times and the FIFO's fill).
+
+```
+# sd:/apps/halo/hwcount.txt: "name value" lines; these are the defaults
+seconds 1      # a block of log lines every so many seconds
+cpu 1          # the Broadway's performance monitor (PMC1 to PMC4)
+gp 1           # GX's counters
+vcache 1       # the vertex cache's counters with each GPU group
+timeline 1     # marks (draw-sync tokens) and the FIFO fill sampler
+fifo_hz 480    # the FIFO sampler's rate
+selftest 1     # check that the counters count
+first 60       # frames to let go by (a level's load) before measuring
+raw 0          # also log each group's raw counters (set 1 on the first run)
+```
+
+Each frame measures one CPU group (cycles on PMC1, three events on the others: instructions and L1
+data misses and mispredicts; miss stall cycles; L2; branch stalls; the instruction mix; TLB) and one
+GPU group (the XF/RAS busy and wait clocks, or a pair of metrics: transform or lighting clocks,
+vertices, texels, triangles, quads, texture-memory stalls, texture-cache misses, vertex-cache
+stalls); the groups take turns, so a rotation is 42 frames and a metric is sampled about five times
+a second. A block, once a second, in the log (Dolphin's console or the SD log) under the tag `hw`:
+
+```
+[hw] block 12: 30 frames, frame 38.10 ms (worst 52.40 ms), cpu waits: gpu 1.20 ms display 0.00 ms | gpu done at 14.30 ms
+[hw] cpu: ipc 0.52 | L1D miss/ki 18 stall 31.0% load 18.0% | L2 miss/kc 5 hit/kc 5 castout/kc 20
+[hw] cpu: br mispredict/ki 6 stall 0.0% lr/ctr 1.0% | fp 9.0% int 45.4% | dtlb search 1.0% itlb 1.0% | kcycles 23571
+[hw] gp: xf wait-in 72.0% wait-out 1.0% | ras busy 15.0% | xfrm 8.0% lit 2.0% bot 3.0% | clk 243.0 MHz
+[hw] gp: verts 30000 tris 10000 quads 50000 texels 400000 | tc miss/ktexel 20 tx stall 2.0% idle 40.0% | vc stall 1.0% vcache miss 10.0%
+[hw] fifo: mean 6.2% max 6.2% of 1048576 bytes (30 samples)
+[hw] verdict: CPU-bound (gp starved: xf wait-in 72.0%, fifo 6.2% full, gpu wait 3.0%); cpu: memory stalls (dcache stall 31.0%, 18 L1D miss/ki)
+```
+
+(Those numbers are made up, from the host test's fake machine; the first real ones are the console's.)
+
+How to read it:
+
+- **`frame` and `worst`** are the processor's frame-to-frame time. `cpu waits` is the time the
+  processor spent blocked in `wl_gx_sync` and the end-of-frame wait for the GPU, and for a free
+  display buffer (the retrace limiter). The processor's counters leave those waits out; everything
+  else (the game, the drawing, the sound thread, the interrupts) is counted. `gpu done at` is when
+  the GPU had finished the frame, from the frame's start.
+- **The verdict.** `CPU-bound (gp starved ...)`: the XF waits for input (`xf wait-in` 60% or more of
+  the GP's clocks), the FIFO is nearly empty and the processor hardly waits for the GPU: the frame
+  is made on the processor, and the part after it says why: `memory stalls` (the L1 data miss stall
+  cycles are 30% of the cycles; look at the profiler's functions that walk data), `branches`,
+  `pipeline stalls` (IPC under 0.6 without a memory or branch cause: load-use and floating-point
+  latency) or `compute` (instructions flow; there are too many of them). `transform-bound`,
+  `fill/TEV-bound`, `texture-bound` and `vertex-fetch-bound` name the busiest GPU part, with the
+  figure that decided it; `GPU-bound (mixed)` is a busy GPU with no part over its threshold; `fits`
+  is a frame under 35 ms that waits for the display. These thresholds are starting values, set from
+  the counters' definitions and not from a console: if the first run's verdict disagrees with the
+  numbers above it, the numbers are the evidence and the thresholds
+  (`wl_hwcount_thresholds_default`) are what to change.
+- **First run on the console.** Set `raw 1`. The `armed` line and the self-test lines say whether
+  the counters count: `gp: counters count (drew 6 vertices; slots read 6 0 6 0; perf0 on slot 0,
+  perf1 on slot 2)` confirms the register map (the self-test needs the renderer to call
+  `wl_hwcount_selftest_begin`/`_end` around its known-vertex draw; without it, the GPU group set is
+  checked by whether any group reads non-zero); `cpu: no counters (cycles read ...)` means the
+  performance monitor did not follow the time base. `clk 243.0 MHz` is the GP's measured clock
+  (a result far from 243 means the nominal clock the pairs' shares are computed with is wrong, and
+  they follow the measured one). A `raw` line per group lists the four counter slots: if a pair's
+  second metric is not on slot 2, the raw lines show which slot moves.
+- **The marks.** `wl_hwcount_mark(id)` (0 to 15, from `d3d8_gx.c` or the game) sends a draw-sync
+  token and the block's `marks` line shows, per id, the mean time into the frame at which the
+  processor gave it and the GPU passed it, `cpu/gpu` in ms; a growing gap is the GPU falling behind
+  at that point of the frame (the world, then the HUD). A mark flushes the write-gather pipe, so
+  keep them few.
+- **Brackets.** A wait for the GPU outside WiiLibs' own (`GX_DrawDone` in `d3d8_gx.c`) is counted
+  as the processor's time and spins the processor's counters; bracket it with
+  `wl_hwcount_wait_begin(WL_HWWAIT_GPU)` and `wl_hwcount_wait_end(WL_HWWAIT_GPU)`.
+
+What to look for per level (and report with the level's name): the block's `frame` against 33.3 ms,
+the verdict at the slowest and fastest moments, the three or four numbers that decided it, and the
+`raw` lines once. A level that is CPU-bound with memory stalls is a data-layout problem; one that is
+CPU-bound with `compute` wants fewer instructions (the profiler's top functions); a texture or
+fill verdict wants fewer or cheaper passes (the draw counts in the frame split); a transform verdict
+wants fewer vertices through the GPU (`gpu_transform` and the vertex programs).
+
 ## The playthrough check
 
 The game played as a person plays it, through the menus, rather than started by the network test:
@@ -974,7 +1062,8 @@ Dolphin runs the game, but these need the console:
 - **Speed.** Dolphin's emulated timing does not follow this code's cost (a
   short function can measure several times its instruction count); a
   frame's time, and where it goes (the log's "a frame's draws" lines, and
-  the sampling profiler's tables, above), on the console.
+  the sampling profiler's tables, above, and the hardware counters' verdict,
+  "The hardware counters"), on the console.
 - **Alignment exceptions.** The PowerPC 750 can trap a floating-point load
   from an address that is not a multiple of 4; Dolphin does not. The
   compressed animations' floats are read a byte at a time for this; any
