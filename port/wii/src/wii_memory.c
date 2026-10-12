@@ -69,6 +69,9 @@ static struct contiguous_window windows[] =
 #define WINDOW_COUNT (sizeof(windows) / sizeof(windows[0]))
 
 static pthread_mutex_t window_lock = PTHREAD_MUTEX_INITIALIZER;
+/* (a change of the windows' pages, taken or freed: wii_memory_window_usage
+counts them again only after one, as the device asks every draw) */
+static unsigned long window_changes = 1;
 
 BOOL wii_memory_claim(void)
 {
@@ -192,6 +195,7 @@ void *platform_contiguous_alloc(unsigned long size, unsigned long alignment,
 	for (page = first; page < first + count; page++)
 		window->page_protection[page] = (unsigned short)protect;
 	window->block_page_count[first] = (unsigned short)count;
+	window_changes++;
 	pthread_mutex_unlock(&window_lock);
 	/* fresh pages are zeroed, as the Xbox kernel's are */
 	memset(address, 0, count * PAGE_SIZE_BYTES);
@@ -203,26 +207,35 @@ the log */
 void wii_memory_window_usage(unsigned long *used_bytes, unsigned long *free_bytes, unsigned long *largest_free)
 {
 	const struct contiguous_window *window = &windows[0];
-	unsigned long page, used = 0, run = 0, largest = 0;
+	static unsigned long counted_changes, used, largest;
+	unsigned long page, run = 0;
 
 	pthread_mutex_lock(&window_lock);
-	for (page = 0; page < window->page_count; page++)
+	if (counted_changes != window_changes)
 	{
-		if (window->page_protection[page])
+		counted_changes = window_changes;
+		used = 0;
+		largest = 0;
+		for (page = 0; page < window->page_count; page++)
 		{
-			used++;
-			run = 0;
-		}
-		else if (++run > largest)
-		{
-			largest = run;
+			if (window->page_protection[page])
+			{
+				used++;
+				run = 0;
+			}
+			else if (++run > largest)
+			{
+				largest = run;
+			}
 		}
 	}
-	pthread_mutex_unlock(&window_lock);
-	*used_bytes = used * PAGE_SIZE_BYTES;
-	*free_bytes = (window->page_count - used) * PAGE_SIZE_BYTES;
+	if (used_bytes)
+		*used_bytes = used * PAGE_SIZE_BYTES;
+	if (free_bytes)
+		*free_bytes = (window->page_count - used) * PAGE_SIZE_BYTES;
 	if (largest_free)
 		*largest_free = largest * PAGE_SIZE_BYTES;
+	pthread_mutex_unlock(&window_lock);
 }
 
 /* the window's start and size (it reaches below PLATFORM_CONTIGUOUS_WINDOW
@@ -246,6 +259,7 @@ void platform_contiguous_free(void *address)
 	for (page = first; page < first + count; page++)
 		window->page_protection[page] = 0;
 	window->block_page_count[first] = 0;
+	window_changes++;
 	pthread_mutex_unlock(&window_lock);
 }
 
