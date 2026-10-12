@@ -369,7 +369,7 @@ def generate_wii_build(n: Writer, sln: Any) -> None:
     stub_cflags = " ".join(wii_abi_flags(devkitpro))
     n.rule(
         name="wii_link",
-        command=(f"$python {LINK_SCRIPT} --linker {linker} --compiler $wii_cc "
+        command=(f"$python {LINK_SCRIPT} --wiilibs {_quote(wiilibs)} --linker {linker} --compiler $wii_cc "
                  f"--cflags '$stub_cflags' --ldflags '$ldflags' --libs '$libs' "
                  f"--stubs {build_dir / 'wii_missing.c'} --report {build_dir / 'missing_symbols.txt'} "
                  f"--output $out @$out.rsp"),
@@ -377,7 +377,8 @@ def generate_wii_build(n: Writer, sln: Any) -> None:
         rspfile="$out.rsp",
         rspfile_content="$in_newline",
     )
-    n.build(outputs=elf, rule="wii_link", inputs=objects, implicit=[LINK_SCRIPT, *wiilibs_outputs],
+    n.build(outputs=elf, rule="wii_link", inputs=objects,
+            implicit=[LINK_SCRIPT, wiilibs / "tools" / "link_stubs.py", *wiilibs_outputs],
             implicit_outputs=[build_dir / "missing_symbols.txt"],
             variables={"ldflags": ldflags, "libs": libs, "stub_cflags": stub_cflags})
     n.rule(name="wii_dol", command=f"{devkitpro / 'tools' / 'bin' / 'elf2dol'} $in $out",

@@ -116,7 +116,8 @@ inflated it to, and the Wii reads it where it is.
 - **Start-up.** The link wraps `main`. `src/wii_boot.c`'s `__wrap_main` does the following, then
   calls the game's `main` (`source/shell/shell_xbox.c`):
   - claims the fixed memory
-  - starts WiiLibs: system buttons, log, crash report, heaps, IOS 58, SD and USB
+  - starts WiiLibs: system buttons, log, crash report, the text console (`wl_platform_console_start`),
+    heaps, IOS 58, SD and USB
   - turns on the game's heap in MEM2 (the overflow of MEM1's malloc)
   - starts the network in the background
 
@@ -135,8 +136,9 @@ inflated it to, and the Wii reads it where it is.
   | `d3d8_gx.c` | the Direct3D device |
   | `wii_extras.c` | the desktop additions the Wii goes without |
 
-  `tools/wii_link.py` stubs any symbol still missing with a function that stops the game and names
-  it (`build/wii/missing_symbols.txt`).
+  `tools/wii_link.py` (WiiLibs' `tools/link_stubs.py`) stubs any symbol still missing with a
+  function that stops the game and names it (`build/wii/missing_symbols.txt`; the stop is WiiLibs'
+  `wl_platform_missing_symbol`, whose screen waits for HOME or START to return to the loader).
 - **Memory.** The Wii's cached memory is at virtual 0x80000000 + P, as the Xbox's is, so the
   game's and Direct3D's physical/virtual arithmetic holds. Every byte of both regions, and the
   memory report in the log, is in "Memory" below. The game's pools are the Xbox's sizes

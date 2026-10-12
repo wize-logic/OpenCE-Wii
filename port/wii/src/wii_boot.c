@@ -10,7 +10,7 @@ __wrap_main here, which then calls the game's:
 - WiiLibs: the reset and power buttons, the log, its heaps (sized for what
   the port uses it for), IOS 58 for USB 2.0, the SD card and a USB drive;
 - for the bring-up, a text console on the screen, in one of WiiLibs' video
-  framebuffers;
+  framebuffers (wl_platform_console_start);
 - the sampling profiler's watcher, when the game's folder holds profile.txt
   (port/wii/src/wii_profile.c);
 - the game's main runs on a thread of its own with a 512 KB stack (WiiLibs'
@@ -21,26 +21,22 @@ __wrap_main here, which then calls the game's:
 - the accounting of the heaps by call site, for the memory report
   (WiiLibs' wl_heap_overflow_track_sites).
 
-Also the trap the bring-up stubs call (tools/wii_link.py): a platform
-function the port does not provide yet stops the game, naming it.
+A fault of the start-up, or a platform function the port does not provide
+yet (the bring-up stubs of tools/wii_link.py, WiiLibs' tools/link_stubs.py),
+stops the game with WiiLibs' stop screen (wl_platform_stop_screen), which
+says why on the console and waits for HOME.
 */
 
-#include <gccore.h>
-
-#include <stdarg.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 
 #include "wl/platform/heap_overflow.h"
 #include "wl/platform/mem.h"
 #include "wl/platform/platform.h"
+#include "wl/platform/stop.h"
 
 #include "wii_memory.h"
 
-#include <string.h>
-
-void wii_missing_symbol(const char *name) __attribute__((noreturn));
 int wii_memory_claim(void);
 void wii_network_start(void);
 void wii_profile_arm(void);
@@ -77,38 +73,6 @@ them, the rest by size; its tables in the game's heap in MEM2 */
 #endif
 #endif
 
-static void wii_report(const char *format, ...)
-{
-	char line[256];
-	va_list arguments;
-
-	va_start(arguments, format);
-	vsnprintf(line, sizeof(line), format, arguments);
-	va_end(arguments);
-	/* the console, and the log */
-	fputs(line, stdout);
-	WL_LOG_I("wii", "%s", line);
-}
-
-/* the console's framebuffer: one of WiiLibs' two, which the device draws
-into later (its frames cover the text once they start), not a third of its
-own (600 KB of MEM1's heap) */
-static void *console_framebuffer;
-
-static void wii_console_start(void)
-{
-	GXRModeObj *mode;
-
-	if (wl_platform_video_init() != WL_OK)
-		return;
-	mode = VIDEO_GetPreferredMode(NULL);
-	console_framebuffer = wl_platform_video_back_buffer();
-	console_init(console_framebuffer, 20, 20, mode->fbWidth, mode->xfbHeight, mode->fbWidth * VI_DISPLAY_PIX_SZ);
-	VIDEO_SetNextFramebuffer(console_framebuffer);
-	VIDEO_Flush();
-	VIDEO_WaitVSync();
-}
-
 /* the game's main thread: its stack, which WiiLibs fills with a pattern so the
 memory report can tell how deep it has been (wii_game_stack_used); the
 deepest seen is about 290 KB (an AI path search in b30) */
@@ -139,10 +103,11 @@ int __wrap_main(void)
 	wl_platform_system_init();
 	wl_platform_log_init(NULL);
 	wl_platform_crash_report_install();
-	wii_console_start();
-	wii_report("Halo: Combat Evolved for the Wii (bring-up build)\n");
+	/* (a console that cannot start leaves the log) */
+	(void)wl_platform_console_start();
+	wl_platform_console_report("wii", "Halo: Combat Evolved for the Wii (bring-up build)\n");
 	if (!claimed)
-		wii_missing_symbol("the fixed memory windows (see the log)");
+		wl_platform_stop_screen("The fixed memory windows could not be claimed (see the log).");
 
 	wl_mem_config_default(&memory);
 	memory.tags = wii_memory_tags;
@@ -150,11 +115,11 @@ int __wrap_main(void)
 	memory.frame_arena_size = 0;
 	memory.scene_stack_size = 0;
 	if (wl_mem_init(&memory) != WL_OK)
-		wii_missing_symbol("memory for WiiLibs' heaps (see the log)");
+		wl_platform_stop_screen("WiiLibs' heaps could not be made (see the log).");
 	/* what MEM1's malloc cannot hold comes from the game's heap in MEM2
 	(the link wraps malloc and the rest: tools/wii_build.py) */
 	if (wl_heap_overflow_enable(WII_MEMORY_TAG_GAME) != WL_OK)
-		wii_missing_symbol("the game's heap in MEM2 (see the log)");
+		wl_platform_stop_screen("The game's heap in MEM2 could not be made (see the log).");
 #ifdef WII_HEAP_SITES
 	{
 		void *storage = WL_MEM_ALLOC(WII_MEMORY_TAG_GAME, WII_HEAP_SITES_STORAGE);
@@ -173,52 +138,14 @@ int __wrap_main(void)
 	wii_network_start();
 	/* the sampling profiler, only if profile.txt is in the game's folder (src/wii_profile.c) */
 	wii_profile_arm();
-	wii_report("IOS %u; SD card %s, USB drive %s\n", (unsigned)ios,
+	wl_platform_console_report("wii", "IOS %u; SD card %s, USB drive %s\n", (unsigned)ios,
 		wl_platform_fs_mounted(WL_DEVICE_SD) ? "mounted" : "absent",
 		wl_platform_fs_mounted(WL_DEVICE_USB) ? "mounted" : "absent");
 	{
 		void *result = NULL;
 
 		if (wl_platform_run_on_stack(game_main, NULL, game_stack, GAME_STACK_SIZE, &result) != WL_OK)
-			wii_missing_symbol("a thread for the game's main (see the log)");
+			wl_platform_stop_screen("The game's main thread could not be made (see the log).");
 		return (int)(intptr_t)result;
-	}
-}
-
-void wii_missing_symbol(const char *name)
-{
-	static int stopped;
-
-	/* (once: a stub reached while stopping only waits) */
-	if (stopped++)
-	{
-		for (;;)
-			VIDEO_WaitVSync();
-	}
-	wii_report("\nThe Wii port does not provide %s yet.\nPress HOME (or START) to return to the loader.\n", name);
-	wl_platform_log_flush();
-	/* (the console's framebuffer on the screen again, if the game's frames
-	had taken its place: after the last frame presented, which the retrace
-	interrupt would otherwise put on the screen over it) */
-	if (console_framebuffer)
-	{
-		wl_platform_video_wait_shown();
-		VIDEO_SetNextFramebuffer(console_framebuffer);
-		VIDEO_Flush();
-	}
-	for (;;)
-	{
-		WlRawInput input;
-		uint32_t index;
-		int home = 0;
-
-		wl_platform_input_poll(&input);
-		for (index = 0; index < WL_INPUT_MAX_REMOTES; index++)
-			home |= input.remotes[index].connected && (input.remotes[index].buttons & WL_WM_HOME);
-		for (index = 0; index < WL_INPUT_MAX_PADS; index++)
-			home |= input.pads[index].connected && (input.pads[index].buttons & WL_PAD_START);
-		if (home || wl_platform_system_events())
-			wl_platform_exit(WL_EXIT_LOADER);
-		VIDEO_WaitVSync();
 	}
 }
