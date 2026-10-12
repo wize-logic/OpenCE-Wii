@@ -222,9 +222,10 @@ static unsigned long environment_serial;
 /* audio.reverb */
 static BOOL reverb_enabled = TRUE;
 
-/* the rate the reverb runs at: the Wii's, its low bus's (the Wii's mixing) */
+/* the rate the reverb runs at: the Wii's, half its low bus's (the Wii's
+mixing; "The Wii's reverb" below) */
 #ifdef HALO_WII
-#define REVERB_RATE LOW_RATE
+#define REVERB_RATE (LOW_RATE / 2)
 #else
 #define REVERB_RATE OUTPUT_RATE
 #endif
@@ -1021,13 +1022,24 @@ reverb out over as long and stops it. Once nothing has been sent for
 REVERB_QUIET_FRAMES and the reverberation is 120 dB down, the reverb stops
 until something is sent again (outdoors, in the menus). */
 
+#ifdef HALO_WII
+/* (the Wii's reverb: 11,025 Hz, four lines; sizes for that rate) */
+#define REVERB_DELAY_SIZE 8192 /* the reflections and reverb delays, 0.3 + 0.1 s at most, and the taps */
+#define REVERB_TAPS 6
+#define REVERB_DIFFUSERS 4
+#define REVERB_DIFFUSER_SIZE 256
+#define REVERB_LINES 4
+#define REVERB_LINE_SIZE 1024
+#define REVERB_FADE_FRAMES 2048 /* 186 ms, as the other builds' 85 ms at 48 kHz is at the double of this rate */
+#else
 #define REVERB_DELAY_SIZE 32768 /* the reflections and reverb delays, 0.3 + 0.1 s at most, and the taps */
 #define REVERB_TAPS 6
 #define REVERB_DIFFUSERS 4
 #define REVERB_DIFFUSER_SIZE 1024
 #define REVERB_LINES 8
 #define REVERB_LINE_SIZE 4096
-#define REVERB_FADE_FRAMES 4096 /* 85 ms at 48 kHz (the Wii's reverb runs at 22 kHz: 186 ms) */
+#define REVERB_FADE_FRAMES 4096 /* 85 ms at 48 kHz */
+#endif
 /* the input delays, then the diffusers, played out */
 #define REVERB_QUIET_FRAMES (REVERB_DELAY_SIZE + REVERB_DIFFUSERS * REVERB_DIFFUSER_SIZE)
 #define REVERB_QUIET_PEAK 1.0e-6f
@@ -1037,11 +1049,22 @@ the lines at full density */
 static const float reverb_tap_times[REVERB_TAPS] = { 0.0f, 3.1f, 5.3f, 7.9f, 11.2f, 14.9f };
 static const float reverb_tap_signs[REVERB_TAPS] = { 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f };
 static const float reverb_diffuser_times[REVERB_DIFFUSERS] = { 4.7f, 3.6f, 12.7f, 9.3f };
+#ifdef HALO_WII
+/* (four of the eight, as far apart as they come, in the same order) */
+static const float reverb_line_times[REVERB_LINES] = { 29.7f, 41.1f, 53.3f, 67.1f };
+/* which lines go in negated, and the two outputs' signs of the lines (the
+input's orthogonal to both outputs', so that what is sent does not come
+straight out) */
+static const float reverb_input_signs[REVERB_LINES] = { 1, -1, -1, 1 };
+static const float reverb_left_signs[REVERB_LINES] = { 1, -1, 1, -1 };
+static const float reverb_right_signs[REVERB_LINES] = { 1, 1, -1, -1 };
+#else
 static const float reverb_line_times[REVERB_LINES] = { 29.7f, 37.1f, 41.1f, 43.7f, 53.3f, 59.9f, 67.1f, 73.1f };
 /* which lines go in negated, and the two outputs' signs of the lines */
 static const float reverb_input_signs[REVERB_LINES] = { 1, -1, -1, 1, 1, -1, -1, 1 };
 static const float reverb_left_signs[REVERB_LINES] = { 1, -1, 1, -1, 1, -1, 1, -1 };
 static const float reverb_right_signs[REVERB_LINES] = { 1, 1, -1, -1, 1, 1, -1, -1 };
+#endif
 
 /* what an environment sets: delays in samples, and gains */
 struct reverb_parameters
@@ -1086,6 +1109,14 @@ static struct
 	unsigned long line_position;
 	/* each line's low pass */
 	float lowpass[REVERB_LINES];
+#ifdef HALO_WII
+	/* the bus at the reverb's rate, the reverberation at it, and the frames
+	that the resampling to and from it reaches back to */
+	float decimated[MIX_CHUNK_FRAMES / 2];
+	float rendered[MIX_CHUNK_FRAMES];
+	float send_history;
+	float rendered_history[OUTPUT_CHANNELS];
+#endif
 } reverb;
 
 static float clamp_real(float value, float minimum, float maximum)
@@ -1173,6 +1204,10 @@ static void reverb_clear(void)
 	memset(reverb.diffusers, 0, sizeof(reverb.diffusers));
 	memset(reverb.lines, 0, sizeof(reverb.lines));
 	memset(reverb.lowpass, 0, sizeof(reverb.lowpass));
+#ifdef HALO_WII
+	reverb.send_history = 0.0f;
+	memset(reverb.rendered_history, 0, sizeof(reverb.rendered_history));
+#endif
 	reverb.from = reverb.to;
 	reverb.fade = 0;
 	reverb.silent = TRUE;
@@ -1190,15 +1225,149 @@ static void reverb_initialize(void)
 	reverb_update(&environment, environment_serial);
 }
 
+#ifdef HALO_WII
+/* The Wii's reverb. The network (taps, diffusers, lines) costs the same for
+each frame it runs, so the Wii runs it at 11,025 Hz, half the low bus's rate
+(a quarter of the output's), on four lines of the eight: the bus is
+decimated by a 1 2 1 low pass, the reverberation is interpolated back up
+linearly, and the rest is the other builds' reverb, from the same I3DL2
+properties, so the room has the decay time, the reflections and the level the
+game set (the high frequencies of the reverberation end at 5 kHz, which
+the properties' HF reference mostly does anyway). While the environment holds
+and the level has reached its target (reverb_steady), a frame uses the one
+set of parameters, and not the crossfade between two. */
+static void reverb_run(const float *send, float *output, unsigned long frames, float target_level);
+
+/* the steady state of reverb_run: the same arithmetic for fade 0, with the
+parameters read once */
+static void reverb_steady(const float *send, float *output, unsigned long frames)
+{
+	const struct reverb_parameters *to = &reverb.to;
+	const float input_scale = 1.0f / sqrtf((float)REVERB_LINES);
+	const float level = reverb.level;
+	const float reflections_gain = to->reflections_gain, late_gain = to->late_gain, diffusion = to->diffusion;
+	float peak = 0.0f;
+	unsigned long position = reverb.delay_position, diffuser_position = reverb.diffuser_position;
+	unsigned long line_position = reverb.line_position;
+	unsigned long frame;
+	int index;
+
+	reverb.silent = FALSE;
+	for (frame = 0; frame < frames; frame++)
+	{
+		float early_left = 0.0f, early_right = 0.0f;
+		float outputs[REVERB_LINES], late_left = 0.0f, late_right = 0.0f, feedback_sum = 0.0f, value;
+		float left, right, loudness, input = send[frame];
+
+		reverb.delay[position & (REVERB_DELAY_SIZE - 1)] = input;
+		for (index = 0; index < REVERB_TAPS; index += 2)
+		{
+			early_left += reverb_tap_signs[index] * reverb.delay[(position - to->taps[index]) & (REVERB_DELAY_SIZE - 1)];
+			early_right += reverb_tap_signs[index + 1] *
+				reverb.delay[(position - to->taps[index + 1]) & (REVERB_DELAY_SIZE - 1)];
+		}
+		value = reverb.delay[(position - to->late_delay) & (REVERB_DELAY_SIZE - 1)];
+		position++;
+		for (index = 0; index < REVERB_DIFFUSERS; index++)
+		{
+			float *buffer = reverb.diffusers[index];
+			float delayed = buffer[(diffuser_position - reverb.diffuser_lengths[index]) & (REVERB_DIFFUSER_SIZE - 1)];
+			float written = flush_denormal(value + diffusion * delayed);
+
+			buffer[diffuser_position & (REVERB_DIFFUSER_SIZE - 1)] = written;
+			value = delayed - diffusion * written;
+		}
+		diffuser_position++;
+		for (index = 0; index < REVERB_LINES; index++)
+		{
+			float line_output = reverb.lines[index][(line_position - to->lengths[index]) & (REVERB_LINE_SIZE - 1)];
+			float lowpass = flush_denormal(line_output + to->damping[index] * (reverb.lowpass[index] - line_output));
+
+			reverb.lowpass[index] = lowpass;
+			late_left += reverb_left_signs[index] * lowpass;
+			late_right += reverb_right_signs[index] * lowpass;
+			outputs[index] = lowpass * to->feedback[index];
+			feedback_sum += outputs[index];
+		}
+		feedback_sum *= 2.0f / REVERB_LINES;
+		value *= input_scale;
+		for (index = 0; index < REVERB_LINES; index++)
+		{
+			reverb.lines[index][line_position & (REVERB_LINE_SIZE - 1)] =
+				flush_denormal(outputs[index] - feedback_sum + value * reverb_input_signs[index]);
+		}
+		line_position++;
+
+		left = early_left * reflections_gain + late_left * late_gain;
+		right = early_right * reflections_gain + late_right * late_gain;
+		output[frame * 2] += left * level;
+		output[frame * 2 + 1] += right * level;
+		/* (the three together, one test: only whether anything is heard) */
+		loudness = fabsf(left) + fabsf(right) + fabsf(input);
+		peak = loudness > peak ? loudness : peak;
+	}
+	reverb.delay_position = position;
+	reverb.diffuser_position = diffuser_position;
+	reverb.line_position = line_position;
+	reverb.quiet = peak > REVERB_QUIET_PEAK ? 0 : reverb.quiet + frames;
+}
+
+/* adds the reverberation of send to output (frames of the low bus, stereo),
+its level moving to target_level */
+static void reverb_process(const float *send, float *output, unsigned long frames, float target_level)
+{
+	unsigned long half = frames / 2, index;
+	float previous = reverb.send_history;
+	float left = reverb.rendered_history[0], right = reverb.rendered_history[1];
+
+	for (index = 0; index < half; index++)
+	{
+		float next = send[2 * index + 1];
+
+		reverb.decimated[index] = 0.5f * send[2 * index] + 0.25f * (previous + next);
+		previous = next;
+	}
+	reverb.send_history = previous;
+	memset(reverb.rendered, 0, half * OUTPUT_CHANNELS * sizeof(float));
+	reverb_run(reverb.decimated, reverb.rendered, half, target_level);
+	/* a frame of the reverb's rate is the low bus's frame after the one
+	between it and the last (their mean) */
+	for (index = 0; index < half; index++)
+	{
+		float rendered_left = reverb.rendered[2 * index], rendered_right = reverb.rendered[2 * index + 1];
+
+		output[4 * index] += 0.5f * (left + rendered_left);
+		output[4 * index + 1] += 0.5f * (right + rendered_right);
+		output[4 * index + 2] += rendered_left;
+		output[4 * index + 3] += rendered_right;
+		left = rendered_left;
+		right = rendered_right;
+	}
+	reverb.rendered_history[0] = left;
+	reverb.rendered_history[1] = right;
+}
+
+/* adds the reverberation of send to output, at the reverb's rate, its level
+moving to target_level */
+static void reverb_run(const float *send, float *output, unsigned long frames, float target_level)
+#else
 /* adds the reverberation of send to output, its level moving to
 target_level */
 static void reverb_process(const float *send, float *output, unsigned long frames, float target_level)
+#endif
 {
 	const struct reverb_parameters *from = &reverb.from, *to = &reverb.to;
 	float input_scale = 1.0f / sqrtf((float)REVERB_LINES), peak = 0.0f;
 	unsigned long frame;
 	int index;
 
+#ifdef HALO_WII
+	if (!reverb.fade && reverb.level == target_level)
+	{
+		reverb_steady(send, output, frames);
+		return;
+	}
+#endif
 	reverb.silent = FALSE;
 	for (frame = 0; frame < frames; frame++)
 	{
@@ -1743,6 +1912,59 @@ static void voice_apply(const struct sdl_stream *stream, const float *left_frame
 		ramp->direct_state[0] = ramp->direct_state[1] = state;
 		ramp->room_lowpass += ramp->ramp_room_lowpass * frames;
 	}
+	else if (!positioned && !stereo)
+	{
+		/* (a mono voice in the world sending to the reverb, its direct path
+		muffled or as it is: the most that the reverb adds to a voice, so
+		with everything in registers) */
+		float room = ramp->room, direct_lowpass = ramp->direct_lowpass, room_lowpass = ramp->room_lowpass;
+		const float ramp_room = ramp->ramp_room, ramp_direct_lowpass = ramp->ramp_direct_lowpass;
+		const float ramp_room_lowpass = ramp->ramp_room_lowpass;
+		float direct_state = ramp->direct_state[0], room_state = ramp->room_state;
+
+		if (filtered)
+		{
+			for (frame = 0; frame < frames; frame++)
+			{
+				float sample = left_frames[frame];
+				float muffled = sample + direct_lowpass * (direct_state - sample);
+
+				room_state = sample + room_lowpass * (room_state - sample);
+				send[frame] += room_state * room;
+				direct_state = muffled;
+				output[frame * 2] += muffled * left;
+				output[frame * 2 + 1] += muffled * right;
+				left += ramp_left;
+				right += ramp_right;
+				room += ramp_room;
+				direct_lowpass += ramp_direct_lowpass;
+				room_lowpass += ramp_room_lowpass;
+			}
+		}
+		else
+		{
+			for (frame = 0; frame < frames; frame++)
+			{
+				float sample = left_frames[frame];
+
+				room_state = sample + room_lowpass * (room_state - sample);
+				send[frame] += room_state * room;
+				output[frame * 2] += sample * left;
+				output[frame * 2 + 1] += sample * right;
+				left += ramp_left;
+				right += ramp_right;
+				room += ramp_room;
+				room_lowpass += ramp_room_lowpass;
+			}
+			direct_state = left_frames[frames - 1];
+			direct_lowpass += ramp_direct_lowpass * frames;
+		}
+		ramp->room = room;
+		ramp->direct_lowpass = direct_lowpass;
+		ramp->room_lowpass = room_lowpass;
+		ramp->direct_state[0] = ramp->direct_state[1] = direct_state;
+		ramp->room_state = room_state;
+	}
 	else
 	{
 		float room = ramp->room, direct_lowpass = ramp->direct_lowpass, room_lowpass = ramp->room_lowpass;
@@ -2103,6 +2325,21 @@ static void mix(float *output, unsigned long frames)
 		frames -= count;
 	}
 }
+
+/* the mix in mono, for a console set to it: each frame's two samples become
+their mean (after the limiter, which has seen both: the mean is never louder
+than the louder of them) */
+static void mix_mono(float *output, unsigned long frames)
+{
+	unsigned long frame;
+
+	for (frame = 0; frame < frames; frame++)
+	{
+		float mean = 0.5f * (output[frame * 2] + output[frame * 2 + 1]);
+
+		output[frame * 2] = output[frame * 2 + 1] = mean;
+	}
+}
 #else
 static void mix(float *output, unsigned long frames)
 {
@@ -2146,6 +2383,9 @@ static void mix(float *output, unsigned long frames)
 static BOOL audio_started = FALSE;
 /* the loudest sample since the last report (dsound_wii_audio_report) */
 static volatile int audio_peak;
+/* whether the output is mono: both channels the mean of the mix's (audio.speakers; the
+console's sound setting, mono) */
+static volatile BOOL audio_mono;
 
 /* WiiLibs' audio thread asks for frames: mixed, and made 16-bit */
 static void audio_fill(void *user, int16_t *stereo, uint32_t frames)
@@ -2160,6 +2400,8 @@ static void audio_fill(void *user, int16_t *stereo, uint32_t frames)
 		uint32_t index;
 
 		mix(buffer, chunk);
+		if (audio_mono)
+			mix_mono(buffer, chunk);
 		for (index = 0; index < chunk * OUTPUT_CHANNELS; index++)
 		{
 			float sample = buffer[index] * 32767.0f;
@@ -2206,6 +2448,23 @@ static void *silent_clock_thread(void *parameter)
 	return NULL;
 }
 
+/* audio.speakers: "console" is the Wii's sound setting (WiiLibs), mono or not */
+static void audio_speakers_read(void)
+{
+	const char *setting = config_string("audio.speakers");
+	WlSoundMode console = wl_platform_sound_mode();
+
+	if (!strcmp(setting, "mono"))
+		audio_mono = TRUE;
+	else if (!strcmp(setting, "stereo"))
+		audio_mono = FALSE;
+	else
+		audio_mono = console == WL_SOUND_MONO;
+	platform_log("audio: playing in %s (audio.speakers \"%s\", the console's setting %s)",
+		audio_mono ? "mono" : "stereo", setting,
+		console == WL_SOUND_MONO ? "mono" : console == WL_SOUND_SURROUND ? "surround, played as stereo" : "stereo");
+}
+
 static void audio_start(void)
 {
 	if (audio_started)
@@ -2213,6 +2472,7 @@ static void audio_start(void)
 	audio_started = TRUE;
 	master_volume = (float)config_real("audio.volume");
 	reverb_enabled = config_boolean("audio.reverb");
+	audio_speakers_read();
 	upsampler_initialize();
 	reverb_initialize();
 	if (config_boolean("audio.enabled") && wl_platform_audio_start(OUTPUT_RATE, 256, audio_fill, NULL) == WL_OK)
