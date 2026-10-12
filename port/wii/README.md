@@ -896,7 +896,9 @@ and pixel shaders.
       (`tests/host/gx_stand_in.c`), draws synthetic scenes the game's way (a structure's
       sections, rigid, skinned, unlit and fogged characters) and runs under `qemu-ppc`: `count`
       gives the instructions a draw by function, `record` a digest of what GX would draw
-      (`--save`, `--compare`, `--device` another copy of the device's sources). Later frames'
+      (`--save`, `--compare`, `--device` another copy of the device's sources), `subdivide` the
+      check of a sea's big triangles drawn in pieces on a sphere map (`count --scene subdivide`
+      their instructions, a triangle a region). Later frames'
       draws, `wii-port` at a5581ec6 then now: the structure's 164,076 instructions then 43,304,
       the rigid models' 92,971 then 25,154, the skinned characters' 225,373 then 171,176, the
       fogged ones' 292,638 then 174,271. With `BENCH_PROBE` it lists the GX state an immediate
@@ -1194,6 +1196,20 @@ and pixel shaders.
       reflection, its coordinates computed per vertex as above (`gx_psh_textures.reflected`).
       Without it the water's reflection pass added nothing, and b30's far sea, where nothing
       lies under the water, was black.
+    - Coordinates on a sphere map computed per vertex and interpolated across a big triangle
+      read directions it does not face: the map bends, and a straight line on it between two
+      directions passes nearer the middle (straight up). b30's sea is triangles of a few
+      hundred units seen from some 30 above, across which the reflection goes from steeply up
+      to the horizon; read so, most of it reflected the sky well above the horizon, darker and
+      bluer than the Xbox's pale sea (3 to 16 texels of 64 off). A processor's draw of up to
+      256 vertices whose stages read a sphere map, where an edge's ends lie apart on the map,
+      is drawn in pieces (`subdivide_triangle`): a triangle is halved across the edge whose
+      middle's coordinates lie furthest (over a texel) from its ends' mean, the middle's
+      outputs the ends' mixed (its position the edge's middle, exactly) and its coordinates its
+      own direction's. An edge is halved by its ends alone, so no crack opens; pieces out of
+      sight are not sent. `tools/wii_draw_bench.py subdivide` checks a sea's triangles: within
+      a texel (1.4 in the worst, a triangle from the eye's feet to the horizon), every point in
+      sight in exactly one piece, at about 2,000 instructions a piece.
   - (1 - x)p + xq is TEV's lerp, one stage.
   - Constants read as 0 or 1 need no register. Those needed in every channel take the four konst
     registers first, and any beyond four are set in TEV registers kept for them.
@@ -1250,6 +1266,13 @@ and pixel shaders.
   from two points along w's gradient. Both vertex paths take them, so a surface's passes meet
   their equal-depth tests whichever path each pass took. A draw whose vertices are all at one w
   takes the last fit's depth: any draw's whose depth was fitted, on either path.
+  - Nothing is clipped at the far plane, as on the Xbox: every draw's depth is scaled by
+    1 / (1 + 1/8192) (`projection_unclipped`), which keeps it under 1 at any distance while the
+    far plane is over 8192 times the near one's distance (b30: 1024 and 1/16), and keeps the
+    draws' depths in the same order. b30's sea lies past its far plane (w 1024) out to the
+    horizon, where GX stopped it and left a band of the sky's clear colour between it and the
+    sky's own water (a violet line along the horizon). The Xbox clamps a depth past the far
+    plane to 1; these stay just under it, so two surfaces both past it compare by distance.
   - The z bias (`D3DRS_ZBIAS`, a polygon offset of -bias depth units and -bias/4 times the
     depth's slope on the Xbox) has no GX form: a biased draw's depth is pulled toward the eye by
     bias / 16384 of its distance (b of a + b/w). The decals (bias 8, `LESSEQUAL` over their
@@ -1289,8 +1312,10 @@ and pixel shaders.
   ```
 
   Each draw, the processor's and GX's alike, and each clear, is numbered and described: `draw N
-  (GX's transform, program 3f6a2f54, target the back buffer): prim, count, screen extent, D0 |
-  blend, alpha test, depth`, then its projection, a vertex's outputs, the pixel shader's
+  (GX's transform, program 3f6a2f54, target the back buffer): prim, count, screen extent, D0`,
+  then its blend, alpha test, depth test and write, colour write and cull mode on a line of
+  their own, its projection (with the w range and the screen extent of all of its vertices, and
+  how many lie before the near plane and past the far), the last vertex's outputs, the pixel shader's
   combiners and constants and each texture (`t0 256x256/14d@<its data's address>`). After each
   draw to the back buffer the points are read back (GX drawn to that point first, so the frame
   is slow), and each change is logged, `pixel (x, y) changed by draw N: r g b a, was r g b a`;
