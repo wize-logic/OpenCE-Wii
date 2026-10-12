@@ -52,7 +52,10 @@ static int setting_gx_lighting = 1;
 
 int config_boolean(const char *name)
 {
-	if (!strcmp(name, "debug.gpu_transform") || !strcmp(name, "debug.gpu_cull") ||
+	/* (BENCH_CPU: every program on the processor, as debug.gpu_transform false) */
+	if (!strcmp(name, "debug.gpu_transform"))
+		return getenv("BENCH_CPU") ? 0 : 1;
+	if (!strcmp(name, "debug.gpu_cull") ||
 		!strcmp(name, "display.bumped_highlights"))
 		return 1;
 	if (!strcmp(name, "display.gx_lighting"))
@@ -515,6 +518,36 @@ static void pixel_shader_set(DWORD texture_modes, DWORD rgb_inputs, DWORD rgb_ou
 static BOOL recording;
 static unsigned long draws_in_frame;
 
+/* (BENCH_PROBE, recording: after each draw, an immediate draw as the game's
+text is drawn, and GX's state as it begins, to find what a draw leaves
+behind that the next does not set) */
+static void probe_state(const char *name, uint32_t selector, uint64_t hash)
+{
+	print("  state %s %u: %016llx\n", name, (unsigned)selector, (unsigned long long)hash);
+}
+
+static void probe(void)
+{
+	struct vertex_shader_object *shader = device.vertex_shader;
+	static const float corners[3][2] = { { 10.0f, 10.0f }, { 60.0f, 10.0f }, { 10.0f, 60.0f } };
+	static struct gx_stand_in_draw taken[256];
+	int vertex;
+
+	gx_stand_in_take(taken, 256);
+	D3DDevice_SetVertexShader(vertex_shader_handles[0]);
+	D3DDevice_Begin(D3DPT_TRIANGLELIST);
+	for (vertex = 0; vertex < 3; vertex++)
+	{
+		D3DDevice_SetVertexDataColor(9, 0xFF6496C8UL);
+		D3DDevice_SetVertexData4f(0, corners[vertex][0], corners[vertex][1], 0.5f, 1.0f);
+	}
+	D3DDevice_End();
+	gx_stand_in_states(probe_state);
+	if (gx_stand_in_take(taken, 256))
+		print("  probe digest %016llx\n", (unsigned long long)taken[0].digest);
+	device.vertex_shader = shader;
+}
+
 static void draw(const char *scene, int frame, D3DPRIMITIVETYPE primitive, const WORD *indices, UINT count)
 {
 	print("region %s frame=%d draw=%lu indices=%u\n", scene, frame, draws_in_frame, count);
@@ -529,6 +562,8 @@ static void draw(const char *scene, int frame, D3DPRIMITIVETYPE primitive, const
 		for (index = 0; index < count_taken && index < 256; index++)
 			print("draw %s f%d d%lu.%lu: %016llx %u\n", scene, frame, draws_in_frame, index,
 				(unsigned long long)taken[index].digest, (unsigned)taken[index].vertices);
+		if (getenv("BENCH_PROBE"))
+			probe();
 	}
 	draws_in_frame++;
 }

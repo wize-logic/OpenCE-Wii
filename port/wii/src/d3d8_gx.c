@@ -2558,14 +2558,43 @@ struct draw_projection
 };
 
 static struct draw_projection projection_loaded;
-/* the last fit, for a draw whose vertices are all at one w */
+/* the z bias the loaded projection has (projection_bias) */
+static float projection_loaded_bias;
+/* the last fit, for a draw whose vertices are all at one w (any draw's
+whose depth was fitted, on either path: projection_load) */
 static float projection_a, projection_b = 0.0f;
+
+/* The z bias (D3DRS_ZBIAS, which d3d8_state.c makes a polygon offset of
+-bias depth units and -bias/4 times the depth's slope, as the Xbox's D3D8
+does). GX has no polygon offset; the draw's depth is pulled toward the eye
+instead, by a part of its distance: bias / 16384 of it (a decal's bias of 8,
+half a millimetre a metre), through b of the projection's a + b / w. A
+decal then stays in front of the surface it lies on whatever angle it is
+seen at, as the slope's term keeps it on the Xbox, though the surface's
+depth and its own are computed differently (GX's transform of the
+surface's vertices, the processor's of the decal's). */
+static float projection_bias(void)
+{
+	float offset;
+
+	if (!D3D__RenderState[D3DRS_SOLIDOFFSETENABLE])
+		return 0.0f;
+	memcpy(&offset, &D3D__RenderState[D3DRS_POLYGONOFFSETZOFFSET], sizeof(offset));
+	return offset < 0.0f ? -offset : 0.0f;
+}
 
 static void projection_load(const struct draw_projection *projection)
 {
 	Mtx44 matrix;
+	float bias = projection_bias();
 
-	if (projection_valid && projection_loaded.perspective == projection->perspective &&
+	/* (the last fit: any draw's of its own depth) */
+	if (projection->perspective && projection->fitted)
+	{
+		projection_a = projection->a;
+		projection_b = projection->b;
+	}
+	if (projection_valid && projection_loaded.perspective == projection->perspective && projection_loaded_bias == bias &&
 		(!projection->perspective || (projection_loaded.a == projection->a && projection_loaded.b == projection->b)))
 		return;
 	memset(matrix, 0, sizeof(matrix));
@@ -2577,7 +2606,8 @@ static void projection_load(const struct draw_projection *projection)
 		matrix[1][1] = -2.0f / SCREEN_HEIGHT;
 		matrix[1][2] = -1.0f;
 		matrix[2][2] = 1.0f - projection->a;
-		matrix[2][3] = projection->b;
+		/* (b / w nearer by bias / 16384 of itself: projection_bias) */
+		matrix[2][3] = projection->b - fabsf(projection->b) * bias * (1.0f / 16384.0f);
 		matrix[3][2] = -1.0f;
 		GX_LoadProjectionMtx(matrix, GX_PERSPECTIVE);
 	}
@@ -2588,10 +2618,13 @@ static void projection_load(const struct draw_projection *projection)
 		matrix[1][1] = -2.0f / SCREEN_HEIGHT;
 		matrix[1][3] = 1.0f;
 		matrix[2][2] = 1.0f;
+		/* (in screen space, bias depth units of the 24 bits nearer) */
+		matrix[2][3] = -bias * (1.0f / 16777216.0f);
 		matrix[3][3] = 1.0f;
 		GX_LoadProjectionMtx(matrix, GX_ORTHOGRAPHIC);
 	}
 	projection_loaded = *projection;
+	projection_loaded_bias = bias;
 	projection_valid = TRUE;
 }
 
@@ -2966,6 +2999,23 @@ static unsigned long vertex_memo_draw;
 
 static u8 gx_primitive(D3DPRIMITIVETYPE type);
 
+/* the registers a stream draw's program reads that no stream gives
+(draw_streams; 0 for the immediate draws, whose vertices carry every
+register): they hold what D3DDevice_SetVertexData last set, in every vertex,
+as the NV2A keeps a register its streams do not give. The detail objects'
+cells are drawn so: each cell's place in register 2 and its reference
+vector in register 3, then its quads from the one buffer. */
+static unsigned long draw_unstreamed;
+
+static void inputs_seed(float (*inputs)[4])
+{
+	unsigned long reg;
+
+	for (reg = 0; reg < NV2A_CPU_INPUT_COUNT && (draw_unstreamed >> reg); reg++)
+		if (draw_unstreamed & (1UL << reg))
+			memcpy(inputs[reg], device.vertex_registers[reg], sizeof(inputs[reg]));
+}
+
 /* one frame's draws described in the log (DRAW_LOG_FRAME; 0: none) */
 #ifndef DRAW_LOG_FRAME
 #define DRAW_LOG_FRAME 0
@@ -2986,6 +3036,7 @@ static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct d
 	int length = 0, stage;
 	UINT vertex;
 
+	inputs_seed(inputs);
 	for (vertex = 0; vertex < count && vertex < 64; vertex++)
 	{
 		fetch(context, vertex, inputs);
@@ -3089,6 +3140,7 @@ static struct draw_projection projection_fit(struct nv2a_cpu_program *program, U
 	struct draw_projection projection = { FALSE, 0.0f, 0.0f };
 	UINT vertex;
 
+	inputs_seed(inputs);
 	{
 		float first_w = 0.0f, first_depth = 0.0f;
 		BOOL have_first = FALSE, fitted = FALSE;
@@ -3220,7 +3272,8 @@ static int position_register_of(const struct vertex_shader_object *shader,
 }
 
 /* the inputs a matrix's columns start from: none, but each element's w 1
-(as stream_fetch gives it) */
+(as stream_fetch gives it), and the registers no stream gives as they are
+set (draw_unstreamed) */
 static void matrix_inputs(const struct vertex_shader_object *shader, float (*inputs)[4])
 {
 	unsigned long index;
@@ -3228,6 +3281,7 @@ static void matrix_inputs(const struct vertex_shader_object *shader, float (*inp
 	memset(inputs, 0, NV2A_CPU_INPUT_COUNT * sizeof(*inputs));
 	for (index = 0; index < shader->element_count; index++)
 		inputs[shader->elements[index].reg & 15][3] = 1.0f;
+	inputs_seed(inputs);
 	for (index = 0; index < NV2A_CPU_INPUT_COUNT; index++)
 		if (draw_uniform.mask & (1UL << index))
 			memcpy(inputs[index], draw_uniform.values[index], sizeof(inputs[index]));
@@ -3312,6 +3366,16 @@ static unsigned long long constants_key(const struct vertex_shader_object *shade
 		if (draw_uniform.mask & (1UL << row))
 		{
 			const unsigned long *words = (const unsigned long *)draw_uniform.values[row];
+
+			for (word = 0; word < 4; word++)
+				hash = (hash ^ words[word]) * 1099511628211ULL;
+		}
+	/* (and the registers no stream gives: draw_unstreamed) */
+	hash = (hash ^ draw_unstreamed) * 1099511628211ULL;
+	for (row = 0; row < NV2A_CPU_INPUT_COUNT; row++)
+		if (draw_unstreamed & (1UL << row))
+		{
+			const unsigned long *words = (const unsigned long *)device.vertex_registers[row];
 
 			for (word = 0; word < 4; word++)
 				hash = (hash ^ words[word]) * 1099511628211ULL;
@@ -3445,6 +3509,7 @@ static BOOL position_keys(const struct vertex_shader_object *shader, struct nv2a
 	unsigned key;
 	int index;
 
+	inputs_seed(inputs);
 	for (key = draw_keys.count; key-- > 0; )
 	{
 		stream_fetch(fetch, draw_keys.representative[key], inputs);
@@ -3525,6 +3590,7 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 	unsigned live_gx;
 
 	memcpy(&point_size, &D3D__RenderState[D3DRS_POINTSIZE], sizeof(point_size));
+	inputs_seed(inputs);
 	if (gpu_transform < 0)
 		gpu_transform = config_boolean("debug.gpu_transform") ? 1 : 0;
 	if (shader && gpu_transform)
@@ -3932,6 +3998,7 @@ static void stream_fetch_plan(struct stream_fetch *fetch)
 	if (!fetch_tables_made)
 		fetch_tables_make();
 	fetch->element_count = 0;
+	draw_unstreamed = read & 0xFFFF;
 	for (element = 0; element < shader->element_count && element < NV2A_CPU_INPUT_COUNT; element++)
 	{
 		const struct vertex_element *source = &shader->elements[element];
@@ -3943,6 +4010,7 @@ static void stream_fetch_plan(struct stream_fetch *fetch)
 		if (!fetch->streams[stream] || !(read & (1UL << (source->reg & 15))))
 			continue;
 		planned = &fetch->elements[fetch->element_count++];
+		draw_unstreamed &= ~(1UL << (source->reg & 15));
 		planned->stride = device.streams[stream].stride;
 		planned->base = fetch->streams[stream] + first * planned->stride + source->offset;
 		planned->reg = source->reg & 15;
@@ -4658,6 +4726,10 @@ static unsigned long long hardware_key(const struct vertex_shader_object *shader
 	for (row = 0; row < NV2A_CPU_INPUT_COUNT; row++)
 		if (draw_uniform.mask & (1UL << row))
 			hash = hash_words(hash, draw_uniform.values[row], sizeof(draw_uniform.values[row]));
+	hash = hash_words(hash, &draw_unstreamed, sizeof(draw_unstreamed));
+	for (row = 0; row < NV2A_CPU_INPUT_COUNT; row++)
+		if (draw_unstreamed & (1UL << row))
+			hash = hash_words(hash, device.vertex_registers[row], sizeof(device.vertex_registers[row]));
 	/* (0 is an empty entry's) */
 	return hash ? hash : 1;
 }
@@ -5734,6 +5806,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 
 	if (gpu_transform < 0)
 		gpu_transform = config_boolean("debug.gpu_transform") ? 1 : 0;
+	inputs_seed(inputs);
 	dependencies = draw_dependencies(shader, program, fetch, count);
 	if (!gpu_transform || !dependencies->clip_captured || primitive_type == D3DPT_POINTLIST)
 		return hardware_rejected(program, "transform off, no clip-space position, or points");
@@ -6453,6 +6526,7 @@ void WINAPI D3DDevice_End(void)
 	{
 		device.statistics.immediate_draws++;
 		draw_serial++;
+		draw_unstreamed = 0;
 		device.statistics.vertices += device.immediate_vertices;
 		program = program_current();
 		if (program && device.immediate_buffer && draw_prepare())

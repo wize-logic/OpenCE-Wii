@@ -29,6 +29,9 @@ returned may be larger) */
 unsigned long gx_stand_in_take(struct gx_stand_in_draw *draws, unsigned long capacity);
 /* vertex writes outside a primitive, and primitives left short (recording) */
 unsigned long gx_stand_in_errors(void);
+/* each state call's last arguments (recording): its name, selector and
+their hash */
+void gx_stand_in_states(void (*each)(const char *name, uint32_t selector, uint64_t hash));
 /* calls to GX's functions (not the vertex writes) since the last take */
 unsigned long gx_stand_in_calls(void);
 

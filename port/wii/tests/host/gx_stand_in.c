@@ -50,6 +50,11 @@ unsigned long gx_stand_in_take(struct gx_stand_in_draw *draws, unsigned long cap
 	return 0;
 }
 
+void gx_stand_in_states(void (*each)(const char *name, uint32_t selector, uint64_t hash))
+{
+	(void)each;
+}
+
 #else
 
 /* ---------- recording */
@@ -435,6 +440,20 @@ static void primitive_begin(u8 primitive, u8 format, u16 count)
 unsigned long gx_stand_in_errors(void)
 {
 	return errors;
+}
+
+void gx_stand_in_states(void (*each)(const char *name, uint32_t selector, uint64_t hash))
+{
+	unsigned index;
+
+	for (index = 0; index < state_count; index++)
+		each(states[index].name, states[index].selector, states[index].hash);
+	/* (and the vertex state's parts) */
+	each("vertex descriptor", 0, hash_bytes(14695981039346656037ULL, vs.desc, sizeof(vs.desc)));
+	each("current matrix", 0, vs.current_matrix);
+	each("texgens", 0, vs.texgens);
+	for (index = 0; index < 8; index++)
+		each("texgen", index, hash_bytes(14695981039346656037ULL, &vs.texgen[index], sizeof(vs.texgen[index])));
 }
 
 unsigned long gx_stand_in_take(struct gx_stand_in_draw *draws, unsigned long capacity)
