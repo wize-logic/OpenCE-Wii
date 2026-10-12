@@ -392,16 +392,18 @@ def generate_wii_build(n: Writer, sln: Any) -> None:
     n.build(outputs=build_dir / "no_constructors.stamp", rule="wii_no_constructors", inputs=elf)
     # (no fused multiply-adds in clang's objects, whatever -ffp-contract=off
     # was told: the lockstep check compares the Wii's game with x86's; but
-    # those of CONTRACTED_SOURCES)
+    # those of CONTRACTED_SOURCES; the check is WiiLibs' tools/fma_check.py,
+    # which tools/wii_fp_check.py calls)
     fp_check = Path("tools/wii_fp_check.py")
     n.rule(name="wii_fp_check",
-           command=f"$python {fp_check} --objdump {tools / 'powerpc-eabi-objdump'} --stamp $out @$out.rsp",
+           command=(f"$python {fp_check} --wiilibs {_quote(wiilibs)} "
+                    f"--objdump {tools / 'powerpc-eabi-objdump'} --stamp $out @$out.rsp"),
            description="WII CHECK no fused multiply-adds in the game's objects",
            rspfile="$out.rsp",
            rspfile_content="$in_newline")
     checked_objects = [obj for obj in objects if obj.with_suffix(".c").name not in CONTRACTED_SOURCES]
     n.build(outputs=build_dir / "no_fused_multiply_adds.stamp", rule="wii_fp_check", inputs=checked_objects,
-            implicit=[fp_check])
+            implicit=[fp_check, wiilibs / "tools" / "fma_check.py"])
     n.build(outputs="wii", rule="phony",
             inputs=[dol, build_dir / "no_constructors.stamp", build_dir / "no_fused_multiply_adds.stamp", *host_tools])
     # the Homebrew Channel's zip (apps/halo: boot.dol, meta.xml, icon.png; no game data)

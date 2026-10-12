@@ -102,7 +102,8 @@ inflated it to, and the Wii reads it where it is.
   - `-ffp-contract=off` because PowerPC has fused multiply-adds. Clang has let them through in a
     function it does not optimise (`#pragma optimize("", off)`: `ai_handle_spatial_effect`,
     `source/ai/ai.c`, now with `#pragma clang fp contract(off)`), so `ninja wii` reads the game's
-    objects for them (`tools/wii_fp_check.py`). The sound mixer (`dsound_sdl.c`) alone has them on
+    objects for them (`tools/wii_fp_check.py`, a thin wrapper that calls WiiLibs'
+    `tools/fma_check.py`). The sound mixer (`dsound_sdl.c`) alone has them on
     (`CONTRACTED_SOURCES`, `tools/wii_build.py`): its output only reaches the speakers, and they take
     14% off its instructions
   - `-fomit-frame-pointer`, unlike the x86 builds: PowerPC's frames are chained through each
