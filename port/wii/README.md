@@ -93,7 +93,16 @@ into `./WiiLibs`) and keeps it as an artifact.
   vertices (fetch, program, store, emit), the streams' flushes (made and kept), the end of the frame's (GX finishing the frame's
   draws; the copy to the display and the wait for its retrace) and the textures' counts (found
   by their mark or looked up, made, hashed, decoded, flushed, TMEM emptied). A frame of more than
-  half a second (loading, mostly) gets a split of its own.
+  half a second (loading, mostly) gets a split of its own. "The game" is everything else between
+  two frames' ends: the game's ticks, its own side of drawing (visibility, the objects' and the
+  structure's preparation, textures looked up in its cache, the transparent geometry's sort, the
+  HUD), the device's calls outside its timed parts (render states, vertex shader constants, a
+  render target's end), the other threads' time on the processor (the mixer's, about 2 ms a
+  frame) and the main loop's sleep that holds a frame to 33 ms (`main_update_time`), which the
+  line gives apart ("of it, N waiting for the frame's 33 ms"). Dolphin's profile of b30 on 12
+  October (frames of 37 to 60 ms, 44 on average) split it as: the ticks 11 ms (about 1.3 a frame,
+  8 ms each), the game's side of drawing 3.3, the device's untimed calls about 4, the mixer 1.8,
+  the processor idle 6.3 (the sleep, and waits for GX inside the device's calls).
 
 ## Game data
 

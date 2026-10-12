@@ -736,6 +736,26 @@ boolean display_vblank_deltas = FALSE;
 boolean display_precache_progress = FALSE;
 struct _screenshot_and_framerate_globals global_screenshot_count = { 0 };
 boolean debug_render_freeze;
+/* port: the time the main loop has slept to hold a frame to its 33 ms
+(main_update_time, main_rasterizer_throttle), in the performance counter's
+units: the Wii's frame split tells it apart from the game's own work
+(port/wii/src/d3d8_gx.c) */
+unsigned __int64 main_frame_wait_time = 0;
+
+/* port: Sleep, its time added to main_frame_wait_time */
+static void main_frame_wait(
+	unsigned long milliseconds)
+{
+	LARGE_INTEGER before;
+	LARGE_INTEGER after;
+
+	QueryPerformanceCounter(&before);
+	Sleep(milliseconds);
+	QueryPerformanceCounter(&after);
+	main_frame_wait_time += (unsigned __int64)(after.QuadPart - before.QuadPart);
+
+	return;
+}
 
 /* ---------- public code */
 
@@ -2672,7 +2692,7 @@ static void main_update_time(
 		{
 			profile_idle_start();
 			if (global_frame_rate_throttle)
-				Sleep(33 - milliseconds_elapsed);
+				main_frame_wait(33 - milliseconds_elapsed); /* port: timed (main_frame_wait_time) */
 			profile_idle_end();
 		}
 		else
@@ -2771,8 +2791,8 @@ void main_rasterizer_throttle(
 				busy for most of each frame of a game held at 30 frames a
 				second (display.interpolation off). A millisecond is well
 				inside a 33 ms frame (Windows sets its timer to 1 ms:
-				win32_posix.c) */
-				Sleep(1);
+				win32_posix.c), timed (main_frame_wait_time) */
+				main_frame_wait(1);
 				if (system_milliseconds() > start_milliseconds + 1000)
 				{
 					console_warning(

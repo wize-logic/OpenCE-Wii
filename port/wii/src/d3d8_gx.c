@@ -3486,6 +3486,11 @@ typedef void (*vertex_fetch_proc)(void *context, UINT vertex, float (*inputs)[4]
 static struct frame_timing timing;
 /* (the sums when the last frame ended: a slow frame's own share) */
 static struct frame_timing last_timing;
+/* the time the game's main loop slept to hold its frames to 33 ms, in
+microseconds (source/main/main.c): part of "the game" in the frame's split,
+but none of its work */
+extern unsigned long long main_frame_wait_time;
+static unsigned long long frame_wait_start;
 
 /* the projection of a draw: a few of its vertices, for their w and depth */
 static struct draw_projection projection_fit(struct nv2a_cpu_program *program, UINT count, vertex_fetch_proc fetch,
@@ -8800,14 +8805,15 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 					timing_frame(timing.store_ticks, 60750),
 					timing_frame(timing.emit_ticks, 60750));
 				platform_log("Direct3D: a frame takes %lu ms: draws %lu, textures %lu, pixel shaders %lu, the end of "
-					"the frame %lu (waiting for GX), the game %lu",
+					"the frame %lu (waiting for GX), the game %lu (of it, %lu waiting for the frame's 33 ms)",
 					timing_frame(now - timing.window_start, 60750),
 					timing_frame(timing.draws, 60750),
 					timing_frame(timing.textures, 60750),
 					timing_frame(timing.pixel_shaders, 60750),
 					timing_frame(timing.present, 60750),
 					timing_frame(now - timing.window_start - timing.draws - timing.textures - timing.pixel_shaders -
-						timing.present, 60750));
+						timing.present, 60750),
+					timing_frame(main_frame_wait_time - frame_wait_start, 1000));
 				platform_log("Direct3D: the end of the frame: GX's draws %lu ms, the copy and a free display buffer %lu",
 					timing_frame(timing.present_gx, 60750),
 					timing_frame(timing.present - timing.present_gx, 60750));
@@ -8828,6 +8834,7 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			memset(&timing, 0, sizeof(timing));
 			timing.window_start = now;
 			last_timing = timing;
+			frame_wait_start = main_frame_wait_time;
 		}
 		memset(texture_failures, 0, sizeof(texture_failures));
 		memset(&device.statistics, 0, sizeof(device.statistics));
