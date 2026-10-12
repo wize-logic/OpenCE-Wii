@@ -4417,6 +4417,10 @@ struct index_record
 	BOOL found;
 	unsigned key_count;
 	UINT processor, representative[MATRIX_KEYS];
+	/* the static buffers' kept outputs (static_outputs_find) whose every
+	vertex these indices name is computed: the entry's generation and values */
+	unsigned long kept_generation;
+	const unsigned char *kept_values;
 	/* in one block: each vertex's node indices and weight (two shorts), then
 	each index's key */
 	unsigned char *block;
@@ -4539,6 +4543,8 @@ static void draw_range_find(const struct stream_fetch *fetch, UINT count)
 	record->count = count;
 	record->base = device.base_vertex_index;
 	record->hash = hash;
+	record->kept_generation = 0;
+	record->kept_values = NULL;
 	record->least = draw_range.least;
 	record->most = draw_range.most;
 	record->used = device.frames;
@@ -5658,6 +5664,9 @@ window, and read by GX by index as the buffers are (draw_hardware).
 struct static_outputs
 {
 	BOOL used;
+	/* (given when the entry is made: an index record names it by this,
+	index_record.kept_generation) */
+	unsigned long generation;
 	unsigned long program_hash, shader_id;
 	/* the sphere-mapped stages kept (bit n: stage n), and the colours */
 	unsigned stages;
@@ -5681,6 +5690,7 @@ struct static_outputs
 };
 
 static struct static_outputs static_outputs[STATIC_OUTPUTS_ENTRIES];
+static unsigned long static_outputs_generation;
 static unsigned long static_outputs_bytes;
 static DWORD vertex_buffer_serial;
 /* (values pushed out during a frame, freed once GX has drawn it) */
@@ -5951,6 +5961,7 @@ static struct static_outputs *static_outputs_find(struct nv2a_cpu_program *progr
 		static_outputs_release(victim, FALSE);
 		*victim = key;
 		victim->used = TRUE;
+		victim->generation = ++static_outputs_generation;
 		victim->seen_frame = victim->used_frame = device.frames;
 		return NULL;
 	}
@@ -5999,6 +6010,15 @@ static struct static_outputs *static_outputs_find(struct nv2a_cpu_program *progr
 		entry->stride = stride;
 		static_outputs_bytes += bytes;
 	}
+	/* (the draw's indices name only vertices computed already: their record
+	says so, while the entry and its values are the same) */
+	if (draw_range.serial == draw_serial && draw_range.record && draw_range.record->kept_generation == entry->generation &&
+		draw_range.record->kept_values == entry->values)
+	{
+		kept_draws++;
+		kept_vertices += count;
+		return entry;
+	}
 	/* the vertices the draw names that are not computed yet */
 	for (vertex = 0; vertex < count; vertex++)
 	{
@@ -6042,6 +6062,11 @@ static struct static_outputs *static_outputs_find(struct nv2a_cpu_program *progr
 	}
 	if (written_least <= written_most)
 		DCFlushRange(entry->values + written_least * entry->stride, (written_most - written_least + 1) * entry->stride);
+	if (draw_range.serial == draw_serial && draw_range.record)
+	{
+		draw_range.record->kept_generation = entry->generation;
+		draw_range.record->kept_values = entry->values;
+	}
 	kept_draws++;
 	kept_vertices += count;
 	return entry;
