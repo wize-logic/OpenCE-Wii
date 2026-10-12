@@ -1,9 +1,9 @@
 /*
 GX_PSH_CHECK.C
 
-A host check of port/wii/src/gx_psh.c (tools/wii_gx_psh_check.py builds and
-runs it): random register combiner programs, and two of the game's, are
-translated, and the TEV program (WiiLibs' WlTevProgram), simulated here, is
+A host check of WiiLibs' wl/xbox/psh.c with the game's recipes (port/wii/src/gx_psh.c;
+tools/wii_gx_psh_check.py builds and runs it): random register combiner
+programs, and two of the game's, are translated, and the TEV program (WiiLibs' WlTevProgram), simulated here, is
 compared with the combiners evaluated directly, with the translation's own model of them
 (signed mappings clamped to [0, 1] outside dot products, registers clamped
 to [0, 1], an unsigned dot product saturating at 1, the mux as a blend by
@@ -222,7 +222,7 @@ static float tev_result(float x, int unclamped)
 	if (!unclamped) return clamp01(x);
 	return x < -1024.0f / 255.0f ? -1024.0f / 255.0f : x > 1023.0f / 255.0f ? 1023.0f / 255.0f : x;
 }
-static float konst_sel(const struct gx_psh_program *p, unsigned sel, int ch, int alpha_half)
+static float konst_sel(const WlXboxPshProgram *p, unsigned sel, int ch, int alpha_half)
 {
 	static const float fractions[8] = { 1, 7/8.f, 6/8.f, 5/8.f, 4/8.f, 3/8.f, 2/8.f, 1/8.f };
 	if (sel < 8) return fractions[sel];
@@ -231,14 +231,14 @@ static float konst_sel(const struct gx_psh_program *p, unsigned sel, int ch, int
 	return 0;
 }
 /* a texel or colour through one of the program's swap tables */
-static v4 swapped(const struct gx_psh_program *p, v4 value, unsigned table)
+static v4 swapped(const WlXboxPshProgram *p, v4 value, unsigned table)
 {
 	v4 out;
 	for (int i = 0; i < 4; i++) out.c[i] = value.c[p->tev.swap[table][i] & 3];
 	return out;
 }
 
-static v4 simulate(const struct gx_psh_program *p, const struct inputs_set *in, v4 *maps /* by texture map: 7 the fog ramp */)
+static v4 simulate(const WlXboxPshProgram *p, const struct inputs_set *in, v4 *maps /* by texture map: 7 the fog ramp */)
 {
 	v4 regs[4]; memset(regs, 0, sizeof(regs));
 	/* (constants the program set in TEV registers) */
@@ -321,7 +321,7 @@ static unsigned rand_output(void)
 /* WiiLibs' validator: the programs checked, those it refuses, and those with
 each error or warning */
 static unsigned long validated, refused, issued[32];
-static int validate(const struct gx_psh_program *program)
+static int validate(const WlXboxPshProgram *program)
 {
 	WlTevReport report;
 	unsigned seen = 0;
@@ -345,13 +345,13 @@ programs with unclamped stages and of the others (those WiiLibs' validator
 refuses it evaluates as 0: not compared) */
 static int eval_worst[2];
 static unsigned long eval_programs[2], eval_differ[2], eval_refused;
-static int has_unclamped(const struct gx_psh_program *p)
+static int has_unclamped(const WlXboxPshProgram *p)
 {
 	for (unsigned i = 0; i < p->tev.stage_count; i++) if (!p->tev.stages[i].color.clamp || !p->tev.stages[i].alpha.clamp) return 1;
 	return 0;
 }
 static uint8_t byte_of(float x) { return (uint8_t)lroundf(clamp01(x) * 255.0f); }
-static int eval_compare(const struct gx_psh_program *p, const struct inputs_set *in, const v4 *maps, v4 got)
+static int eval_compare(const WlXboxPshProgram *p, const struct inputs_set *in, const v4 *maps, v4 got)
 {
 	WlTevPixel px;
 	uint32_t rgba;
@@ -373,7 +373,7 @@ static unsigned long stages_made, programs_made;
 static unsigned check_cube, check_reflected;
 static int check(const DWORD *state, unsigned present, const char *name, int verbose)
 {
-	struct gx_psh_textures textures; struct gx_psh_program program;
+	WlXboxPshTextures textures; WlXboxPshProgram program;
 	memset(&textures, 0, sizeof(textures)); textures.present = present;
 	textures.cube = check_cube & present;
 	textures.bumped = check_bumped;
@@ -396,7 +396,7 @@ static int check(const DWORD *state, unsigned present, const char *name, int ver
 		in.v0 = rand4(); in.v1 = rand4();
 		memset(maps, 0, sizeof(maps));
 		fog_factor = frand();
-		for (int ch = 0; ch < 4; ch++) maps[GX_PSH_FOG_TEXMAP].c[ch] = fog_factor;
+		for (int ch = 0; ch < 4; ch++) maps[WL_XBOX_PSH_FOG_TEXMAP].c[ch] = fog_factor;
 		/* (an intensity texture: its value in all four channels) */
 		if (check_d0_alpha_map)
 			for (int ch = 0; ch < 4; ch++) maps[check_d0_alpha_map].c[ch] = in.v0.c[3];
@@ -419,7 +419,7 @@ static int check(const DWORD *state, unsigned present, const char *name, int ver
 	if (eval_program_worst > eval_worst[unclamped]) eval_worst[unclamped] = eval_program_worst;
 	return 1;
 }
-static void print_stages(const struct gx_psh_program *program)
+static void print_stages(const WlXboxPshProgram *program)
 {
 	for (unsigned i = 0; i < program->tev.stage_count; i++)
 	{
@@ -438,7 +438,7 @@ static void print_stages(const struct gx_psh_program *program)
 reading a bumped map a lookup (or a repeat right after one), each lookup's
 two stages before it the offset's terms and reading no texture, and texture
 coordinates 0 to 2 asked of the vertices */
-static int bumped_structure(const struct gx_psh_program *p, unsigned bumped, const char *name)
+static int bumped_structure(const WlXboxPshProgram *p, unsigned bumped, const char *name)
 {
 	unsigned lookups = 0;
 
@@ -448,19 +448,19 @@ static int bumped_structure(const struct gx_psh_program *p, unsigned bumped, con
 		int reads = st->texmap < 4 && (bumped & (1u << st->texmap));
 		unsigned char mode = p->indirect[i];
 
-		if (reads != (mode == _gx_psh_indirect_lookup || mode == _gx_psh_indirect_repeat) ||
-			(mode == _gx_psh_indirect_lookup && (i < 2 || p->indirect[i - 1] != _gx_psh_indirect_t ||
-			p->indirect[i - 2] != _gx_psh_indirect_s || p->tev.stages[i - 1].texmap != WL_TEV_NONE ||
+		if (reads != (mode == WL_XBOX_PSH_INDIRECT_LOOKUP || mode == WL_XBOX_PSH_INDIRECT_REPEAT) ||
+			(mode == WL_XBOX_PSH_INDIRECT_LOOKUP && (i < 2 || p->indirect[i - 1] != WL_XBOX_PSH_INDIRECT_T ||
+			p->indirect[i - 2] != WL_XBOX_PSH_INDIRECT_S || p->tev.stages[i - 1].texmap != WL_TEV_NONE ||
 			p->tev.stages[i - 2].texmap != WL_TEV_NONE)) ||
-			(mode == _gx_psh_indirect_repeat && (p->indirect[i - 1] != _gx_psh_indirect_lookup &&
-			p->indirect[i - 1] != _gx_psh_indirect_repeat)))
+			(mode == WL_XBOX_PSH_INDIRECT_REPEAT && (p->indirect[i - 1] != WL_XBOX_PSH_INDIRECT_LOOKUP &&
+			p->indirect[i - 1] != WL_XBOX_PSH_INDIRECT_REPEAT)))
 		{
 			printf("%s: the bumped lookup at stage %u is not set up for GX's indirect unit\n", name, i);
 			return 0;
 		}
-		lookups += mode == _gx_psh_indirect_lookup;
+		lookups += mode == WL_XBOX_PSH_INDIRECT_LOOKUP;
 	}
-	if (!lookups || (p->texcoords & 7) != 7 || p->vertices != _gx_psh_vertices_bumped_reflection)
+	if (!lookups || (p->texcoords & 7) != 7 || p->vertices != WL_XBOX_PSH_VERTICES_BUMPED_REFLECTION)
 	{
 		printf("%s: no bumped lookup, or the offset's coordinates not asked for\n", name);
 		return 0;
@@ -647,8 +647,8 @@ static int specular_programs(void)
 	{
 		int bumped = !(variant & 1), overbright = (variant & 2) != 0, shiny = (variant & 4) != 0;
 		DWORD state[200];
-		struct gx_psh_textures textures;
-		struct gx_psh_program program;
+		WlXboxPshTextures textures;
+		WlXboxPshProgram program;
 		double total = 0;
 		float worst = 0;
 		unsigned samples = 0, large = 0;
@@ -845,8 +845,8 @@ static int game_programs(void)
 		for (unsigned separate = 0; separate < 8; separate++)
 		{
 			DWORD state[200];
-			struct gx_psh_textures textures;
-			struct gx_psh_program program;
+			WlXboxPshTextures textures;
+			WlXboxPshProgram program;
 
 			memset(state, 0, sizeof(state));
 			memset(&textures, 0, sizeof(textures));
@@ -918,7 +918,7 @@ static int game_programs(void)
 				if (programs[index].bumped && !bumped_structure(&program, programs[index].bumped, name))
 					failures++;
 				/* (a flat reflection: its coordinates the device's, as a bumped one's) */
-				if (programs[index].reflected && (program.vertices != _gx_psh_vertices_bumped_reflection ||
+				if (programs[index].reflected && (program.vertices != WL_XBOX_PSH_VERTICES_BUMPED_REFLECTION ||
 					!(program.texcoords & 8)))
 				{
 					printf("%s: the flat reflection's coordinates not asked of the device\n", name);
@@ -934,7 +934,7 @@ static int game_programs(void)
 				sphere map at stage 3) */
 				for (unsigned sphere = 0; index == 0 && sphere < 2; sphere++)
 				{
-					struct gx_psh_textures ramped = textures;
+					WlXboxPshTextures ramped = textures;
 
 					ramped.present = sphere ? 0xF : programs[index].present;
 					ramped.cube = sphere ? 8 : 0;
@@ -992,8 +992,8 @@ static int model_programs(void)
 		static const DWORD ai[8] = { 0x0A200000, 0x1C200000, 0x0C200D15 };
 		static const DWORD ao[8] = { 0x000000C0, 0x00000090, 0x000000CD };
 		DWORD state[200];
-		struct gx_psh_textures textures;
-		struct gx_psh_program program;
+		WlXboxPshTextures textures;
+		WlXboxPshProgram program;
 		char name[96];
 		float program_worst = 0;
 
@@ -1061,7 +1061,7 @@ static int model_programs(void)
 			in.v1 = rand4();
 			memset(maps, 0, sizeof(maps));
 			fog_factor = frand();
-			for (int ch = 0; ch < 4; ch++) maps[GX_PSH_FOG_TEXMAP].c[ch] = fog_factor;
+			for (int ch = 0; ch < 4; ch++) maps[WL_XBOX_PSH_FOG_TEXMAP].c[ch] = fog_factor;
 			for (int i = 0; i < 4; i++) maps[i] = in.t[i];
 			if (ramp)
 				for (int ch = 0; ch < 4; ch++) maps[6].c[ch] = in.v0.c[3];
@@ -1110,8 +1110,8 @@ static int environment_fog_programs(void)
 	for (unsigned trial = 0; trial < 40; trial++)
 	{
 		DWORD state[200];
-		struct gx_psh_textures textures;
-		struct gx_psh_program program;
+		WlXboxPshTextures textures;
+		WlXboxPshProgram program;
 		float program_worst = 0;
 
 		memset(state, 0, sizeof(state));
@@ -1237,7 +1237,7 @@ int main(int argc, char **argv)
 		if (only >= 0) {
 			printf("count %08x final %08x %08x\n", state[D3DRS_PSCOMBINERCOUNT], state[D3DRS_PSFINALCOMBINERINPUTSABCD], state[D3DRS_PSFINALCOMBINERINPUTSEFG]);
 			for (int st = 0; st < count; st++) printf("  %d: rgb %08x -> %08x  alpha %08x -> %08x\n", st, state[D3DRS_PSRGBINPUTS0+st], state[D3DRS_PSRGBOUTPUTS0+st], state[D3DRS_PSALPHAINPUTS0+st], state[D3DRS_PSALPHAOUTPUTS0+st]);
-			struct gx_psh_textures tx; struct gx_psh_program pg; memset(&tx, 0, sizeof(tx)); tx.present = 7;
+			WlXboxPshTextures tx; WlXboxPshProgram pg; memset(&tx, 0, sizeof(tx)); tx.present = 7;
 			tx.fog = (unsigned char)fog_on; tx.fog_color = fog_color & 0x00FFFFFFUL;
 			gx_psh_translate(state, &tx, &pg);
 			printf("  %u stages, %s%s\n", pg.tev.stage_count, pg.reason ? pg.reason : pg.approximate ? "approximate: " : "exact",

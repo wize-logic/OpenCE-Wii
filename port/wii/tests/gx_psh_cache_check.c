@@ -1,10 +1,10 @@
 /*
 GX_PSH_CACHE_CHECK.C
 
-A host check of port/wii/src/gx_psh_cache.c (tools/wii_gx_psh_check.py
-builds and runs it after gx_psh_check): every program the cache gives is
-compared with the combiners translated afresh (gx_psh_translate), byte for
-byte.
+A host check of WiiLibs' wl/xbox/psh_cache.c with the game's recipes
+(port/wii/src/gx_psh.c; tools/wii_gx_psh_check.py builds and runs it after
+gx_psh_check): every program the cache gives is compared with the combiners
+translated afresh (gx_psh_translate), byte for byte.
 
 - Random combiner programs, each drawn with its constants as they were,
   changed within their signatures (a channel's 0s and 1s kept), and changed
@@ -22,11 +22,11 @@ usage: gx_psh_cache_check [programs [seed]]
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "gx_psh_cache.h"
+#include "gx_psh.h"
 
 static unsigned long compared, differ;
 
-static void compare(const DWORD *state, const struct gx_psh_textures *textures, const char *what);
+static void compare(const DWORD *state, const WlXboxPshTextures *textures, const char *what);
 
 static unsigned rand_input(int alpha_portion)
 {
@@ -103,7 +103,7 @@ static DWORD same_signature(DWORD value)
 	return (DWORD)out[0] << 24 | (DWORD)out[1] << 16 | (DWORD)out[2] << 8 | out[3];
 }
 
-static void program_random(DWORD *state, struct gx_psh_textures *textures)
+static void program_random(DWORD *state, WlXboxPshTextures *textures)
 {
 	int count = 1 + rand() % 8, stage, portion, k;
 
@@ -152,7 +152,7 @@ static void program_random(DWORD *state, struct gx_psh_textures *textures)
 	}
 	textures->present = (unsigned)rand() % 16;
 	textures->separate_alpha = textures->present & (unsigned)rand();
-	for (k = 0; k < GX_PSH_TEXTURES; k++)
+	for (k = 0; k < WL_XBOX_PSH_TEXTURES; k++)
 		textures->contents[k] = (unsigned char)(textures->present & (1U << k) ? rand() % 3 : 0);
 	textures->fog = (unsigned char)(rand() % 2);
 	/* (now and then a bumped reflection's lookup, or a stage read as colour 1) */
@@ -174,13 +174,13 @@ static void specular(int draws)
 	static const DWORD rgb_out[6] = { 0x000030C9, 0x00010D00, 0x000020D0, 0x00000C00, 0x000110CD, 0x000010CD };
 	static const DWORD alpha_in[6] = { 0x4B204B20, 0x4A204A20, 0x2C120C11, 0x0D0D1415, 0x1D1D151C, 0x1D1D0000 };
 	static const DWORD alpha_out[6] = { 0x00020400, 0x00020500, 0x00000C00, 0x000000D5, 0x000000D5, 0x000000D0 };
-	static struct gx_psh_program fresh;
+	static WlXboxPshProgram fresh;
 	int draw, stage, recipes = 0;
 
 	for (draw = 0; draw < draws; draw++)
 	{
 		DWORD state[200];
-		struct gx_psh_textures textures;
+		WlXboxPshTextures textures;
 		DWORD brightness = (DWORD)(draw % 5 == 0 ? 0xFF : 0x20 + rand() % 0xC0);
 
 		memset(state, 0, sizeof(state));
@@ -212,7 +212,7 @@ static void specular(int draws)
 	printf("the specular pass: %d draws, %d of them the recipe's\n", draws, recipes);
 }
 
-static void constants_random(DWORD *state, struct gx_psh_textures *textures)
+static void constants_random(DWORD *state, WlXboxPshTextures *textures)
 {
 	int k;
 
@@ -229,7 +229,7 @@ static void constants_random(DWORD *state, struct gx_psh_textures *textures)
 	textures->fog_color = rand_constant() & 0x00FFFFFFUL;
 }
 
-static void constants_resigned(DWORD *state, struct gx_psh_textures *textures)
+static void constants_resigned(DWORD *state, WlXboxPshTextures *textures)
 {
 	DWORD before[18], after[18];
 	int k, j;
@@ -257,10 +257,10 @@ static void constants_resigned(DWORD *state, struct gx_psh_textures *textures)
 }
 
 /* the cache's program against a fresh translation */
-static void compare(const DWORD *state, const struct gx_psh_textures *textures, const char *what)
+static void compare(const DWORD *state, const WlXboxPshTextures *textures, const char *what)
 {
-	static struct gx_psh_program fresh;
-	const struct gx_psh_program *cached;
+	static WlXboxPshProgram fresh;
+	const WlXboxPshProgram *cached;
 	BOOL usable, fresh_usable, translated;
 
 	cached = gx_psh_cache_program(state, textures, &usable, &translated);
@@ -308,13 +308,13 @@ static void compare(const DWORD *state, const struct gx_psh_textures *textures, 
 
 /* ---------- the game's model program, over frames */
 
-/* the device's cache before gx_psh_cache.c: 48 programs, each for the whole
+/* the device's cache before the structures' one: 48 programs, each for the whole
 of the pixel shader render states and the textures */
 static DWORD old_states[48][D3DRS_PS_MAX];
-static struct gx_psh_textures old_textures[48];
+static WlXboxPshTextures old_textures[48];
 static unsigned old_count, old_next;
 
-static int old_cache_translates(const DWORD *state, const struct gx_psh_textures *textures)
+static int old_cache_translates(const DWORD *state, const WlXboxPshTextures *textures)
 {
 	unsigned index;
 
@@ -339,7 +339,7 @@ static void models(int objects, int frames)
 	static const DWORD ro[] = { 0x000030cd, 0x00000400, 0x00000c00, 0x00000900, 0x000000b4, 0x00000d00, 0x00000800, 0x00000c00 };
 	static const DWORD ai[] = { 0x0a200000, 0x1c200000, 0x0c200d15, 0, 0, 0, 0, 0 };
 	static const DWORD ao[] = { 0x000000c0, 0x00000090, 0x000000cd, 0, 0, 0, 0, 0 };
-	struct gx_psh_cache_counts before, after;
+	WlXboxPshCacheCounts before, after;
 	unsigned long old_translations = 0;
 	int frame, object, stage;
 
@@ -349,7 +349,7 @@ static void models(int objects, int frames)
 		for (object = 0; object < objects; object++)
 		{
 			DWORD state[200];
-			struct gx_psh_textures textures;
+			WlXboxPshTextures textures;
 			/* (the fog's colour scaled by the object's density, from its
 			distance; the planar fog's error 0; its change colours) */
 			float density = 0.2f + 0.6f * (float)((object * 37 + frame * (1 + object % 3)) % 100) / 100.0f;
@@ -397,13 +397,13 @@ static void models(int objects, int frames)
 int main(int argc, char **argv)
 {
 	int programs = argc > 1 ? atoi(argv[1]) : 3000, program, draw;
-	struct gx_psh_cache_counts counts;
+	WlXboxPshCacheCounts counts;
 
 	srand(argc > 2 ? (unsigned)atoi(argv[2]) : 2342);
 	for (program = 0; program < programs; program++)
 	{
 		DWORD state[200];
-		struct gx_psh_textures textures;
+		WlXboxPshTextures textures;
 
 		program_random(state, &textures);
 		constants_random(state, &textures);

@@ -47,7 +47,7 @@ interpreter.
 */
 
 #include "gx_lighting.h"
-#include "nv2a_cpu_native.h"
+#include "wl/xbox/vsh_native.h"
 
 #include <math.h>
 #include <string.h>
@@ -120,7 +120,7 @@ static float dot3(const float *a, const float *b)
 
 static float length3(const float *a)
 {
-	return nv2a_sqrtf(dot3(a, a));
+	return wl_xbox_vsh_sqrtf(dot3(a, a));
 }
 
 /* E's rows applied to a world direction (no translation) */
@@ -159,7 +159,7 @@ BOOL gx_lighting_space_make(const float (*c)[4], struct gx_lighting_space *space
 	sigma2 = dot3(v[2], v[2]);
 	if (!(sigma2 > 1.0e-20f))
 		return FALSE;
-	space->sigma = nv2a_sqrtf(sigma2);
+	space->sigma = wl_xbox_vsh_sqrtf(sigma2);
 	/* (Gram-Schmidt from the last row up: K's columns) */
 	space->k12 = dot3(v[1], v[2]) / sigma2;
 	for (column = 0; column < 3; column++)
@@ -360,7 +360,7 @@ static BOOL point_light(struct gx_lighting *lighting, const float (*c)[4], const
 		a[2] = -1.0f / (d * d);
 	}
 	/* the fall-off, in E (whose lengths are sigma times the world's) */
-	radius = space->sigma / nv2a_sqrtf(c[position_constant][3]);
+	radius = space->sigma / wl_xbox_vsh_sqrtf(c[position_constant][3]);
 	for (component = 0; component < 3; component++)
 		offset_e[component] = center[component] - position[component];
 	distance = length3(offset_e);
@@ -459,7 +459,7 @@ void gx_lighting_evaluate(const struct gx_lighting *lighting, const float positi
 			for (component = 0; component < 3; component++)
 				to[component] = light->position[component] - position[component];
 			distance2 = dot3(to, to);
-			distance = nv2a_sqrtf(distance2);
+			distance = wl_xbox_vsh_sqrtf(distance2);
 			for (component = 0; component < 3; component++)
 				to[component] /= distance;
 			/* (the hardware's direction is GX_InitLightDir's negated) */
@@ -719,7 +719,7 @@ of Newton's steps (the sphere maps' grids, a few hundred points each: their
 library square roots were most of a grid's time) */
 static float reciprocal_root(float x)
 {
-	double y = nv2a_reciprocal_root_estimate(x);
+	double y = wl_xbox_vsh_reciprocal_root_estimate(x);
 
 	y = y * (1.5 - 0.5 * x * y * y);
 	y = y * (1.5 - 0.5 * x * y * y);
@@ -758,7 +758,7 @@ void gx_lighting_view_frame(const struct gx_lighting_space *space, const float t
 	float z[3], x[3], y[3], length, k;
 	int row, column;
 
-	length = nv2a_sqrtf(dot3(toward, toward));
+	length = wl_xbox_vsh_sqrtf(dot3(toward, toward));
 	if (step > 0.0f && length > 1.0e-12f)
 	{
 		/* (rounded in the world: its elevation and azimuth to the nearest

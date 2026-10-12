@@ -13,7 +13,7 @@ address in their Data field.
 
 GX has no programmable vertex stage: each draw's vertices are fetched from
 their streams by the vertex shader's declaration and run through its NV2A
-program on the processor (nv2a_cpu.c), and GX draws what the program leaves
+program on the processor (WiiLibs' wl/xbox/vsh.c), and GX draws what the program leaves
 in screen space, through an orthographic projection: x and y in pixels,
 depth from the viewport's z scale. The pixel stage is a TEV approximation of
 the register combiners (tev_setup), the textures decoded into GX's RGBA8
@@ -43,10 +43,9 @@ int: libogc's is renamed while its headers are read) */
 #undef BOOL
 
 #include "gx_psh.h"
-#include "gx_psh_cache.h"
 #include "gx_lighting.h"
 #include "port_config.h"
-#include "nv2a_cpu_native.h"
+#include "wl/xbox/vsh_native.h"
 #include "wii_memory.h"
 #include "wii_video.h"
 #include "xbox_texture_formats.h"
@@ -116,21 +115,21 @@ struct vertex_shader_object
 	unsigned long id;
 	DWORD *instructions;
 	unsigned long instruction_count;
-	struct vertex_element elements[NV2A_CPU_INPUT_COUNT];
+	struct vertex_element elements[WL_XBOX_VSH_INPUT_COUNT];
 	unsigned long element_count;
 	/* compiled for the processor the first time it draws */
-	struct nv2a_cpu_program *program;
-	/* what its outputs depend on (nv2a_cpu_analyze), with the program */
-	struct nv2a_cpu_dependencies dependencies;
-	/* ... and which components read a constant (nv2a_cpu_analyze_constants:
+	WlXboxVshProgram *program;
+	/* what its outputs depend on (wl_xbox_vsh_analyze), with the program */
+	WlXboxVshDependencies dependencies;
+	/* ... and which components read a constant (wl_xbox_vsh_analyze_constants:
 	the others a static vertex buffer's outputs can keep) */
-	struct nv2a_cpu_dependencies constant_reads;
+	WlXboxVshDependencies constant_reads;
 	/* ... and with the inputs a draw held the same taken as constants
 	(draw_dependencies) */
 	struct
 	{
 		unsigned long uniform;
-		struct nv2a_cpu_dependencies dependencies;
+		WlXboxVshDependencies dependencies;
 	} specialized[2];
 	unsigned specialized_count;
 };
@@ -722,7 +721,7 @@ static void parse_declaration(struct vertex_shader_object *object, const DWORD *
 
 				offsets[stream & 15] += (token & 0x08000000) ? count : count * 4;
 			}
-			else if (object->element_count < NV2A_CPU_INPUT_COUNT)
+			else if (object->element_count < WL_XBOX_VSH_INPUT_COUNT)
 			{
 				struct vertex_element *element = &object->elements[object->element_count++];
 
@@ -2282,13 +2281,14 @@ static unsigned textures_bind(void)
 /* ---------- the pixel stage
 
 The pixel shader's register combiners are translated to TEV stages
-(gx_psh.c), kept by the combiners, the textures' kinds and their constants'
-signatures (gx_psh_cache.c). A shader GX cannot hold takes the first stage's
+(WiiLibs' wl/xbox/psh.c, with the game's recipes: gx_psh.c), kept by the
+combiners, the textures' kinds and their constants' signatures (WiiLibs'
+wl/xbox/psh_cache.c). A shader GX cannot hold takes the first stage's
 texture, modulated by the diffuse colour. */
 
 /* the last draw's program (NULL before the first), and whether it was
 usable */
-static const struct gx_psh_program *pixel_shader_program;
+static const WlXboxPshProgram *pixel_shader_program;
 static BOOL pixel_shader_usable;
 static unsigned long pixel_shaders_logged;
 
@@ -2317,7 +2317,7 @@ recipe): colour 0. */
 
 /* the program's vertex terms (_gx_psh_vertices_*) and the TEV stages set
 for the indirect unit */
-static unsigned char vertex_terms = _gx_psh_vertices_program;
+static unsigned char vertex_terms = WL_XBOX_PSH_VERTICES_PROGRAM;
 static unsigned indirect_stages;
 
 enum
@@ -2373,7 +2373,7 @@ static void bump_offset_bind(void)
 	}
 	object = bound_objects[0];
 	GX_InitTexObjTlut(&object, BUMP_OFFSET_TLUT);
-	GX_LoadTexObj(&object, (u8)(GX_TEXMAP0 + GX_PSH_BUMP_TEXMAP));
+	GX_LoadTexObj(&object, (u8)(GX_TEXMAP0 + WL_XBOX_PSH_BUMP_TEXMAP));
 }
 
 /* the indirect unit as the program's stages ask (NULL: off, for stages the
@@ -2392,7 +2392,7 @@ static BOOL bumped_highlights(void)
 	return enabled ? TRUE : FALSE;
 }
 
-static void indirect_apply(const struct gx_psh_program *program)
+static void indirect_apply(const WlXboxPshProgram *program)
 {
 	static f32 matrix[2][3] = { { 0.5f, 0.0f, 0.0f }, { 0.0f, 0.5f, 0.0f } };
 	unsigned used = 0, stage;
@@ -2400,10 +2400,10 @@ static void indirect_apply(const struct gx_psh_program *program)
 	if (program)
 	{
 		for (stage = 0; stage < program->tev.stage_count; stage++)
-			if (program->indirect[stage] != _gx_psh_indirect_none)
+			if (program->indirect[stage] != WL_XBOX_PSH_INDIRECT_NONE)
 				used |= 1U << stage;
 	}
-	for (stage = 0; stage < GX_PSH_MAXIMUM_STAGES; stage++)
+	for (stage = 0; stage < WL_XBOX_PSH_MAX_STAGES; stage++)
 		if (indirect_stages & ~used & (1U << stage))
 			GX_SetTevDirect((u8)stage);
 	if (!used)
@@ -2415,7 +2415,7 @@ static void indirect_apply(const struct gx_psh_program *program)
 	}
 	bump_offset_bind();
 	GX_SetNumIndStages(1);
-	GX_SetIndTexOrder(GX_INDTEXSTAGE0, GX_TEXCOORD0, (u8)(GX_TEXMAP0 + GX_PSH_BUMP_TEXMAP));
+	GX_SetIndTexOrder(GX_INDTEXSTAGE0, GX_TEXCOORD0, (u8)(GX_TEXMAP0 + WL_XBOX_PSH_BUMP_TEXMAP));
 	GX_SetIndTexCoordScale(GX_INDTEXSTAGE0, GX_ITS_1, GX_ITS_1);
 	GX_SetIndTexMatrix(GX_ITM_0, matrix, BUMP_OFFSET_SCALE);
 	for (stage = 0; stage < program->tev.stage_count; stage++)
@@ -2424,24 +2424,24 @@ static void indirect_apply(const struct gx_psh_program *program)
 
 		switch (program->indirect[stage])
 		{
-		case _gx_psh_indirect_s:
+		case WL_XBOX_PSH_INDIRECT_S:
 			/* (no lookup, but the lookup's map scales the coordinate) */
-			GX_SetTevOrder((u8)stage, GX_TEXCOORD0 + GX_PSH_BUMP_TEXCOORD_S,
+			GX_SetTevOrder((u8)stage, GX_TEXCOORD0 + WL_XBOX_PSH_BUMP_TEXCOORD_S,
 				(u32)program->tev.stages[stage + 2].texmap | GX_TEXMAP_DISABLE, tev->channel);
 			GX_SetTevIndirect((u8)stage, GX_INDTEXSTAGE0, GX_ITF_8, GX_ITB_ST, GX_ITM_S0, GX_ITW_0, GX_ITW_0, GX_FALSE,
 				GX_FALSE, GX_ITBA_OFF);
 			break;
-		case _gx_psh_indirect_t:
-			GX_SetTevOrder((u8)stage, GX_TEXCOORD0 + GX_PSH_BUMP_TEXCOORD_T,
+		case WL_XBOX_PSH_INDIRECT_T:
+			GX_SetTevOrder((u8)stage, GX_TEXCOORD0 + WL_XBOX_PSH_BUMP_TEXCOORD_T,
 				(u32)program->tev.stages[stage + 1].texmap | GX_TEXMAP_DISABLE, tev->channel);
 			GX_SetTevIndirect((u8)stage, GX_INDTEXSTAGE0, GX_ITF_8, GX_ITB_ST, GX_ITM_T0, GX_ITW_0, GX_ITW_0, GX_TRUE,
 				GX_FALSE, GX_ITBA_OFF);
 			break;
-		case _gx_psh_indirect_lookup:
+		case WL_XBOX_PSH_INDIRECT_LOOKUP:
 			GX_SetTevIndirect((u8)stage, GX_INDTEXSTAGE0, GX_ITF_8, GX_ITB_NONE, GX_ITM_OFF, GX_ITW_OFF, GX_ITW_OFF,
 				GX_TRUE, GX_FALSE, GX_ITBA_OFF);
 			break;
-		case _gx_psh_indirect_repeat:
+		case WL_XBOX_PSH_INDIRECT_REPEAT:
 			GX_SetTevIndRepeat((u8)stage);
 			break;
 		}
@@ -2454,7 +2454,7 @@ static void tev_fallback(unsigned stages)
 	struct texture_entry *entry = bound_entries[0];
 
 	indirect_apply(NULL);
-	vertex_terms = _gx_psh_vertices_program;
+	vertex_terms = WL_XBOX_PSH_VERTICES_PROGRAM;
 
 	if (!(stages & 1) || !entry)
 	{
@@ -2475,17 +2475,17 @@ bit 1 COLOR1A1). draw_hardware leaves an output nothing reads alone */
 static unsigned tev_texcoords = 0x1F, tev_channels = 3;
 /* the textures the stages set up last were translated for (a lit draw's
 planar fog translates them again with D0's alpha a ramp's: lit_fog_ramp) */
-static struct gx_psh_textures tev_textures;
+static WlXboxPshTextures tev_textures;
 
 static void tev_setup(unsigned stages)
 {
 	static int debug = -1;
-	struct gx_psh_textures textures;
+	WlXboxPshTextures textures;
 
 	/* (all of the vertices' values, until a translation says less) */
 	tev_texcoords = 0x1F;
 	tev_channels = 3;
-	const struct gx_psh_program *program;
+	const WlXboxPshProgram *program;
 	BOOL usable, translated;
 	DWORD stage;
 	BOOL bumped_reflection, flat_reflection;
@@ -2498,7 +2498,7 @@ static void tev_setup(unsigned stages)
 	if (debug)
 	{
 		indirect_apply(NULL);
-		vertex_terms = _gx_psh_vertices_program;
+		vertex_terms = WL_XBOX_PSH_VERTICES_PROGRAM;
 		GX_SetNumTevStages(1);
 		GX_SetTevSwapMode(GX_TEVSTAGE0, GX_TEV_SWAP0, GX_TEV_SWAP0);
 		if (debug == 2 && (stages & 1))
@@ -2533,7 +2533,7 @@ static void tev_setup(unsigned stages)
 	flat_reflection = !bumped_reflection && ((modes >> 5) & 0x1f) == 0x11 &&
 		(((modes >> 10) & 0x1f) == 0x11 || ((modes >> 10) & 0x1f) == 0x0B) && ((modes >> 15) & 0x1f) == 0x0C &&
 		(stages & 8) && bound_entries[3] && bound_entries[3]->sphere;
-	for (stage = 0; stage < GX_PSH_TEXTURES; stage++)
+	for (stage = 0; stage < WL_XBOX_PSH_TEXTURES; stage++)
 	{
 		DWORD mode = (modes >> (5 * stage)) & 0x1f;
 
@@ -2612,7 +2612,7 @@ static void tev_setup(unsigned stages)
 	tev_channels = 3;
 	if (usable)
 	{
-		gx_psh_apply(program);
+		wl_xbox_psh_apply(program);
 		indirect_apply(program);
 		vertex_terms = program->vertices;
 		tev_texcoords = program->texcoords;
@@ -2895,7 +2895,7 @@ reads the disc's edge */
 static void sphere_coordinates(const float direction[4], float out[2])
 {
 	float x = direction[0], y = direction[1], z = direction[2];
-	float length = nv2a_sqrtf(x * x + y * y + z * z), m;
+	float length = wl_xbox_vsh_sqrtf(x * x + y * y + z * z), m;
 
 	if (!(length > 1.0e-12f))
 	{
@@ -2905,7 +2905,7 @@ static void sphere_coordinates(const float direction[4], float out[2])
 	x /= length;
 	y /= length;
 	z /= length;
-	m = 2.0f * nv2a_sqrtf(x * x + y * y + (z + 1.0f) * (z + 1.0f));
+	m = 2.0f * wl_xbox_vsh_sqrtf(x * x + y * y + (z + 1.0f) * (z + 1.0f));
 	if (!(m > 1.0e-6f))
 	{
 		out[0] = 0.5f;
@@ -2936,7 +2936,7 @@ struct gx_vertex
 (store_plan_set, once emit_attributes is) */
 static struct
 {
-	/* the program's outputs (NV2A_CPU_LIVE_...) */
+	/* the program's outputs (WL_XBOX_VSH_LIVE_...) */
 	unsigned live;
 	/* the texture stages sent; those of them sphere maps, and those whose
 	coordinates are scaled (a linear texture's, in texels) */
@@ -2949,25 +2949,25 @@ static void store_plan_set(void)
 {
 	unsigned stage;
 
-	store_plan.live = NV2A_CPU_LIVE_POSITION;
+	store_plan.live = WL_XBOX_VSH_LIVE_POSITION;
 	if (emit_attributes & 1)
-		store_plan.live |= NV2A_CPU_LIVE_D0;
+		store_plan.live |= WL_XBOX_VSH_LIVE_D0;
 	if (emit_attributes & 2)
-		store_plan.live |= NV2A_CPU_LIVE_D1;
+		store_plan.live |= WL_XBOX_VSH_LIVE_D1;
 	if (emit_attributes & 0x40)
-		store_plan.live |= NV2A_CPU_LIVE_FOG;
+		store_plan.live |= WL_XBOX_VSH_LIVE_FOG;
 	store_plan.stages = (emit_attributes >> 2) & 15;
 	/* (a bumped reflection's terms read the frame's rows, coordinates 1 to 3:
 	bumped_reflection_vertex) */
-	if (vertex_terms == _gx_psh_vertices_bumped_reflection)
-		store_plan.live |= NV2A_CPU_LIVE_T0 << 1 | NV2A_CPU_LIVE_T0 << 2 | NV2A_CPU_LIVE_T0 << 3;
+	if (vertex_terms == WL_XBOX_PSH_VERTICES_BUMPED_REFLECTION)
+		store_plan.live |= WL_XBOX_VSH_LIVE_T0 << 1 | WL_XBOX_VSH_LIVE_T0 << 2 | WL_XBOX_VSH_LIVE_T0 << 3;
 	store_plan.sphere = sphere_stages & store_plan.stages;
 	store_plan.scaled = 0;
 	for (stage = 0; stage < 4; stage++)
 	{
 		if (!(store_plan.stages & (1U << stage)))
 			continue;
-		store_plan.live |= NV2A_CPU_LIVE_T0 << stage;
+		store_plan.live |= WL_XBOX_VSH_LIVE_T0 << stage;
 		/* (a scale of 1 leaves a coordinate as it is) */
 		if (!(store_plan.sphere & (1U << stage)) &&
 			(texcoord_scale[stage][0] != 1.0f || texcoord_scale[stage][1] != 1.0f))
@@ -3020,7 +3020,7 @@ static void reflection_of(const float n[3], const float e[3], float out[4])
 /* a bumped reflection's vertex: texture coordinate 3 the sphere coordinates
 of the flat normal's reflection, 1 and 2 how far they move as the normal
 tilts along the frame's x and y, colour 1 the flat normal */
-static void bumped_reflection_vertex(const struct nv2a_cpu_output *out, struct gx_vertex *vertex)
+static void bumped_reflection_vertex(const WlXboxVshOutput *out, struct gx_vertex *vertex)
 {
 	const float *row0 = out->t[1], *row1 = out->t[2], *row2 = out->t[3];
 	float normal[3], eye[3], tilted[3], reflection[4], base[2], moved[2], length;
@@ -3055,10 +3055,10 @@ static void bumped_reflection_vertex(const struct nv2a_cpu_output *out, struct g
 				term = -BUMP_OFFSET_LIMIT;
 			if (term > BUMP_OFFSET_LIMIT)
 				term = BUMP_OFFSET_LIMIT;
-			vertex->texcoord[GX_PSH_BUMP_TEXCOORD_S + axis][index] = term;
+			vertex->texcoord[WL_XBOX_PSH_BUMP_TEXCOORD_S + axis][index] = term;
 		}
 	}
-	length = nv2a_sqrtf(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]);
+	length = wl_xbox_vsh_sqrtf(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]);
 	for (index = 0; index < 3; index++)
 		vertex->color1[index] = color_byte(length > 1.0e-12f ? (normal[index] / length + 1.0f) * 0.5f : 0.5f);
 	vertex->color1[3] = 255;
@@ -3066,7 +3066,7 @@ static void bumped_reflection_vertex(const struct nv2a_cpu_output *out, struct g
 
 /* a specular light's vertex: colour 0 (1 - e.l) / 2 of the eye's and the
 light's directions (texture coordinates 2 and 3), normalized */
-static void specular_vertex(const struct nv2a_cpu_output *out, struct gx_vertex *vertex)
+static void specular_vertex(const WlXboxVshOutput *out, struct gx_vertex *vertex)
 {
 	const float *e = out->t[2], *l = out->t[3];
 	float ee = e[0] * e[0] + e[1] * e[1] + e[2] * e[2], ll = l[0] * l[0] + l[1] * l[1] + l[2] * l[2];
@@ -3074,13 +3074,13 @@ static void specular_vertex(const struct nv2a_cpu_output *out, struct gx_vertex 
 	u8 level;
 
 	if (ee > 1.0e-20f && ll > 1.0e-20f)
-		el = (e[0] * l[0] + e[1] * l[1] + e[2] * l[2]) / nv2a_sqrtf(ee * ll);
+		el = (e[0] * l[0] + e[1] * l[1] + e[2] * l[2]) / wl_xbox_vsh_sqrtf(ee * ll);
 	level = color_byte((1.0f - el) * 0.5f);
 	vertex->color0[0] = vertex->color0[1] = vertex->color0[2] = level;
 	vertex->color0[3] = 255;
 }
 
-static void vertex_store(const struct nv2a_cpu_output *out, const struct draw_projection *projection,
+static void vertex_store(const WlXboxVshOutput *out, const struct draw_projection *projection,
 	const float *raw_position, struct gx_vertex *vertex)
 {
 	unsigned stages = store_plan.stages;
@@ -3110,9 +3110,9 @@ static void vertex_store(const struct nv2a_cpu_output *out, const struct draw_pr
 		vertex->position[1] = out->position[1] + 0.5f;
 		vertex->position[2] = depth - 1.0f;
 	}
-	if (store_plan.live & NV2A_CPU_LIVE_D0)
+	if (store_plan.live & WL_XBOX_VSH_LIVE_D0)
 		color_bytes(out->d0, vertex->color0);
-	if (store_plan.live & NV2A_CPU_LIVE_D1)
+	if (store_plan.live & WL_XBOX_VSH_LIVE_D1)
 		color_bytes(out->d1, vertex->color1);
 	for (stage = 0; stages; stage++, stages >>= 1)
 	{
@@ -3131,10 +3131,10 @@ static void vertex_store(const struct nv2a_cpu_output *out, const struct draw_pr
 			vertex->texcoord[stage][1] = out->t[stage][1];
 		}
 	}
-	if (store_plan.live & NV2A_CPU_LIVE_FOG)
+	if (store_plan.live & WL_XBOX_VSH_LIVE_FOG)
 		vertex->fog = store_plan.fog_table ? fog_coordinate(out->fog) : fog_ramp_coordinate(out->fog);
 	/* (a pass's own terms, in place of what the program made of them) */
-	if (vertex_terms == _gx_psh_vertices_bumped_reflection)
+	if (vertex_terms == WL_XBOX_PSH_VERTICES_BUMPED_REFLECTION)
 		bumped_reflection_vertex(out, vertex);
 	else if (vertex_terms == _gx_psh_vertices_specular)
 		specular_vertex(out, vertex);
@@ -3221,7 +3221,7 @@ static void inputs_seed(float (*inputs)[4])
 {
 	unsigned long reg;
 
-	for (reg = 0; reg < NV2A_CPU_INPUT_COUNT && (draw_unstreamed >> reg); reg++)
+	for (reg = 0; reg < WL_XBOX_VSH_INPUT_COUNT && (draw_unstreamed >> reg); reg++)
 		if (draw_unstreamed & (1UL << reg))
 			memcpy(inputs[reg], device.vertex_registers[reg], sizeof(inputs[reg]));
 }
@@ -3538,11 +3538,11 @@ static void draw_log_pixels(void)
 /* (a logged draw described: hardware the path, GX's transform or the
 processor's) */
 static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct draw_projection *projection,
-	void (*fetch)(void *, UINT, float (*)[4]), void *context, struct nv2a_cpu_program *program, float point_size,
+	void (*fetch)(void *, UINT, float (*)[4]), void *context, WlXboxVshProgram *program, float point_size,
 	BOOL hardware, const WORD *indices)
 {
-	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
-	struct nv2a_cpu_output out;
+	float inputs[WL_XBOX_VSH_INPUT_COUNT][4] = { { 0.0f } };
+	WlXboxVshOutput out;
 	float minimum[2] = { 1.0e9f, 1.0e9f }, maximum[2] = { -1.0e9f, -1.0e9f };
 	char textures[240];
 	int length = 0, stage;
@@ -3554,7 +3554,7 @@ static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct d
 	for (vertex = 0; vertex < count; vertex++)
 	{
 		fetch(context, vertex, inputs);
-		nv2a_cpu_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size, &out);
+		wl_xbox_vsh_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size, &out);
 		for (stage = 0; stage < 2; stage++)
 		{
 			if (out.position[stage] < minimum[stage])
@@ -3597,7 +3597,7 @@ static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct d
 		for (vertex = 0; vertex < count; vertex++)
 		{
 			fetch(context, vertex, inputs);
-			nv2a_cpu_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size, &out);
+			wl_xbox_vsh_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size, &out);
 			if (out.clip[3] < w_minimum)
 				w_minimum = out.clip[3];
 			if (out.clip[3] > w_maximum)
@@ -3627,7 +3627,7 @@ static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct d
 		for (vertex = 0; vertex < count; vertex++)
 		{
 			fetch(context, vertex, inputs);
-			nv2a_cpu_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size, &out);
+			wl_xbox_vsh_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size, &out);
 			platform_log("  v%u i%ld c %.7g %.7g %.7g %.7g s %.3f %.3f %.1f", vertex,
 				indices ? (long)indices[vertex] + (long)device.base_vertex_index : -1L, out.clip[0], out.clip[1],
 				out.clip[2], out.clip[3], out.position[0], out.position[1], out.position[2]);
@@ -3650,7 +3650,7 @@ static void draw_log(D3DPRIMITIVETYPE primitive_type, UINT count, const struct d
 				(unsigned long)D3D__RenderState[D3DRS_PSALPHAOUTPUTS0 + combiner]);
 	}
 	{
-		const struct gx_psh_program *shader = pixel_shader_program;
+		const WlXboxPshProgram *shader = pixel_shader_program;
 		const DWORD *rs = D3D__RenderState;
 
 		platform_log("  c0 %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx, final %08lx %08lx",
@@ -3686,11 +3686,11 @@ extern unsigned long long main_frame_wait_time;
 static unsigned long long frame_wait_start;
 
 /* the projection of a draw: a few of its vertices, for their w and depth */
-static struct draw_projection projection_fit(struct nv2a_cpu_program *program, UINT count, vertex_fetch_proc fetch,
+static struct draw_projection projection_fit(WlXboxVshProgram *program, UINT count, vertex_fetch_proc fetch,
 	void *context, float point_size)
 {
-	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
-	struct nv2a_cpu_output out;
+	float inputs[WL_XBOX_VSH_INPUT_COUNT][4] = { { 0.0f } };
+	WlXboxVshOutput out;
 	struct draw_projection projection = { FALSE, 0.0f, 0.0f };
 	UINT vertex;
 
@@ -3703,7 +3703,7 @@ static struct draw_projection projection_fit(struct nv2a_cpu_program *program, U
 		for (vertex = 0; vertex < probes && !fitted; vertex++)
 		{
 			fetch(context, vertex, inputs);
-			nv2a_cpu_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size, &out);
+			wl_xbox_vsh_run(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size, &out);
 			if (!out.clip_captured)
 				break;
 			projection.perspective = TRUE;
@@ -3746,7 +3746,7 @@ them */
 static struct
 {
 	unsigned long mask;
-	float values[NV2A_CPU_INPUT_COUNT][4];
+	float values[WL_XBOX_VSH_INPUT_COUNT][4];
 } draw_uniform;
 
 /* ... or, where those inputs take a few values (a model of several nodes, each
@@ -3794,8 +3794,8 @@ static inline BOOL draw_keyed(void)
 }
 
 struct stream_fetch;
-static const struct nv2a_cpu_dependencies *draw_dependencies(struct vertex_shader_object *shader,
-	struct nv2a_cpu_program *program, struct stream_fetch *fetch, UINT count);
+static const WlXboxVshDependencies *draw_dependencies(struct vertex_shader_object *shader,
+	WlXboxVshProgram *program, struct stream_fetch *fetch, UINT count);
 static void stream_fetch(void *context, UINT vertex, float (*inputs)[4]);
 
 /* ---------- the position in hardware
@@ -3809,13 +3809,13 @@ surface's passes, some on each path, then reach the same depths, which
 their equal depth tests need. */
 
 static int position_register_of(const struct vertex_shader_object *shader,
-	const struct nv2a_cpu_dependencies *dependencies)
+	const WlXboxVshDependencies *dependencies)
 {
 	unsigned long mask = dependencies->clip[0] | dependencies->clip[1] | dependencies->clip[3];
 	unsigned long index, bits = mask & 0xFFFF;
 	int reg;
 
-	if (!dependencies->clip_captured || (mask & NV2A_CPU_NOT_AFFINE) || !bits || (bits & (bits - 1)))
+	if (!dependencies->clip_captured || (mask & WL_XBOX_VSH_NOT_AFFINE) || !bits || (bits & (bits - 1)))
 		return -1;
 	for (reg = 0; !(bits & (1UL << reg)); reg++)
 		;
@@ -3832,11 +3832,11 @@ static void matrix_inputs(const struct vertex_shader_object *shader, float (*inp
 {
 	unsigned long index;
 
-	memset(inputs, 0, NV2A_CPU_INPUT_COUNT * sizeof(*inputs));
+	memset(inputs, 0, WL_XBOX_VSH_INPUT_COUNT * sizeof(*inputs));
 	for (index = 0; index < shader->element_count; index++)
 		inputs[shader->elements[index].reg & 15][3] = 1.0f;
 	inputs_seed(inputs);
-	for (index = 0; index < NV2A_CPU_INPUT_COUNT; index++)
+	for (index = 0; index < WL_XBOX_VSH_INPUT_COUNT; index++)
 		if (draw_uniform.mask & (1UL << index))
 			memcpy(inputs[index], draw_uniform.values[index], sizeof(inputs[index]));
 }
@@ -3878,7 +3878,7 @@ parts, and each matrix of its nodes. */
 #define CONSTANTS_HASHES 8
 
 static unsigned long long constants_hash(const struct vertex_shader_object *shader,
-	const struct nv2a_cpu_program *program)
+	const WlXboxVshProgram *program)
 {
 	static struct
 	{
@@ -3887,7 +3887,7 @@ static unsigned long long constants_hash(const struct vertex_shader_object *shad
 		unsigned long long hash;
 	} hashes[CONSTANTS_HASHES];
 	static unsigned next;
-	const struct nv2a_cpu_dependencies *dependencies = &shader->dependencies;
+	const WlXboxVshDependencies *dependencies = &shader->dependencies;
 	unsigned long long hash;
 	u32 lanes[2] = { 0, 0 };
 	unsigned long part;
@@ -3907,7 +3907,7 @@ static unsigned long long constants_hash(const struct vertex_shader_object *shad
 		lanes[1] = constant_rows_all[1];
 	}
 	else
-		for (part = 0; part < NV2A_CPU_CONSTANT_COUNT / 32; part++)
+		for (part = 0; part < WL_XBOX_VSH_CONSTANT_COUNT / 32; part++)
 		{
 			unsigned long bits = dependencies->constants[part];
 
@@ -3954,13 +3954,13 @@ static unsigned long long hash_words(unsigned long long hash, const void *data, 
 	return hash;
 }
 
-static unsigned long long constants_key(const struct vertex_shader_object *shader, const struct nv2a_cpu_program *program)
+static unsigned long long constants_key(const struct vertex_shader_object *shader, const WlXboxVshProgram *program)
 {
 	unsigned long long hash = constants_hash(shader, program);
 	unsigned long row, word;
 
 	hash = hash_step(hash, (u32)draw_uniform.mask);
-	for (row = 0; row < NV2A_CPU_INPUT_COUNT; row++)
+	for (row = 0; row < WL_XBOX_VSH_INPUT_COUNT; row++)
 		if (draw_uniform.mask & (1UL << row))
 		{
 			const unsigned long *words = (const unsigned long *)draw_uniform.values[row];
@@ -3970,7 +3970,7 @@ static unsigned long long constants_key(const struct vertex_shader_object *shade
 		}
 	/* (and the registers no stream gives: draw_unstreamed) */
 	hash = hash_step(hash, (u32)draw_unstreamed);
-	for (row = 0; row < NV2A_CPU_INPUT_COUNT; row++)
+	for (row = 0; row < WL_XBOX_VSH_INPUT_COUNT; row++)
 		if (draw_unstreamed & (1UL << row))
 		{
 			const unsigned long *words = (const unsigned long *)device.vertex_registers[row];
@@ -3981,12 +3981,12 @@ static unsigned long long constants_key(const struct vertex_shader_object *shade
 	return hash ? hash : 1;
 }
 
-static BOOL position_matrix_compute(const struct vertex_shader_object *shader, struct nv2a_cpu_program *program,
+static BOOL position_matrix_compute(const struct vertex_shader_object *shader, WlXboxVshProgram *program,
 	int reg, float point_size, BOOL fit);
 
 /* the position matrix (position_matrix_rows) for the constants and
 draw_uniform, and where fit, its depth (position_projection) */
-static BOOL position_matrix(const struct vertex_shader_object *shader, struct nv2a_cpu_program *program, int reg,
+static BOOL position_matrix(const struct vertex_shader_object *shader, WlXboxVshProgram *program, int reg,
 	float point_size, BOOL fit)
 {
 	unsigned long long key = constants_key(shader, program);
@@ -4009,14 +4009,14 @@ static BOOL position_matrix(const struct vertex_shader_object *shader, struct nv
 /* the program's clip-space and screen-space positions for up to four
 values of the position's register (points), the other inputs as given: its
 compiled function for four at once where it has one and the position is v0
-(nv2a_cpu_run_positions, the same to the bit), else a run for each */
-static void position_runs(struct nv2a_cpu_program *program, float (*inputs)[4], int reg, float point_size,
+(wl_xbox_vsh_run_positions, the same to the bit), else a run for each */
+static void position_runs(WlXboxVshProgram *program, float (*inputs)[4], int reg, float point_size,
 	const float (*points)[4], int count, float (*clips)[4], float (*screens)[4])
 {
 	float saved[4];
 	int point;
 
-	if (reg == 0 && nv2a_cpu_run_positions(program, (const float (*)[4])device.vertex_constants,
+	if (reg == 0 && wl_xbox_vsh_run_positions(program, (const float (*)[4])device.vertex_constants,
 		(const float (*)[4])inputs, points, clips, screens))
 	{
 		position_lanes_runs++;
@@ -4025,11 +4025,11 @@ static void position_runs(struct nv2a_cpu_program *program, float (*inputs)[4], 
 	memcpy(saved, inputs[reg], sizeof(saved));
 	for (point = 0; point < count; point++)
 	{
-		struct nv2a_cpu_output out;
+		WlXboxVshOutput out;
 
 		memcpy(inputs[reg], points[point], sizeof(inputs[reg]));
-		nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
-			&out, NV2A_CPU_LIVE_POSITION);
+		wl_xbox_vsh_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
+			&out, WL_XBOX_VSH_LIVE_POSITION);
 		memcpy(clips[point], out.clip, sizeof(clips[point]));
 		memcpy(screens[point], out.position, sizeof(screens[point]));
 	}
@@ -4037,13 +4037,13 @@ static void position_runs(struct nv2a_cpu_program *program, float (*inputs)[4], 
 	position_single_runs += (unsigned long)count;
 }
 
-static BOOL position_matrix_compute(const struct vertex_shader_object *shader, struct nv2a_cpu_program *program,
+static BOOL position_matrix_compute(const struct vertex_shader_object *shader, WlXboxVshProgram *program,
 	int reg, float point_size, BOOL fit)
 {
 	float ws[4];
 	const float *scale = device.vertex_constants[VERTEX_CONSTANT_BIAS - 38];
 	const float *offset = device.vertex_constants[VERTEX_CONSTANT_BIAS - 37];
-	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
+	float inputs[WL_XBOX_VSH_INPUT_COUNT][4] = { { 0.0f } };
 	/* (the origin, then each axis: the base and the columns) */
 	float points[4][4], clips[4][4], screens[4][4];
 	int component;
@@ -4134,10 +4134,10 @@ static void position_matrix_load(void)
 /* each of the draw's values a position matrix (draw_keys), its first's left
 in position_matrix_rows, position_projection (the only depth fitted: the
 draw's) and draw_uniform */
-static BOOL position_keys(const struct vertex_shader_object *shader, struct nv2a_cpu_program *program, void *fetch,
+static BOOL position_keys(const struct vertex_shader_object *shader, WlXboxVshProgram *program, void *fetch,
 	int reg, float point_size)
 {
-	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
+	float inputs[WL_XBOX_VSH_INPUT_COUNT][4] = { { 0.0f } };
 	unsigned key;
 	int index;
 
@@ -4145,7 +4145,7 @@ static BOOL position_keys(const struct vertex_shader_object *shader, struct nv2a
 	for (key = draw_keys.count; key-- > 0; )
 	{
 		stream_fetch(fetch, draw_keys.representative[key], inputs);
-		for (index = 0; index < NV2A_CPU_INPUT_COUNT; index++)
+		for (index = 0; index < WL_XBOX_VSH_INPUT_COUNT; index++)
 			if (draw_uniform.mask & (1UL << index))
 				memcpy(draw_uniform.values[index], inputs[index], sizeof(inputs[index]));
 		if (!position_matrix(shader, program, reg, point_size, key == 0))
@@ -4160,7 +4160,7 @@ draw in hardware first */
 #define PROGRAM_STATISTICS 24
 static struct { unsigned long hash, vertices, draws; } program_statistics[PROGRAM_STATISTICS];
 
-static void program_statistics_add(const struct nv2a_cpu_program *program, unsigned long vertices)
+static void program_statistics_add(const WlXboxVshProgram *program, unsigned long vertices)
 {
 	unsigned index, least = 0;
 
@@ -4267,7 +4267,7 @@ draw_hardware) */
 
 struct subdivide_vertex
 {
-	struct nv2a_cpu_output out;
+	WlXboxVshOutput out;
 	/* (the position in the model, where GX's matrix transforms it) */
 	float raw[4];
 	struct gx_vertex sent;
@@ -4318,7 +4318,7 @@ static BOOL subdivide_depth_free(void)
 /* the texture coordinates on a sphere map the draw's vertices carry */
 static unsigned subdivide_coordinates(void)
 {
-	return store_plan.sphere | (vertex_terms == _gx_psh_vertices_bumped_reflection ? 1U << 3 : 0);
+	return store_plan.sphere | (vertex_terms == WL_XBOX_PSH_VERTICES_BUMPED_REFLECTION ? 1U << 3 : 0);
 }
 
 static void subdivide_mix(const struct subdivide_vertex *a, const struct subdivide_vertex *b,
@@ -4533,11 +4533,11 @@ static void subdivide_triangle(const struct subdivide_vertex *a, const struct su
 /* a processor's draw of triangles on a sphere map, subdivided where the map
 needs it (after draw_run's projection and log); FALSE where it is not such a
 draw, which draw_run then draws */
-static BOOL draw_run_subdivided(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitive_type, UINT count,
+static BOOL draw_run_subdivided(WlXboxVshProgram *program, D3DPRIMITIVETYPE primitive_type, UINT count,
 	vertex_fetch_proc fetch, void *context, const WORD *indices, const struct vertex_shader_object *shader,
 	int position_register, BOOL keyed, const struct draw_projection *projection, float point_size)
 {
-	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
+	float inputs[WL_XBOX_VSH_INPUT_COUNT][4] = { { 0.0f } };
 	unsigned least = 0, most = 0, coordinates, live, pass;
 	UINT vertex, triangle, triangles;
 
@@ -4583,7 +4583,7 @@ static BOOL draw_run_subdivided(struct nv2a_cpu_program *program, D3DPRIMITIVETY
 	}
 	/* each vertex once: every output vertex_store reads, and the clip-space
 	position, which the view's sides are tested by */
-	live = store_plan.live | NV2A_CPU_LIVE_POSITION;
+	live = store_plan.live | WL_XBOX_VSH_LIVE_POSITION;
 	subdivide_budget = SUBDIVIDE_MOST_PIECES;
 	for (vertex = 0; vertex <= most - least; vertex++)
 		subdivide_vertices[vertex].filled = FALSE;
@@ -4597,7 +4597,7 @@ static BOOL draw_run_subdivided(struct nv2a_cpu_program *program, D3DPRIMITIVETY
 		if (kept->filled)
 			continue;
 		fetch(context, vertex, inputs);
-		nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
+		wl_xbox_vsh_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
 			point_size, &kept->out, live);
 		memcpy(kept->raw, inputs[position_register >= 0 ? position_register : 0], sizeof(kept->raw));
 		vertex_store(&kept->out, projection, position_register >= 0 && !processor ? kept->raw : NULL, &kept->sent);
@@ -4667,13 +4667,13 @@ static BOOL draw_run_subdivided(struct nv2a_cpu_program *program, D3DPRIMITIVETY
 	return TRUE;
 }
 
-static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitive_type, UINT count,
+static void draw_run(WlXboxVshProgram *program, D3DPRIMITIVETYPE primitive_type, UINT count,
 	vertex_fetch_proc fetch, void *context, const WORD *indices, const struct vertex_shader_object *shader)
 {
 	int position_register = -1;
 	uint64_t started = timing_now();
-	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
-	struct nv2a_cpu_output out;
+	float inputs[WL_XBOX_VSH_INPUT_COUNT][4] = { { 0.0f } };
+	WlXboxVshOutput out;
 	struct draw_projection projection = { FALSE, 0.0f, 0.0f };
 	float point_size;
 	UINT vertex;
@@ -4747,7 +4747,7 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 			if (shader)
 				emit_attributes_set();
 			store_plan_set();
-			live_gx = position_register >= 0 ? store_plan.live & ~NV2A_CPU_LIVE_POSITION : store_plan.live;
+			live_gx = position_register >= 0 ? store_plan.live & ~WL_XBOX_VSH_LIVE_POSITION : store_plan.live;
 
 			gx_begin(gx_primitive(primitive_type), DEVICE_VERTEX_FORMAT, (u16)count);
 			for (vertex = 0; vertex < count; vertex++)
@@ -4761,7 +4761,7 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 
 					fetch(context, vertex, inputs);
 					t1 = PPCMftb();
-					nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants,
+					wl_xbox_vsh_run_live(program, (const float (*)[4])device.vertex_constants,
 						(const float (*)[4])inputs, point_size, &out, processor ? store_plan.live : live_gx);
 					t2 = PPCMftb();
 					vertex_store(&out, &projection, position_register >= 0 && !processor ? inputs[position_register] : NULL,
@@ -4798,7 +4798,7 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 		if (shader)
 			emit_attributes_set();
 		store_plan_set();
-		live_gx = position_register >= 0 ? store_plan.live & ~NV2A_CPU_LIVE_POSITION : store_plan.live;
+		live_gx = position_register >= 0 ? store_plan.live & ~WL_XBOX_VSH_LIVE_POSITION : store_plan.live;
 
 		gx_begin(gx_primitive(primitive_type), DEVICE_VERTEX_FORMAT, (u16)count);
 		for (vertex = 0; vertex < count; vertex++)
@@ -4808,7 +4808,7 @@ static void draw_run(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitiv
 
 			sent.matrix = (u8)(processor ? GX_PNMTX0 : GX_PNMTX1 + 3 * draw_key_of[vertex]);
 			fetch(context, vertex, inputs);
-			nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
+			wl_xbox_vsh_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
 				point_size, &out, processor ? store_plan.live : live_gx);
 			vertex_store(&out, &projection, position_register >= 0 && !processor ? inputs[position_register] : NULL,
 				&sent);
@@ -4850,7 +4850,12 @@ static u8 gx_primitive(D3DPRIMITIVETYPE type)
 	}
 }
 
-static struct nv2a_cpu_program *program_current(void)
+/* the game's vertex programs compiled ahead of time (build/wii/gen/nv2a_programs.c,
+which WiiLibs' tools/xbox_vsh_codegen.c writes) */
+extern const WlXboxVshNative xbox_vsh_natives[];
+extern const unsigned long xbox_vsh_natives_count;
+
+static WlXboxVshProgram *program_current(void)
 {
 	struct vertex_shader_object *shader = device.vertex_shader;
 
@@ -4861,9 +4866,10 @@ static struct nv2a_cpu_program *program_current(void)
 		shader->program = malloc(sizeof(*shader->program));
 		if (!shader->program)
 			return NULL;
-		nv2a_cpu_compile(shader->instructions, shader->instruction_count, shader->program);
-		nv2a_cpu_analyze(shader->program, &shader->dependencies);
-		nv2a_cpu_analyze_constants(shader->program, &shader->constant_reads);
+		wl_xbox_vsh_compile((const uint32_t *)shader->instructions, shader->instruction_count, xbox_vsh_natives,
+			xbox_vsh_natives_count, shader->program);
+		wl_xbox_vsh_analyze(shader->program, &shader->dependencies);
+		wl_xbox_vsh_analyze_constants(shader->program, &shader->constant_reads);
 	}
 	return shader->program;
 }
@@ -5080,7 +5086,7 @@ struct stream_fetch
 	/* the elements of the registers the program reads, whose stream is
 	set (stream_fetch_plan) */
 	unsigned element_count;
-	struct fetch_element elements[NV2A_CPU_INPUT_COUNT];
+	struct fetch_element elements[WL_XBOX_VSH_INPUT_COUNT];
 };
 
 static void stream_fetch_plan(struct stream_fetch *fetch)
@@ -5093,7 +5099,7 @@ static void stream_fetch_plan(struct stream_fetch *fetch)
 		fetch_tables_make();
 	fetch->element_count = 0;
 	draw_unstreamed = read & 0xFFFF;
-	for (element = 0; element < shader->element_count && element < NV2A_CPU_INPUT_COUNT; element++)
+	for (element = 0; element < shader->element_count && element < WL_XBOX_VSH_INPUT_COUNT; element++)
 	{
 		const struct vertex_element *source = &shader->elements[element];
 		unsigned stream = source->stream & (MAXIMUM_STREAMS - 1);
@@ -5212,7 +5218,7 @@ static void stream_fetch(void *context, UINT vertex, float (*inputs)[4])
 
 /* ---------- draws in hardware
 
-A program whose outputs are affine functions of its inputs (nv2a_cpu_analyze)
+A program whose outputs are affine functions of its inputs (wl_xbox_vsh_analyze)
 is, for one draw's constants, a matrix: GX's own transform computes it from
 the game's vertex buffers, which it reads by index, and the processor runs
 the program only for the matrix's columns (the outputs for no input and for
@@ -5695,14 +5701,14 @@ names (a skinned model's part bound to one node: its node indices and
 weights), its analysis with those as constants, whose values draw_uniform
 keeps for the matrices; where they hold a few values, draw_keys keeps them
 (once a draw: draw_hardware's, then draw_run's if it is the processor's) */
-static const struct nv2a_cpu_dependencies *draw_dependencies(struct vertex_shader_object *shader,
-	struct nv2a_cpu_program *program, struct stream_fetch *fetch, UINT count)
+static const WlXboxVshDependencies *draw_dependencies(struct vertex_shader_object *shader,
+	WlXboxVshProgram *program, struct stream_fetch *fetch, UINT count)
 {
 	static unsigned long serial;
-	static const struct nv2a_cpu_dependencies *found;
-	const struct nv2a_cpu_dependencies *general = &shader->dependencies;
+	static const WlXboxVshDependencies *found;
+	const WlXboxVshDependencies *general = &shader->dependencies;
 	unsigned long clip = general->clip[0] | general->clip[1] | general->clip[3], candidates = 0;
-	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
+	float inputs[WL_XBOX_VSH_INPUT_COUNT][4] = { { 0.0f } };
 	unsigned index;
 	int reg;
 
@@ -5714,9 +5720,9 @@ static const struct nv2a_cpu_dependencies *draw_dependencies(struct vertex_shade
 	draw_key_of = vertex_keys;
 	found = NULL;
 	serial = draw_serial;
-	if (!fetch || !count || !general->clip_captured || !(clip & NV2A_CPU_NOT_AFFINE))
+	if (!fetch || !count || !general->clip_captured || !(clip & WL_XBOX_VSH_NOT_AFFINE))
 		return found = general;
-	for (reg = 0; reg < NV2A_CPU_INPUT_COUNT; reg++)
+	for (reg = 0; reg < WL_XBOX_VSH_INPUT_COUNT; reg++)
 	{
 		const struct vertex_element *element;
 
@@ -5743,12 +5749,12 @@ static const struct nv2a_cpu_dependencies *draw_dependencies(struct vertex_shade
 	else
 	{
 		/* the candidates' bytes in each vertex, grouped by value */
-		const unsigned char *streams[NV2A_CPU_INPUT_COUNT];
-		UINT strides[NV2A_CPU_INPUT_COUNT], bytes[NV2A_CPU_INPUT_COUNT], vertex, key;
+		const unsigned char *streams[WL_XBOX_VSH_INPUT_COUNT];
+		UINT strides[WL_XBOX_VSH_INPUT_COUNT], bytes[WL_XBOX_VSH_INPUT_COUNT], vertex, key;
 		unsigned long wholes[MATRIX_KEYS];
-		int regs[NV2A_CPU_INPUT_COUNT], reg_count = 0, which;
+		int regs[WL_XBOX_VSH_INPUT_COUNT], reg_count = 0, which;
 
-		for (reg = 0; reg < NV2A_CPU_INPUT_COUNT; reg++)
+		for (reg = 0; reg < WL_XBOX_VSH_INPUT_COUNT; reg++)
 		{
 			const struct vertex_element *element;
 
@@ -5791,7 +5797,7 @@ static const struct nv2a_cpu_dependencies *draw_dependencies(struct vertex_shade
 		(void)regs;
 	}
 	stream_fetch(fetch, draw_keys.representative[0], inputs);
-	for (reg = 0; reg < NV2A_CPU_INPUT_COUNT; reg++)
+	for (reg = 0; reg < WL_XBOX_VSH_INPUT_COUNT; reg++)
 		if (candidates & (1UL << reg))
 			memcpy(draw_uniform.values[reg], inputs[reg], sizeof(inputs[reg]));
 	draw_uniform.mask = candidates;
@@ -5800,7 +5806,7 @@ static const struct nv2a_cpu_dependencies *draw_dependencies(struct vertex_shade
 			return found = &shader->specialized[index].dependencies;
 	index = shader->specialized_count < 2 ? shader->specialized_count++ : 1;
 	shader->specialized[index].uniform = candidates;
-	nv2a_cpu_analyze_uniform(program, candidates, &shader->specialized[index].dependencies);
+	wl_xbox_vsh_analyze_uniform(program, candidates, &shader->specialized[index].dependencies);
 	return found = &shader->specialized[index].dependencies;
 }
 
@@ -5819,7 +5825,7 @@ struct hardware_matrices
 static struct hardware_matrices hardware_cache[HARDWARE_CACHE_ENTRIES];
 static unsigned long hardware_cache_hits;
 
-static unsigned long long hardware_key(const struct vertex_shader_object *shader, const struct nv2a_cpu_program *program)
+static unsigned long long hardware_key(const struct vertex_shader_object *shader, const WlXboxVshProgram *program)
 {
 	/* (the program, its declaration and the constants: constants_hash) */
 	unsigned long long hash = constants_hash(shader, program);
@@ -5832,11 +5838,11 @@ static unsigned long long hardware_key(const struct vertex_shader_object *shader
 	hash = hash_words(hash, state, sizeof(state));
 	hash = hash_words(hash, texcoord_scale, sizeof(texcoord_scale));
 	hash = hash_words(hash, &draw_uniform.mask, sizeof(draw_uniform.mask));
-	for (row = 0; row < NV2A_CPU_INPUT_COUNT; row++)
+	for (row = 0; row < WL_XBOX_VSH_INPUT_COUNT; row++)
 		if (draw_uniform.mask & (1UL << row))
 			hash = hash_words(hash, draw_uniform.values[row], sizeof(draw_uniform.values[row]));
 	hash = hash_words(hash, &draw_unstreamed, sizeof(draw_unstreamed));
-	for (row = 0; row < NV2A_CPU_INPUT_COUNT; row++)
+	for (row = 0; row < WL_XBOX_VSH_INPUT_COUNT; row++)
 		if (draw_unstreamed & (1UL << row))
 			hash = hash_words(hash, device.vertex_registers[row], sizeof(device.vertex_registers[row]));
 	/* (0 is an empty entry's) */
@@ -6111,7 +6117,7 @@ static BOOL sphere_bake(const struct texture_entry *world, const float frame[3][
 			GX_SetScissor(0, 0, width, height);
 		}
 		states_apply();
-		gx_psh_apply(pixel_shader_program);
+		wl_xbox_psh_apply(pixel_shader_program);
 		indirect_apply(pixel_shader_program);
 	}
 	GX_InitTexObj(out, buffer, SIZE, SIZE, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
@@ -6219,7 +6225,7 @@ static void lit_sphere_matrix(const float rows[3][4], u32 id)
 	int row, column, k;
 
 	for (row = 0; row < 3; row++)
-		scale += nv2a_sqrtf(rows[row][0] * rows[row][0] + rows[row][1] * rows[row][1] + rows[row][2] * rows[row][2]);
+		scale += wl_xbox_vsh_sqrtf(rows[row][0] * rows[row][0] + rows[row][1] * rows[row][1] + rows[row][2] * rows[row][2]);
 	length = scale > 1.0e-12f ? 3.0f / scale : 0.0f;
 	memset(matrix, 0, sizeof(matrix));
 	for (row = 0; row < 2; row++)
@@ -6240,7 +6246,7 @@ static void lit_sphere_matrix(const float rows[3][4], u32 id)
 /* whether the draw is lit on GX (lit), found before its matrices: its
 program has a recipe and the setting is on, and what GX would make of it
 the processor otherwise computes for each vertex */
-static BOOL lit_choose(const struct nv2a_cpu_program *program, const struct vertex_shader_object *shader,
+static BOOL lit_choose(const WlXboxVshProgram *program, const struct vertex_shader_object *shader,
 	const struct stream_fetch *fetch, BOOL cpu_colors, unsigned cpu_spheres)
 {
 	const struct vertex_element *normal;
@@ -6368,9 +6374,9 @@ matrix GX_DTTMTX0 (to the ramp's coordinates), so the vertices send no
 alpha. FALSE: the vertices' alpha, the pixel shader as it was. */
 static BOOL lit_fog_ramp(BOOL keyed)
 {
-	const struct gx_psh_textures *textures = &tev_textures;
-	struct gx_psh_textures ramped;
-	const struct gx_psh_program *program;
+	const WlXboxPshTextures *textures = &tev_textures;
+	WlXboxPshTextures ramped;
+	const WlXboxPshProgram *program;
 	BOOL usable, translated;
 	float matrix[3][4];
 	unsigned which, slot;
@@ -6387,8 +6393,8 @@ static BOOL lit_fog_ramp(BOOL keyed)
 	/* (a map of 4 to 7 that the stages' separate alphas, the fog's ramp
 	and a bumped lookup leave free) */
 	for (map = 7; map >= 4; map--)
-		if (!(textures->separate_alpha & (1U << (map - 4))) && !(map == GX_PSH_FOG_TEXMAP && textures->fog) &&
-			!(map == GX_PSH_BUMP_TEXMAP && (textures->bumped || textures->vertex_color)))
+		if (!(textures->separate_alpha & (1U << (map - 4))) && !(map == WL_XBOX_PSH_FOG_TEXMAP && textures->fog) &&
+			!(map == WL_XBOX_PSH_BUMP_TEXMAP && (textures->bumped || textures->vertex_color)))
 			break;
 	lit_fog_reason = FOG_REFUSED_MAP;
 	if (map < 4)
@@ -6462,7 +6468,7 @@ static BOOL lit_fog_ramp(BOOL keyed)
 	}
 	fog_ramps[which].frame_number = device.frames;
 	pixel_shader_program = program;
-	gx_psh_apply(program);
+	wl_xbox_psh_apply(program);
 	indirect_apply(program);
 	if (form.product)
 		lit_fog_products++;
@@ -6474,7 +6480,7 @@ static BOOL lit_fog_ramp(BOOL keyed)
 	matrix, else each vertex's index, as its position's) */
 	GX_LoadTexMtxImm(matrix, GX_DTTMTX0, GX_MTX3x4);
 	GX_SetTexCoordGen2(GX_TEXCOORD5, GX_TG_MTX3x4, GX_TG_POS, GX_PNMTX1, GX_FALSE, GX_DTTMTX0);
-	GX_SetNumTexGens(GX_PSH_D0_ALPHA_TEXCOORD + 1);
+	GX_SetNumTexGens(WL_XBOX_PSH_D0_ALPHA_TEXCOORD + 1);
 	if (keyed)
 		GX_SetVtxDesc(GX_VA_TEX5MTXIDX, GX_DIRECT);
 	return TRUE;
@@ -6779,11 +6785,11 @@ static BOOL fog_post_matrix(const float rows[3][4], const float fog_row[4], Mtx 
 
 /* whether the post-transform rows give each key's fog: at its
 representative vertex, the program's against the rows' (to a ramp's texel) */
-static BOOL fog_post_check(const Mtx post, const Mtx *key_rows, struct nv2a_cpu_program *program, void *fetch,
+static BOOL fog_post_check(const Mtx post, const Mtx *key_rows, WlXboxVshProgram *program, void *fetch,
 	int position_register, float point_size)
 {
-	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
-	struct nv2a_cpu_output out;
+	float inputs[WL_XBOX_VSH_INPUT_COUNT][4] = { { 0.0f } };
+	WlXboxVshOutput out;
 	unsigned key;
 
 	inputs_seed(inputs);
@@ -6794,8 +6800,8 @@ static BOOL fog_post_check(const Mtx post, const Mtx *key_rows, struct nv2a_cpu_
 		int row;
 
 		stream_fetch(fetch, draw_keys.representative[key], inputs);
-		nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
-			&out, NV2A_CPU_LIVE_FOG);
+		wl_xbox_vsh_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
+			&out, WL_XBOX_VSH_LIVE_FOG);
 		p = inputs[position_register];
 		for (row = 0; row < 3; row++)
 			place[row] = key_rows[key][row][0] * p[0] + key_rows[key][row][1] * p[1] + key_rows[key][row][2] * p[2] +
@@ -6818,7 +6824,7 @@ matrices (fog_post_matrix) */
 static unsigned long fog_post_draws;
 
 /* why a program's draws stay on the processor: once a program, for the log */
-static BOOL hardware_rejected(const struct nv2a_cpu_program *program, const char *reason)
+static BOOL hardware_rejected(const WlXboxVshProgram *program, const char *reason)
 {
 	static unsigned long logged[32];
 	static unsigned count;
@@ -7103,7 +7109,7 @@ static void kept_frees_flush(void)
 
 /* ---------- the outputs of static vertex buffers, kept
 
-An output of a program that reads no constant (nv2a_cpu_analyze_constants)
+An output of a program that reads no constant (wl_xbox_vsh_analyze_constants)
 is, for a vertex, the same whatever the draw's constants: a function of the
 vertex buffers alone. The environment's bumped lightmap pass (10c30c53)
 writes one: its texture coordinate 3, the incoming light's direction (v7)
@@ -7123,7 +7129,7 @@ window, and read by GX by index as the buffers are (draw_hardware).
 - An entry's outputs are computed only from the frame after it was first
   seen: a buffer locked each frame (the dynamic ones) is never kept.
 - A vertex is computed when a draw first names it (a bit a vertex) as
-  draw_hardware computes it, nv2a_cpu_run_live for those outputs alone (the
+  draw_hardware computes it, wl_xbox_vsh_run_live for those outputs alone (the
   same to the bit: tests/nv2a_native_check.c), and what is new flushed from
   the processor's cache before GX reads it.
 - At most STATIC_OUTPUTS_BYTES in all, in the kept buffers' memory (the
@@ -7299,7 +7305,7 @@ registers of bound streams; the streams in *streams */
 static unsigned static_outputs_wanted(const struct vertex_shader_object *shader, const struct stream_fetch *fetch,
 	unsigned spheres, BOOL colors, BOOL *colors_kept, unsigned *streams)
 {
-	const struct nv2a_cpu_dependencies *reads = &shader->constant_reads;
+	const WlXboxVshDependencies *reads = &shader->constant_reads;
 	unsigned long registers = 0, mask;
 	unsigned stages = 0, stage;
 	int reg, component;
@@ -7311,7 +7317,7 @@ static unsigned static_outputs_wanted(const struct vertex_shader_object *shader,
 		if (!(spheres & (1U << stage)))
 			continue;
 		mask = reads->t[stage][0] | reads->t[stage][1] | reads->t[stage][2];
-		if (!(mask & NV2A_CPU_READS_CONSTANT))
+		if (!(mask & WL_XBOX_VSH_READS_CONSTANT))
 		{
 			stages |= 1U << stage;
 			registers |= mask & 0xFFFF;
@@ -7322,13 +7328,13 @@ static unsigned static_outputs_wanted(const struct vertex_shader_object *shader,
 		mask = 0;
 		for (component = 0; component < 4; component++)
 			mask |= reads->d0[component] | reads->d1[component];
-		if (!(mask & NV2A_CPU_READS_CONSTANT))
+		if (!(mask & WL_XBOX_VSH_READS_CONSTANT))
 		{
 			*colors_kept = TRUE;
 			registers |= mask & 0xFFFF;
 		}
 	}
-	for (reg = 0; reg < NV2A_CPU_INPUT_COUNT; reg++)
+	for (reg = 0; reg < WL_XBOX_VSH_INPUT_COUNT; reg++)
 	{
 		const struct vertex_element *element;
 		unsigned stream;
@@ -7350,7 +7356,7 @@ static unsigned static_outputs_wanted(const struct vertex_shader_object *shader,
 /* the kept outputs for a draw (draw_hardware's, of vertices least to most,
 none past 16 bits), every vertex it names computed; NULL where they are not
 kept (not static yet, or no memory) */
-static struct static_outputs *static_outputs_find(struct nv2a_cpu_program *program,
+static struct static_outputs *static_outputs_find(WlXboxVshProgram *program,
 	const struct vertex_shader_object *shader, struct stream_fetch *fetch, UINT count, const WORD *indices,
 	UINT first, unsigned long most, unsigned spheres, BOOL colors, float point_size)
 {
@@ -7494,16 +7500,16 @@ static struct static_outputs *static_outputs_find(struct nv2a_cpu_program *progr
 	for (vertex = 0; vertex < count; vertex++)
 	{
 		unsigned long whole = indices ? (unsigned long)indices[vertex] + device.base_vertex_index : first + vertex;
-		float inputs[NV2A_CPU_INPUT_COUNT][4];
-		struct nv2a_cpu_output out;
+		float inputs[WL_XBOX_VSH_INPUT_COUNT][4];
+		WlXboxVshOutput out;
 		unsigned char *values;
 
 		if (entry->computed[whole >> 5] & (1UL << (whole & 31)))
 			continue;
 		memset(inputs, 0, sizeof(inputs));
 		stream_fetch(fetch, vertex, inputs);
-		nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
-			&out, entry->stages * NV2A_CPU_LIVE_T0 | (entry->colors ? NV2A_CPU_LIVE_D0 | NV2A_CPU_LIVE_D1 : 0));
+		wl_xbox_vsh_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
+			&out, entry->stages * WL_XBOX_VSH_LIVE_T0 | (entry->colors ? WL_XBOX_VSH_LIVE_D0 | WL_XBOX_VSH_LIVE_D1 : 0));
 		values = entry->values + whole * entry->stride;
 		for (stage = 0; stage < 4; stage++)
 			if (entry->stages & (1U << stage))
@@ -8009,7 +8015,7 @@ enum
 struct hardware_vertices
 {
 	unsigned flags;
-	struct nv2a_cpu_program *program;
+	WlXboxVshProgram *program;
 	/* (fetch's elements for what the processor computes of a vertex) */
 	struct stream_fetch *fetch;
 	float (*inputs)[4];
@@ -8083,16 +8089,16 @@ static struct gx_vertex *hardware_vertex_compute(const struct hardware_vertices 
 		draw_run's (x w, y w, -w), through the identity) where it is the
 		processor's, its colours and sphere maps' coordinates where they
 		are */
-		struct nv2a_cpu_output out_values;
+		WlXboxVshOutput out_values;
 		float (*inputs)[4] = h->inputs;
 
 		stream_fetch(h->fetch, vertex, inputs);
 		if (processor || h->cpu_spheres)
 		{
-			unsigned live = (processor ? NV2A_CPU_LIVE_POSITION : 0) |
-				(h->cpu_colors ? NV2A_CPU_LIVE_D0 | NV2A_CPU_LIVE_D1 : 0) | h->cpu_spheres * NV2A_CPU_LIVE_T0;
+			unsigned live = (processor ? WL_XBOX_VSH_LIVE_POSITION : 0) |
+				(h->cpu_colors ? WL_XBOX_VSH_LIVE_D0 | WL_XBOX_VSH_LIVE_D1 : 0) | h->cpu_spheres * WL_XBOX_VSH_LIVE_T0;
 
-			nv2a_cpu_run_live(h->program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
+			wl_xbox_vsh_run_live(h->program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
 				h->point_size, &out_values, live);
 			if (processor)
 			{
@@ -8125,7 +8131,7 @@ static struct gx_vertex *hardware_vertex_compute(const struct hardware_vertices 
 			}
 		}
 		else
-			nv2a_cpu_run_colors(h->program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
+			wl_xbox_vsh_run_colors(h->program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
 				&out_values);
 		if (h->cpu_colors)
 		{
@@ -8352,13 +8358,13 @@ static void hardware_emit_draw(const struct hardware_vertices *h, UINT count)
 #undef HW_EMIT
 }
 
-static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitive_type, UINT count,
+static BOOL draw_hardware(WlXboxVshProgram *program, D3DPRIMITIVETYPE primitive_type, UINT count,
 	const WORD *indices, UINT first, struct stream_fetch *fetch)
 {
 	struct vertex_shader_object *shader = (struct vertex_shader_object *)fetch->shader;
-	const struct nv2a_cpu_dependencies *dependencies;
-	float inputs[NV2A_CPU_INPUT_COUNT][4] = { { 0.0f } };
-	struct nv2a_cpu_output base, column;
+	const WlXboxVshDependencies *dependencies;
+	float inputs[WL_XBOX_VSH_INPUT_COUNT][4] = { { 0.0f } };
+	WlXboxVshOutput base, column;
 	const struct vertex_element *position_element;
 	/* each stage's source: -1 the position, else the GX texture attribute */
 	int stage_source[4], texture_registers[4], texture_count = 0, position_register, stage, component;
@@ -8398,11 +8404,11 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	dependencies = draw_dependencies(shader, program, fetch, count);
 	if (!gpu_transform || !dependencies->clip_captured || primitive_type == D3DPT_POINTLIST)
 		return hardware_rejected(program, "transform off, no clip-space position, or points");
-	if (vertex_terms != _gx_psh_vertices_program)
+	if (vertex_terms != WL_XBOX_PSH_VERTICES_PROGRAM)
 		return hardware_rejected(program, "a pass's own vertex terms (a bumped reflection's, a specular light's)");
 	clip_mask = dependencies->clip[0] | dependencies->clip[1] | dependencies->clip[3];
 	position_register = single_register(clip_mask);
-	if ((clip_mask & NV2A_CPU_NOT_AFFINE) || position_register < 0)
+	if ((clip_mask & WL_XBOX_VSH_NOT_AFFINE) || position_register < 0)
 		return hardware_rejected(program, "the clip-space position is not affine in one register");
 	position_element = element_of(shader, position_register);
 	if (!position_element || position_element->type != D3DVSDT_FLOAT3 ||
@@ -8432,7 +8438,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 			}
 			continue;
 		}
-		if (mask & NV2A_CPU_NOT_AFFINE)
+		if (mask & WL_XBOX_VSH_NOT_AFFINE)
 			return hardware_rejected(program, "a texture coordinate read is not affine");
 		if (!(mask & 0xFFFF))
 			continue;
@@ -8473,11 +8479,11 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 			cpu_colors = TRUE;
 		}
 	}
-	if (dependencies->fog && (tev_texcoords & (1U << GX_PSH_FOG_TEXCOORD)))
+	if (dependencies->fog && (tev_texcoords & (1U << WL_XBOX_PSH_FOG_TEXCOORD)))
 	{
 		DWORD mode = D3D__RenderState[D3DRS_FOGTABLEMODE];
 
-		if ((dependencies->fog & NV2A_CPU_NOT_AFFINE) || single_register(dependencies->fog) != position_register ||
+		if ((dependencies->fog & WL_XBOX_VSH_NOT_AFFINE) || single_register(dependencies->fog) != position_register ||
 			(mode != D3DFOG_NONE && mode != D3DFOG_LINEAR))
 			return hardware_rejected(program, "the fog is not affine in the position, or its table is exponential");
 		fogged = TRUE;
@@ -8488,7 +8494,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	keyed = draw_keyed();
 	if (keyed)
 	{
-		const struct nv2a_cpu_dependencies *general = &shader->dependencies;
+		const WlXboxVshDependencies *general = &shader->dependencies;
 
 		for (stage = 0; stage < 4; stage++)
 			if (!stage_unread[stage] && !(cpu_spheres & (1U << stage)) &&
@@ -8542,19 +8548,19 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	else
 	{
 	/* (the outputs read of the program's runs alone, which
-	nv2a_cpu_run_live gives as nv2a_cpu_run does: the texture coordinates
+	wl_xbox_vsh_run_live gives as wl_xbox_vsh_run does: the texture coordinates
 	the stages read and the fog, and for no input the colours) */
-	unsigned columns_live = (tev_texcoords & 15) * NV2A_CPU_LIVE_T0 | NV2A_CPU_LIVE_FOG;
+	unsigned columns_live = (tev_texcoords & 15) * WL_XBOX_VSH_LIVE_T0 | WL_XBOX_VSH_LIVE_FOG;
 
 	matrix_inputs(shader, inputs);
-	nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size, &base,
-		columns_live | NV2A_CPU_LIVE_D0 | NV2A_CPU_LIVE_D1);
+	wl_xbox_vsh_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size, &base,
+		columns_live | WL_XBOX_VSH_LIVE_D0 | WL_XBOX_VSH_LIVE_D1);
 	for (component = 0; component < 4; component++)
 	{
 		if (component < 3)
 		{
 			inputs[position_register][component] = 1.0f;
-			nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
+			wl_xbox_vsh_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs, point_size,
 				&column, columns_live);
 			inputs[position_register][component] = 0.0f;
 			for (stage = 0; stage < 4; stage++)
@@ -8586,7 +8592,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		for (which = 0; which < 2; which++)
 		{
 			inputs[texture_registers[stage_source[stage]]][which] = 1.0f;
-			nv2a_cpu_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
+			wl_xbox_vsh_run_live(program, (const float (*)[4])device.vertex_constants, (const float (*)[4])inputs,
 				point_size, &column, columns_live);
 			inputs[texture_registers[stage_source[stage]]][which] = 0.0f;
 			for (s_t = 0; s_t < 2; s_t++)
@@ -8806,8 +8812,8 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		/* (texture coordinate 4: the position through the vertex's own matrix,
 		then the fog's row; q 1) */
 		GX_LoadTexMtxImm(fog_post_rows, GX_DTTMTX1, GX_MTX3x4);
-		GX_SetTexCoordGen2(GX_TEXCOORD0 + GX_PSH_FOG_TEXCOORD, GX_TG_MTX3x4, GX_TG_POS, GX_PNMTX1, GX_FALSE, GX_DTTMTX1);
-		GX_SetVtxDesc(GX_VA_TEX0MTXIDX + GX_PSH_FOG_TEXCOORD, GX_DIRECT);
+		GX_SetTexCoordGen2(GX_TEXCOORD0 + WL_XBOX_PSH_FOG_TEXCOORD, GX_TG_MTX3x4, GX_TG_POS, GX_PNMTX1, GX_FALSE, GX_DTTMTX1);
+		GX_SetVtxDesc(GX_VA_TEX0MTXIDX + WL_XBOX_PSH_FOG_TEXCOORD, GX_DIRECT);
 		fog_post_draws++;
 	}
 	if (lit_on && lit.colors)
@@ -8936,16 +8942,16 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 			fetch's elements for the outputs it runs the program for, and a lit
 			draw's blended vertices' position, normal, node indices and weight) */
 			{
-				const struct nv2a_cpu_dependencies *general = &shader->dependencies;
+				const WlXboxVshDependencies *general = &shader->dependencies;
 				unsigned long reads = 0;
 				unsigned element;
 
 				if (draw_keys.processor)
-					reads |= nv2a_cpu_live_inputs(general, NV2A_CPU_LIVE_POSITION) |
+					reads |= wl_xbox_vsh_live_inputs(general, WL_XBOX_VSH_LIVE_POSITION) |
 						(lit_on ? 1UL << 0 | 1UL << 1 | 1UL << NODE_INDICES | 1UL << NODE_WEIGHT : 0);
 				if (cpu_colors)
-					reads |= nv2a_cpu_live_inputs(general, NV2A_CPU_LIVE_D0 | NV2A_CPU_LIVE_D1 | NV2A_CPU_LIVE_FOG);
-				reads |= nv2a_cpu_live_inputs(general, cpu_spheres * NV2A_CPU_LIVE_T0);
+					reads |= wl_xbox_vsh_live_inputs(general, WL_XBOX_VSH_LIVE_D0 | WL_XBOX_VSH_LIVE_D1 | WL_XBOX_VSH_LIVE_FOG);
+				reads |= wl_xbox_vsh_live_inputs(general, cpu_spheres * WL_XBOX_VSH_LIVE_T0);
 				vertex_fetch = *fetch;
 				vertex_fetch.element_count = 0;
 				for (element = 0; element < fetch->element_count; element++)
@@ -9010,7 +9016,7 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 
 static void draw_streams(D3DPRIMITIVETYPE primitive_type, UINT count, const WORD *indices, UINT first)
 {
-	struct nv2a_cpu_program *program = program_current();
+	WlXboxVshProgram *program = program_current();
 	struct stream_fetch fetch;
 	unsigned long element;
 
@@ -9096,12 +9102,12 @@ void WINAPI D3DDevice_Begin(D3DPRIMITIVETYPE primitive_type)
 static void immediate_fetch(void *context, UINT vertex, float (*inputs)[4])
 {
 	(void)context;
-	memcpy(inputs, device.immediate_buffer[vertex], NV2A_CPU_INPUT_COUNT * sizeof(*inputs));
+	memcpy(inputs, device.immediate_buffer[vertex], WL_XBOX_VSH_INPUT_COUNT * sizeof(*inputs));
 }
 
 void WINAPI D3DDevice_End(void)
 {
-	struct nv2a_cpu_program *program;
+	WlXboxVshProgram *program;
 
 	if (device.immediate && device.immediate_vertices)
 	{
@@ -9440,8 +9446,8 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			texture_counts.flushed_bytes / 1024);
 		memset(&texture_counts, 0, sizeof(texture_counts));
 		{
-			static struct gx_psh_cache_counts shaders_last;
-			struct gx_psh_cache_counts shaders;
+			static WlXboxPshCacheCounts shaders_last;
+			WlXboxPshCacheCounts shaders;
 			WlGxTargetStats targets;
 
 			gx_psh_cache_counts(&shaders);

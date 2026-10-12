@@ -27,8 +27,8 @@ LINUX_CONFIG = LINUX_DIR / "port.json"
 LINK_SCRIPT = Path("tools/wii_link.py")
 
 # WiiLibs' libraries the port links, in link order (WiiLibs/README.md)
-WIILIBS_LIBRARIES = ("wl/platform/libwl_platform.a", "wl/audio/libwl_audio.a", "wl/audio/libwl_audio_core.a",
-                     "wl/gxtex/libwl_gxtex.a", "wl/gfx/libwl_gfx.a", "wl/codec/libwl_codec.a", "wl/base/libwl_base.a")
+WIILIBS_LIBRARIES = ("wl/xbox/libwl_xbox.a", "wl/platform/libwl_platform.a", "wl/audio/libwl_audio.a",
+                     "wl/audio/libwl_audio_core.a", "wl/gxtex/libwl_gxtex.a", "wl/gfx/libwl_gfx.a", "wl/codec/libwl_codec.a", "wl/base/libwl_base.a")
 
 # Flags shared by the game and the XDK-facing half of the platform layer:
 # the MSVC/Xbox ABI the source was written against (as the Linux build's
@@ -305,22 +305,21 @@ def generate_wii_build(n: Writer, sln: Any) -> None:
         add_object(linux_platform_dir / name, platform_flags(linux_platform_dir / name))
     for source in sorted(wii_platform_dir.glob("*.c")):
         add_object(source, platform_flags(source))
-    # the game's vertex programs compiled ahead of time: a host tool decodes
-    # its microcode with nv2a_cpu.c's decoder and writes each program as C
-    # (port/wii/tools/nv2a_codegen.c)
-    codegen_source = PORT_DIR / "tools" / "nv2a_codegen.c"
+    # the game's vertex programs compiled ahead of time: WiiLibs' host tool
+    # decodes its microcode with wl/xbox/vsh.c's decoder and writes each
+    # program as C (tools/xbox_vsh_codegen.c), the table xbox_vsh_natives that
+    # d3d8_gx.c hands to wl_xbox_vsh_compile
+    codegen_source = wiilibs / "tools" / "xbox_vsh_codegen.c"
     codegen = build_dir / "tools" / "nv2a_codegen"
     microcode = Path("source/rasterizer/xbox/rasterizer_xbox_vertex_shaders_data.inc")
     programs = build_dir / "gen" / "nv2a_programs.c"
     n.rule(name="wii_host_cc",
-           command=f"cc -O1 -std=gnu11 -DNV2A_CPU_NO_NATIVES -I{PORT_DIR / 'tests' / 'host'} -I{wii_platform_dir} "
-                   f"-I{_quote(wiilibs)} -o $out $in -lm",
+           command=f"cc -O1 -std=gnu11 -I{_quote(wiilibs)} -o $out $in -lm",
            description="WII HOST CC $out")
-    # (with WiiLibs' sqrt, which nv2a_cpu_native.h's nv2a_sqrtf is)
+    # (with WiiLibs' sqrt, which vsh_native.h's wl_xbox_vsh_sqrtf is)
     n.build(outputs=codegen, rule="wii_host_cc", inputs=[codegen_source, wiilibs / "wl" / "gfx" / "gfx_sqrt.c"],
-            implicit=[wii_platform_dir / "nv2a_cpu.c", wii_platform_dir / "nv2a_cpu.h",
-                      wii_platform_dir / "nv2a_cpu_native.h", PORT_DIR / "tests" / "host" / "platform.h",
-                      wiilibs / "wl" / "gfx" / "gfx_sqrt.h"])
+            implicit=[wiilibs / "wl" / "xbox" / name for name in ("vsh.c", "vsh.h", "vsh_native.h")] +
+            [wiilibs / "wl" / "gfx" / "gfx_sqrt.h"])
     n.rule(name="wii_nv2a_codegen", command="$in $microcode $out > /dev/null", description="WII NV2A PROGRAMS $out")
     n.build(outputs=programs, rule="wii_nv2a_codegen", inputs=codegen, implicit=[microcode],
             variables={"microcode": str(microcode)})

@@ -2,30 +2,34 @@
 NV2A_NATIVE_CHECK.C
 
 A host check of the vertex programs compiled ahead of time
-(port/wii/tools/nv2a_codegen.c; tools/wii_nv2a_check.py builds and runs it):
+(WiiLibs' tools/xbox_vsh_codegen.c; tools/wii_nv2a_check.py builds and runs it):
 each of the game's programs is run as its function and on the interpreter
-(port/wii/src/nv2a_cpu.c) over random constants and inputs, and the two
+(WiiLibs' wl/xbox/vsh.c) over random constants and inputs, and the two
 must give the same outputs, bit for bit; so must its function for the
-outputs a draw reads (nv2a_cpu_run_live), in those outputs, for random sets
+outputs a draw reads (wl_xbox_vsh_run_live), in those outputs, for random sets
 of them; and for the inputs the analysis says some outputs read
-(nv2a_cpu_live_inputs: d3d8_gx.c fetches no others), those outputs must be
+(wl_xbox_vsh_live_inputs: d3d8_gx.c fetches no others), those outputs must be
 the same whatever the others hold. A model's vertex on one node (weight 1 on its first index, or 0
 on its second) must give every output that the node with weight 1 alone
 does, whatever the other index (port/wii/src/d3d8_gx.c keys such vertices
 by their node). An output component the analysis finds reads no constant
-(nv2a_cpu_analyze_constants) must be the same, bit for bit, for other
+(wl_xbox_vsh_analyze_constants) must be the same, bit for bit, for other
 random constants, on the interpreter and as its function computes the
 outputs that hold such components alone (port/wii/src/d3d8_gx.c keeps
 those of a static vertex buffer, computed once, for its later draws,
-whatever their constants). Then the functions' own arithmetic: nv2a_sqrtf (WiiLibs'
+whatever their constants). Then the functions' own arithmetic: wl_xbox_vsh_sqrtf (WiiLibs'
 wl_sqrtf_exact, which WiiLibs' own tests cover) with its refinement,
 wl_sqrtf_refine, from estimates as coarse as frsqrte's, against sqrtf, and
-nv2a_floor_index against floorf.
+wl_xbox_vsh_floor_index against floorf.
 
 usage: nv2a_native_check microcode.inc
 */
 
-#include "nv2a_cpu_native.h"
+#include "wl/xbox/vsh_native.h"
+
+/* (the generated programs: nv2a_programs.c) */
+extern const WlXboxVshNative xbox_vsh_natives[];
+extern const unsigned long xbox_vsh_natives_count;
 
 #include <math.h>
 #include <stdint.h>
@@ -43,59 +47,59 @@ static float random_float(void)
 }
 
 /* the outputs in live the same in both */
-static int live_same(const struct nv2a_cpu_output *a, const struct nv2a_cpu_output *b, unsigned live)
+static int live_same(const WlXboxVshOutput *a, const WlXboxVshOutput *b, unsigned live)
 {
 	int stage;
 
-	if ((live & NV2A_CPU_LIVE_POSITION) && (memcmp(a->position, b->position, sizeof(a->position)) ||
+	if ((live & WL_XBOX_VSH_LIVE_POSITION) && (memcmp(a->position, b->position, sizeof(a->position)) ||
 		memcmp(a->clip, b->clip, sizeof(a->clip)) || a->clip_captured != b->clip_captured))
 		return 0;
-	if ((live & NV2A_CPU_LIVE_D0) && memcmp(a->d0, b->d0, sizeof(a->d0)))
+	if ((live & WL_XBOX_VSH_LIVE_D0) && memcmp(a->d0, b->d0, sizeof(a->d0)))
 		return 0;
-	if ((live & NV2A_CPU_LIVE_D1) && memcmp(a->d1, b->d1, sizeof(a->d1)))
+	if ((live & WL_XBOX_VSH_LIVE_D1) && memcmp(a->d1, b->d1, sizeof(a->d1)))
 		return 0;
-	if ((live & NV2A_CPU_LIVE_BACK) && (memcmp(a->b0, b->b0, sizeof(a->b0)) || memcmp(a->b1, b->b1, sizeof(a->b1))))
+	if ((live & WL_XBOX_VSH_LIVE_BACK) && (memcmp(a->b0, b->b0, sizeof(a->b0)) || memcmp(a->b1, b->b1, sizeof(a->b1))))
 		return 0;
-	if ((live & NV2A_CPU_LIVE_POINT_SIZE) && memcmp(&a->point_size, &b->point_size, sizeof(a->point_size)))
+	if ((live & WL_XBOX_VSH_LIVE_POINT_SIZE) && memcmp(&a->point_size, &b->point_size, sizeof(a->point_size)))
 		return 0;
 	for (stage = 0; stage < 4; stage++)
-		if ((live & (NV2A_CPU_LIVE_T0 << stage)) && memcmp(a->t[stage], b->t[stage], sizeof(a->t[stage])))
+		if ((live & (WL_XBOX_VSH_LIVE_T0 << stage)) && memcmp(a->t[stage], b->t[stage], sizeof(a->t[stage])))
 			return 0;
-	if ((live & NV2A_CPU_LIVE_FOG) && memcmp(&a->fog, &b->fog, sizeof(a->fog)))
+	if ((live & WL_XBOX_VSH_LIVE_FOG) && memcmp(&a->fog, &b->fog, sizeof(a->fog)))
 		return 0;
 	return 1;
 }
 
 /* a component of an output in live that reads no constant (reads:
-nv2a_cpu_analyze_constants) the same in both; checked counts them */
-static int constant_free_same(const struct nv2a_cpu_dependencies *reads, const struct nv2a_cpu_output *a,
-	const struct nv2a_cpu_output *b, unsigned live, unsigned long *checked)
+wl_xbox_vsh_analyze_constants) the same in both; checked counts them */
+static int constant_free_same(const WlXboxVshDependencies *reads, const WlXboxVshOutput *a,
+	const WlXboxVshOutput *b, unsigned live, unsigned long *checked)
 {
 	int stage, component;
 
 	for (component = 0; component < 4; component++)
 	{
-		if ((live & NV2A_CPU_LIVE_D0) && !(reads->d0[component] & NV2A_CPU_READS_CONSTANT))
+		if ((live & WL_XBOX_VSH_LIVE_D0) && !(reads->d0[component] & WL_XBOX_VSH_READS_CONSTANT))
 		{
 			++*checked;
 			if (memcmp(&a->d0[component], &b->d0[component], sizeof(float)))
 				return 0;
 		}
-		if ((live & NV2A_CPU_LIVE_D1) && !(reads->d1[component] & NV2A_CPU_READS_CONSTANT))
+		if ((live & WL_XBOX_VSH_LIVE_D1) && !(reads->d1[component] & WL_XBOX_VSH_READS_CONSTANT))
 		{
 			++*checked;
 			if (memcmp(&a->d1[component], &b->d1[component], sizeof(float)))
 				return 0;
 		}
 		for (stage = 0; stage < 4; stage++)
-			if ((live & (NV2A_CPU_LIVE_T0 << stage)) && !(reads->t[stage][component] & NV2A_CPU_READS_CONSTANT))
+			if ((live & (WL_XBOX_VSH_LIVE_T0 << stage)) && !(reads->t[stage][component] & WL_XBOX_VSH_READS_CONSTANT))
 			{
 				++*checked;
 				if (memcmp(&a->t[stage][component], &b->t[stage][component], sizeof(float)))
 					return 0;
 			}
 	}
-	if ((live & NV2A_CPU_LIVE_FOG) && !(reads->fog & NV2A_CPU_READS_CONSTANT))
+	if ((live & WL_XBOX_VSH_LIVE_FOG) && !(reads->fog & WL_XBOX_VSH_READS_CONSTANT))
 	{
 		++*checked;
 		if (memcmp(&a->fog, &b->fog, sizeof(float)))
@@ -104,25 +108,25 @@ static int constant_free_same(const struct nv2a_cpu_dependencies *reads, const s
 	return 1;
 }
 
-/* the outputs (NV2A_CPU_LIVE_...) with a component that depends on the
+/* the outputs (WL_XBOX_VSH_LIVE_...) with a component that depends on the
 vertex and reads no constant */
-static unsigned constant_free_outputs(const struct nv2a_cpu_dependencies *reads)
+static unsigned constant_free_outputs(const WlXboxVshDependencies *reads)
 {
 	unsigned live = 0;
 	int stage, component;
 
 	for (component = 0; component < 4; component++)
 	{
-		if ((reads->d0[component] & 0xFFFF) && !(reads->d0[component] & NV2A_CPU_READS_CONSTANT))
-			live |= NV2A_CPU_LIVE_D0;
-		if ((reads->d1[component] & 0xFFFF) && !(reads->d1[component] & NV2A_CPU_READS_CONSTANT))
-			live |= NV2A_CPU_LIVE_D1;
+		if ((reads->d0[component] & 0xFFFF) && !(reads->d0[component] & WL_XBOX_VSH_READS_CONSTANT))
+			live |= WL_XBOX_VSH_LIVE_D0;
+		if ((reads->d1[component] & 0xFFFF) && !(reads->d1[component] & WL_XBOX_VSH_READS_CONSTANT))
+			live |= WL_XBOX_VSH_LIVE_D1;
 		for (stage = 0; stage < 4; stage++)
-			if ((reads->t[stage][component] & 0xFFFF) && !(reads->t[stage][component] & NV2A_CPU_READS_CONSTANT))
-				live |= NV2A_CPU_LIVE_T0 << stage;
+			if ((reads->t[stage][component] & 0xFFFF) && !(reads->t[stage][component] & WL_XBOX_VSH_READS_CONSTANT))
+				live |= WL_XBOX_VSH_LIVE_T0 << stage;
 	}
-	if ((reads->fog & 0xFFFF) && !(reads->fog & NV2A_CPU_READS_CONSTANT))
-		live |= NV2A_CPU_LIVE_FOG;
+	if ((reads->fog & 0xFFFF) && !(reads->fog & WL_XBOX_VSH_READS_CONSTANT))
+		live |= WL_XBOX_VSH_LIVE_FOG;
 	return live;
 }
 
@@ -138,8 +142,8 @@ static double coarse_estimate(double x, int which)
 	return ldexp(scale, exponent) * (which == 0 ? 1.0 : which == 1 ? 1.0 + 1.0 / 32.0 : 1.0 - 1.0 / 32.0);
 }
 
-/* nv2a_sqrtf's arithmetic for every 199th positive float (each of the
-smallest), and nv2a_floor_index around the whole numbers and sixty-fourths */
+/* wl_xbox_vsh_sqrtf's arithmetic for every 199th positive float (each of the
+smallest), and wl_xbox_vsh_floor_index around the whole numbers and sixty-fourths */
 static unsigned long arithmetic_check(void)
 {
 	static const float specials[] = { 0.0f, -0.0f, 1.0f / 0.0f, -1.0f, 3.40282347e+38f, 1.0e-45f };
@@ -161,19 +165,19 @@ static unsigned long arithmetic_check(void)
 			if (memcmp(&refined, &exact, sizeof(exact)))
 			{
 				if (differ < 8)
-					printf("nv2a_sqrtf(%a): %a, sqrtf %a\n", x, refined, exact);
+					printf("wl_xbox_vsh_sqrtf(%a): %a, sqrtf %a\n", x, refined, exact);
 				differ++;
 			}
 		}
 	}
 	for (which = 0; which < (int)(sizeof(specials) / sizeof(specials[0])); which++)
 	{
-		float root = nv2a_sqrtf(specials[which]), exact = sqrtf(specials[which]);
+		float root = wl_xbox_vsh_sqrtf(specials[which]), exact = sqrtf(specials[which]);
 
 		checked++;
 		if (memcmp(&root, &exact, sizeof(exact)) && !(root != root && exact != exact))
 		{
-			printf("nv2a_sqrtf(%a): %a, sqrtf %a\n", specials[which], root, exact);
+			printf("wl_xbox_vsh_sqrtf(%a): %a, sqrtf %a\n", specials[which], root, exact);
 			differ++;
 		}
 	}
@@ -187,10 +191,10 @@ static unsigned long arithmetic_check(void)
 			float x = step ? nextafterf(whole, step < 0 ? -1.0e30f : 1.0e30f) : whole;
 
 			checked++;
-			if (nv2a_floor_index(x) != (int)floorf(x))
+			if (wl_xbox_vsh_floor_index(x) != (int)floorf(x))
 			{
 				if (differ < 8)
-					printf("nv2a_floor_index(%a): %d, floorf %d\n", x, nv2a_floor_index(x), (int)floorf(x));
+					printf("wl_xbox_vsh_floor_index(%a): %d, floorf %d\n", x, wl_xbox_vsh_floor_index(x), (int)floorf(x));
 				differ++;
 			}
 		}
@@ -201,10 +205,10 @@ static unsigned long arithmetic_check(void)
 
 int main(int argc, char **argv)
 {
-	static DWORD words[65536];
-	static float constants[NV2A_CPU_CONSTANT_COUNT][4], other_constants[NV2A_CPU_CONSTANT_COUNT][4],
-		inputs[NV2A_CPU_INPUT_COUNT][4];
-	static struct nv2a_cpu_program program;
+	static uint32_t words[65536];
+	static float constants[WL_XBOX_VSH_CONSTANT_COUNT][4], other_constants[WL_XBOX_VSH_CONSTANT_COUNT][4],
+		inputs[WL_XBOX_VSH_INPUT_COUNT][4];
+	static WlXboxVshProgram program;
 	unsigned long count = 0, position, checked = 0, differ = 0, native = 0, one_node_checked = 0, inputs_checked = 0;
 	unsigned long constant_free_programs = 0, constant_free_checked = 0, positions_checked = 0;
 	char line[512];
@@ -238,7 +242,7 @@ int main(int argc, char **argv)
 			}
 			else if (cursor[0] == '0' && cursor[1] == 'x' && count < 65536)
 			{
-				words[count++] = (DWORD)strtoul(cursor, &cursor, 16);
+				words[count++] = (uint32_t)strtoul(cursor, &cursor, 16);
 			}
 			else
 			{
@@ -250,15 +254,15 @@ int main(int argc, char **argv)
 	for (position = 0; position < count; )
 	{
 		unsigned long instruction_count = words[position] >> 16;
-		const DWORD *instructions = words + position + 1;
-		struct nv2a_cpu_dependencies reads;
+		const uint32_t *instructions = words + position + 1;
+		WlXboxVshDependencies reads;
 		unsigned free_outputs;
 		int trial;
 
 		position += 1 + instruction_count * 4;
 		if (!instruction_count || position > count)
 			continue;
-		nv2a_cpu_compile(instructions, instruction_count, &program);
+		wl_xbox_vsh_compile(instructions, instruction_count, xbox_vsh_natives, xbox_vsh_natives_count, &program);
 		if (!program.native)
 		{
 			printf("a program of %lu instructions has no function\n", instruction_count);
@@ -266,56 +270,56 @@ int main(int argc, char **argv)
 			continue;
 		}
 		native++;
-		nv2a_cpu_analyze_constants(&program, &reads);
+		wl_xbox_vsh_analyze_constants(&program, &reads);
 		free_outputs = constant_free_outputs(&reads);
 		if (free_outputs)
 		{
 			constant_free_programs++;
-			printf("program %08lx: outputs the vertex's alone %03x\n", nv2a_cpu_hash(instructions, instruction_count),
+			printf("program %08lx: outputs the vertex's alone %03x\n", wl_xbox_vsh_hash(instructions, instruction_count),
 				free_outputs);
 		}
 		for (trial = 0; trial < 64; trial++)
 		{
-			struct nv2a_cpu_output compiled, interpreted;
-			nv2a_cpu_live_proc run = program.native;
+			WlXboxVshOutput compiled, interpreted;
+			WlXboxVshLiveProc run = program.native;
 			int row, component;
 
-			for (row = 0; row < NV2A_CPU_CONSTANT_COUNT; row++)
+			for (row = 0; row < WL_XBOX_VSH_CONSTANT_COUNT; row++)
 				for (component = 0; component < 4; component++)
 					constants[row][component] = random_float();
-			for (row = 0; row < NV2A_CPU_INPUT_COUNT; row++)
+			for (row = 0; row < WL_XBOX_VSH_INPUT_COUNT; row++)
 				for (component = 0; component < 4; component++)
 					inputs[row][component] = random_float();
 			/* (a0's constants: a whole number, as the game's indices are) */
-			for (row = 0; row < NV2A_CPU_CONSTANT_COUNT; row += 7)
+			for (row = 0; row < WL_XBOX_VSH_CONSTANT_COUNT; row += 7)
 				constants[row][0] = (float)(rand() % 64);
-			nv2a_cpu_run(&program, (const float (*)[4])constants, (const float (*)[4])inputs, 1.0f, &compiled);
+			wl_xbox_vsh_run(&program, (const float (*)[4])constants, (const float (*)[4])inputs, 1.0f, &compiled);
 			program.native = NULL;
-			nv2a_cpu_run(&program, (const float (*)[4])constants, (const float (*)[4])inputs, 1.0f, &interpreted);
+			wl_xbox_vsh_run(&program, (const float (*)[4])constants, (const float (*)[4])inputs, 1.0f, &interpreted);
 			program.native = run;
 			checked++;
 			if (memcmp(&compiled, &interpreted, sizeof(compiled)))
 			{
 				printf("program %08lx (%lu instructions): its function and the interpreter differ\n",
-					nv2a_cpu_hash(instructions, instruction_count), instruction_count);
+					wl_xbox_vsh_hash(instructions, instruction_count), instruction_count);
 				differ++;
 				break;
 			}
 			/* its function for some of the outputs: those the same */
 			{
-				static const unsigned sets[] = { NV2A_CPU_LIVE_ALL, NV2A_CPU_LIVE_POSITION,
-					NV2A_CPU_LIVE_POSITION | NV2A_CPU_LIVE_D0, NV2A_CPU_LIVE_POSITION | NV2A_CPU_LIVE_T0,
-					NV2A_CPU_LIVE_POSITION | NV2A_CPU_LIVE_D0 | NV2A_CPU_LIVE_T0 | NV2A_CPU_LIVE_FOG };
-				struct nv2a_cpu_output live_output;
-				unsigned live = trial < 5 ? sets[trial] : (unsigned)rand() & NV2A_CPU_LIVE_ALL;
+				static const unsigned sets[] = { WL_XBOX_VSH_LIVE_ALL, WL_XBOX_VSH_LIVE_POSITION,
+					WL_XBOX_VSH_LIVE_POSITION | WL_XBOX_VSH_LIVE_D0, WL_XBOX_VSH_LIVE_POSITION | WL_XBOX_VSH_LIVE_T0,
+					WL_XBOX_VSH_LIVE_POSITION | WL_XBOX_VSH_LIVE_D0 | WL_XBOX_VSH_LIVE_T0 | WL_XBOX_VSH_LIVE_FOG };
+				WlXboxVshOutput live_output;
+				unsigned live = trial < 5 ? sets[trial] : (unsigned)rand() & WL_XBOX_VSH_LIVE_ALL;
 
 				memset(&live_output, 0xA5 + trial, sizeof(live_output));
-				nv2a_cpu_run_live(&program, (const float (*)[4])constants, (const float (*)[4])inputs, 1.0f,
+				wl_xbox_vsh_run_live(&program, (const float (*)[4])constants, (const float (*)[4])inputs, 1.0f,
 					&live_output, live);
 				if (!live_same(&live_output, &interpreted, live))
 				{
 					printf("program %08lx: its function for the outputs %03x differs\n",
-						nv2a_cpu_hash(instructions, instruction_count), live);
+						wl_xbox_vsh_hash(instructions, instruction_count), live);
 					differ++;
 					break;
 				}
@@ -334,22 +338,22 @@ int main(int argc, char **argv)
 						points[point][component] = trial & 1 ? random_float() :
 							component == 3 ? 1.0f : component + 1 == point ? 1.0f : 0.0f;
 				memset(clips, 0x3C, sizeof(clips));
-				nv2a_cpu_run_positions(&program, (const float (*)[4])constants, (const float (*)[4])inputs,
+				wl_xbox_vsh_run_positions(&program, (const float (*)[4])constants, (const float (*)[4])inputs,
 					(const float (*)[4])points, clips, screens);
 				memcpy(saved, inputs[0], sizeof(saved));
 				for (point = 0; point < 4; point++)
 				{
-					struct nv2a_cpu_output one;
+					WlXboxVshOutput one;
 
 					memcpy(inputs[0], points[point], sizeof(inputs[0]));
-					nv2a_cpu_run_live(&program, (const float (*)[4])constants, (const float (*)[4])inputs, 1.0f, &one,
-						NV2A_CPU_LIVE_POSITION);
+					wl_xbox_vsh_run_live(&program, (const float (*)[4])constants, (const float (*)[4])inputs, 1.0f, &one,
+						WL_XBOX_VSH_LIVE_POSITION);
 					positions_checked++;
 					if (memcmp(one.clip, clips[point], sizeof(one.clip)) ||
 						memcmp(one.position, screens[point], sizeof(one.position)))
 					{
 						printf("program %08lx: its positions function differs at point %d\n",
-							nv2a_cpu_hash(instructions, instruction_count), point);
+							wl_xbox_vsh_hash(instructions, instruction_count), point);
 						differ++;
 						break;
 					}
@@ -362,24 +366,24 @@ int main(int argc, char **argv)
 			constants, on the interpreter and as its function computes the
 			outputs that hold them alone (as d3d8_gx.c keeps them) */
 			{
-				struct nv2a_cpu_output other, alone;
+				WlXboxVshOutput other, alone;
 
-				for (row = 0; row < NV2A_CPU_CONSTANT_COUNT; row++)
+				for (row = 0; row < WL_XBOX_VSH_CONSTANT_COUNT; row++)
 					for (component = 0; component < 4; component++)
 						other_constants[row][component] = random_float();
-				for (row = 0; row < NV2A_CPU_CONSTANT_COUNT; row += 5)
+				for (row = 0; row < WL_XBOX_VSH_CONSTANT_COUNT; row += 5)
 					other_constants[row][0] = (float)(rand() % 64);
 				program.native = NULL;
-				nv2a_cpu_run(&program, (const float (*)[4])other_constants, (const float (*)[4])inputs, 1.0f, &other);
+				wl_xbox_vsh_run(&program, (const float (*)[4])other_constants, (const float (*)[4])inputs, 1.0f, &other);
 				program.native = run;
 				memset(&alone, 0x5A + trial, sizeof(alone));
-				nv2a_cpu_run_live(&program, (const float (*)[4])other_constants, (const float (*)[4])inputs, 1.0f,
+				wl_xbox_vsh_run_live(&program, (const float (*)[4])other_constants, (const float (*)[4])inputs, 1.0f,
 					&alone, free_outputs);
-				if (!constant_free_same(&reads, &interpreted, &other, NV2A_CPU_LIVE_ALL, &constant_free_checked) ||
+				if (!constant_free_same(&reads, &interpreted, &other, WL_XBOX_VSH_LIVE_ALL, &constant_free_checked) ||
 					!constant_free_same(&reads, &interpreted, &alone, free_outputs, &constant_free_checked))
 				{
 					printf("program %08lx: an output that reads no constant differs with other constants\n",
-						nv2a_cpu_hash(instructions, instruction_count));
+						wl_xbox_vsh_hash(instructions, instruction_count));
 					differ++;
 					break;
 				}
@@ -387,55 +391,55 @@ int main(int argc, char **argv)
 			/* the inputs the analysis says those outputs read: the outputs the
 			same whatever the others hold (d3d8_gx.c fetches no more) */
 			{
-				static float others[NV2A_CPU_INPUT_COUNT][4];
-				static struct nv2a_cpu_dependencies dependencies;
-				struct nv2a_cpu_output first, second;
-				unsigned live = (unsigned)rand() & NV2A_CPU_LIVE_ALL;
+				static float others[WL_XBOX_VSH_INPUT_COUNT][4];
+				static WlXboxVshDependencies dependencies;
+				WlXboxVshOutput first, second;
+				unsigned live = (unsigned)rand() & WL_XBOX_VSH_LIVE_ALL;
 				unsigned long reads;
 
 				if (!trial)
-					nv2a_cpu_analyze(&program, &dependencies);
-				reads = nv2a_cpu_live_inputs(&dependencies, live);
-				for (row = 0; row < NV2A_CPU_INPUT_COUNT; row++)
+					wl_xbox_vsh_analyze(&program, &dependencies);
+				reads = wl_xbox_vsh_live_inputs(&dependencies, live);
+				for (row = 0; row < WL_XBOX_VSH_INPUT_COUNT; row++)
 					for (component = 0; component < 4; component++)
 						others[row][component] = (reads & (1UL << row)) ? inputs[row][component] : random_float();
-				nv2a_cpu_run_live(&program, (const float (*)[4])constants, (const float (*)[4])inputs, 1.0f, &first, live);
-				nv2a_cpu_run_live(&program, (const float (*)[4])constants, (const float (*)[4])others, 1.0f, &second, live);
+				wl_xbox_vsh_run_live(&program, (const float (*)[4])constants, (const float (*)[4])inputs, 1.0f, &first, live);
+				wl_xbox_vsh_run_live(&program, (const float (*)[4])constants, (const float (*)[4])others, 1.0f, &second, live);
 				inputs_checked++;
 				if (!live_same(&first, &second, live))
 				{
 					printf("program %08lx: the outputs %03x read more than inputs %04lx\n",
-						nv2a_cpu_hash(instructions, instruction_count), live, reads);
+						wl_xbox_vsh_hash(instructions, instruction_count), live, reads);
 					differ++;
 					break;
 				}
-				reads = nv2a_cpu_live_inputs(&dependencies, NV2A_CPU_LIVE_D0 | NV2A_CPU_LIVE_D1 | NV2A_CPU_LIVE_FOG);
-				for (row = 0; row < NV2A_CPU_INPUT_COUNT; row++)
+				reads = wl_xbox_vsh_live_inputs(&dependencies, WL_XBOX_VSH_LIVE_D0 | WL_XBOX_VSH_LIVE_D1 | WL_XBOX_VSH_LIVE_FOG);
+				for (row = 0; row < WL_XBOX_VSH_INPUT_COUNT; row++)
 					for (component = 0; component < 4; component++)
 						others[row][component] = (reads & (1UL << row)) ? inputs[row][component] : random_float();
 				memset(&first, 0, sizeof(first));
 				memset(&second, 0, sizeof(second));
-				nv2a_cpu_run_colors(&program, (const float (*)[4])constants, (const float (*)[4])inputs, &first);
-				nv2a_cpu_run_colors(&program, (const float (*)[4])constants, (const float (*)[4])others, &second);
-				if (!live_same(&first, &second, NV2A_CPU_LIVE_D0 | NV2A_CPU_LIVE_D1 | NV2A_CPU_LIVE_FOG))
+				wl_xbox_vsh_run_colors(&program, (const float (*)[4])constants, (const float (*)[4])inputs, &first);
+				wl_xbox_vsh_run_colors(&program, (const float (*)[4])constants, (const float (*)[4])others, &second);
+				if (!live_same(&first, &second, WL_XBOX_VSH_LIVE_D0 | WL_XBOX_VSH_LIVE_D1 | WL_XBOX_VSH_LIVE_FOG))
 				{
 					printf("program %08lx: its colours read more than inputs %04lx\n",
-						nv2a_cpu_hash(instructions, instruction_count), reads);
+						wl_xbox_vsh_hash(instructions, instruction_count), reads);
 					differ++;
 					break;
 				}
 			}
 			/* its colour-only function: the same colours and fog */
 			{
-				struct nv2a_cpu_output colors;
+				WlXboxVshOutput colors;
 
 				memset(&colors, 0, sizeof(colors));
-				nv2a_cpu_run_colors(&program, (const float (*)[4])constants, (const float (*)[4])inputs, &colors);
+				wl_xbox_vsh_run_colors(&program, (const float (*)[4])constants, (const float (*)[4])inputs, &colors);
 				if (memcmp(colors.d0, compiled.d0, sizeof(colors.d0)) || memcmp(colors.d1, compiled.d1, sizeof(colors.d1)) ||
 					memcmp(&colors.fog, &compiled.fog, sizeof(colors.fog)))
 				{
 					printf("program %08lx: its colour-only function's colours differ\n",
-						nv2a_cpu_hash(instructions, instruction_count));
+						wl_xbox_vsh_hash(instructions, instruction_count));
 					differ++;
 					break;
 				}
@@ -444,7 +448,7 @@ int main(int argc, char **argv)
 			node indices (a, b) with a weight of 1, or (b, a) with 0, give
 			every output that (a, a) with 1 does */
 			{
-				struct nv2a_cpu_output one_node, other;
+				WlXboxVshOutput one_node, other;
 				int a = rand() % 256, b = rand() % 256, order;
 
 				inputs[NODE_INDICES][0] = a / 255.0f;
@@ -454,18 +458,18 @@ int main(int argc, char **argv)
 				inputs[NODE_WEIGHT][0] = 1.0f;
 				inputs[NODE_WEIGHT][1] = inputs[NODE_WEIGHT][2] = 0.0f;
 				inputs[NODE_WEIGHT][3] = 1.0f;
-				nv2a_cpu_run(&program, (const float (*)[4])constants, (const float (*)[4])inputs, 1.0f, &one_node);
+				wl_xbox_vsh_run(&program, (const float (*)[4])constants, (const float (*)[4])inputs, 1.0f, &one_node);
 				for (order = 0; order < 2; order++)
 				{
 					inputs[NODE_INDICES][order] = b / 255.0f;
 					inputs[NODE_WEIGHT][0] = order ? 1.0f : 0.0f;
-					nv2a_cpu_run(&program, (const float (*)[4])constants, (const float (*)[4])inputs, 1.0f, &other);
+					wl_xbox_vsh_run(&program, (const float (*)[4])constants, (const float (*)[4])inputs, 1.0f, &other);
 					inputs[NODE_INDICES][order] = a / 255.0f;
 					one_node_checked++;
 					if (memcmp(&one_node, &other, sizeof(other)))
 					{
 						printf("program %08lx: a vertex on node %d (indices %d and %d, weight %d) differs\n",
-							nv2a_cpu_hash(instructions, instruction_count), a, order ? a : b, order ? b : a, order);
+							wl_xbox_vsh_hash(instructions, instruction_count), a, order ? a : b, order ? b : a, order);
 						differ++;
 						break;
 					}

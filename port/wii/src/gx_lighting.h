@@ -42,7 +42,7 @@ enum
 struct gx_lighting_recipe;
 
 /* the recipe of a program whose colours GX's lights can make (by its hash,
-nv2a_cpu_hash), else NULL */
+wl_xbox_vsh_hash), else NULL */
 const struct gx_lighting_recipe *gx_lighting_recipe_find(unsigned long hash);
 /* whether the recipe's program makes texture coordinate 3 the reflection
 of the eye about the normal (a cube map's direction) */

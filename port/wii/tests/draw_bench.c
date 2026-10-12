@@ -318,12 +318,12 @@ static void vertex_shaders_create(void)
 			&vertex_shader_handles[index], 0);
 }
 
-/* the program's hash (its compiled program's: nv2a_cpu_hash) */
+/* the program's hash (its compiled program's: wl_xbox_vsh_hash) */
 static unsigned long vertex_shader_hash(int index)
 {
 	const DWORD *code = (const DWORD *)((const unsigned char *)vertex_shader_code + vertex_shader_offsets[index]);
 
-	return nv2a_cpu_hash(code + 1, code[0] >> 16);
+	return wl_xbox_vsh_hash((const uint32_t *)(code + 1), code[0] >> 16);
 }
 
 static int vertex_shader_find(unsigned long hash)
@@ -345,7 +345,7 @@ static void programs_list(void)
 	for (index = 0; index < 67; index++)
 	{
 		struct vertex_shader_object *shader = vertex_shader_from_handle(vertex_shader_handles[index]);
-		const struct nv2a_cpu_dependencies *d;
+		const WlXboxVshDependencies *d;
 		unsigned long clip;
 		int stage;
 
@@ -354,7 +354,7 @@ static void programs_list(void)
 		d = &shader->dependencies;
 		clip = d->clip[0] | d->clip[1] | d->clip[3];
 		print("%2d %08lx decl %02x clip %05lx%s relative %d t:", index, vertex_shader_hash(index),
-			vertex_shader_declaration_of[index] * 4, clip, (clip & NV2A_CPU_NOT_AFFINE) ? " (not affine)" : "",
+			vertex_shader_declaration_of[index] * 4, clip, (clip & WL_XBOX_VSH_NOT_AFFINE) ? " (not affine)" : "",
 			d->relative);
 		for (stage = 0; stage < 4; stage++)
 			print(" %05lx", d->t[stage][0] | d->t[stage][1] | d->t[stage][2]);
@@ -482,8 +482,8 @@ static unsigned grid_indices(unsigned columns, unsigned rows, BOOL strip, WORD *
 
 /* ---------- the camera and the lights (as tests/gx_lighting_check.c sets them) */
 
-static float constants[NV2A_CPU_CONSTANT_COUNT][4];
-#define C(index) constants[(index) + NV2A_CPU_CONSTANT_BIAS]
+static float constants[WL_XBOX_VSH_CONSTANT_COUNT][4];
+#define C(index) constants[(index) + WL_XBOX_VSH_CONSTANT_BIAS]
 
 static void camera_set(int frame)
 {
@@ -1103,11 +1103,11 @@ static int subdivide_check(void)
 	device.vertex_constants[VERTEX_CONSTANT_BIAS - 37][1] = 240.0f;
 	transform_hardware = TRUE;
 	transform_software();
-	store_plan.live = NV2A_CPU_LIVE_POSITION | NV2A_CPU_LIVE_T0;
+	store_plan.live = WL_XBOX_VSH_LIVE_POSITION | WL_XBOX_VSH_LIVE_T0;
 	store_plan.stages = 1;
 	store_plan.sphere = 1;
 	store_plan.scaled = 0;
-	vertex_terms = _gx_psh_vertices_program;
+	vertex_terms = WL_XBOX_PSH_VERTICES_PROGRAM;
 	subdivide_piece_seen = subdivide_check_seen;
 	/* (the pool of middles, as draw_run_subdivided makes it) */
 	subdivide_vertices = malloc((SUBDIVIDE_MOST_VERTICES + SUBDIVIDE_POOL) * sizeof(*subdivide_vertices));
@@ -1178,7 +1178,7 @@ int main(int argc, char **argv)
 	}
 	recording = argc > 3 && !strcmp(argv[3], "record");
 	if (recording && getenv("BENCH_TRACE"))
-		gx_stand_in_trace(GX_PSH_FOG_TEXCOORD, trace_value);
+		gx_stand_in_trace(WL_XBOX_PSH_FOG_TEXCOORD, trace_value);
 	environment_make();
 	models_make();
 	for (frame = 0; frame < frames; frame++)
