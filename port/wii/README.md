@@ -225,9 +225,10 @@ the log sink read the time base with `mftbu`/`mftb` in place, with no call. The 
 `GetTickCount` and `QueryPerformanceCounter` (`xbox_kernel.c`) use the same (they went through
 newlib's `clock_gettime` and a division of nanoseconds by a million), and so do the files' timing
 (`xbox_files.c`: the counter counts microseconds, so that `card_now` and each read do no
-multiplication and division) and the controllers' (`xinput_wii.c`). What is left is in
-`src/d3d8_gx.c`: its timing of the stages reads the clock about ten times a draw (`draw_streams`,
-`draw_prepare`); with this each read is cheap, but the reads could be fewer.
+multiplication and division) and the controllers' (`xinput_wii.c`). The device's timing of its
+stages (`src/d3d8_gx.c`, about ten reads a draw) adds time base ticks (`wl_timebase_read`, a few
+instructions a read) and converts them only when the log reports (`timing_frame`, `wl_udiv64_16`):
+`D3DDevice_Present` held 31 calls of `__udivdi3`, and holds none.
 
 ### The loading screen
 
@@ -810,6 +811,21 @@ and pixel shaders.
       (`stream_flush`);
     - whether a draw's indices name only kept outputs already computed (its index record notes
       the entry), so the scan is skipped;
+    - a draw whose vertices are their indices alone (position, an indexed normal and texture
+      coordinates, no matrix index: the structure's passes), once its index record has hashed the
+      same twice, as a GX display list of its primitive and indices, written once and called
+      (`index_list_draw`; libogc's `GX_BeginDispList`, since WiiLibs' `wl_gx_dl_*` records only
+      its own layouts). GX's state stays outside the list, so one list serves every pass of the
+      same primitive and number of attributes (four a record), at most 512 KB in all, with the
+      kept outputs' reserve. The log's `the structure's indices as display lists` line counts
+      the calls, the lists written and those without room; `debug.gx_display_lists = false`
+      sends the indices again;
+    - a draw the processor has a part in (a blended vertex's position, the colours, a sphere map's
+      coordinates, the planar fog's alpha, a normal sent): each vertex's part computed once a
+      draw into the vertex memo, then sent by a loop made for that combination of what is sent
+      (`hardware_emit`), in place of one loop testing every case at every index. The log's
+      `the processor's part in hardware's vertices` line lists the combinations (their flags in
+      hex: `HW_KEYED` 1 and so on) with their draws and indices;
     - the pixel engine's state (blend, updates, depth, alpha test, culling), written only where it
       changes (`states_shadow`), and only the texture coordinates and colour channels the
       stages read generated.
@@ -1156,7 +1172,9 @@ and pixel shaders.
   checks every primitive's descriptor (`vertex_shape_check`).
 - **Debugging.** The desktop ports' `debug.gpu_debug_flat` and `debug.gpu_debug_texture0` (in
   `config.toml`) show the diffuse colour, or the first texture, alone. One frame's draws are
-  described in the log (`DRAW_LOG_FRAME`).
+  described in the log (`DRAW_LOG_FRAME`, a frame number, defined when `src/d3d8_gx.c` is built),
+  the processor's draws and GX's alike, each with the pixels at `DRAW_LOG_POINTS` (`{ x, y, x, y
+  ... }`) read back after it: which draw makes a pixel what it is.
 
 ### What the frame draws
 
