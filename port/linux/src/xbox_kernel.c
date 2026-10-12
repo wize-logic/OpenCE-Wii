@@ -23,6 +23,9 @@ int wii_thread_priority(pthread_t thread, int win32_priority);
 #endif
 #include <time.h>
 #include <unistd.h>
+#ifdef HALO_WII
+#include "wl/platform/timebase.h" /* port: the time base's conversions without 64-bit division */
+#endif
 #ifdef HALO_WEB
 #include <emscripten.h>
 #endif
@@ -680,11 +683,46 @@ VOID WINAPI Sleep(DWORD milliseconds)
 
 /* ---------- time */
 
+/* The Xbox performance counter runs at the 733 MHz CPU clock. Report a
+microsecond counter instead: coarse enough that 32-bit intermediate
+arithmetic in the game stays in range, fine enough for frame timing. */
+#define PLATFORM_PERFORMANCE_FREQUENCY 1000000ULL
+
 /* The game's clocks count from when it started, as the Xbox's count from
 power-on. Its code keeps times in signed 32-bit variables, which a host up
 for more than 24.8 days (2^31 ms since boot) overflows: a hosted game then
 timed out its own clients. They start at 10 s, about where an Xbox's clock
 is by the time the game runs. */
+#ifdef HALO_WII
+/* port: the Wii reads the time base (60.75 MHz) and converts it by
+wl_timebase_ms and wl_timebase_us, which divide in 32 bits by constants.
+newlib's clock_gettime and a 64-bit division of nanoseconds by a million
+each cost a library call of about a hundred instructions, and the game
+reads the clock thousands of times a frame. */
+static unsigned long long platform_clock_ticks(void)
+{
+	static unsigned long long start;
+	unsigned long long value = wl_timebase_read();
+
+	/* (no atomics: a 64-bit one is a library call here; two threads
+	making the first call write starts a few microseconds apart) */
+	if (!start)
+		start = value - 10ULL * WL_TIMEBASE_HZ;
+	return value - start;
+}
+
+DWORD WINAPI GetTickCount(void)
+{
+	return (DWORD)wl_timebase_ms(platform_clock_ticks());
+}
+
+/* (the counter reports microseconds, as below) */
+BOOL WINAPI QueryPerformanceCounter(LARGE_INTEGER *count)
+{
+	count->QuadPart = (LONGLONG)wl_timebase_us(platform_clock_ticks());
+	return TRUE;
+}
+#else
 static unsigned long long platform_clock_nanoseconds(void)
 {
 	static unsigned long long start;
@@ -708,16 +746,13 @@ DWORD WINAPI GetTickCount(void)
 	return (DWORD)(platform_clock_nanoseconds() / 1000000ULL);
 }
 
-/* The Xbox performance counter runs at the 733 MHz CPU clock. Report a
-microsecond counter instead: coarse enough that 32-bit intermediate
-arithmetic in the game stays in range, fine enough for frame timing. */
-#define PLATFORM_PERFORMANCE_FREQUENCY 1000000ULL
-
 BOOL WINAPI QueryPerformanceCounter(LARGE_INTEGER *count)
 {
 	count->QuadPart = (LONGLONG)(platform_clock_nanoseconds() / (1000000000ULL / PLATFORM_PERFORMANCE_FREQUENCY));
 	return TRUE;
 }
+
+#endif
 
 BOOL WINAPI QueryPerformanceFrequency(LARGE_INTEGER *frequency)
 {

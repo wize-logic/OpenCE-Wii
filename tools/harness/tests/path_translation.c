@@ -1,14 +1,15 @@
 /*
 PATH_TRANSLATION.C (test)
 
-The Wii's translation of an Xbox path to the card's (port/linux/src/xbox_files.c, translate_as_written): a path
-that is there as it is written is made with one stat, and a file to be made in a folder that is there with one
-stat of the folder and one look into it, where the look at every part of the path (the game's first way, kept
-below as translate_reference, taken from the code before) opens and reads each directory along it. test_path_
-translation.py takes the code from the sources as under_test.inc.
+The Wii's translation of an Xbox path to the card's (port/linux/src/xbox_files.c, append_path with the directories'
+listings): a directory is read once and the spellings of its entries come from what was read, where the look at every
+part of the path (the game's first way, kept below as translate_reference) opens and reads each directory along it at
+every path. test_path_translation.py takes the code from the sources as under_test.inc.
 
-The answer must be the one the look at every part gives, for paths that are there, files that are not yet, other
-spellings of the names, and dots; and the directories looked into are counted.
+The answer must be the one the look at every part gives, for paths that are there, files that are not yet, folders
+that are not there, other spellings of the names, names that differ in the case only, and dots; and the directories
+read are counted: each once, whatever the number of paths, and never again by a second pass. A directory of more
+entries than are kept, and a table of directories that is full, are looked into each time, and give the same answers.
 */
 
 #define _FILE_OFFSET_BITS 64
@@ -18,6 +19,7 @@ spellings of the names, and dots; and the directories looked into are counted.
 #include <dirent.h>
 #include <fcntl.h>
 #include <ftw.h>
+#include <pthread.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
@@ -29,7 +31,7 @@ spellings of the names, and dots; and the directories looked into are counted.
 
 typedef int BOOL;
 
-static int looks; /* the directories looked into */
+static int looks; /* the directories looked into without a listing */
 
 static int counted_find(const char *directory, const char *name, char *result, posix_ulong result_size)
 {
@@ -40,7 +42,7 @@ static int counted_find(const char *directory, const char *name, char *result, p
 
 #include "under_test.inc"
 
-/* the look at every part of the path, as the code did before translate_as_written */
+/* the look at every part of the path, as the code did before the listings */
 static void translate_reference(const char *root, const char *cursor, char *host_path, unsigned long host_path_size)
 {
 	char resolved[1024];
@@ -61,7 +63,7 @@ static void translate_reference(const char *root, const char *cursor, char *host
 		if (!component_length || strspn(component, ". ") == component_length)
 			continue;
 
-		if (posix_find_entry_case_insensitive(resolved, component, on_disk, sizeof(on_disk)))
+		if (counted_find(resolved, component, on_disk, sizeof(on_disk)))
 		{
 			char exact[1100];
 			struct posix_file_information information;
@@ -118,30 +120,78 @@ static int remove_entry(const char *path, const struct stat *information, int ty
 	return remove(path);
 }
 
-/* translated both ways; the answer is the same, and the directories looked into are those said (-1: not counted) */
-static void check(const char *path, int fast_expected, int looks_expected)
+/* translated both ways: the answer is the same */
+static void check(const char *path)
 {
 	char fast[1100];
 	char reference[1100];
 	char resolved[1024];
-	int made;
+	int saved_looks;
 
 	snprintf(resolved, sizeof(resolved), "%s", root);
+	append_path(resolved, sizeof(resolved), path);
+	snprintf(fast, sizeof(fast), "%s", resolved);
+	saved_looks = looks;
 	looks = 0;
-	made = translate_as_written(resolved, sizeof(resolved), path, fast, sizeof(fast));
-	CHECK(made == fast_expected, "%s: the quick way %s", path, made ? "answers" : "does not answer");
-	if (made)
-	{
-		if (looks_expected >= 0)
-			CHECK(looks == looks_expected, "%s: %d directories looked into, not %d", path, looks, looks_expected);
-		translate_reference(root, path, reference, sizeof(reference));
-		CHECK(!strcmp(fast, reference), "%s: %s, but the look at every part gives %s", path, fast, reference);
-	}
+	translate_reference(root, path, reference, sizeof(reference));
+	looks = saved_looks;
+	CHECK(!strcmp(fast, reference), "%s: %s, but the look at every part gives %s", path, fast, reference);
+}
+
+/* the paths of the cases, translated: the directories read since the last call */
+static const char *const paths[] =
+{
+	/* there as written */
+	"saved\\playlists\\default_playlist\\00\\blam.lst",
+	"saved/playlists/default_playlist/00/blam.lst",
+	"\\saved\\playlists\\",
+	"maps\\a10.map",
+	"saved\\Mixed\\File.TXT",
+	/* not made yet, in a folder that is there, and in folders that are not */
+	"saved\\playlists\\default_playlist\\00\\new.lst",
+	"saved\\playlists\\default_playlist\\00\\other.lst",
+	"empty\\anything",
+	"saved\\playlists\\default_playlist\\01\\new.lst",
+	"saved\\nothing\\deeper\\file",
+	/* other spellings */
+	"saved\\Mixed\\file.txt",
+	"SAVED\\Playlists\\default_playlist\\00\\BLAM.LST",
+	"Maps\\A10.MAP",
+	/* names that differ in the case only: the one written wins, else the first the directory gives */
+	"both\\name",
+	"both\\Name",
+	"both\\NAME",
+	"both\\nAmE",
+	/* dots are not parts of the path */
+	"saved\\.\\playlists\\..\\default_playlist\\00\\blam.lst",
+	"saved\\playlists\\...\\default_playlist",
+	"",
+	"\\\\",
+	/* a file where a folder is */
+	"maps\\a10.map\\inside",
+	/* a folder of more entries than are kept */
+	"large\\f000",
+	"large\\F000",
+	"large\\F599",
+	"large\\f599",
+	"large\\F700",
+	"large\\g000",
+};
+
+static void translate_all(void)
+{
+	unsigned long index;
+
+	for (index = 0; index < sizeof(paths) / sizeof(paths[0]); index++)
+		check(paths[index]);
 }
 
 int main(int argc, char **argv)
 {
 	char template_path[] = "/tmp/halo-paths-XXXXXX";
+	char name[64];
+	unsigned long reads;
+	int index;
 
 	CHECK(argc == 1 || argc == 2, "no case is needed");
 	CHECK(mkdtemp(template_path) != NULL, "mkdtemp");
@@ -150,29 +200,82 @@ int main(int argc, char **argv)
 	make("saved/Mixed/File.TXT", 0);
 	make("maps/a10.map", 0);
 	make("empty", 1);
+	make("both/name", 0);
+	make("both/Name", 0);
+	for (index = 0; index < 600; index++)
+	{
+		snprintf(name, sizeof(name), "large/f%03d", index);
+		make(name, 0);
+	}
 
-	/* there as written: one stat, no directory looked into */
-	check("saved\\playlists\\default_playlist\\00\\blam.lst", 1, 0);
-	check("saved/playlists/default_playlist/00/blam.lst", 1, 0);
-	check("\\saved\\playlists\\", 1, 0);
-	check("maps\\a10.map", 1, 0);
-	check("saved\\Mixed\\File.TXT", 1, 0);
-	/* not made yet, in a folder that is there: the folder's one stat and one look for the file's spelling */
-	check("saved\\playlists\\default_playlist\\00\\new.lst", 1, 1);
-	check("saved\\Mixed\\file.txt", 1, 1);
-	check("empty\\anything", 1, 1);
-	/* dots are not parts of the path */
-	check("saved\\.\\playlists\\..\\default_playlist\\00\\blam.lst", 1, 0);
-	check("saved\\playlists\\...\\default_playlist", 1, 0);
-	/* the folder is not there, or is another spelling (on a host that tells cases apart): not the quick way's
-	to answer, and the look at every part is what is done */
-	check("saved\\playlists\\default_playlist\\01\\new.lst", 0, -1);
-	check("SAVED\\playlists\\default_playlist\\00\\blam.lst", 0, -1);
-	check("saved\\nothing\\deeper\\file", 0, -1);
-	check("", 0, -1);
-	check("\\\\", 0, -1);
-	/* a file where a folder is */
-	check("maps\\a10.map\\inside", 0, -1);
+	/* every path gives the look at every part's answer */
+	translate_all();
+
+	/* a directory is read once: a second pass reads none and looks into the too large one only */
+	reads = directory_listing_reads;
+	looks = 0;
+	translate_all();
+	CHECK(directory_listing_reads == reads, "a second pass read %lu directories again", directory_listing_reads - reads);
+	CHECK(looks == 6, "%d looks into directories (the large one's, six paths), not six", looks);
+
+	/* new files in one folder: no directory is read for them */
+	reads = directory_listing_reads;
+	looks = 0;
+	for (index = 0; index < 16; index++)
+	{
+		char path[128];
+
+		snprintf(path, sizeof(path), "saved\\playlists\\default_playlist\\00\\file%02d.lst", index);
+		check(path);
+	}
+	CHECK(directory_listing_reads == reads && looks == 0, "16 new files in a listed folder read %lu directories, looked into %d",
+		directory_listing_reads - reads, looks);
+
+	/* a file made since the directory was read is taken as written, a file removed since as it was: the same file
+	on the card, which does not tell the cases apart */
+	make("saved/Mixed/Made.TXT", 0);
+	{
+		char resolved[1024];
+
+		snprintf(resolved, sizeof(resolved), "%s", root);
+		append_path(resolved, sizeof(resolved), "saved\\Mixed\\made.txt");
+		CHECK(!strcmp(resolved + strlen(root), "/saved/Mixed/made.txt"), "a file made since: %s", resolved);
+	}
+	{
+		char path[1100];
+		char resolved[1024];
+
+		snprintf(path, sizeof(path), "%s/saved/Mixed/File.TXT", root);
+		unlink(path);
+		snprintf(resolved, sizeof(resolved), "%s", root);
+		append_path(resolved, sizeof(resolved), "saved\\Mixed\\file.txt");
+		CHECK(!strcmp(resolved + strlen(root), "/saved/Mixed/File.TXT"), "a file removed since: %s", resolved);
+	}
+
+	/* a table that is full: the 70 folders of one folder, then more than the table holds, give the same answers
+	(the ones that were kept and the ones that were not) */
+	for (index = 0; index < 80; index++)
+	{
+		snprintf(name, sizeof(name), "many/d%02d/x", index);
+		make(name, 1);
+	}
+	for (index = 0; index < 80; index++)
+	{
+		char path[128];
+
+		snprintf(path, sizeof(path), "many\\d%02d\\x\\file", index);
+		check(path);
+		snprintf(path, sizeof(path), "many\\D%02d\\X\\file", index);
+		check(path);
+	}
+	CHECK(directory_listing_count == 64, "the table holds %lu directories, not 64", directory_listing_count);
+	for (index = 0; index < 80; index++)
+	{
+		char path[128];
+
+		snprintf(path, sizeof(path), "many\\D%02d\\X\\Y", index);
+		check(path);
+	}
 
 	nftw(template_path, remove_entry, 16, FTW_DEPTH | FTW_PHYS);
 	return 0;
