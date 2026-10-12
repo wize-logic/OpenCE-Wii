@@ -156,6 +156,53 @@ void wii_map_gamecube(const WlRawPad *gamecube, XINPUT_GAMEPAD *pad, BOOL menu)
 	sticks(pad, gamecube->stick[0], gamecube->stick[1]);
 }
 
+/* ---------- the Nunchuk's thrust as melee */
+
+enum
+{
+	MELEE_IDLE,
+	MELEE_PENDING,
+	MELEE_SHOWN
+};
+
+void wii_melee_press_flag(struct wii_melee_press *press, uint64_t now_us)
+{
+	press->state = MELEE_PENDING;
+	press->flagged_us = now_us;
+}
+
+BOOL wii_melee_press_read(struct wii_melee_press *press, unsigned long poll, uint64_t now_us, BOOL menu)
+{
+	if (menu)
+	{
+		press->state = MELEE_IDLE;
+		return FALSE;
+	}
+	if (press->state == MELEE_PENDING)
+	{
+		if (now_us - press->flagged_us > WII_MELEE_PENDING_US)
+		{
+			press->state = MELEE_IDLE;
+			return FALSE;
+		}
+		press->state = MELEE_SHOWN;
+		press->shown_poll = poll;
+		return TRUE;
+	}
+	if (press->state == MELEE_SHOWN)
+	{
+		if (poll == press->shown_poll)
+			return TRUE;
+		press->state = MELEE_IDLE;
+	}
+	return FALSE;
+}
+
+void wii_map_melee(XINPUT_GAMEPAD *pad)
+{
+	button(pad, TRUE, XINPUT_GAMEPAD_B);
+}
+
 /* the pointer's turn: nothing within the box, then a ramp that reaches the
 fastest turn at the screen's edge (wl_pointer_turn) */
 void wii_map_pointer_look(float x, float y, float seconds, float yaw_rate, float pitch_rate, float *yaw,

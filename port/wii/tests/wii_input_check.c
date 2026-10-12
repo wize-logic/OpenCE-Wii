@@ -14,6 +14,7 @@ reachable from every scheme; the sticks' axes and signs; the triggers
 #include <stdio.h>
 #include <string.h>
 
+#include "wl/platform/input_gesture.h"
 #include "wl/platform/input_shape.h"
 #include "xinput_wii_map.h"
 
@@ -494,6 +495,159 @@ static struct rumble_run run_rumble(unsigned strength, unsigned tick_us, unsigne
 	return run;
 }
 
+/* ---------- the Nunchuk's thrust as melee */
+
+/* a trace of the Nunchuk's forward axis (1/100 g) at 100 readings a second, a
+steady hand's noise on every axis; the game polls every 33 ms and reads the
+gamepad (once or three times a poll), and counts the presses of B */
+struct thrust_run
+{
+	int presses;
+	int polls_pressed;
+	unsigned long first_poll;
+	int reads_disagree;
+};
+
+static double melee_push(double t, double at, double rise_ms, double peak)
+{
+	double u = t - at;
+
+	if (u < 0)
+		return 0;
+	if (u < rise_ms)
+		return peak * u / rise_ms;
+	u -= rise_ms;
+	if (u < 30)
+		return peak;
+	u -= 30;
+	return u < 100 ? peak - (peak + 90) * u / 100.0 : 0;
+}
+
+/* shape 0: a thrust at 500 ms; 1: a walk's shake; 2: a held tilt; 3: a roll of the wrist */
+static struct thrust_run run_thrust(int shape, int reads_per_poll, BOOL menu_from_poll, unsigned menu_polls)
+{
+	struct thrust_run run;
+	WlThrust thrust;
+	struct wii_melee_press press;
+	int16_t frame[8][3];
+	unsigned n = 0, noise = 7;
+	unsigned long poll = 0;
+	BOOL was_pressed = FALSE;
+	double ms;
+	uint64_t now_us = 7000000u;
+
+	memset(&run, 0, sizeof(run));
+	memset(&press, 0, sizeof(press));
+	wl_thrust_init(&thrust);
+	(void)menu_from_poll;
+	for (ms = 10; ms <= 6000; ms += 10)
+	{
+		int16_t a[3];
+
+		noise = noise * 1103515245u + 12345u;
+		a[0] = (int16_t)((noise >> 16) % 7) - 3;
+		a[1] = (int16_t)((noise >> 20) % 7) - 3;
+		a[2] = 100 + (int16_t)((noise >> 24) % 7) - 3;
+		if (shape == 0)
+			a[1] = (int16_t)(a[1] + melee_push(ms, 500, 60, 130));
+		else if (shape == 1)
+		{
+			a[0] = (int16_t)(a[0] + 25 * sin(ms * 0.0126));
+			a[1] = (int16_t)(a[1] + 45 * sin(ms * 0.0251 + 0.7));
+			a[2] = (int16_t)(a[2] + 35 * sin(ms * 0.0503));
+		}
+		else if (shape == 2)
+		{
+			a[1] = (int16_t)(a[1] + 70);
+			a[2] = (int16_t)(a[2] - 30);
+		}
+		else
+		{
+			double angle = ms < 500 ? 0.0 : ms > 700 ? 1.5708 : (ms - 500) / 200.0 * 1.5708;
+
+			a[0] = (int16_t)(a[0] + 100 * sin(angle));
+			a[2] = (int16_t)(a[2] - 100 + 100 * cos(angle));
+		}
+		memcpy(frame[n++], a, sizeof(a));
+		if (n == 3)
+		{
+			BOOL pressed = FALSE;
+			int read;
+
+			now_us += 30000;
+			poll++;
+			if (wl_thrust_feed(&thrust, (const int16_t(*)[3])frame, n, n, now_us))
+				wii_melee_press_flag(&press, now_us);
+			n = 0;
+			for (read = 0; read < reads_per_poll; read++)
+			{
+				BOOL got = wii_melee_press_read(&press, poll, now_us + 2000 * (read + 1), poll <= menu_polls);
+
+				if (read == 0)
+					pressed = got;
+				else if (got != pressed)
+					run.reads_disagree++;
+			}
+			if (pressed)
+			{
+				run.polls_pressed++;
+				if (!was_pressed)
+				{
+					run.presses++;
+					if (!run.first_poll)
+						run.first_poll = poll;
+				}
+			}
+			was_pressed = pressed;
+		}
+	}
+	return run;
+}
+
+static void check_melee(void)
+{
+	XINPUT_GAMEPAD pad;
+	struct wii_melee_press press;
+	struct thrust_run run;
+	int reads;
+
+	memset(&pad, 0, sizeof(pad));
+	wii_map_melee(&pad);
+	CHECK(analog_mask(&pad) == B && pad.wButtons == 0, "a thrust presses B and nothing else");
+
+	/* a thrust: one press of one poll, then released; as often as the game reads within the poll */
+	for (reads = 1; reads <= 3; reads++)
+	{
+		run = run_thrust(0, reads, FALSE, 0);
+		CHECK(run.presses == 1 && run.polls_pressed == 1, "a thrust read %d times a poll: %d presses over %d polls", reads,
+			run.presses, run.polls_pressed);
+		CHECK(run.reads_disagree == 0, "the reads of one poll agree");
+		CHECK(run.first_poll >= 17 && run.first_poll <= 20, "a thrust at 500 ms is pressed in poll %lu (about 17 to 20)", run.first_poll);
+	}
+	/* a walk, a held tilt and a turn of the wrist press nothing */
+	CHECK(run_thrust(1, 1, FALSE, 0).presses == 0, "a walk's shake does not melee");
+	CHECK(run_thrust(2, 1, FALSE, 0).presses == 0, "a held tilt does not melee");
+	CHECK(run_thrust(3, 1, FALSE, 0).presses == 0, "a turn of the wrist does not melee");
+	/* a menu up (B is back there): the thrust is dropped, not saved for later */
+	run = run_thrust(0, 1, TRUE, 40);
+	CHECK(run.presses == 0, "no melee while a menu is up (%d presses)", run.presses);
+
+	/* the press: waits to be read, shown to every read of one poll, gone at the next poll, dropped when late */
+	memset(&press, 0, sizeof(press));
+	CHECK(!wii_melee_press_read(&press, 1, 1000, FALSE), "nothing flagged: not pressed");
+	wii_melee_press_flag(&press, 2000);
+	CHECK(wii_melee_press_read(&press, 5, 2500, FALSE), "flagged: pressed at the first read");
+	CHECK(wii_melee_press_read(&press, 5, 2600, FALSE), "and for the rest of that poll");
+	CHECK(!wii_melee_press_read(&press, 6, 40000, FALSE), "and released at the next poll");
+	CHECK(!wii_melee_press_read(&press, 6, 40100, FALSE), "and it stays released");
+	wii_melee_press_flag(&press, 50000);
+	CHECK(!wii_melee_press_read(&press, 9, 50000 + WII_MELEE_PENDING_US + 1, FALSE), "a thrust nobody read in time is dropped");
+	CHECK(!wii_melee_press_read(&press, 9, 50000 + WII_MELEE_PENDING_US + 2, FALSE), "and not shown later");
+	wii_melee_press_flag(&press, 90000);
+	CHECK(!wii_melee_press_read(&press, 12, 90100, TRUE), "a thrust in a menu is not shown");
+	CHECK(!wii_melee_press_read(&press, 12, 90200, FALSE), "nor after the menu");
+}
+
 static void check_rumble(void)
 {
 	static const unsigned strengths[] = { 1000, 6554, 16384, 32768, 40000, 49152, 58982, 64000, 65535 };
@@ -585,6 +739,7 @@ int main(void)
 	check_pointer_loss();
 	check_pointer_steadiness();
 	check_rumble();
+	check_melee();
 	printf("wii_input_check: %d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

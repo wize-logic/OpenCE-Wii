@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Builds and runs the host checks of the Wii's controllers: the mapping (port/wii/tests/wii_input_check.c):
 synthetic WiiLibs input states through port/wii/src/xinput_wii_map.c, compared with the Xbox gamepad state the README
-("The controllers") says they give; the HOME menu's state machine (port/wii/tests/wii_home_check.c) with
-port/wii/src/wii_home.c, against fake controllers, a fake game and a clock; and the script verbs that drive those
+("The controllers") says they give, with the Nunchuk's thrust as melee (synthetic acceleration traces through WiiLibs'
+input_gesture.c); the HOME menu's state machine (port/wii/tests/wii_home_check.c) with
+port/wii/src/wii_home.c, against fake controllers, a fake game and a clock; the wrist strap reminder's state machine
+(port/wii/tests/wii_strap_check.c, with port/wii/src/wii_strap.c); and the script verbs that drive those
 on a run without a person (port/wii/tests/wii_script_check.c, with port/linux/src/test_input.c: home, remote,
 extension, battery, event). WiiLibs' input_shape.c comes from
 WiiLibs' checkout: WIILIBS, else ./WiiLibs (the CI's), else ../WiiLibs.
@@ -52,8 +54,10 @@ def main() -> int:
     src = ROOT / "port" / "wii" / "src"
     builds = [
         ("wii_input_check", [tests / "wii_input_check.c", src / "xinput_wii_map.c",
-                             wiilibs / "wl" / "platform" / "input_shape.c"]),
+                             wiilibs / "wl" / "platform" / "input_shape.c",
+                             wiilibs / "wl" / "platform" / "input_gesture.c"]),
         ("wii_home_check", [tests / "wii_home_check.c", src / "wii_home.c"]),
+        ("wii_strap_check", [tests / "wii_strap_check.c", src / "wii_strap.c", src / "wii_home.c"]),
     ]
     status = 0
     for name, sources in builds:

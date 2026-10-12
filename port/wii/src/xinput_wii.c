@@ -33,6 +33,7 @@ where it is held (input.pointer_steadiness), which takes the hand's tremor out.
 
 #include <string.h>
 
+#include "wl/platform/input_gesture.h"
 #include "wl/platform/input_shape.h"
 #include "wl/platform/platform.h"
 
@@ -82,6 +83,13 @@ static uint64_t input_polled_us;
 static uint64_t look_us[PORT_COUNT];
 static WlPointer pointers[PORT_COUNT];
 static struct motor motors[PORT_COUNT];
+/* the Nunchuk's thrust as melee (input.nunchuk_melee): the detector for each
+port while its Remote has a Nunchuk and the setting is on, the press it found,
+and how many times the controllers have been polled (a press is shown by poll) */
+static WlThrust thrusts[PORT_COUNT];
+static BOOL thrust_live[PORT_COUNT];
+static struct wii_melee_press melee_presses[PORT_COUNT];
+static unsigned long poll_serial;
 /* which controllers the last poll found (a bit a port), for the rumble
 service, which must not read the poll's state while it is being filled */
 static volatile unsigned remotes_connected;
@@ -132,6 +140,57 @@ static float pointer_steadiness(void)
 	return radius;
 }
 
+/* input.nunchuk_melee, read again when the settings change */
+static BOOL nunchuk_melee(void)
+{
+	static unsigned long read_at = (unsigned long)-1;
+	static BOOL on;
+
+	if (read_at != config_changes())
+	{
+		read_at = config_changes();
+		on = config_boolean("input.nunchuk_melee") ? TRUE : FALSE;
+	}
+	return on;
+}
+
+/* the frame's readings of a Nunchuk to its detector: a thrust is a press of
+melee for the game's next read (nothing is done, and nothing kept, for a port
+without a Nunchuk or with the setting off) */
+static void thrust_step(int port, const WlRawRemote *remote, uint64_t now_us)
+{
+	if (!nunchuk_melee() || !remote->connected || remote->extension != WL_EXT_NUNCHUK)
+	{
+		if (thrust_live[port])
+		{
+			thrust_live[port] = FALSE;
+			melee_presses[port].state = 0;
+		}
+		return;
+	}
+	if (!thrust_live[port])
+	{
+		thrust_live[port] = TRUE;
+		wl_thrust_init(&thrusts[port]);
+	}
+	if (remote->nunchuk_samples &&
+		wl_thrust_feed(&thrusts[port], remote->nunchuk_accel, remote->nunchuk_samples, remote->nunchuk_reports, now_us))
+		wii_melee_press_flag(&melee_presses[port], now_us);
+}
+
+static BOOL input_logging(void);
+
+/* with debug.input_log, how the GameCube controllers' reads at every retrace
+are doing (WiiLibs counts them): about every ten seconds */
+static void pad_stats_log(void)
+{
+	WlPadStats stats;
+
+	wl_platform_input_pad_stats(&stats);
+	platform_log("input: pads read at the retrace: %u samples, %u with fresh data; %u polls, %u that read the pads themselves",
+		stats.retrace_samples, stats.retrace_fresh, stats.polls, stats.polls_unsampled);
+}
+
 /* the controllers once a frame at most (every port reads them each tick) */
 static const WlRawInput *input_read(void)
 {
@@ -145,6 +204,7 @@ static const WlRawInput *input_read(void)
 
 		wl_platform_input_poll(&input);
 		input_polled_us = now;
+		poll_serial++;
 		script_remotes(&input);
 		/* (the HOME menu: its look at the controllers, and what the script presses) */
 		wii_home_game_poll(&input, now, script_navigation, test_input_home_pressed());
@@ -154,6 +214,7 @@ static const WlRawInput *input_read(void)
 				remote_bits |= 1u << port;
 			if (input.pads[port].connected)
 				pad_bits |= 1u << port;
+			thrust_step(port, &input.remotes[port], now);
 			/* (the Classic Controller has the sticks to look with, not the pointer) */
 			if (input.remotes[port].extension == WL_EXT_CLASSIC)
 				memset(&pointers[port], 0, sizeof(pointers[port]));
@@ -163,6 +224,8 @@ static const WlRawInput *input_read(void)
 		}
 		remotes_connected = remote_bits;
 		pads_connected = pad_bits;
+		if (pad_bits && poll_serial % 300 == 0 && input_logging())
+			pad_stats_log();
 	}
 	return &input;
 }
@@ -283,7 +346,12 @@ DWORD WINAPI XInputGetState(HANDLE device, PXINPUT_STATE state)
 		if (raw->remotes[port].extension == WL_EXT_CLASSIC)
 			wii_map_classic(&raw->remotes[port], &state->Gamepad, ui_widgets_active());
 		else
+		{
 			wii_map_remote(&raw->remotes[port], &state->Gamepad, ui_widgets_active());
+			if (raw->remotes[port].extension == WL_EXT_NUNCHUK &&
+				wii_melee_press_read(&melee_presses[port], poll_serial, wl_platform_time_us(), ui_widgets_active()))
+				wii_map_melee(&state->Gamepad);
+		}
 	}
 	else if (raw->pads[port].connected)
 	{

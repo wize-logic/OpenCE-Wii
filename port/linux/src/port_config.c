@@ -230,6 +230,10 @@ static const struct config_setting config_settings[] =
 		"sides, so that circles stay round (the picture is a little softer\n"
 		"sideways); \"stretch\" fills the screen, stretched a third sideways. A\n"
 		"4:3 console setting shows the picture as it is." },
+	{ "display.wii_strap_reminder", _config_boolean, "false", "HALO_WII_STRAP_REMINDER", _environment_value, _platform_wii,
+		"The Wii: at start, a plain screen asks the player to use the Wii Remote's\n"
+		"wrist strap and to make room to move. A (the Classic Controller's lower\n"
+		"button) goes on, after the first second. Off by default." },
 	{ "display.per_pixel_lighting", _config_boolean, "false", "HALO_PER_PIXEL_LIGHTING", _environment_value,
 		_platform_all,
 		"Light the models (characters, weapons, vehicles, scenery) for each\n"
@@ -306,6 +310,12 @@ static const struct config_setting config_settings[] =
 		"move takes it to where it points at once. The distance is a share of\n"
 		"half the screen: 0 for none (every report moves it), 0.03 the default\n"
 		"(about 10 pixels of the 640 across), 0.25 the most." },
+	{ "input.nunchuk_melee", _config_boolean, "false", "HALO_NUNCHUK_MELEE", _environment_value, _platform_wii,
+		"The Wii: a quick thrust of the Nunchuk forward, from rest, presses the\n"
+		"melee button for one frame (once for each thrust). It is told by the\n"
+		"change of the Nunchuk's acceleration, not by its size, so walking and\n"
+		"turning do not melee. Off by default; the melee button works either\n"
+		"way. Needs a Wii Remote with a Nunchuk, and never acts in a menu." },
 	{ "input.mouse_vertical_sensitivity", _config_real, "0.0", "HALO_MOUSE_VERTICAL_SENSITIVITY", _environment_value,
 		_platform_desktop,
 		"How far the view turns up and down for the mouse's movement; 0 for the\n"
