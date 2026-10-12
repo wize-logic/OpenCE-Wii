@@ -366,7 +366,7 @@ will tell which it was, from the `files:` lines and the times on them.)
   | `wii_home.c` | the HOME button's menu and the Wii's notices as a state machine apart from the game (checked on the host) |
   | `wii_home_game.c` | that machine joined to the game (its pause, WiiLibs' sound fade and exit) and the overlay it draws over the frame |
   | `posix_net_wii.c` | sockets over WiiLibs' network layer, for system link |
-  | `d3d8_gx.c` | the Direct3D device on GX, with `gx_psh.c` and `gx_psh_cache.c` (pixel shaders to TEV), `gx_lighting.c` (lights and sphere maps for GX), `nv2a_cpu.c` (the vertex programs on the processor) and `wii_bitmap_texel.c` (the processor's reads of GX's textures) |
+  | `d3d8_gx.c` | the Direct3D device on GX, with WiiLibs' `wl/xbox` (the pixel shaders to TEV and their cache, the vertex programs on the processor and their compiler), `gx_psh.c` (the game's pixel shaders WiiLibs' translation leaves to it, made by hand), `gx_lighting.c` (lights and sphere maps for GX) and `wii_bitmap_texel.c` (the processor's reads of GX's textures) |
   | `wii_extras.c` | the desktop additions the Wii goes without |
 
   `tools/wii_link.py` (WiiLibs' `tools/link_stubs.py`) stubs any symbol still missing with a
@@ -466,8 +466,8 @@ will tell which it was, from the `files:` lines and the times on them.)
   (`wl/gfx/gfx_sqrt_wrap.c`), which refines `frsqrte`'s estimate and gives the same correctly
   rounded root in about 60. WiiLibs' tests (`tests/gfx/test_gfx_sqrt.c`) compare it with the
   host's `sqrtf` bit for bit, from estimates as coarse as the 750's (`WL_TEST_EXHAUSTIVE=1`: every
-  float); `nv2a_cpu_native.h`'s `nv2a_sqrtf` is the same function (`wl_sqrtf_exact`), and
-  `tools/wii_nv2a_check.py` builds it from WiiLibs. The game calls it for every vector's length
+  float); WiiLibs' `wl/xbox/vsh_native.h`'s `wl_xbox_vsh_sqrtf` is the same function
+  (`wl_sqrtf_exact`), and `tools/wii_nv2a_check.py` builds it from WiiLibs. The game calls it for every vector's length
   (`square_root`).
 - **Movies.** Bink movies are skipped (`source/bink/bink_playback.c`).
 - **Sound.** The shared DirectSound mixer (`port/linux/src/dsound_sdl.c`) fills WiiLibs' audio
@@ -803,11 +803,15 @@ console's settings and logs it once at the device's creation, as `video: 480i NT
 ## Drawing
 
 `src/d3d8_gx.c` is a Direct3D 8 device on GX. It keeps the game's own rasterizer and its vertex
-and pixel shaders.
+and pixel shaders. What any Xbox game's port could use is WiiLibs' (`wl/xbox`, its README): the
+combiners' translation to TEV programs and their cache, the vertex programs' interpreter, analysis
+and compiler. What is Halo's stays here: the pixel shaders made by hand (`src/gx_psh.c`, which
+WiiLibs' translation calls first), the list of the game's vertex programs compiled at build time
+(`build/wii/gen/nv2a_programs.c`, from the game's microcode), and the lights (`src/gx_lighting.c`).
 
 - **Vertex shaders.** GX has no programmable vertex stage. A program GX's fixed transform can
   compute goes to it; the others run on the CPU, vertex by vertex.
-  - `nv2a_cpu_analyze` walks each program with every value a set of the inputs it depends on and
+  - `wl_xbox_vsh_analyze` walks each program with every value a set of the inputs it depends on and
     whether it is still affine in them (the generated programs carry the result as a comment).
   - An affine program is, for one draw's constants, a matrix. Its columns come from running it for
     no input and for each input component alone. GX then reads the game's vertex buffers by index:
@@ -917,19 +921,20 @@ and pixel shaders.
   - A draw on the CPU plans its vertex elements once: only the registers its program reads, each
     type with its own case, bytes and packed normals converted by table. Each vertex then computes
     only what the stages read: the program skips instructions that reach no output sent
-    (`nv2a_cpu_run_live`), and the texture scale, sphere map and fog table apply only where set.
-  - At build time, `tools/nv2a_codegen.c` decodes the game's 67 programs with the interpreter's own
-    decoder (`src/nv2a_cpu.c`) and writes each one as a C function (about 180 KB of code). Each takes the
+    (`wl_xbox_vsh_run_live`), and the texture scale, sphere map and fog table apply only where set.
+  - At build time, WiiLibs' `tools/xbox_vsh_codegen.c` decodes the game's 67 programs with the
+    interpreter's own decoder (`wl/xbox/vsh.c`) and writes each one as a C function (about 180 KB
+    of code), and the table `xbox_vsh_natives` that `d3d8_gx.c` hands to `wl_xbox_vsh_compile`. Each takes the
     outputs a draw reads, and runs an instruction only if it reaches one of them (found backwards
     from the end, a register's component at a time). A program is found by a hash of its words.
     For the 23 skinned programs (those that index their constants by a0) it also writes a
-    function of the position alone for four values of v0 at once (`nv2a_cpu_run_positions`):
+    function of the position alone for four values of v0 at once (`wl_xbox_vsh_run_positions`):
     what reads nothing of v0 (the nodes' blend) once, the rest for each point, operation for
     operation as a run does, so a position matrix's four runs (and the depth's fit's two) are
     one call, the same to the bit (`tests/nv2a_native_check.c` compares them with runs; about
     76 KB more code). A skinned model makes one for every key of every part each frame.
   - Square roots and ARL's floor give the libraries' results without their calls
-    (`nv2a_sqrtf`: frsqrte refined in double, rounded, then corrected by the midpoints' exact
+    (`wl_xbox_vsh_sqrtf`: frsqrte refined in double, rounded, then corrected by the midpoints' exact
     squares). A skinned vertex takes about 1,600 instructions where it took 3,400.
   - Any other program runs on the interpreter.
   - A cube map sampled as a sphere map at a direction the vertices give (a model's reflection)
@@ -970,7 +975,7 @@ and pixel shaders.
     and the KB of them in use, the blocks of their own, the window blocks refused and the times
     they were given back.
   - **Static buffers' outputs kept.** An output that reads no constant is, for a vertex, the
-    same whatever the draw's constants (`nv2a_cpu_analyze_constants`; the generated programs
+    same whatever the draw's constants (`wl_xbox_vsh_analyze_constants`; the generated programs
     list them as "the vertex's alone"). Where what the processor computes for such a draw (a
     sphere-mapped stage's coordinates, or both colours) reads no constant and the streams it
     reads are static, it is computed once a vertex, kept in the kept buffers' memory (below; at
@@ -1111,7 +1116,8 @@ and pixel shaders.
   - The depth is fitted per draw as a + b/w from a few of its vertices. This is exact for the
     game's projections.
   - Draws whose w doesn't vary, such as the interface's, are drawn in screen space.
-- **Pixel shaders.** The register combiners are translated to TEV stages (`src/gx_psh.c`).
+- **Pixel shaders.** The register combiners are translated to TEV stages (WiiLibs'
+  `wl/xbox/psh.c`, through `src/gx_psh.c`, which gives it the game's recipes).
   - The stages are a WiiLibs TEV program (`wl/platform/tev.h`): its builder, register pool and
     merging of what a stage's inputs need of its order and konst selections. WiiLibs' validator
     checks each program as it is translated, and `wl_tev_apply_unchecked` sets it, with the swap
@@ -1120,7 +1126,8 @@ and pixel shaders.
     stage's free half where nothing between depends on it, and each stage's order is reduced to
     what it reads (`stages_compact`): about half the stages of the random set, three of the menu
     planet's twelve, and fewer texture coordinates and colours asked of the vertices.
-  - A program is translated once for its structure (`src/gx_psh_cache.c`): its combiners, its
+  - A program is translated once for its structure (WiiLibs' `wl/xbox/psh_cache.c`, keyed on the
+    texture modes too): its combiners, its
     textures, and each constant's signature (which channels are 0 or 1, which are equal, which
     constants are equal). Where the translation's result changes with the constants only in the
     konst and preloaded values that hold them (two more translations with other constants of the
@@ -1130,7 +1137,8 @@ and pixel shaders.
     ten of a refusal's attempts). `tests/gx_psh_cache_check.c` compares every program the cache
     gives with a fresh translation; the log's `pixel shader programs` line counts the
     translations, the programs kept and changed, and the changes translated again to check them.
-  - Three of the game's programs are recognized and made by hand (`gx_psh.c`'s recipes):
+  - Three of the game's programs are recognized and made by hand (`gx_psh.c`'s recipes, which
+    WiiLibs' translation tries first through its recipe hook, `WlXboxPshRecipe`):
     - the models' (`set_environment_shader_pixel_shader`: base, detail, multipurpose and cube
       maps, eight combiners), which keeps more values alive than TEV's four registers: with the
       cube map bound the general translation refused it ("no free register"), and every model
@@ -1240,7 +1248,7 @@ and pixel shaders.
     simplified, and each approximation says why. One that still doesn't fit draws its first
     texture times its diffuse colour.
   - `tools/wii_gx_psh_check.py` simulates the TEV stages against the combiners, for random
-    programs and the game's. It also counts WiiLibs' validator's findings and compares WiiLibs'
+    programs and the game's (WiiLibs' own tests, `tests/xbox`, check random programs too). It also counts WiiLibs' validator's findings and compares WiiLibs'
     evaluator (`wl_tev_eval`) with its simulation. It finds WiiLibs from `WIILIBS`, else
     `./WiiLibs` (the CI's), else `../WiiLibs`.
 - **Culling.** `D3DRS_CULLMODE` names the screen winding to discard. Both vertex paths keep the

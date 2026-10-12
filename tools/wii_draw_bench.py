@@ -108,13 +108,12 @@ def build(record: bool, device: str = None) -> Path:
     src = Path(device).resolve() if device else WII / "src"
     out_dir = WORK / (kind + ("-device" if device else ""))
     out_dir.mkdir(parents=True, exist_ok=True)
-    # the vertex programs compiled ahead of time, as tools/wii_nv2a_check.py makes them
+    # the vertex programs compiled ahead of time, as tools/wii_nv2a_check.py makes them (WiiLibs'
+    # tools/xbox_vsh_codegen.c)
     codegen = WORK / "nv2a_codegen"
     programs = WORK / "nv2a_programs.c"
-    run(["cc", "-std=gnu11", "-O1", "-ffp-contract=off", "-DNV2A_CPU_NO_NATIVES", f"-I{WII / 'tests' / 'host'}",
-         f"-I{src}", f"-I{wiilibs}", "-o", str(codegen),
-         str(src.parent / "tools" / "nv2a_codegen.c" if device else WII / "tools" / "nv2a_codegen.c"),
-         str(wiilibs / "wl" / "gfx" / "gfx_sqrt.c"), "-lm"])
+    run(["cc", "-std=gnu11", "-O1", "-ffp-contract=off", f"-I{wiilibs}", "-o", str(codegen),
+         str(wiilibs / "tools" / "xbox_vsh_codegen.c"), str(wiilibs / "wl" / "gfx" / "gfx_sqrt.c"), "-lm"])
     run([str(codegen), str(MICROCODE), str(programs)])
     user_mode_headers(devkitpro, out_dir / "include")
     includes = [f"-I{out_dir / 'include'}"]
@@ -134,9 +133,7 @@ def build(record: bool, device: str = None) -> Path:
         (WII / "tests" / "draw_bench.c", flags),
         (WII / "tests" / "host" / "gx_stand_in.c", plain),
         (src / "gx_psh.c", flags),
-        (src / "gx_psh_cache.c", flags),
         (src / "gx_lighting.c", flags),
-        (src / "nv2a_cpu.c", flags),
         (programs, flags),
         (LINUX_SOURCES / "d3d8_state.c", flags),
         (LINUX_SOURCES / "xbox_texture_formats.c", flags),
@@ -144,6 +141,10 @@ def build(record: bool, device: str = None) -> Path:
         (wiilibs / "wl" / "base" / "hash.c", plain),
         (wiilibs / "wl" / "gfx" / "gfx_sqrt.c", plain),
         (wiilibs / "wl" / "platform" / "wii" / "tev_wii.c", plain),
+        # (WiiLibs' Xbox translators: the combiners' translation and its cache, the vertex programs)
+        (wiilibs / "wl" / "xbox" / "psh.c", plain),
+        (wiilibs / "wl" / "xbox" / "psh_cache.c", plain),
+        (wiilibs / "wl" / "xbox" / "vsh.c", plain),
     ]
     objects = []
     for source, unit_flags in units:
@@ -294,7 +295,7 @@ def main() -> int:
         command = sub.add_parser(name)
         command.add_argument("--scene", default="all", help="environment, rigid, skinned, unlit, fogged or all")
         command.add_argument("--frames", type=int, default=4)
-        command.add_argument("--device", help="another copy of port/wii/src (with tools/ beside it) to build instead")
+        command.add_argument("--device", help="another copy of port/wii/src to build instead")
         if name == "count":
             command.add_argument("--top", type=int, default=12, help="functions listed for the later frames")
             command.add_argument("--verbose", action="store_true", help="the first frame's functions too")

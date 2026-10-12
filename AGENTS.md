@@ -20,7 +20,7 @@ end.
 | `port/linux/include/` | The port's headers: the limits (`halo_port_limits.h`, with `HALO_PORT_NETWORK_VERSION`), capacities (`halo_port_capacity.h`), the prefix header, `halo_linux_source_fixups.h` (port functions the game's sources call) |
 | `port/include/xdk/` | Stand-ins for the Xbox SDK's headers (declarations only) |
 | `port/windows/` | The Windows build's own files (`win32_*.c`, headers) |
-| `port/wii/` | The Wii port (branch `wii-port`): its platform files (`src/`), the Direct3D device on GX (`d3d8_gx.c`), the prefix header, the shared files it keeps (`port.json`), host checks (`tests/`), the vertex program compiler (`tools/nv2a_codegen.c`) |
+| `port/wii/` | The Wii port (branch `wii-port`): its platform files (`src/`), the Direct3D device on GX (`d3d8_gx.c`), the prefix header, the shared files it keeps (`port.json`), host checks (`tests/`); the device's Xbox translators (combiners to TEV, vertex programs and their compiler) are WiiLibs' `wl/xbox` |
 | `port/android/` | The Android app: the guest runtime, the host library (`host/`), the Java app (`app/`), host imports (`host_imports.list`) |
 | `port/web/` | The web build: its runtime (`src/`: entry, sockets inside the page, memory watch), the page and its service worker (`site/`), the SDL port, tests |
 | `port/assets/` | What the builds embed or ship: high-res HUD (`hud/`), fonts, titles, menus (`menus/`), icons, network brokers |
@@ -238,10 +238,10 @@ converted, how it draws, and the lockstep check.
   `tools/wii_convert_maps.py` into `build/wii/sd/apps/halo/maps`. Never
   commit or upload game data or converted maps.
 - Host checks that need no emulator: `python3 tools/wii_gx_psh_check.py`
-  (the TEV translation against the combiners, built with WiiLibs' TEV
-  programs: it finds WiiLibs in `WIILIBS`, `./WiiLibs` or `../WiiLibs`) and
-  `python3 tools/wii_nv2a_check.py` (the generated vertex programs against
-  the interpreter) and `python3 tools/wii_input_check.py` (the controllers'
+  (WiiLibs' TEV translation, `wl/xbox`, with the game's recipes against the
+  combiners: it finds WiiLibs in `WIILIBS`, `./WiiLibs` or `../WiiLibs`) and
+  `python3 tools/wii_nv2a_check.py` (the game's vertex programs compiled by
+  WiiLibs' `tools/xbox_vsh_codegen.c` against its interpreter) and `python3 tools/wii_input_check.py` (the controllers'
   mapping to the Xbox gamepad) and `python3 tools/wii_gx_texel_check.py` (the
   processor's reads of GX's textures), and `WIILIBS=WiiLibs python3 -m unittest
   tools/test_wii_profile.py` (the profile tool), all in the CI's `wii` job. `tools/wii_animation_check.py`
@@ -279,7 +279,7 @@ tool's `model` and `effort` parameters).
 
 | Role | Model | Effort | Owns |
 | --- | --- | --- | --- |
-| renderer | opus | high | The Direct3D device on GX and the frame rate: `port/wii/src/d3d8_gx.c`, `gx_psh*.c`, `gx_lighting.c`, `nv2a_cpu*`, `port/wii/tools/nv2a_codegen.c`, `tools/wii_gx_textures.py` |
+| renderer | opus | high | The Direct3D device on GX and the frame rate: `port/wii/src/d3d8_gx.c`, `gx_psh.c`, `gx_lighting.c`, WiiLibs' `wl/xbox` (through a WiiLibs branch), `tools/wii_gx_textures.py` |
 | game | opus | high | The game right on a big-endian machine: the map converter and its checks (`tools/wii_convert_maps.py`, `wii_tag_layout.py`, `wii_*_check.py`), the lockstep check (`tools/lockstep_compare.py`), the playthrough scripts (`port/wii/tests/*.txt`), and the `port:` fixes in `source/` and `port/linux/game/` |
 | platform | sonnet | high | Everything around the game: WiiLibs (its own worktree, branch off `Xbox`), the Wii's other platform files (`port/wii/src/wii_*.c`, `xinput_wii.c`, `posix_net_wii.c`), the CI and build scripts (`.github/workflows/build.yml`, `tools/ci_build.py`, `tools/wii_build.py`, `tools/wii_package.py`), and the documents |
 
@@ -414,9 +414,11 @@ can. Fixes are made by the main session or a `gx-renderer` or
 
 #### gx-renderer
 
-Owns the Wii's Direct3D device: `port/wii/src/d3d8_gx.c`, `gx_psh.c`,
-`nv2a_cpu.c`, `nv2a_cpu.h`, `nv2a_cpu_native.h`,
-`port/wii/tools/nv2a_codegen.c`.
+Owns the Wii's Direct3D device: `port/wii/src/d3d8_gx.c`, `gx_psh.c` (the
+game's recipes), `gx_lighting.c`; and, in WiiLibs' worktree on a branch of
+its own, the translators the device takes from WiiLibs' `wl/xbox`
+(`psh.c`, `psh_cache.c`, `vsh.c`, `tools/xbox_vsh_codegen.c`) with their
+tests.
 - Drawing must match the processor's path: a change to GX's transform is
   checked by an A/B of the same moment with `debug.gpu_transform = false`
   (a checkpoint run the main session makes).

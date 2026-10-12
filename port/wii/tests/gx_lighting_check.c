@@ -3,7 +3,7 @@ GX_LIGHTING_CHECK.C
 
 A host check of the models' lighting on GX's lights (port/wii/src/gx_lighting.c;
 tools/wii_nv2a_check.py builds and runs it): each program gx_lighting.c has a
-recipe for is run on the interpreter (port/wii/src/nv2a_cpu.c) for random
+recipe for is run on the interpreter (WiiLibs' wl/xbox/vsh.c) for random
 scenes (a camera, a model of skinned nodes in front of it, lights about it,
 the reflection's and fogs' constants) and vertices, and what GX would make of
 the same vertex (the lights gx_lighting_make sets, lit as Dolphin lights them:
@@ -30,7 +30,7 @@ fails where the colours that should be close are not.
 usage: gx_lighting_check microcode.inc
 */
 
-#include "nv2a_cpu_native.h"
+#include "wl/xbox/vsh_native.h"
 #include "gx_lighting.h"
 
 #include <math.h>
@@ -172,7 +172,7 @@ static void report(const char *name, const struct statistic *statistic, const ch
 }
 
 /* the program words of the hash, from the microcode */
-static int program_find(const DWORD *words, unsigned long word_count, unsigned long hash, struct nv2a_cpu_program *program)
+static int program_find(const DWORD *words, unsigned long word_count, unsigned long hash, WlXboxVshProgram *program)
 {
 	unsigned long position;
 
@@ -184,9 +184,9 @@ static int program_find(const DWORD *words, unsigned long word_count, unsigned l
 		position += 1 + count * 4;
 		if (!count || position > word_count)
 			continue;
-		if (nv2a_cpu_hash(instructions, count) == hash)
+		if (wl_xbox_vsh_hash(instructions, count) == hash)
 		{
-			nv2a_cpu_compile(instructions, count, program);
+			wl_xbox_vsh_compile(instructions, count, NULL, 0, program);
 			return 1;
 		}
 	}
@@ -209,7 +209,7 @@ struct results
 	unsigned long scenes, refused, ramp_refused, ramp_rows;
 };
 
-static void check_program(const struct nv2a_cpu_program *program, struct results *results)
+static void check_program(const WlXboxVshProgram *program, struct results *results)
 {
 	const struct gx_lighting_recipe *recipe = gx_lighting_recipe_find(program->hash);
 	int skinned = gx_lighting_recipe_skinned(recipe);
@@ -217,8 +217,8 @@ static void check_program(const struct nv2a_cpu_program *program, struct results
 
 	for (scene = 0; scene < SCENES; scene++)
 	{
-		static float constants[NV2A_CPU_CONSTANT_COUNT][4];
-		float (*c)[4] = constants + NV2A_CPU_CONSTANT_BIAS;
+		static float constants[WL_XBOX_VSH_CONSTANT_COUNT][4];
+		float (*c)[4] = constants + WL_XBOX_VSH_CONSTANT_BIAS;
 		float view[3][3], eye[3], center[3], model[3], fovy = uniform(0.9f, 1.3f), aspect = 4.0f / 3.0f;
 		float nodes[NODES][3][4], w2v[3][4], center_e[3], base[3][3], frames[3][3][3];
 		float near_plane = 0.06f, far_plane = 1000.0f;
@@ -424,15 +424,15 @@ static void check_program(const struct nv2a_cpu_program *program, struct results
 
 		for (vertex = 0; vertex < VERTICES; vertex++)
 		{
-			float inputs[NV2A_CPU_INPUT_COUNT][4], matrix[3][4], v_rows[3][4], e_rows[3][4], world[3], normal[3];
+			float inputs[WL_XBOX_VSH_INPUT_COUNT][4], matrix[3][4], v_rows[3][4], e_rows[3][4], world[3], normal[3];
 			float position_e[3], normal_e[3];
-			struct nv2a_cpu_output out;
+			WlXboxVshOutput out;
 			unsigned char d0[4], d1[4];
 			int first = rand() % NODES, second = rand() % NODES, component;
 			float weight = rand() % 3 ? 1.0f : uniform(0.0f, 1.0f);
 
 			memset(inputs, 0, sizeof(inputs));
-			for (row = 0; row < NV2A_CPU_INPUT_COUNT; row++)
+			for (row = 0; row < WL_XBOX_VSH_INPUT_COUNT; row++)
 				inputs[row][3] = 1.0f;
 			for (row = 0; row < 3; row++)
 				inputs[0][row] = skinned || program->hash == 0x71f9f272UL ? uniform(-0.5f, 0.5f) : model[row] + uniform(-0.5f, 0.5f);
@@ -445,7 +445,7 @@ static void check_program(const struct nv2a_cpu_program *program, struct results
 			inputs[5][0] = (float)first / 255.0f;
 			inputs[5][1] = (float)second / 255.0f;
 			inputs[6][0] = (float)lroundf(weight * 32767.0f) / 32767.0f;
-			nv2a_cpu_run(program, (const float (*)[4])constants, (const float (*)[4])inputs, 1.0f, &out);
+			wl_xbox_vsh_run(program, (const float (*)[4])constants, (const float (*)[4])inputs, 1.0f, &out);
 
 			/* GX: the vertex's matrix (its node, or its blend), through E */
 			if (skinned)
@@ -637,7 +637,7 @@ int main(int argc, char **argv)
 	printf("gx_lighting_check: GX's lights against the programs, %d scenes of %d vertices each\n", SCENES, VERTICES);
 	for (index = 0; index < sizeof(programs) / sizeof(programs[0]); index++)
 	{
-		static struct nv2a_cpu_program program;
+		static WlXboxVshProgram program;
 		struct results results;
 
 		memset(&results, 0, sizeof(results));
