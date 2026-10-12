@@ -128,7 +128,7 @@ inflated it to, and the Wii reads it where it is.
   | File | What it does |
   | --- | --- |
   | `wii_platform.c` | log, messages and quitting |
-  | `wii_posix.c` | where the game's folder is, `sysconf`'s memory, random bytes, thread priorities |
+  | `wii_posix.c` | names for the shared files over WiiLibs: where the game's folder is (`wl_platform_fs_find_app_dir`), random bytes (`wl_platform_random_bytes`), thread priorities (`wl_posix_thread_set_relative_priority`), the heap report |
   | `xinput_wii.c` | XInput over the Wii Remote with Nunchuk or Classic Controller, and the GameCube controller |
   | `posix_net_wii.c` | sockets over WiiLibs' network layer, for system link |
   | `d3d8_gx.c` | the Direct3D device |
@@ -160,11 +160,12 @@ inflated it to, and the Wii reads it where it is.
   only `FIONBIO`), so `ioctlsocket(FIONREAD)` fails with `WSAEINVAL`, and it has no
   `getpeername`. Options other than `SO_REUSEADDR`, `SO_BROADCAST`, `SO_SNDBUF`, `SO_RCVBUF` and
   `TCP_NODELAY` are accepted and ignored.
-- **Positioned reads.** `pread`, `pwrite` and `pause`, which newlib declares and does not define,
-  are WiiLibs' weak definitions (`wl/platform/posix.h`, `wii/posix_wii.c`).
+- **Positioned reads.** `pread`, `pwrite`, `pause` and `sysconf`, which newlib declares and does
+  not define, are WiiLibs' weak definitions (`wl/platform/posix.h`, `wii/posix_wii.c`).
 - **Threads.** libogc's threads are strictly prioritised. Each of the game's threads gets the
-  game's main priority (WiiLibs' `WL_THREAD_PRIO_MAIN`, LWP 64: `WII_GAME_MAIN_PRIO` in
-  `src/wii_posix.c`), moved by its Win32 priority, and a 128 KB stack. The game's main runs on a
+  game's main priority (WiiLibs' `WL_THREAD_PRIO_MAIN`, LWP 64: `WL_POSIX_PRIO_MAIN`), moved by
+  its Win32 priority (`wii_thread_priority` in `src/wii_posix.c`, over WiiLibs'
+  `wl_posix_thread_set_relative_priority`), and a 128 KB stack. The game's main runs on a
   thread of its own with a 512 KB stack, started by WiiLibs' `wl_platform_run_on_stack`
   (`src/wii_boot.c`): libogc's main thread has 128 KB, below which lie its audio DSP structures,
   and a deep AI path search in b30 went past it (the game's stack reaches about 290 KB; the memory
@@ -302,8 +303,8 @@ internal ones included, so that what MEM1 cannot hold comes from a 5 MB heap in 
 `-u __wrap_malloc`; `__wrap_main` turns the overflow on with `wl_heap_overflow_enable` once
 WiiLibs' heaps are up. Its blocks carry a 32-byte header, so they are 32-byte aligned; the log
 says so at the first one, and "malloc(N) failed, from ..." (addresses for `addr2line` on
-`build/wii/halo.elf`) when both heaps are full. `GlobalMemoryStatus` (`sysconf` in
-`src/wii_posix.c`) counts MEM1's free bytes and the overflow heap's free budget.
+`build/wii/halo.elf`) when both heaps are full. `GlobalMemoryStatus` (WiiLibs' `sysconf`,
+`wii/posix_wii.c`) counts MEM1's free bytes and the overflow heap's free budget.
 
 **The memory report.** Every 240 frames the log has:
 - `memory: MEM1 heap N KB used, N KB free` (newlib's `mallinfo`);
