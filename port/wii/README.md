@@ -258,15 +258,6 @@ copied to the Xbox's hard drive, which was most of a level's load there. On the 
   maps does not (24 files, no `loading.tga`), and the converter copies none. The word LOADING is
   then missing from the picture (the texture is made and left as it was).
 
-Now (1) to (3) below are done, on the Wii only: `game_precache_new_map` leaves the progress bar
-up and `map_load_in_progress` set (`progress_bar_port_load_begin`), `main_new_map` ends both once
-the game is made (`progress_bar_port_load_end`), and `progress_bar_port_pump` draws the bar alone
-(`render_port_loading_frame`: no widgets, no `sound_render`) and presents, at most every 33 ms,
-from `cache_file_block_until_not_busy`, `cached_map_block_on_async_request` and between the
-heavier calls of `game_initialize_for_new_map`; its progress rises with the load's time, 1 -
-1/(1 + seconds/2). A checkpoint has yet to show it in Dolphin (a level's load: the swirl moving,
-the log's long frame split into frames of about 33 ms). What it was written from:
-
 What the animation needs, which is not the platform's: (1) the progress bar kept active and
 `map_load_in_progress` set until `main_new_map` has finished, not until the precache says done;
 (2) a pump, `loading_pump()`, that draws only the progress bar (not the widgets, whose tags the
