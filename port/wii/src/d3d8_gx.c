@@ -4990,6 +4990,10 @@ static struct
 	const unsigned char *normals;
 	UINT normal_stride;
 	BOOL normal_packed;
+	/* where GX reads the normals by index (kept_normals_find), if it does */
+	BOOL normals_indexed;
+	const unsigned char *normals_array;
+	UINT normals_array_stride;
 	/* a point of the draw in E */
 	float center[3];
 } lit;
@@ -5508,8 +5512,10 @@ static void lit_state(BOOL keyed, const struct draw_projection *projection, cons
 			memcpy(turn[row], lit.space.world_to_eye[row], sizeof(turn[row]));
 		GX_LoadNrmMtxImm(turn, GX_PNMTX0);
 	}
-	GX_SetVtxDesc(GX_VA_NRM, GX_DIRECT);
+	GX_SetVtxDesc(GX_VA_NRM, lit.normals_indexed ? GX_INDEX16 : GX_DIRECT);
 	vertex_format(HARDWARE_VERTEX_FORMAT, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
+	if (lit.normals_indexed)
+		GX_SetArray(GX_VA_NRM, (void *)lit.normals_array, (u8)lit.normals_array_stride);
 	if (lit.colors)
 	{
 		if (lit.alpha && lit_fog_ramp(keyed))
@@ -5547,6 +5553,10 @@ static void lit_state(BOOL keyed, const struct draw_projection *projection, cons
 	}
 }
 
+/* (emit_indices' normals: none, each decoded and sent, or read by GX by
+index) */
+enum { EMIT_NORMALS_NONE, EMIT_NORMALS_SENT, EMIT_NORMALS_INDEXED };
+
 /* the vertices of a draw in hardware of which the processor computes nothing:
 each index's matrix indices (keyed: its value's position matrix, and with
 sphere_matrices its normal's sphere map matrix, with fog_post_matrices its
@@ -5554,7 +5564,7 @@ fog's (fog_post_matrix), with fog_matrices its planar fog ramp
 coordinate's), its position and texture coordinates by index, and a
 lit draw's normal. A loop for each case, so that an index costs only what
 it sends. */
-static void emit_indices(const WORD *indices, UINT first, UINT count, unsigned texture_count, BOOL keyed, BOOL normals,
+static void emit_indices(const WORD *indices, UINT first, UINT count, unsigned texture_count, BOOL keyed, int normals,
 	BOOL sphere_matrices, BOOL fog_post_matrices, BOOL fog_matrices)
 {
 	UINT base = indices ? device.base_vertex_index : first, vertex;
@@ -5618,7 +5628,9 @@ static void emit_indices(const WORD *indices, UINT first, UINT count, unsigned t
 				GX_MatrixIndex1x8((u8)(GX_PNMTX1 + 3 * key));
 		}
 		GX_Position1x16(index);
-		if (normals)
+		if (normals == EMIT_NORMALS_INDEXED)
+			GX_Normal1x16(index);
+		else if (normals)
 		{
 			float normal[3];
 
@@ -6185,6 +6197,182 @@ static struct static_outputs *static_outputs_find(struct nv2a_cpu_program *progr
 	return entry;
 }
 
+/* ---------- the lit models' normals, decoded once
+
+A draw lit by GX sends each vertex's normal, which the models' buffers hold
+packed (11, 11 and 10 bits: D3DVSDT_NORMPACKED3), a form GX does not read:
+it was decoded for every index of every lit draw (58,000 a frame in b30).
+The models' buffers are static, so each one's normals are decoded once into
+three floats a vertex (the same as lit_normal's, to the bit) beside it in
+the contiguous window, and GX reads them by index as it reads the
+positions. A buffer is keyed as the kept outputs key theirs (its header,
+data, stride and serial, the normal's offset), and kept from the frame
+after it is first seen, its vertices decoded from 0 to the most a draw
+names; at most KEPT_NORMALS_BYTES in all, and only while the window keeps
+STATIC_OUTPUTS_RESERVE free in one run besides. An entry not drawn for
+STATIC_OUTPUTS_IDLE frames is freed once GX has drawn the frame. Normals of
+three floats in the buffer GX reads where they are. */
+#define KEPT_NORMALS_ENTRIES 128
+#define KEPT_NORMALS_WAYS 4
+#define KEPT_NORMALS_BYTES (768UL * 1024UL)
+
+struct kept_normals
+{
+	const D3DVertexBuffer *buffer;
+	DWORD data, serial;
+	UINT stride, offset;
+	unsigned long seen_frame, used_frame;
+	/* vertices 0 to decoded - 1, three floats each; room for capacity */
+	float *values;
+	unsigned long decoded, capacity;
+};
+
+static struct kept_normals kept_normals[KEPT_NORMALS_ENTRIES];
+static unsigned long kept_normals_bytes;
+static float *kept_normals_frees[KEPT_NORMALS_ENTRIES];
+static unsigned kept_normals_free_count;
+/* in the statistics' window: lit draws whose normals GX read by index (from
+the kept, or from their buffer), vertices decoded, draws without room */
+static unsigned long kept_normal_draws, kept_normals_decoded, kept_normals_refused;
+
+/* an entry's values freed: once GX has drawn the frame (or now, past room
+to wait) */
+static void kept_normals_release(struct kept_normals *entry, BOOL drawn)
+{
+	if (entry->values)
+	{
+		if (drawn)
+			platform_contiguous_free(entry->values);
+		else if (kept_normals_free_count < KEPT_NORMALS_ENTRIES)
+			kept_normals_frees[kept_normals_free_count++] = entry->values;
+		else
+		{
+			GX_DrawDone();
+			xf_flush_after();
+			platform_contiguous_free(entry->values);
+		}
+		kept_normals_bytes -= entry->capacity * 12;
+	}
+	memset(entry, 0, sizeof(*entry));
+}
+
+static void kept_normals_frame_drawn(void)
+{
+	unsigned index;
+
+	while (kept_normals_free_count)
+		platform_contiguous_free(kept_normals_frees[--kept_normals_free_count]);
+	for (index = 0; index < KEPT_NORMALS_ENTRIES; index++)
+		if (kept_normals[index].buffer && device.frames - kept_normals[index].used_frame > STATIC_OUTPUTS_IDLE)
+			kept_normals_release(&kept_normals[index], TRUE);
+}
+
+/* the array GX reads a lit draw's normals from by index, vertices up to
+most (lit.normals_array, lit.normals_array_stride); FALSE where the normals
+are sent with each vertex (not static yet, no room) */
+static BOOL kept_normals_find(const struct vertex_shader_object *shader, unsigned long least, unsigned long most)
+{
+	const struct vertex_element *normal = element_of(shader, 1);
+	unsigned stream = normal->stream & (MAXIMUM_STREAMS - 1);
+	D3DVertexBuffer *buffer = device.streams[stream].buffer;
+	UINT stride = device.streams[stream].stride;
+	struct kept_normals *entry = NULL, *victim = NULL;
+	unsigned set, way;
+	unsigned long vertex;
+
+	if (!buffer || !buffer->Data || stride > 255)
+		return FALSE;
+	if (!lit.normal_packed)
+	{
+		/* (three floats: GX reads them where they are) */
+		lit.normals_array = lit.normals;
+		lit.normals_array_stride = stride;
+		stream_flush(buffer, lit.normals - normal->offset + least * stride, (most - least + 1) * stride);
+		kept_normal_draws++;
+		return TRUE;
+	}
+	if (!buffer->Lock)
+	{
+		if (!++vertex_buffer_serial)
+			vertex_buffer_serial++;
+		buffer->Lock = vertex_buffer_serial;
+	}
+	set = (unsigned)((((unsigned long)buffer >> 4) * 2654435761UL) >> 8) % (KEPT_NORMALS_ENTRIES / KEPT_NORMALS_WAYS) *
+		KEPT_NORMALS_WAYS;
+	for (way = 0; way < KEPT_NORMALS_WAYS; way++)
+	{
+		struct kept_normals *candidate = &kept_normals[set + way];
+
+		if (candidate->buffer == buffer && candidate->data == buffer->Data && candidate->serial == buffer->Lock &&
+			candidate->stride == stride && candidate->offset == normal->offset)
+		{
+			entry = candidate;
+			break;
+		}
+		if (!victim || (victim->buffer && (!candidate->buffer || candidate->used_frame < victim->used_frame)))
+			victim = candidate;
+	}
+	if (!entry)
+	{
+		kept_normals_release(victim, FALSE);
+		victim->buffer = buffer;
+		victim->data = buffer->Data;
+		victim->serial = buffer->Lock;
+		victim->stride = stride;
+		victim->offset = normal->offset;
+		victim->seen_frame = victim->used_frame = device.frames;
+		return FALSE;
+	}
+	entry->used_frame = device.frames;
+	/* (not static yet: seen this frame only) */
+	if (entry->seen_frame == device.frames)
+		return FALSE;
+	if (most >= entry->capacity)
+	{
+		unsigned long capacity = (most + 1024) & ~1023UL, largest = 0;
+		float *values = NULL;
+
+		wii_memory_window_usage(NULL, NULL, &largest);
+		if (kept_normals_bytes - entry->capacity * 12 + capacity * 12 <= KEPT_NORMALS_BYTES &&
+			largest >= capacity * 12 + STATIC_OUTPUTS_RESERVE)
+			values = platform_contiguous_alloc(capacity * 12, 32, PLATFORM_ANY_PHYSICAL_ADDRESS, 0);
+		if (!values)
+		{
+			kept_normals_refused++;
+			return FALSE;
+		}
+		if (entry->values)
+		{
+			memcpy(values, entry->values, entry->decoded * 12);
+			DCFlushRange(values, entry->decoded * 12);
+			if (kept_normals_free_count < KEPT_NORMALS_ENTRIES)
+				kept_normals_frees[kept_normals_free_count++] = entry->values;
+			else
+			{
+				GX_DrawDone();
+				xf_flush_after();
+				platform_contiguous_free(entry->values);
+			}
+			kept_normals_bytes -= entry->capacity * 12;
+		}
+		entry->values = values;
+		entry->capacity = capacity;
+		kept_normals_bytes += capacity * 12;
+	}
+	if (most >= entry->decoded)
+	{
+		for (vertex = entry->decoded; vertex <= most; vertex++)
+			lit_normal((UINT)vertex, entry->values + 3 * vertex);
+		DCFlushRange(entry->values + 3 * entry->decoded, (most + 1 - entry->decoded) * 12);
+		kept_normals_decoded += most + 1 - entry->decoded;
+		entry->decoded = most + 1;
+	}
+	lit.normals_array = (const unsigned char *)entry->values;
+	lit.normals_array_stride = 12;
+	kept_normal_draws++;
+	return TRUE;
+}
+
 static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE primitive_type, UINT count,
 	const WORD *indices, UINT first, struct stream_fetch *fetch)
 {
@@ -6486,6 +6674,9 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		lit_on = FALSE;
 		lit_refused++;
 	}
+	/* (the normals by index, where no vertex sends its own: the processor's
+	blended ones) */
+	lit.normals_indexed = lit_on && !draw_keys.processor && kept_normals_find(shader, least, most);
 	lit_done = wl_platform_time_us();
 	if (lit_on)
 	{
@@ -6722,8 +6913,9 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	emitting = wl_platform_time_us();
 	gx_begin(gx_primitive(primitive_type), HARDWARE_VERTEX_FORMAT, (u16)count);
 	if (plain)
-		emit_indices(indices, first, count, texture_count + kept_count, keyed, lit_on, lit_on && lit.reflection && keyed,
-			fog_post, lit_on && lit.fog_ramped && keyed);
+		emit_indices(indices, first, count, texture_count + kept_count, keyed,
+			!lit_on ? EMIT_NORMALS_NONE : lit.normals_indexed ? EMIT_NORMALS_INDEXED : EMIT_NORMALS_SENT,
+			lit_on && lit.reflection && keyed, fog_post, lit_on && lit.fog_ramped && keyed);
 	else
 		for (vertex = 0; vertex < count; vertex++)
 		{
@@ -6826,6 +7018,8 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 				alpha where it is the fog's */
 				if (processor)
 					GX_Normal3f32(computed->normal[0], computed->normal[1], computed->normal[2]);
+				else if (lit.normals_indexed)
+					GX_Normal1x16(index);
 				else
 				{
 					float normal[3];
@@ -7139,6 +7333,7 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		xf_flush_after();
 		texture_frees_flush();
 		static_outputs_frame_drawn();
+		kept_normals_frame_drawn();
 		/* (GX's texture cache emptied once a frame, whatever was written) */
 		texture_memory_changed = TRUE;
 		timing.present += wl_platform_time_us() - started;
@@ -7229,6 +7424,16 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		platform_log("Direct3D: lit by GX, the planar fog by GX's ramp in %lu draws (%lu ramps written), the processor's "
 			"in %lu; a model's fog through its nodes' matrices in %lu draws", lit_fog_draws, fog_ramps_made,
 			lit_fog_refused, fog_post_draws);
+		{
+			unsigned index, entries = 0;
+
+			for (index = 0; index < KEPT_NORMALS_ENTRIES; index++)
+				entries += kept_normals[index].values ? 1 : 0;
+			platform_log("Direct3D: lit by GX, the normals read by index in %lu draws; %lu decoded, %u buffers' kept "
+				"(%lu KB), %lu draws without room", kept_normal_draws, kept_normals_decoded, entries,
+				kept_normals_bytes / 1024, kept_normals_refused);
+			kept_normal_draws = kept_normals_decoded = kept_normals_refused = 0;
+		}
 		lit_draws = lit_vertices = lit_refused = sphere_bakes_made = sphere_bakes_borrowed = fog_post_draws = 0;
 		lit_fog_draws = fog_ramps_made = lit_fog_refused = 0;
 		platform_log("Direct3D: textures not drawn: %lu without data, %lu of a shape, %lu of a format, "
