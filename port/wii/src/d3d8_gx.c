@@ -5732,6 +5732,93 @@ static void static_outputs_frame_drawn(void)
 			static_outputs_release(&static_outputs[index], TRUE);
 }
 
+/* ---------- the streams GX reads, flushed once while they are static
+
+GX reads a draw's streams from memory, so the processor's cache is flushed
+over the range the draw reads (DCFlushRange, a dcbf a line). The models'
+and the structure's buffers are written once, and drawn many times a frame,
+pass after pass: their ranges were flushed at every draw. A buffer's serial
+(its header's Lock, as the kept outputs take it: given at first sight,
+cleared by D3DVertexBuffer_Lock) says it has not been written through a
+lock since; the range flushed under the serial is kept for each buffer
+(STREAM_FLUSHES of them, by the header's address), and a draw within it
+flushes nothing. A serial's own first frame is flushed at every draw, as a
+buffer the game locks each frame (the dynamic ones) always is. */
+#define STREAM_FLUSHES 256
+
+static struct
+{
+	const D3DVertexBuffer *buffer;
+	DWORD data, serial;
+	unsigned long frame;
+	/* the bytes flushed under the serial since its first frame, from the
+	buffer's start: [first, end) */
+	unsigned long first, end;
+} stream_flushes[STREAM_FLUSHES];
+/* in the statistics' window: flushes made and their bytes, and those not
+needed */
+static unsigned long stream_flushes_made, stream_flush_bytes, stream_flushes_kept;
+
+static void stream_flush(D3DVertexBuffer *buffer, const unsigned char *start, unsigned long bytes)
+{
+	const unsigned char *base;
+	unsigned long first, end;
+	unsigned slot;
+
+	if (!buffer || !buffer->Data)
+	{
+		DCFlushRange((void *)start, bytes);
+		stream_flushes_made++;
+		stream_flush_bytes += bytes;
+		return;
+	}
+	if (!buffer->Lock)
+	{
+		if (!++vertex_buffer_serial)
+			vertex_buffer_serial++;
+		buffer->Lock = vertex_buffer_serial;
+	}
+	base = (const unsigned char *)PLATFORM_PHYSICAL_TO_VIRTUAL(buffer->Data);
+	first = (unsigned long)(start - base);
+	end = first + bytes;
+	slot = ((unsigned long)buffer >> 4) % STREAM_FLUSHES;
+	if (stream_flushes[slot].buffer != buffer || stream_flushes[slot].data != buffer->Data ||
+		stream_flushes[slot].serial != buffer->Lock)
+	{
+		stream_flushes[slot].buffer = buffer;
+		stream_flushes[slot].data = buffer->Data;
+		stream_flushes[slot].serial = buffer->Lock;
+		stream_flushes[slot].frame = device.frames;
+		stream_flushes[slot].first = stream_flushes[slot].end = 0;
+	}
+	if (stream_flushes[slot].frame != device.frames && first >= stream_flushes[slot].first &&
+		end <= stream_flushes[slot].end)
+	{
+		stream_flushes_kept++;
+		return;
+	}
+	DCFlushRange((void *)start, bytes);
+	stream_flushes_made++;
+	stream_flush_bytes += bytes;
+	/* (kept from the frame after the serial's first: one range, grown where
+	the new one meets it, else the larger) */
+	if (stream_flushes[slot].frame == device.frames)
+		return;
+	if (first <= stream_flushes[slot].end && end >= stream_flushes[slot].first &&
+		stream_flushes[slot].end > stream_flushes[slot].first)
+	{
+		if (first < stream_flushes[slot].first)
+			stream_flushes[slot].first = first;
+		if (end > stream_flushes[slot].end)
+			stream_flushes[slot].end = end;
+	}
+	else if (end - first > stream_flushes[slot].end - stream_flushes[slot].first)
+	{
+		stream_flushes[slot].first = first;
+		stream_flushes[slot].end = end;
+	}
+}
+
 /* the stages and colours of what the processor computes for a draw
 (spheres, colors) whose outputs read no constant and depend only on
 registers of bound streams; the streams in *streams */
@@ -6305,8 +6392,8 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 	{
 		GX_SetVtxDesc(GX_VA_POS, GX_INDEX16);
 		GX_SetArray(GX_VA_POS, (void *)position_stream, (u8)position_stride);
-		DCFlushRange((void *)(position_stream - position_element->offset + least * position_stride),
-			(most - least + 1) * position_stride);
+		stream_flush(device.streams[position_element->stream & (MAXIMUM_STREAMS - 1)].buffer,
+			position_stream - position_element->offset + least * position_stride, (most - least + 1) * position_stride);
 	}
 	for (component = 0; component < texture_count; component++)
 	{
@@ -6322,7 +6409,8 @@ static BOOL draw_hardware(struct nv2a_cpu_program *program, D3DPRIMITIVETYPE pri
 		else
 			vertex_format(HARDWARE_VERTEX_FORMAT, GX_VA_TEX0 + component, GX_TEX_ST, GX_F32, 0);
 		GX_SetArray(GX_VA_TEX0 + component, (void *)(stream + element->offset), (u8)stride);
-		DCFlushRange((void *)(stream + least * stride), (most - least + 1) * stride);
+		stream_flush(device.streams[element->stream & (MAXIMUM_STREAMS - 1)].buffer, stream + least * stride,
+			(most - least + 1) * stride);
 	}
 	/* (the kept sphere map coordinates, read by index from the kept values,
 	then the processor's, sent with each vertex) */
@@ -6964,6 +7052,9 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 				entries, kept_entries, static_outputs_bytes / 1024, kept_refused);
 			kept_draws = kept_vertices = kept_computed = kept_refused = 0;
 		}
+		platform_log("Direct3D: the streams GX reads: %lu ranges flushed (%lu KB), %lu flushed before and kept",
+			stream_flushes_made, stream_flush_bytes / 1024, stream_flushes_kept);
+		stream_flushes_made = stream_flush_bytes = stream_flushes_kept = 0;
 		platform_log("Direct3D: lit by GX (display.gx_lighting): %lu draws, %lu vertices, %lu refused; %lu view sphere "
 			"maps drawn; the planar fog by GX's ramp in %lu draws (%lu ramps written), the processor's in %lu; "
 			"a model's fog through its nodes' matrices in %lu draws",
