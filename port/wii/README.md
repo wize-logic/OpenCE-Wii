@@ -363,8 +363,8 @@ will tell which it was, from the `files:` lines and the times on them.)
   | `wii_profile.c` | arms WiiLibs' sampling profiler and hardware counters when `profile.txt` or `hwcount.txt` is in the game's folder |
   | `xinput_wii.c` | XInput over the Wii Remote with Nunchuk or Classic Controller, and the GameCube controller; the pointer's aim |
   | `xinput_wii_map.c` | what each button and stick of those controllers is as the Xbox gamepad (checked on the host) |
-  | `wii_home.c` | the HOME button's menu and the Wii's notices as a state machine apart from the game (checked on the host) |
-  | `wii_home_game.c` | that machine joined to the game (its pause, WiiLibs' sound fade and exit) and the overlay it draws over the frame |
+  | `wii_home_config.c` | what Halo asks of WiiLibs' HOME menu and wrist strap reminder (`wl/platform/home_menu.h`, `strap_screen.h`): the Reset to title item, the Classic Controller's buttons as the game's menus have them, the scripted controller's gamepad as navigation (checked on the host through WiiLibs' state machines) |
+  | `wii_home_game.c` | WiiLibs' `home_shell.h` joined to the game: its pause, Reset to title (`main_goto_main_menu`), Return to the loader (`platform_request_quit`), the facts the menu asks (a level running, a player on a Remote) and the strap reminder's setting; the sound fade, the exit and the overlay over the frame are WiiLibs' |
   | `posix_net_wii.c` | sockets over WiiLibs' network layer, for system link |
   | `d3d8_gx.c` | the Direct3D device on GX, with WiiLibs' `wl/xbox` (the pixel shaders to TEV and their cache, the vertex programs on the processor and their compiler), `gx_psh.c` (the game's pixel shaders WiiLibs' translation leaves to it, made by hand), `gx_lighting.c` (lights and sphere maps for GX) and `wii_bitmap_texel.c` (the processor's reads of GX's textures) |
   | `wii_extras.c` | the desktop additions the Wii goes without |
@@ -1765,15 +1765,16 @@ the setting on. Which way is forward is the sign of the Nunchuk's long axis (`fo
 confirms it (item 2 below).
 
 **The wrist strap reminder (`display.wii_strap_reminder`, off by default).** With the setting on, a
-plain screen of black and text comes up at the start, drawn with the overlay (`wii_home_game.c`, the
+plain screen of black and text comes up at the start, drawn with the overlay (WiiLibs' `home_shell.h`, the
 HOME menu's mechanism): "PLEASE USE THE WRIST STRAP", a line on fastening it, a line on making room
 and standing back from the screen, and when a Remote with a Nunchuk is connected, a line on holding
 the Nunchuk firmly and keeping its cable clear. The controllers are ignored for the first second (the
 prompt "A: CONTINUE" is dim until then): A (the Classic Controller's lower button, a GameCube
 controller's A) goes on, and only a fresh press does, so an A held from the loader does not. The game
 sees no controller (and no rumble) while it is up and until that A is let go (or 1.5 s); it comes
-once per start, and HOME does nothing under it. The words are our own. `wii_strap.c` is the state
-machine; `tests/wii_strap_check.c` checks it.
+once per start, and HOME does nothing under it. The words are our own. WiiLibs' `strap_screen.c` is the state
+machine (the words and the Classic Controller's buttons are `wii_home_config.c`'s); `tests/wii_strap_check.c`
+checks the game's setting of it, and WiiLibs' `test_platform_strap_screen` the machine.
 
 Sticks and triggers arrive from WiiLibs over their whole travel (the GameCube's sticks are
 full at the end of their gates, its triggers run from 30 to 180 as `PAD_Clamp` takes them, the
@@ -1810,7 +1811,7 @@ Controller's pointer is not used; the Wii U Pro Controller is not supported (its
 not read).
 
 **The HOME button** (a Wii Remote's, or a Classic Controller's own; a GameCube controller has none)
-opens a menu over the game, `src/wii_home.c` and `src/wii_home_game.c`:
+opens a menu over the game, WiiLibs' `wl/platform/home_menu.h` joined to the game by `src/wii_home_game.c`:
 
 ```
 HOME
@@ -1889,8 +1890,8 @@ Checking the thrust and the reminder: the same script builds `tests/wii_input_ch
 `input_gesture.c` (synthetic acceleration traces polled every 33 ms and read once to three times a
 poll: a thrust is one press in one poll, in the poll after it rose, and a walk's shake, a held tilt and
 a turn of the wrist press nothing; a thrust in a menu is dropped; the press shown to every read of its
-poll, released at the next, dropped when unread) and `tests/wii_strap_check.c` with `src/wii_strap.c`
-(the first second ignored, a fresh press of A going on, an A held from before not, every controller's A
+poll, released at the next, dropped when unread) and `tests/wii_strap_check.c` with WiiLibs' `strap_screen.c` and the game's
+`wii_home_config.c` (the first second ignored, a fresh press of A going on, an A held from before not, every controller's A
 and no other button, the game kept from the A until it is let go, once only, the Nunchuk line only with a
 Nunchuk, and only characters the overlay's font has). WiiLibs' `test_platform_input_gesture` checks the
 detector alone (a thrust at three report rates and frame lengths, a tilted hand, a clipped one, two
@@ -1898,15 +1899,20 @@ thrusts close and far apart, no rest before, and the signs), and `test_platform_
 `test_platform_input_reports` the retrace sampling (a tap between polls, a held button, errors, the
 counters, no read after a retrace's) and the Nunchuk's readings.
 
-Checking the HOME menu: the same script builds `tests/wii_home_check.c` with `src/wii_home.c` (the
-state machine against fake controllers, a fake game and a clock: opening and closing, the pause
-made once and undone only if it was the menu's, the sound's fades, the items and the loader's question,
-the buttons held as it closes, every controller's navigation, HOME of the Classic Controller only on
-one, the notices' debounce, their once and their expiry, the battery looked at every two seconds, and
-nothing asked while closed) and `tests/wii_script_check.c` with the real `test_input.c` (a script of
-the verbs played a read at a time, and lines that must be refused). WiiLibs' tests cover the frame
-overlay, the font, the audio fade and the simulated buttons (`test_platform_overlay`,
-`test_platform_audio_fade`, `test_platform_shutdown`).
+Checking the HOME menu: the same script builds `tests/wii_home_check.c` with WiiLibs' `home_menu.c` and the
+game's `wii_home_config.c` (the game's settings through the state machine against fake controllers and a
+fake game: the items and their words, the loader's question, Reset to title resuming the game before
+it goes to its menu, the Classic Controller's lower button accepting and its right one going back, the
+scripted controller's gamepad and HOME, the notices' words and the log lines `tests/home_menu.txt` looks
+for, and every word in the overlay's font) and `tests/wii_script_check.c` with the real `test_input.c` (a script of
+the verbs played a read at a time, and lines that must be refused). WiiLibs' tests cover the state machines
+themselves (`test_platform_home_menu`: opening and closing, the pause made once and undone only if it was
+the menu's, the sound's fades, the items, the buttons held as it closes, every controller's navigation,
+HOME of the Classic Controller only on one, the notices' debounce, their once and their expiry, the
+battery looked at every two seconds, nothing asked while closed; `test_platform_strap_screen`;
+`test_platform_home_shell`: the overlay hooked only while something shows), the frame overlay, the font,
+the audio fade and the simulated buttons (`test_platform_overlay`, `test_platform_audio_fade`,
+`test_platform_shutdown`).
 
 Checking the mapping: `tools/wii_input_check.py` builds `tests/wii_input_check.c` for the host
 with WiiLibs' `input_shape.c` and maps synthetic input states, comparing the Xbox gamepad with

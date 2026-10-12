@@ -2,12 +2,12 @@
 """Builds and runs the host checks of the Wii's controllers: the mapping (port/wii/tests/wii_input_check.c):
 synthetic WiiLibs input states through port/wii/src/xinput_wii_map.c, compared with the Xbox gamepad state the README
 ("The controllers") says they give, with the Nunchuk's thrust as melee (synthetic acceleration traces through WiiLibs'
-input_gesture.c); the HOME menu's state machine (port/wii/tests/wii_home_check.c) with
-port/wii/src/wii_home.c, against fake controllers, a fake game and a clock; the wrist strap reminder's state machine
-(port/wii/tests/wii_strap_check.c, with port/wii/src/wii_strap.c); and the script verbs that drive those
+input_gesture.c); Halo's configuration of the HOME menu (port/wii/tests/wii_home_check.c, port/wii/src/wii_home_config.c)
+run through WiiLibs' state machine (wl/platform/home_menu.c) against fake controllers, a fake game and a clock; the
+same for the wrist strap reminder (port/wii/tests/wii_strap_check.c, WiiLibs' strap_screen.c); and the script verbs that drive those
 on a run without a person (port/wii/tests/wii_script_check.c, with port/linux/src/test_input.c: home, remote,
 extension, battery, event; and the other controllers' player, N:, connect, disconnect and bot N, four controllers
-read in order a frame at a time). WiiLibs' input_shape.c comes from
+read in order a frame at a time). WiiLibs' input_shape.c, home_menu.c, strap_screen.c and overlay.c come from
 WiiLibs' checkout: WIILIBS, else ./WiiLibs (the CI's), else ../WiiLibs.
 
 The check includes a stand-in for the Xbox gamepad's declarations (port/wii/tests/host_input/platform.h); this
@@ -29,9 +29,9 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def wiilibs_dir() -> Path:
     for candidate in (os.environ.get("WIILIBS"), ROOT / "WiiLibs", ROOT.parent / "WiiLibs"):
-        if candidate and (Path(candidate) / "wl" / "platform" / "input_shape.h").is_file():
+        if candidate and (Path(candidate) / "wl" / "platform" / "home_menu.h").is_file():
             return Path(candidate)
-    sys.exit("WiiLibs (with wl/platform/input_shape.h) not found: set WIILIBS to its checkout")
+    sys.exit("WiiLibs (with wl/platform/home_menu.h) not found: set WIILIBS to its checkout")
 
 
 def gamepad_defines(path: Path) -> dict:
@@ -53,12 +53,15 @@ def main() -> int:
     flags = ["cc", "-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Wno-unused-parameter",
              f"-I{tests / 'host_input'}", f"-I{ROOT / 'port' / 'wii' / 'src'}", f"-I{wiilibs}"]
     src = ROOT / "port" / "wii" / "src"
+    platform = wiilibs / "wl" / "platform"
     builds = [
         ("wii_input_check", [tests / "wii_input_check.c", src / "xinput_wii_map.c",
                              wiilibs / "wl" / "platform" / "input_shape.c",
                              wiilibs / "wl" / "platform" / "input_gesture.c"]),
-        ("wii_home_check", [tests / "wii_home_check.c", src / "wii_home.c"]),
-        ("wii_strap_check", [tests / "wii_strap_check.c", src / "wii_strap.c", src / "wii_home.c"]),
+        ("wii_home_check", [tests / "wii_home_check.c", src / "wii_home_config.c", platform / "home_menu.c", platform / "strap_screen.c",
+                            platform / "overlay.c"]),
+        ("wii_strap_check", [tests / "wii_strap_check.c", src / "wii_home_config.c", platform / "strap_screen.c",
+                             platform / "home_menu.c", platform / "overlay.c"]),
     ]
     status = 0
     for name, sources in builds:
