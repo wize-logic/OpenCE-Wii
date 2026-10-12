@@ -77,7 +77,7 @@ vertices, and draws simpler ones sooner) */
 #define OBJECT_SHADOWS_DEFAULT "false"
 #define BUMPED_HIGHLIGHTS_DEFAULT "false"
 #define GX_LIGHTING_DEFAULT "true"
-#define BUMPED_LIGHTMAPS_DEFAULT "false"
+#define BUMPED_LIGHTMAPS_DEFAULT "true"
 #define ENVIRONMENT_REFLECTIONS_DEFAULT "false"
 /* (audio.reverb's: the reverb would add half again to what the Wii's processor spends
 on a battle's sound, 3% of it; dsound_sdl.c, the Wii's mixing) */
@@ -208,8 +208,8 @@ static const struct config_setting config_settings[] =
 		_platform_all,
 		"The environment's bump maps in its light: each surface's lightmap\n"
 		"shaded by its bump map along the light's direction, as on the Xbox;\n"
-		"false draws the lightmap flat (the Wii's default: the bump's direction\n"
-		"is a cube map lookup, each vertex's on the processor)." },
+		"false draws the lightmap flat, without the pass's cube map lookup (on\n"
+		"the Wii, its direction is computed once a vertex and kept)." },
 	{ "display.environment_reflections", _config_boolean, ENVIRONMENT_REFLECTIONS_DEFAULT,
 		"HALO_ENVIRONMENT_REFLECTIONS", _environment_value, _platform_all,
 		"The environment's reflections (shiny floors and walls: a cube map\n"
