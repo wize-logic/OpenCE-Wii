@@ -48,6 +48,7 @@ int: libogc's is renamed while its headers are read) */
 #include "port_config.h"
 #include "nv2a_cpu_native.h"
 #include "wii_memory.h"
+#include "wii_video.h"
 #include "xbox_texture_formats.h"
 #include "wl/codec/gx_tex.h"
 
@@ -446,7 +447,7 @@ HRESULT WINAPI Direct3D_CreateDevice(UINT adapter, D3DDEVTYPE device_type, void 
 		/* the video mode and GX (the text console of the start-up goes), the
 		frame buffer with an alpha: the game blends by what it leaves there */
 		wl_gx_set_efb_alpha(TRUE);
-		device.gx_ready = wl_platform_video_init() == WL_OK && wl_gx_init() == WL_OK;
+		device.gx_ready = wii_video_init() == WL_OK && wl_gx_init() == WL_OK;
 		if (!device.gx_ready)
 			platform_log("Direct3D: GX did not start (nothing is displayed)");
 		else
@@ -7080,7 +7081,7 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 
 			if (wanted != interval)
 			{
-				wl_platform_video_set_interval(wanted);
+				wii_video_present_interval(wanted);
 				interval = wanted;
 			}
 		}
