@@ -781,6 +781,12 @@ and pixel shaders.
     decoder (`src/nv2a_cpu.c`) and writes each one as a C function (about 180 KB of code). Each takes the
     outputs a draw reads, and runs an instruction only if it reaches one of them (found backwards
     from the end, a register's component at a time). A program is found by a hash of its words.
+    For the 23 skinned programs (those that index their constants by a0) it also writes a
+    function of the position alone for four values of v0 at once (`nv2a_cpu_run_positions`):
+    what reads nothing of v0 (the nodes' blend) once, the rest for each point, operation for
+    operation as a run does, so a position matrix's four runs (and the depth's fit's two) are
+    one call, the same to the bit (`tests/nv2a_native_check.c` compares them with runs; about
+    76 KB more code). A skinned model makes one for every key of every part each frame.
   - Square roots and ARL's floor give the libraries' results without their calls
     (`nv2a_sqrtf`: frsqrte refined in double, rounded, then corrected by the midpoints' exact
     squares). A skinned vertex takes about 1,600 instructions where it took 3,400.
@@ -835,9 +841,13 @@ and pixel shaders.
       row of (0, 0, 1), E the eye's space, turned and moved from the world's: the position
       matrices make E, the projection is multiplied by K, the depth's row is the same. The
       normal matrices are E's rows of each node's matrix.
-    - The normal goes with each vertex as three floats, read from the map's 11:11:10 word as the
-      programs read it (or the processor's skinned normal for a vertex whose position is the
-      processor's).
+    - The normal is three floats, from the map's 11:11:10 word as the programs read it, decoded
+      once for each static buffer into an array beside it in the contiguous window (at most
+      768 KB, and only while the window keeps 1 MB more free in one run), which GX reads by
+      index as it reads the positions (`kept_normals_find`; three floats in the buffer it reads
+      where they are). It was decoded and sent for every index of every draw, 58,000 a frame in
+      b30. A draw with vertices whose position is the processor's (a blend beyond the draw's
+      matrices) sends every normal, those vertices' the processor's skinned one.
     - COLOR0 is D0: the ambient colour, a light far along each distant light's direction (and
       one opposite for a translucent shader's back side), and each point light. COLOR1A1 is
       D1, the Fresnel colour c-80 + c-81 (n.e): two lights at the eye, signed
@@ -870,10 +880,15 @@ and pixel shaders.
       azimuth are rounded in the world, the frame's x level, so the map is the same however the
       camera turns and is drawn again only when a draw's direction from the eye crosses a step
       (rounded in the eye's space, a moving camera drew every map again each frame: b30, riding
-      the Pelican, 25 a frame). 32 are kept, in the contiguous window, the one drawn longest ago
-      replaced. The node matrices take texture matrix rows 39 (texture
-      coordinate 3's own) and 45 to 58, eight of them, so a draw of more nodes (with its blended
-      vertices' matrix) has its reflection's coordinates from the processor. Row 60 is
+      the Pelican, 25 a frame). 64 are kept, in the contiguous window (9 KB each), the one drawn
+      longest ago replaced; at most 24 are drawn in a frame, and a draw past those takes the kept
+      map of its cube map whose frame is nearest its own. With 32 kept, fewer than b30's draws
+      need, every map was drawn again every frame (583 to 1,862 in 60 frames). A draw's stages'
+      texture matrices take two rows each (30 to 39, by their first row) and the node matrices
+      the ten pairs 40 to 58: every one of a draw's nine keys and its blended vertices'. With
+      eight (rows 39 and 45 to 58), a part of nine keys had every vertex's reflection
+      coordinates from the processor (the program run whole, then the sphere map's square
+      roots). Row 60 is
       `GX_IDENTITY`, which every draw in screen space reads its texture coordinates through: the
       first build put the eighth and ninth nodes' matrices over it, and every such draw after came out as
       streaks. Each frame now begins with `GX_IDENTITY` loaded again, and the display copy's
@@ -898,9 +913,12 @@ and pixel shaders.
       (a harness of the loop's lit vertex, with its call: 193 to 54, 206 to 66 with a node's
       matrix index, about 140 fewer). A vertex whose position is the processor's (a blend beyond the
       draw's matrices) still runs the program for its position and is skinned for its normal.
-    - The log's `lit by GX` line counts the draws, their vertices, those refused (no such space,
-      more lights or colours than GX holds), the view's sphere maps drawn, and the draws whose
-      planar fog was the ramp's (and the ramps written) or the processor's.
+    - The log's `lit by GX` lines count the draws, their vertices, those refused (no such space,
+      more lights or colours than GX holds), the view's sphere maps drawn and the draws that took
+      a near one, the draws whose planar fog was the ramp's (and the ramps written) or the
+      processor's, and the draws whose normals GX read by index, the normals decoded and the
+      kilobytes kept. (The log keeps some 200 characters of a line: the statistics' lines are
+      short of it.)
 
   GX then draws the results:
   - A program that divides by its clip-space w is sent as (x·w, y·w, −w) through a perspective
@@ -927,6 +945,24 @@ and pixel shaders.
     ten of a refusal's attempts). `tests/gx_psh_cache_check.c` compares every program the cache
     gives with a fresh translation; the log's `pixel shader programs` line counts the
     translations, the programs kept and changed, and the changes translated again to check them.
+  - Three of the game's programs are recognized and made by hand (`gx_psh.c`'s recipes):
+    - the models' (`set_environment_shader_pixel_shader`: base, detail, multipurpose and cube
+      maps, eight combiners), which keeps more values alive than TEV's four registers: with the
+      cube map bound the general translation refused it ("no free register"), and every model
+      with a reflection (the Pelicans, the Marines, the ring in b30's sky) was the fallback's base
+      map times its diffuse colour, its detail, self-illumination, change colour, reflection and
+      fog left out, and its alpha that times D0's (0 for a lit model). The recipe reads the
+      multipurpose map's channels through swap tables (the game's dot products pick them),
+      keeps its values in PREV, REG0 and REG1 and the fifth constant in REG2, in 11 to 14
+      stages, exactly; `tools/wii_gx_psh_check.py` checks all 432 variants (detail masks and
+      functions, doubled or not, both fogs, the cube map or not, D0's alpha a ramp's or not)
+      against NV2A's combiners (`nv2a_eval`: the detail's biased add is signed, so 2 t1 - 1
+      darkens, which the general translation's clamped model does not), to 0/255;
+    - the structure's fog pass (`_rasterizer_environment_fog_begin`), in seven stages, exactly,
+      which with both density maps and the game's constants (b30's sea) ran out of registers;
+    - the specular lights' pass from a lightmap (below).
+    A fallback (a program still beyond GX) asks only texture coordinate 0 and colour 0 of the
+    vertices, which is all it reads.
   - Combiner registers are renamed as they are written, and dead values are dropped.
   - Inputs a stage can't reach (a second texture or rasterized colour, a second constant, a
     doubly inverted product) are first computed into a free register, or into the operation's
