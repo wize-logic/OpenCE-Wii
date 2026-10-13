@@ -141,6 +141,11 @@ def build(record: bool, device: str = None) -> Path:
         (wiilibs / "wl" / "base" / "hash.c", plain),
         (wiilibs / "wl" / "gfx" / "gfx_sqrt.c", plain),
         (wiilibs / "wl" / "platform" / "wii" / "tev_wii.c", plain),
+        # (WiiLibs' direct GX layer's flush and vertex sizes, and the NV2A's raster state as GX takes it,
+        # which the device draws through: libogc's GX alone, here the stand-in)
+        (wiilibs / "wl" / "platform" / "gx_vertex.c", plain),
+        (wiilibs / "wl" / "platform" / "wii" / "gx_flush_wii.c", plain),
+        (wiilibs / "wl" / "xbox" / "nv2a_raster.c", plain),
         # (WiiLibs' Xbox translators: the combiners' translation and its cache, the vertex programs)
         (wiilibs / "wl" / "xbox" / "psh.c", plain),
         (wiilibs / "wl" / "xbox" / "psh_cache.c", plain),

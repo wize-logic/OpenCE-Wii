@@ -1324,7 +1324,9 @@ WiiLibs' translation calls first), the list of the game's vertex programs compil
   nothing for it (its `gx.o`, disassembled: the value is only kept). So after each of those the
   device's next primitive is preceded by eight vertices of zeros in its own vertex format (its
   size from libogc's vertex descriptor and the formats the device set), which are one point and
-  draw nothing (`gx_begin`; `debug.gpu_xf_flush_safe`, on by default). Where WiiLibs' GX wait (250
+  draw nothing (`gx_begin` through WiiLibs' direct GX layer, `wl/platform/gx_direct.h`:
+  `wl_gx_direct_vertex_format`, `wl_gx_direct_flush_pending`; `debug.gpu_xf_flush_safe`, on by
+  default). Where WiiLibs' GX wait (250
   ms) runs out, at the frame's draws or its display copy, the log says where GX stood: its status
   flags, the GP FIFO's read and write pointers and fill, the CPU FIFO's write pointer, the last
   token passed and the flushes sent (`GX did not finish in time`).
@@ -1333,7 +1335,12 @@ WiiLibs' translation calls first), the list of the game's vertex programs compil
   read no texture coordinate from its vertices and whose colours are constant would be. Such a
   draw sends a colour of 0 (RGB565, two bytes) that neither channel reads; the processor's draws
   of a matrix index and nothing else read send their first colour as 0. A build with assertions
-  checks every primitive's descriptor (`vertex_shape_check`).
+  checks every primitive's descriptor (`vertex_shape_check`, WiiLibs' `wl_gx_direct_vertex_shape_ok`).
+- **Raster state.** The compare functions, blending and cull modes are WiiLibs' mappings of the
+  NV2A's (`wl/xbox/nv2a_pipeline.h`: `wl_nv2a_gx_compare`, `wl_nv2a_gx_blend_of`, `wl_nv2a_cull_d3d`,
+  `wl_nv2a_gx_cull`), the Xbox's Direct3D's render states being the NV2A's own values; the GX
+  mode that culls what is clockwise on the screen is measured once at the first frame
+  (`cull_measure`).
 - **Debugging.** The desktop ports' `debug.gpu_debug_flat` and `debug.gpu_debug_texture0` (in
   `config.toml`) show the diffuse colour, or the first texture, alone. The draw log, a setting of
   any build, describes every draw of one frame and names the draws that make a pixel what it is:
